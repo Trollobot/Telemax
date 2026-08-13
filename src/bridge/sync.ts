@@ -1555,8 +1555,12 @@ export async function syncAllChatsToTelegram(
 ): Promise<void> {
   for (const chat of chats) {
     if (!chat || typeof chat !== 'object') continue;
-    const c = chat as { id?: unknown; type?: string; participants?: Record<string, unknown>; lastMessage?: { text?: string } };
+    const c = chat as { id?: unknown; type?: string; status?: string; participants?: Record<string, unknown>; lastMessage?: { text?: string } };
     if (c.id == null) continue;
+    // CHATS_LIST keeps returning chats the account left/closed (status "CLOSED") —
+    // MAX's own client hides those, so mirror that instead of creating a Telegram
+    // topic for an abandoned test group every full resync (confirmed live 2026-08-13).
+    if (c.status && c.status !== 'ACTIVE') continue;
 
     try {
       const name = resolveDisplayName(chat);
