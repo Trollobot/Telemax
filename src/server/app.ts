@@ -113,6 +113,8 @@ function syncChatsIfPossible(): Promise<void> {
     (chat) => resolveChatName(chat, myAccountId, contactProfiles),
     max,
     messageLinks_,
+    myAccountId,
+    contactProfiles,
   )
     .catch((err) => logger.error('Chat sync to Telegram failed:', err))
     .finally(() => {

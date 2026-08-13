@@ -1550,15 +1550,28 @@ export async function syncAllChatsToTelegram(
   resolveDisplayName: (chat: unknown) => string,
   max: MaxClient,
   messageLinks: MessageLinkStore,
+  myAccountId: number | null,
+  contactProfiles: Map<number, ContactProfile>,
 ): Promise<void> {
   for (const chat of chats) {
     if (!chat || typeof chat !== 'object') continue;
-    const c = chat as { id?: unknown; lastMessage?: { text?: string } };
+    const c = chat as { id?: unknown; type?: string; participants?: Record<string, unknown>; lastMessage?: { text?: string } };
     if (c.id == null) continue;
 
     try {
       const name = resolveDisplayName(chat);
-      const { topicId } = await ensureTopicForMaxChat(bot, targetGroupId, c.id, chatMapStore, name);
+      const { topicId, created } = await ensureTopicForMaxChat(bot, targetGroupId, c.id, chatMapStore, name);
+      if (created) {
+        // Same intro card the live-push path sends on first contact (sendAutoInfoCard) —
+        // this bulk-sync path (used by /reboot and startup resync) never went through
+        // that code and silently skipped it for every topic it creates.
+        const participantIds = c.participants ? Object.keys(c.participants).map(Number) : [];
+        const otherId = participantIds.find((id) => id !== myAccountId);
+        const participantCount = c.participants ? participantIds.length : undefined;
+        await sendContactInfoCard(bot, targetGroupId, topicId, name, c.type, participantCount, otherId, otherId != null ? contactProfiles.get(otherId) : undefined).catch(
+          (err) => logger.error('Failed to send auto contact-info card', err),
+        );
+      }
       const mapping = await chatMapStore.getByMaxChatId(c.id);
       const cursor = mapping?.historyBackfillCursor != null ? Number(mapping.historyBackfillCursor) : null;
       const history = await fetchFullHistory(max, c.id, cursor);
