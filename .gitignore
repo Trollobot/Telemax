@@ -1,0 +1,32 @@
+node_modules/
+dist/
+coverage/
+.DS_Store
+
+# secrets & runtime state — never commit
+.env
+.env.*
+!.env.example
+.data/
+data/
+*.session.json
+
+# anything a debug script might drop — this is a safety net, not a substitute for
+# keeping ad-hoc debug scripts out of the repo entirely
+*.log
+*.bin
+*_debug.*
+crash_*.json
+
+# deploy artifacts / local tooling — not part of the published project
+*.tar.gz
+.claude/
+
+# internal spec/design docs — reverse-engineering notes and process, not meant
+# for the public repo (see repo discussion 2026-08-13)
+ТЗ.md
+max-protocol-full.md
+
+# ad-hoc dev script with a real contact's MAX chat id + name hardcoded in — not
+# needed to run/deploy the app, just an old manual test
+scripts/dev/test-bridge-telegram.ts
