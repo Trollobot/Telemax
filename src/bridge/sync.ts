@@ -466,7 +466,7 @@ async function backfillHistoryToTelegram(
   }
 }
 
-/** Builds and sends the contact/chat card — shared by the /info command and the auto-send on first contact with a new chat. */
+/** Builds and sends the contact/chat card — shared by the /info command and the auto-send on first contact with a new chat. Returns the sent message's id so auto-send callers can pin it. */
 async function sendContactInfoCard(
   bot: Telegraf,
   targetGroupId: string,
@@ -476,21 +476,21 @@ async function sendContactInfoCard(
   participantCount: number | undefined,
   otherId: number | undefined,
   profile: ContactProfile | undefined,
-): Promise<void> {
+): Promise<number> {
   if (chatType !== 'DIALOG' || otherId == null) {
-    await bot.telegram.sendMessage(
+    const sent = await bot.telegram.sendMessage(
       targetGroupId,
       [`ℹ️ ${fallbackTitle}`, chatType ? `Тип: ${chatType}` : null, participantCount != null ? `Участников: ${participantCount}` : null]
         .filter(Boolean)
         .join('\n'),
       { message_thread_id: topicId },
     );
-    return;
+    return sent.message_id;
   }
 
   if (!profile) {
-    await bot.telegram.sendMessage(targetGroupId, 'ℹ️ Нет данных о контакте.', { message_thread_id: topicId });
-    return;
+    const sent = await bot.telegram.sendMessage(targetGroupId, 'ℹ️ Нет данных о контакте.', { message_thread_id: topicId });
+    return sent.message_id;
   }
 
   const p = profile as ContactProfile & { registrationTime?: unknown; country?: string; baseUrl?: string; description?: string };
@@ -507,14 +507,23 @@ async function sendContactInfoCard(
   const caption = lines.join('\n');
 
   try {
-    if (p.baseUrl) {
-      await bot.telegram.sendPhoto(targetGroupId, p.baseUrl, { caption, message_thread_id: topicId });
-    } else {
-      await bot.telegram.sendMessage(targetGroupId, caption, { message_thread_id: topicId });
-    }
+    const sent = p.baseUrl
+      ? await bot.telegram.sendPhoto(targetGroupId, p.baseUrl, { caption, message_thread_id: topicId })
+      : await bot.telegram.sendMessage(targetGroupId, caption, { message_thread_id: topicId });
+    return sent.message_id;
   } catch (err) {
     logger.error('Failed to send contact info card, falling back to text-only', err);
-    await bot.telegram.sendMessage(targetGroupId, caption, { message_thread_id: topicId }).catch(() => {});
+    const sent = await bot.telegram.sendMessage(targetGroupId, caption, { message_thread_id: topicId });
+    return sent.message_id;
+  }
+}
+
+/** Pins the auto-sent intro card so it stays visible at the top of the topic even after the chat scrolls — not used for on-demand /info, only the first-contact auto-card. */
+async function pinInfoCard(bot: Telegraf, targetGroupId: string, messageId: number): Promise<void> {
+  try {
+    await bot.telegram.pinChatMessage(targetGroupId, messageId, { disable_notification: true });
+  } catch (err) {
+    logger.error('Failed to pin auto contact-info card', err);
   }
 }
 
@@ -752,7 +761,8 @@ export function wireBridge({
     const { chat, otherId, profile } = resolveDialogContact(String(chatId));
     if (chat) {
       const count = chat.participants ? Object.keys(chat.participants).length : undefined;
-      await sendContactInfoCard(bot, targetGroupId, topicId, chat.title || `MAX chat ${String(chatId)}`, chat.type, count, otherId, profile);
+      const messageId = await sendContactInfoCard(bot, targetGroupId, topicId, chat.title || `MAX chat ${String(chatId)}`, chat.type, count, otherId, profile);
+      await pinInfoCard(bot, targetGroupId, messageId);
       return;
     }
     const id = typeof senderId === 'number' ? senderId : Number(senderId);
@@ -767,7 +777,8 @@ export function wireBridge({
         logger.error(`Failed to fetch CONTACT_INFO for new contact ${id}`, err);
       }
     }
-    await sendContactInfoCard(bot, targetGroupId, topicId, `MAX ID ${id}`, 'DIALOG', undefined, id, senderProfile);
+    const messageId = await sendContactInfoCard(bot, targetGroupId, topicId, `MAX ID ${id}`, 'DIALOG', undefined, id, senderProfile);
+    await pinInfoCard(bot, targetGroupId, messageId);
   }
 
   async function handleMaxPush(payload: MaxPushPayload): Promise<void> {
@@ -1572,9 +1583,12 @@ export async function syncAllChatsToTelegram(
         const participantIds = c.participants ? Object.keys(c.participants).map(Number) : [];
         const otherId = participantIds.find((id) => id !== myAccountId);
         const participantCount = c.participants ? participantIds.length : undefined;
-        await sendContactInfoCard(bot, targetGroupId, topicId, name, c.type, participantCount, otherId, otherId != null ? contactProfiles.get(otherId) : undefined).catch(
-          (err) => logger.error('Failed to send auto contact-info card', err),
-        );
+        try {
+          const messageId = await sendContactInfoCard(bot, targetGroupId, topicId, name, c.type, participantCount, otherId, otherId != null ? contactProfiles.get(otherId) : undefined);
+          await pinInfoCard(bot, targetGroupId, messageId);
+        } catch (err) {
+          logger.error('Failed to send auto contact-info card', err);
+        }
       }
       const mapping = await chatMapStore.getByMaxChatId(c.id);
       const cursor = mapping?.historyBackfillCursor != null ? Number(mapping.historyBackfillCursor) : null;
