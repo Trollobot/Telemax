@@ -1,4 +1,4 @@
-const STORAGE_KEY = 'telgamax_api_key';
+const STORAGE_KEY = 'telemax_api_key';
 
 export function getStoredApiKey(): string | null {
   return localStorage.getItem(STORAGE_KEY);

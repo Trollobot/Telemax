@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Interactive first-time setup for TelgaMax. Generates the two secret keys
+# Interactive first-time setup for Telemax. Generates the two secret keys
 # automatically, asks only for the two things nobody but you can provide
 # (the Telegram bot token and target group id), writes .env, and offers to
 # build + start the bridge right away.
@@ -19,7 +19,7 @@ if ! command -v openssl >/dev/null 2>&1; then
   exit 1
 fi
 
-bold "=== TelgaMax — первая настройка ==="
+bold "=== Telemax — первая настройка ==="
 echo
 echo "Понадобится токен бота — создайте его через @BotFather (https://t.me/BotFather), команда /newbot."
 echo

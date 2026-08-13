@@ -21,7 +21,7 @@ fi
 
 export DEBIAN_FRONTEND=noninteractive
 
-bold "=== TelgaMax — установка на чистый сервер ==="
+bold "=== Telemax — установка на чистый сервер ==="
 echo
 
 echo "[1/5] Обновляю систему (может занять несколько минут)..."
