@@ -8,6 +8,19 @@ export function createTelegramBot(token: string): Telegraf {
   return new Telegraf(token);
 }
 
+// Telegram only accepts these six fixed values for a forum topic's icon_color —
+// no arbitrary RGB, and no way to use an actual photo (Bot API limitation, not
+// ours). Hashing the MAX chat id picks one deterministically, so the same
+// contact's topic always gets the same color, even recreated after /reboot.
+const TOPIC_ICON_COLORS = [0x6fb9f0, 0xffd67e, 0xcb86db, 0x8eee98, 0xff93b2, 0xfb6f5f] as const;
+
+function pickTopicIconColor(maxChatId: unknown): (typeof TOPIC_ICON_COLORS)[number] {
+  const str = String(maxChatId);
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) hash = (hash * 31 + str.charCodeAt(i)) | 0;
+  return TOPIC_ICON_COLORS[Math.abs(hash) % TOPIC_ICON_COLORS.length] as (typeof TOPIC_ICON_COLORS)[number];
+}
+
 export interface EnsuredTopic {
   topicId: number;
   /** True when this call just created the topic — callers use this to decide whether to seed it. */
@@ -43,7 +56,9 @@ export async function ensureTopicForMaxChat(
     return { topicId: existing.telegramTopicId, created: false, historySynced: existing.historySynced === true };
   }
 
-  const topic = await bot.telegram.createForumTopic(groupId, title ?? `MAX chat ${String(maxChatId)}`);
+  const topic = await bot.telegram.createForumTopic(groupId, title ?? `MAX chat ${String(maxChatId)}`, {
+    icon_color: pickTopicIconColor(maxChatId),
+  });
   await chatMapStore.upsert({
     maxChatId,
     telegramTopicId: topic.message_thread_id,
