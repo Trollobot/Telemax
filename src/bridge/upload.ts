@@ -6,6 +6,10 @@
  */
 import { gzipSync } from 'node:zlib';
 import type { Telegraf } from 'telegraf';
+// undici's own FormData, not the global one: maxFetch runs on undici's fetch, and
+// the npm package's types are nominally incompatible with @types/node's bundled
+// undici-types copy behind the global — same class at runtime either way.
+import { FormData } from 'undici';
 import type { MaxClient } from '../max/client.js';
 import { maxFetch } from '../max/ca.js';
 import { renderTgsToWebm } from './lottie.js';

@@ -15,7 +15,7 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import tls from 'node:tls';
-import { Agent } from 'undici';
+import { Agent, fetch as undiciFetch, type RequestInit, type Response } from 'undici';
 import { createLogger } from '../logger.js';
 
 const logger = createLogger('max-ca');
@@ -47,10 +47,14 @@ const maxDispatcher = new Agent({ connect: { ca: MAX_TLS_CA } });
  * fetch() for MAX-owned hosts only (upload slots, file/photo/video CDN) — same
  * trust set as the MaxClient socket. Never route Telegram/GitHub/anything else
  * through this: keeping the state CA away from those connections is the point.
+ *
+ * MUST be undici's own fetch, not the global one: Node's built-in fetch runs on
+ * an internal (older) undici, and handing it an Agent from the npm undici v8
+ * fails at dispatch time with "invalid onRequestStart method" — the handler
+ * interface changed between those majors. Same-version fetch + Agent is the
+ * only supported combination. Hit live 2026-08-14: every MAX CDN download died
+ * with it while plain-TCP traffic kept working.
  */
 export function maxFetch(url: string, init: RequestInit = {}): Promise<Response> {
-  // `dispatcher` is undici's fetch extension — absent from the standard RequestInit
-  // type, and the installed undici's own types clash with @types/node's bundled
-  // undici-types copy, so the cast has to go through unknown.
-  return fetch(url, { ...init, dispatcher: maxDispatcher } as unknown as RequestInit);
+  return undiciFetch(url, { ...init, dispatcher: maxDispatcher });
 }
