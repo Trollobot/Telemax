@@ -112,6 +112,7 @@ async function completeMaxLogin(loginToken: string): Promise<void> {
   currentSession = session;
   activePhone = session.phone;
   broadcastStatus();
+  refreshBotDescription();
 }
 
 /**
@@ -165,6 +166,7 @@ async function killMaxSession(): Promise<void> {
   contactProfiles = new Map();
   maxConnected = false;
   broadcastStatus();
+  refreshBotDescription();
 }
 
 /** Keeps the LOGIN-derived chat snapshot from going stale as messages flow in either direction. */
@@ -233,6 +235,7 @@ async function loginWithSession(session: MaxSession): Promise<void> {
     await sessionStore.clear();
   }
   broadcastStatus();
+  refreshBotDescription();
 }
 
 async function startServer(): Promise<void> {
@@ -290,6 +293,7 @@ async function startServer(): Promise<void> {
         getChats: () => cachedChats,
         getMyAccountId: () => myAccountId,
         getContactProfiles: () => contactProfiles,
+        getActivePhone: () => activePhone,
         triggerFullResync: () => refreshChatsAndNames().then(() => syncChatsIfPossible()),
         killEverything: killMaxSession,
       }));
@@ -629,14 +633,26 @@ const TELEGRAM_RETRY_DELAYS_MS = [2_000, 5_000, 15_000, 30_000, 60_000];
 
 // Shown in the bot's Telegram profile (Bot API 512-char limit on setMyDescription).
 // The two caveats are platform-level, not bugs — worth surfacing here since neither
-// is discoverable from the UI itself.
-const BOT_DESCRIPTION = `Мост MAX (+7XXXXXXXXXX) ↔ Telegram: сообщения, файлы, голосовые, стикеры, опросы, пересылка. Звонки — только уведомления, без аудио.
+// is discoverable from the UI itself. A function, not a constant, since the phone
+// number isn't known yet at first launch (or ever, before the very first auth) —
+// this used to hardcode the developer's own production number, which leaked into
+// every other install of this project. Confirmed live 2026-08-14.
+function buildBotDescription(): string {
+  const phoneLabel = activePhone ? ` (${activePhone})` : '';
+  return `Мост MAX${phoneLabel} ↔ Telegram: сообщения, файлы, голосовые, стикеры, опросы, пересылка. Звонки — только уведомления, без аудио.
 
 Ограничения:
 • Свайп-удаление в Telegram бот не видит (нет такого события в Bot API) — удаляй командой /delete (или /delete me) ответом на сообщение.
 • Голоса за опрос из MAX сами не появляются в Telegram — счёт через /poll ответом на опрос.
 
 Команды: /help /donate /apikey /version /info /poll /delete /newgroup /invite /kick /leavegroup /deletegroup /reboot /kill`;
+}
+
+/** Best-effort refresh once the phone number becomes known (or changes) — the initial setMyDescription at Telegram launch may well have fired before MAX auth finished. */
+function refreshBotDescription(): void {
+  if (!bot || !tgActive) return;
+  bot.telegram.setMyDescription(buildBotDescription()).catch((err) => logger.error('Failed to refresh bot description', err));
+}
 
 // Populates Telegram's "/" command menu with one-line descriptions. /help (bridge/sync.ts)
 // has the full reference — these are just enough to jog the memory from the menu.
@@ -707,7 +723,7 @@ async function launchTelegramBotWithRetry(bot: Telegraf, attempt = 0): Promise<v
   // actual command surface and the two platform-level gaps a user could otherwise
   // spend time re-discovering (Bot API has no delete-notification event at all, and
   // Telegram's poll widget has no way to receive a vote cast on the MAX side).
-  bot.telegram.setMyDescription(BOT_DESCRIPTION).catch((err) => logger.error('Failed to set bot description', err));
+  bot.telegram.setMyDescription(buildBotDescription()).catch((err) => logger.error('Failed to set bot description', err));
   bot.telegram.setMyCommands(BOT_COMMANDS).catch((err) => logger.error('Failed to set bot commands', err));
   void reportIfJustUpdated(bot);
 

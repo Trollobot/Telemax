@@ -26,7 +26,7 @@
 ## Требования
 
 - Docker + Docker Compose
-- Telegram-бот (токен из [@BotFather](https://t.me/BotFather)) и Telegram-группа с включёнными темами (forum topics), куда бот добавлен администратором
+- Telegram-бот (токен из [@BotFather](https://t.me/BotFather)) и Telegram-группа с включёнными темами (forum topics), куда бот добавлен администратором **с правом «Управление темами» (Manage Topics)** — без него бот не сможет создавать темы под MAX-чаты
 - Номер MAX, на который будет авторизован мост
 
 ## Быстрый старт

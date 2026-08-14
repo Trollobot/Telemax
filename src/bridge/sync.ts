@@ -573,6 +573,7 @@ export interface BridgeOptions {
   getChats: () => unknown[];
   getMyAccountId: () => number | null;
   getContactProfiles: () => Map<number, ContactProfile>;
+  getActivePhone: () => string;
   /** Refetches MAX's chat list and re-runs the full backfill sync — used by /reboot after wiping local state. Fire-and-forget on the caller's side (server/app.ts already guards against overlapping runs). */
   triggerFullResync: () => Promise<void>;
   /** Disconnects from MAX and deletes the encrypted session — used by /kill. Awaited (unlike triggerFullResync) since /kill's own confirmation message should only go out once this has actually finished. */
@@ -592,6 +593,7 @@ export function wireBridge({
   getChats,
   getMyAccountId,
   getContactProfiles,
+  getActivePhone,
   triggerFullResync,
   killEverything,
 }: BridgeOptions): WiredBridge {
@@ -1040,7 +1042,8 @@ export function wireBridge({
 
   /** Full command reference + the two platform-level gaps that aren't discoverable from the UI. Doubles as the bot profile's setMyDescription text (server/app.ts), just with room to actually explain each command instead of a 512-char squeeze. */
   bot.command('help', async (ctx) => {
-    const text = `🌉 Мост MAX (+7XXXXXXXXXX) ↔ Telegram
+    const phone = getActivePhone();
+    const text = `🌉 Мост MAX${phone ? ` (${phone})` : ''} ↔ Telegram
 
 Сообщения, файлы, голосовые, стикеры и опросы синхронизируются в обе стороны автоматически — команды нужны только для управления. Обычная пересылка сообщений (drag-forward) в тему тоже работает сама — прилетит в привязанный MAX-чат с пометкой «↩️ Переслано от/из...». Звонки — только текстовые уведомления (входящий звонит / завершённый / пропущенный), без передачи аудио — для этого нужен WebRTC, вне рамок Bot API-моста.
 
