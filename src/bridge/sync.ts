@@ -581,6 +581,20 @@ export function wireBridge({
   triggerFullResync,
   killEverything,
 }: BridgeOptions): WiredBridge {
+  // Every update Telegraf would otherwise route to a command/action/message
+  // handler below passes through here first. /reboot and /kill only gate on
+  // typing a confirmation phrase — and that phrase is public (open-source repo,
+  // even echoed back in /help) — so without this, anyone who finds the bot on
+  // Telegram (a direct DM, or being added to a totally unrelated group) could
+  // trigger them, or /newgroup, or anything else. The target group is meant to
+  // BE the trust boundary; this is what actually enforces that. poll_answer
+  // updates carry no `chat` at all and are separately authorized by their own
+  // poll_id lookup (see bot.on('poll_answer') below), so those pass through.
+  bot.use((ctx, next) => {
+    if (ctx.chat && String(ctx.chat.id) !== targetGroupId) return;
+    return next();
+  });
+
   const outgoingCids = new RecentCids();
   const messageLinks = new MessageLinkStore();
   const pollLinks = new PollLinkStore();
