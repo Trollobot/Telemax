@@ -1,6 +1,9 @@
 services:
   telemax:
-    build: .
+    build:
+      context: .
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
     restart: unless-stopped
     ports:
       - "3000:3000"

@@ -8,6 +8,12 @@ RUN npm run build
 FROM node:22-slim AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
+# Baked in from the host's git checkout at build time (docker-compose.yml passes
+# it through from $GIT_COMMIT) — the runtime image has no .git of its own
+# (excluded via .dockerignore), so this is the only way /version can know what
+# commit is actually running vs what's latest on GitHub.
+ARG GIT_COMMIT=unknown
+ENV GIT_COMMIT=$GIT_COMMIT
 # node:22-slim ships without a CA bundle, so MaxClient's TLS verification
 # (rejectUnauthorized: true, on by default) fails with "unable to get local
 # issuer certificate" — confirmed live on first deploy 2026-08-08. MAX's cert

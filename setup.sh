@@ -8,6 +8,41 @@ cd "$(dirname "$0")"
 
 bold() { printf '\033[1m%s\033[0m\n' "$1"; }
 
+# Runs on every invocation, even on an already-configured install (the .env
+# check below exits before the rest of setup) — an update pulled in via the
+# watcher itself needs the watcher already installed to have gotten here, and
+# re-running enable is harmless, so this is the one place that's safe to do
+# unconditionally.
+if [ "$(id -u)" = "0" ] && command -v systemctl >/dev/null 2>&1; then
+  REPO_DIR="$(pwd)"
+  cat > /etc/systemd/system/telemax-updater.service <<EOF
+[Unit]
+Description=Telemax update watcher (one-shot)
+
+[Service]
+Type=oneshot
+WorkingDirectory=$REPO_DIR
+ExecStart=$REPO_DIR/update-watcher.sh
+EOF
+  cat > /etc/systemd/system/telemax-updater.timer <<'EOF'
+[Unit]
+Description=Run the Telemax update watcher every minute
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+Unit=telemax-updater.service
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now telemax-updater.timer >/dev/null 2>&1
+  echo "Вотчер обновлений (telemax-updater, systemd-таймер) установлен и включён в автозапуск — см. README."
+else
+  echo "Пропускаю установку вотчера обновлений — нужны root и systemd. Обновляться придётся вручную: ./update.sh"
+fi
+
 if [ -f .env ]; then
   echo ".env уже существует — настройка не нужна."
   echo "Если хотите начать заново: удалите .env и запустите setup.sh снова."
@@ -130,7 +165,7 @@ fi
 
 echo
 echo "Собираю образ — первая сборка дольше обычного (внутри headless-браузер для рендера стикеров), обычно несколько минут."
-docker compose up -d --build
+GIT_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo unknown) docker compose up -d --build
 
 PUBLIC_IP=$(curl -s --max-time 3 ifconfig.me || true)
 HOST="${PUBLIC_IP:-<адрес-сервера>}"

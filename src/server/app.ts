@@ -3,6 +3,7 @@ import { createServer } from 'node:http';
 import { WebSocketServer, type WebSocket } from 'ws';
 import { Telegraf } from 'telegraf';
 import path from 'node:path';
+import { readFile, unlink } from 'node:fs/promises';
 import { createServer as createViteServer } from 'vite';
 import { MaxClient, type MaxMessageEvent, type MaxContactInfo } from '../max/client.js';
 import { OPCODES, formatOpcode } from '../max/opcodes.js';
@@ -10,6 +11,7 @@ import { extractMyAccountId, resolveChatName, type ContactProfile } from '../max
 import { SessionStore, type MaxSession } from '../store/sessionStore.js';
 import { ChatMapStore } from '../store/chatMapStore.js';
 import { wireBridge, syncAllChatsToTelegram, MessageLinkStore } from '../bridge/sync.js';
+import { shortSha } from '../bridge/version.js';
 import { createLogger, jsonStringify, redactSecrets } from '../logger.js';
 import { config } from './config.js';
 import { isValidApiKey, requireApiKey } from './authMiddleware.js';
@@ -594,13 +596,14 @@ const BOT_DESCRIPTION = `Мост MAX (+7XXXXXXXXXX) ↔ Telegram: сообще�
 • Свайп-удаление в Telegram бот не видит (нет такого события в Bot API) — удаляй командой /delete (или /delete me) ответом на сообщение.
 • Голоса за опрос из MAX не появляются в виджете Telegram сами — счёт через /poll ответом на сообщение опроса.
 
-Команды: /help /donate /info /poll /delete /newgroup /invite /kick /leavegroup /deletegroup /reboot /kill`;
+Команды: /help /donate /version /info /poll /delete /newgroup /invite /kick /leavegroup /deletegroup /reboot /kill`;
 
 // Populates Telegram's "/" command menu with one-line descriptions. /help (bridge/sync.ts)
 // has the full reference — these are just enough to jog the memory from the menu.
 const BOT_COMMANDS = [
   { command: 'help', description: 'Полный список команд и ограничений' },
   { command: 'donate', description: 'Поддержать проект (рубли / TON)' },
+  { command: 'version', description: 'Версия бота, обновление по кнопке' },
   { command: 'info', description: 'Карточка контакта/чата (просто в теме)' },
   { command: 'poll', description: 'Актуальный счёт опроса (ответом на сообщение)' },
   { command: 'delete', description: 'Удалить сообщение с обеих сторон (ответом)' },
@@ -614,6 +617,21 @@ const BOT_COMMANDS = [
   { command: 'reboot', description: 'Пересоздать все темы с нуля (требует подтверждения)' },
   { command: 'kill', description: 'Разлогинить MAX и стереть все данные (необратимо)' },
 ];
+
+const UPDATE_COMPLETED_MARKER = path.join(process.cwd(), '.data', 'update-completed');
+
+/** update.sh (run by the host-side update-watcher, see setup.sh) writes this with the new commit right before restarting the container — read once on startup so the update isn't silent. */
+async function reportIfJustUpdated(bot: Telegraf): Promise<void> {
+  let commit: string;
+  try {
+    commit = (await readFile(UPDATE_COMPLETED_MARKER, 'utf8')).trim();
+  } catch {
+    return;
+  }
+  await unlink(UPDATE_COMPLETED_MARKER).catch(() => {});
+  if (!commit) return;
+  await bot.telegram.sendMessage(config.targetTelegramGroup, `✅ Обновлено до ${shortSha(commit)}.`).catch((err) => logger.error('Failed to send post-update notice', err));
+}
 
 function retryTelegramLaunch(bot: Telegraf, attempt: number, reason: unknown): void {
   tgActive = false;
@@ -650,6 +668,7 @@ async function launchTelegramBotWithRetry(bot: Telegraf, attempt = 0): Promise<v
   // Telegram's poll widget has no way to receive a vote cast on the MAX side).
   bot.telegram.setMyDescription(BOT_DESCRIPTION).catch((err) => logger.error('Failed to set bot description', err));
   bot.telegram.setMyCommands(BOT_COMMANDS).catch((err) => logger.error('Failed to set bot commands', err));
+  void reportIfJustUpdated(bot);
 
   // message_reaction and poll_answer are opt-in — Telegram omits them from the default update set unless requested.
   bot

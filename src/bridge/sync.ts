@@ -1,3 +1,5 @@
+import path from 'node:path';
+import { writeFile } from 'node:fs/promises';
 import { Markup, type Telegraf } from 'telegraf';
 import type { ChatAction, TelegramEmoji } from 'telegraf/types';
 import type { MaxClient, MaxMessageEvent, MaxHistoryMessage } from '../max/client.js';
@@ -7,6 +9,7 @@ import type { ChatMapStore } from '../store/chatMapStore.js';
 import { ensureTopicForMaxChat } from '../telegram/bot.js';
 import { downloadMaxAttachment, describeAttachment, type MaxAttachment, type DownloadContext } from './attachments.js';
 import { uploadTelegramAttachmentToMax } from './upload.js';
+import { checkVersion, shortSha, type VersionStatus } from './version.js';
 import { createLogger, jsonStringify } from '../logger.js';
 
 const logger = createLogger('bridge');
@@ -527,6 +530,26 @@ async function pinInfoCard(bot: Telegraf, targetGroupId: string, messageId: numb
   }
 }
 
+/** Picked up within a minute by update-watcher.sh on the host (see setup.sh) — writing it is the only thing the container itself does towards an update, everything else (git pull, rebuild, restart) happens outside it. */
+const UPDATE_REQUESTED_MARKER = path.join(process.cwd(), '.data', 'update-requested');
+
+/** Shared by /version and the daily scheduled check — same text/buttons either way. */
+function formatVersionMessage(status: VersionStatus): { text: string; replyMarkup?: ReturnType<typeof Markup.inlineKeyboard>['reply_markup'] } {
+  const currentLabel = status.current ? shortSha(status.current) : 'неизвестна (образ собран без GIT_COMMIT)';
+  if (!status.latest) {
+    return { text: `📦 Текущая версия: ${currentLabel}\n\n⚠️ Не удалось проверить обновления на GitHub — сеть недоступна или лимит запросов.` };
+  }
+  if (!status.updateAvailable) {
+    return { text: `📦 Текущая версия: ${currentLabel}\n\n✅ Это последняя версия.` };
+  }
+  const text = `📦 Текущая версия: ${currentLabel}\n🆕 Доступна новая: ${shortSha(status.latest.sha)} — ${status.latest.message}\n\nОбновить сейчас? Пересборка и перезапуск займут пару минут, история переписки не затрагивается.`;
+  const replyMarkup = Markup.inlineKeyboard([
+    Markup.button.callback('🔄 Обновить', 'tlmx_update'),
+    Markup.button.callback('⏰ Позже', 'tlmx_dismiss'),
+  ]).reply_markup;
+  return { text, replyMarkup };
+}
+
 export interface BridgeOptions {
   max: MaxClient;
   bot: Telegraf;
@@ -615,6 +638,25 @@ export function wireBridge({
         logger.error(`Failed to poll MAX reactions for chat ${relayed.chatId} message ${String(relayed.messageId)}`, err);
       }
     }
+  }
+
+  // Checked roughly once a day, at a jittered offset rather than a fixed clock
+  // time — spreads GitHub API calls out and means a restart doesn't permanently
+  // pin the check to the exact minute the container happened to boot.
+  const VERSION_CHECK_MIN_MS = 20 * 60 * 60 * 1000;
+  const VERSION_CHECK_MAX_MS = 28 * 60 * 60 * 1000;
+  scheduleVersionCheck();
+
+  function scheduleVersionCheck(): void {
+    const delay = VERSION_CHECK_MIN_MS + Math.random() * (VERSION_CHECK_MAX_MS - VERSION_CHECK_MIN_MS);
+    setTimeout(() => void runScheduledVersionCheck().finally(scheduleVersionCheck), delay);
+  }
+
+  async function runScheduledVersionCheck(): Promise<void> {
+    const status = await checkVersion();
+    if (!status.updateAvailable) return;
+    const { text, replyMarkup } = formatVersionMessage(status);
+    await bot.telegram.sendMessage(targetGroupId, text, { reply_markup: replyMarkup }).catch((err) => logger.error('Failed to send scheduled version-update notice', err));
   }
 
   max.on('message', (event: MaxMessageEvent) => {
@@ -983,6 +1025,7 @@ export function wireBridge({
 /deletegroup — удалить группу (требует подтверждения)
 
 Обслуживание бота:
+/version — проверить версию, обновить по кнопке (раз в сутки бот сам напомнит, если вышло обновление)
 /reboot — удалить ВСЕ темы в этой Telegram-группе и пересинхронизировать всё с нуля из MAX (требует подтверждения, MAX не затрагивается)
 /kill — то же самое + разлогинить MAX-сессию (нужна новая SMS-авторизация через веб-панель). Необратимо, требует подтверждения.
 
@@ -1007,6 +1050,28 @@ export function wireBridge({
         { columns: 1 },
       ).reply_markup,
     });
+  });
+
+  bot.command('version', async (ctx) => {
+    const status = await checkVersion();
+    const { text, replyMarkup } = formatVersionMessage(status);
+    await bot.telegram.sendMessage(ctx.chat.id, text, { message_thread_id: ctx.message.message_thread_id, reply_markup: replyMarkup });
+  });
+
+  bot.action('tlmx_update', async (ctx) => {
+    await ctx.answerCbQuery('Обновление запрошено');
+    try {
+      await writeFile(UPDATE_REQUESTED_MARKER, new Date().toISOString(), 'utf8');
+      await ctx.editMessageText('⏳ Обновление запрошено — вотчер на сервере подхватит его в течение минуты, пересоберёт и перезапустит бота. История переписки не затрагивается.');
+    } catch (err) {
+      logger.error('Failed to write update-requested marker', err);
+      await ctx.editMessageText('❌ Не удалось запросить обновление — смотри логи контейнера.');
+    }
+  });
+
+  bot.action('tlmx_dismiss', async (ctx) => {
+    await ctx.answerCbQuery('Ок');
+    await ctx.editMessageText('⏰ Отложено — напомню при следующей ежедневной проверке.');
   });
 
   /** Contact card for the person/group on the other end of this topic — name, phone, country, registration date, and (best-effort) their avatar. */
