@@ -13,6 +13,7 @@
  */
 import { gzipSync } from 'node:zlib';
 import type { MaxClient } from '../max/client.js';
+import { maxFetch } from '../max/ca.js';
 import { createLogger } from '../logger.js';
 
 const logger = createLogger('attachments');
@@ -90,9 +91,11 @@ export interface DownloadContext {
   messageId: unknown;
 }
 
+// Every URL that reaches this helper is a MAX-owned host (photo/sticker/file/video
+// CDN) — hence maxFetch, which trusts the Russian state chain those certs use.
 async function downloadUrl(url: string): Promise<Buffer | null> {
   try {
-    const res = await fetch(url);
+    const res = await maxFetch(url);
     if (!res.ok) {
       logger.error(`downloadUrl got non-OK response ${res.status} ${res.statusText} for ${url}`);
       return null;

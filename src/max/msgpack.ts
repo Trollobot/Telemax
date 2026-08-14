@@ -1,22 +1,15 @@
 import { addExtension, unpack, unpackMultiple } from 'msgpackr';
 
-let extensionsRegistered = false;
-
 /**
  * Ext type code=1 wraps a nested msgpack-encoded buffer (max-protocol-full.md §1.4).
  * msgpackr's addExtension typings require `Class`/`pack` even for an unpack-only
  * extension, hence the cast — this extension is never used for packing.
+ * Registered once at module load (ES modules only ever execute once).
  */
-function ensureExtensionsRegistered(): void {
-  if (extensionsRegistered) return;
-  extensionsRegistered = true;
-  addExtension({
-    type: 1,
-    unpack: (buffer: Buffer) => unpack(buffer),
-  } as Parameters<typeof addExtension>[0]);
-}
-
-ensureExtensionsRegistered();
+addExtension({
+  type: 1,
+  unpack: (buffer: Buffer) => unpack(buffer),
+} as Parameters<typeof addExtension>[0]);
 
 /**
  * Decodes a (decompressed) frame payload. Some MAX responses concatenate more

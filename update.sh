@@ -15,6 +15,10 @@ set -a
 [ -f .env ] && source .env
 set +a
 
+# Installs set up before setup.sh started restricting .env permissions left it
+# world-readable — tighten it on every update so old installs get fixed too.
+[ -f .env ] && chmod 600 .env
+
 notify() {
   [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TARGET_TELEGRAM_GROUP:-}" ] || return 0
   curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \

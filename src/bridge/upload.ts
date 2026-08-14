@@ -7,6 +7,7 @@
 import { gzipSync } from 'node:zlib';
 import type { Telegraf } from 'telegraf';
 import type { MaxClient } from '../max/client.js';
+import { maxFetch } from '../max/ca.js';
 import { renderTgsToWebm } from './lottie.js';
 
 async function fetchTelegramFile(bot: Telegraf, fileId: string): Promise<Buffer> {
@@ -20,7 +21,7 @@ async function uploadPhotoToMax(max: MaxClient, buffer: Buffer): Promise<{ _type
   const { url } = await max.requestPhotoUpload();
   const form = new FormData();
   form.append('file', new Blob([buffer], { type: 'image/jpeg' }), 'photo.jpg');
-  const res = await fetch(url, {
+  const res = await maxFetch(url, {
     method: 'POST',
     headers: {
       'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
@@ -40,7 +41,7 @@ async function uploadPhotoToMax(max: MaxClient, buffer: Buffer): Promise<{ _type
 
 async function uploadFileToMax(max: MaxClient, buffer: Buffer, filename: string): Promise<{ _type: 'FILE'; fileId: unknown }> {
   const slot = await max.requestFileUpload();
-  const res = await fetch(slot.url, {
+  const res = await maxFetch(slot.url, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/octet-stream',
@@ -74,7 +75,7 @@ async function uploadFileToMax(max: MaxClient, buffer: Buffer, filename: string)
 async function uploadVoiceToMax(max: MaxClient, buffer: Buffer, filename: string, duration: number): Promise<{ _type: 'AUDIO'; audioId: unknown; token: string; duration: number }> {
   const slot = await max.requestVoiceUploadSlot();
   const readyPromise = max.waitForAudioReady(); // start listening before the POST so the push can't arrive unheard
-  const res = await fetch(slot.url, {
+  const res = await maxFetch(slot.url, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/octet-stream',
@@ -100,7 +101,7 @@ async function uploadVideoToMax(
 ): Promise<{ _type: 'VIDEO'; videoId: unknown; token: string }> {
   const slot = await max.requestVideoUpload();
   const readyPromise = max.waitForVideoReady(); // start listening before the POST so the push can't arrive unheard
-  const res = await fetch(slot.url, {
+  const res = await maxFetch(slot.url, {
     method: 'POST',
     headers: {
       'Content-Type': contentType,

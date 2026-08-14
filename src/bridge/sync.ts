@@ -574,6 +574,8 @@ export interface BridgeOptions {
   getMyAccountId: () => number | null;
   getContactProfiles: () => Map<number, ContactProfile>;
   getActivePhone: () => string;
+  /** 'https' once the panel booted with its (self-signed) certificate, 'http' when TLS is off or cert setup failed — /apikey builds its login link with it. */
+  getPanelScheme: () => 'http' | 'https';
   /** Refetches MAX's chat list and re-runs the full backfill sync — used by /reboot after wiping local state. Fire-and-forget on the caller's side (server/app.ts already guards against overlapping runs). */
   triggerFullResync: () => Promise<void>;
   /** Disconnects from MAX and deletes the encrypted session — used by /kill. Awaited (unlike triggerFullResync) since /kill's own confirmation message should only go out once this has actually finished. */
@@ -594,6 +596,7 @@ export function wireBridge({
   getMyAccountId,
   getContactProfiles,
   getActivePhone,
+  getPanelScheme,
   triggerFullResync,
   killEverything,
 }: BridgeOptions): WiredBridge {
@@ -1101,9 +1104,14 @@ export function wireBridge({
     }
     const port = process.env.PORT ?? '3000';
     const ip = await detectPublicIp();
+    const scheme = getPanelScheme();
+    const certNote =
+      scheme === 'https'
+        ? '\n\n🔒 Сертификат самоподписанный — браузер один раз предупредит «подключение не защищено»: жми «Дополнительно» → «Перейти на сайт».'
+        : '';
     const text = ip
-      ? `🔑 Вход в веб-панель (ссылка сразу авторизует):\nhttp://${ip}:${port}/?key=${encodeURIComponent(apiKey)}`
-      : `🔑 Ключ для веб-панели (не удалось определить IP сервера — откройте панель вручную и введите ключ):\n<code>${apiKey}</code>`;
+      ? `🔑 Вход в веб-панель (ссылка сразу авторизует):\n${scheme}://${ip}:${port}/?key=${encodeURIComponent(apiKey)}${certNote}`
+      : `🔑 Ключ для веб-панели (не удалось определить IP сервера — откройте панель вручную и введите ключ):\n<code>${apiKey}</code>${certNote}`;
     await bot.telegram.sendMessage(ctx.chat.id, text, {
       message_thread_id: ctx.message.message_thread_id,
       parse_mode: 'HTML',
@@ -1721,7 +1729,6 @@ export async function syncAllChatsToTelegram(
         logger.info(`${cursor == null ? 'Backfilling' : 'Catching up on'} ${history.length} messages for MAX chat ${String(c.id)}`);
         await backfillHistoryToTelegram(bot, targetGroupId, topicId, history, max, c.id, messageLinks, chatMapStore, chats);
       }
-      await chatMapStore.markHistorySynced(c.id);
     } catch (err) {
       logger.error(`Failed to sync MAX chat ${c.id} to Telegram`, err);
     }

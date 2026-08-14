@@ -40,11 +40,25 @@ const SECRET_KEYS = new Set([
   'photoToken',
   'code',
   'apiKey',
+  // CHECK_PASSWORD's request payload — without these the MAX account password
+  // went to the web-panel packet log in plain text.
+  'password',
+  'trackId',
+  // PII, not a credential — but the packet log has no reason to show raw phone numbers.
+  'phone',
 ]);
 
-/** Recursively redacts known secret-bearing keys before logging or sending to the UI. */
+// The session/login tokens are 663-char strings whose field key is NOT reliable
+// across accounts/builds (tokens.ts scans for them by length for exactly that
+// reason) — so key-based redaction alone can miss them. Any string this long in
+// a packet log is far more likely to be a credential or a base64 blob than
+// human-readable content; mask them all regardless of key.
+const LONG_STRING_THRESHOLD = 512;
+
+/** Recursively redacts known secret-bearing keys (and any suspiciously long string) before logging or sending to the UI. */
 export function redactSecrets(value: unknown, seen = new Set<unknown>()): unknown {
-  if (typeof value === 'string' || value === null || typeof value !== 'object') return value;
+  if (typeof value === 'string') return value.length >= LONG_STRING_THRESHOLD ? maskString(value) : value;
+  if (value === null || typeof value !== 'object') return value;
   if (seen.has(value)) return '[circular]';
   seen.add(value);
 
@@ -72,6 +86,9 @@ export function jsonStringify(value: unknown): string {
 
 function maskString(value: unknown): string {
   if (typeof value !== 'string') return '[redacted]';
-  if (value.length <= 8) return '[redacted]';
+  // Partial reveal (first/last 4 chars) is only safe for long values like the
+  // 663-char tokens, where 8 leaked chars are useless — for anything short
+  // enough to be a password or SMS code it would leak most of the secret.
+  if (value.length <= 32) return '[redacted]';
   return `${value.slice(0, 4)}...${value.slice(-4)} (${value.length})`;
 }

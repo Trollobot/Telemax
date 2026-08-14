@@ -25,7 +25,7 @@ interface Metrics {
 }
 
 interface ChatMapping {
-  maxChatId: number;
+  maxChatId: string; // normalized to a decimal string server-side (BigInt-safe)
   telegramTopicId: number;
   title?: string;
   createdAt: string;
@@ -35,7 +35,6 @@ interface MaxChat {
   id: number;
   type: string;
   displayName: string;
-  newMessages?: number;
   lastMessage?: { text?: string; sender?: number };
 }
 
@@ -240,20 +239,27 @@ export default function App() {
 
     let cancelled = false;
 
-    apiFetch('/api/status')
-      .then((r: Response) => {
-        if (r.status === 401) throw new Error('unauthorized');
-        return r.json();
-      })
-      .then((data: { packetsSent: number; packetsReceived: number; uptimeSeconds: number; maxOnline: boolean; tgActive: boolean; deviceId: string; phone: string; latencyMs: number | null }) => {
-        if (cancelled) return;
-        setMetrics({ packetsSent: data.packetsSent, packetsReceived: data.packetsReceived, uptimeSeconds: data.uptimeSeconds });
-        setStatus({ max: data.maxOnline, tg: data.tgActive, deviceId: data.deviceId, phone: data.phone, latencyMs: data.latencyMs });
-        if (data.phone) setAuthStep('done');
-      })
-      .catch((err: Error) => {
-        if (!cancelled && err.message === 'unauthorized') handleUnauthorized();
-      });
+    const refreshStatus = (isInitial: boolean) => {
+      apiFetch('/api/status')
+        .then((r: Response) => {
+          if (r.status === 401) throw new Error('unauthorized');
+          return r.json();
+        })
+        .then((data: { packetsSent: number; packetsReceived: number; uptimeSeconds: number; maxOnline: boolean; tgActive: boolean; deviceId: string; phone: string; latencyMs: number | null }) => {
+          if (cancelled) return;
+          setMetrics({ packetsSent: data.packetsSent, packetsReceived: data.packetsReceived, uptimeSeconds: data.uptimeSeconds });
+          setStatus({ max: data.maxOnline, tg: data.tgActive, deviceId: data.deviceId, phone: data.phone, latencyMs: data.latencyMs });
+          if (isInitial && data.phone) setAuthStep('done');
+        })
+        .catch((err: Error) => {
+          if (!cancelled && err.message === 'unauthorized') handleUnauthorized();
+        });
+    };
+
+    refreshStatus(true);
+    // The WS pushes status changes, but packets/uptime only come from /api/status —
+    // without polling they froze at their on-mount values until a full page reload.
+    const metricsTimer = window.setInterval(() => refreshStatus(false), 30_000);
 
     apiFetch('/api/chat-mappings')
       .then((r: Response) => (r.ok ? r.json() : { data: [] }))
@@ -265,17 +271,29 @@ export default function App() {
       .then((body: { data?: { chats?: MaxChat[] } }) => !cancelled && setMaxChats(body.data?.chats ?? []))
       .catch(() => {});
 
-    const ws = openStatusSocket();
-    ws.onmessage = (event: MessageEvent<string>) => {
-      const msg = JSON.parse(event.data);
-      if (msg.type === 'init_logs') setLogs(msg.data);
-      else if (msg.type === 'log') setLogs((prev) => [...prev, msg.data].slice(-50));
-      else if (msg.type === 'status') setStatus(msg.data);
+    // Reconnect with a small delay when the socket drops (server redeploy/restart) —
+    // otherwise the panel silently froze until a manual reload.
+    let ws: WebSocket | null = null;
+    let reconnectTimer: number | undefined;
+    const connect = () => {
+      ws = openStatusSocket();
+      ws.onmessage = (event: MessageEvent<string>) => {
+        const msg = JSON.parse(event.data);
+        if (msg.type === 'init_logs') setLogs(msg.data);
+        else if (msg.type === 'log') setLogs((prev) => [...prev, msg.data].slice(-50));
+        else if (msg.type === 'status') setStatus(msg.data);
+      };
+      ws.onclose = () => {
+        if (!cancelled) reconnectTimer = window.setTimeout(connect, 3_000);
+      };
     };
+    connect();
 
     return () => {
       cancelled = true;
-      ws.close();
+      window.clearInterval(metricsTimer);
+      window.clearTimeout(reconnectTimer);
+      ws?.close();
     };
   }, [apiKey]);
 

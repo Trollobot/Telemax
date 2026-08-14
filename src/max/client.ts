@@ -4,6 +4,7 @@ import { pack } from 'msgpackr';
 import { readFrameHeader, encodeFrame, decompressPayload, FRAME_HEADER_SIZE } from './frame.js';
 import { decodeFramePayload, pickObject } from './msgpack.js';
 import { OPCODES, DIR, formatOpcode } from './opcodes.js';
+import { MAX_TLS_CA } from './ca.js';
 import { findAuthToken, findLongToken, describeAuthError, extractPasswordChallenge, type PasswordChallenge } from './tokens.js';
 
 export type VerifyCodeResult = { status: 'ok'; loginToken: string } | { status: 'password_required'; challenge: PasswordChallenge };
@@ -144,7 +145,10 @@ export class MaxClient extends EventEmitter {
     this.socket = tls.connect(
       this.opts.port,
       this.opts.host,
-      { servername: this.opts.sni, rejectUnauthorized: this.opts.rejectUnauthorized },
+      // `ca` REPLACES Node's default trust store for this socket, so MAX_TLS_CA
+      // re-includes the bundled roots alongside the Russian state chain MAX's
+      // cert actually needs (scoped here instead of NODE_EXTRA_CA_CERTS — see ca.ts).
+      { servername: this.opts.sni, rejectUnauthorized: this.opts.rejectUnauthorized, ca: MAX_TLS_CA },
       () => {
         this.reconnectAttempt = 0;
         this.emit('connected');
@@ -293,11 +297,11 @@ export class MaxClient extends EventEmitter {
   }
 
   /**
-   * Resolves with the first response frame matching `opcode`. Auth calls are
-   * sent one at a time on a single connection, so simple opcode matching
-   * (rather than tracking `seq` correlation, which the server doesn't
-   * reliably echo) is sufficient here — do not fire concurrent calls for the
-   * same opcode.
+   * Resolves with the first response frame matching `opcode`. The server doesn't
+   * reliably echo `seq`, so opcode matching is the only correlation available —
+   * which is only unambiguous while at most ONE request per opcode is in flight.
+   * request() below enforces that; don't call this directly for request/response
+   * pairs.
    */
   waitForOpcode(opcode: number, timeoutMs = 20_000): Promise<MaxMessageEvent> {
     return new Promise((resolve, reject) => {
@@ -324,10 +328,39 @@ export class MaxClient extends EventEmitter {
     });
   }
 
+  // Tail of the in-flight request chain per opcode — see request() below.
+  private readonly requestChains = new Map<number, Promise<unknown>>();
+
+  /**
+   * Sends `payload` and resolves with the first response frame carrying `opcode`,
+   * serializing same-opcode requests: the next one is only sent once the previous
+   * one's response (or timeout) settled. Without this, two concurrent calls for
+   * the same opcode both resolved on whichever response frame landed first —
+   * a real race, not theoretical: Telegraf handles a poll batch's updates
+   * concurrently, so two quick Telegram messages fired two overlapping MSG_SENDs
+   * and could cross-wire the messageId links that edit/delete rely on. Different
+   * opcodes still run in parallel (the backfill's CHAT_HISTORY doesn't wait for
+   * an unrelated FILE_DOWNLOAD).
+   *
+   * Known residual gap: if a request times out and its response arrives late,
+   * the NEXT same-opcode request may consume that stale frame — unavoidable
+   * without seq correlation, and timeouts here usually mean the connection is
+   * about to be torn down and re-established anyway.
+   */
+  private request(opcode: number, payload?: unknown, timeoutMs?: number): Promise<MaxMessageEvent> {
+    const prev = this.requestChains.get(opcode) ?? Promise.resolve();
+    const run = prev.then(() => {
+      const wait = this.waitForOpcode(opcode, timeoutMs);
+      this.send(opcode, payload);
+      return wait;
+    });
+    // Keep the chain alive on failure so the next request still runs.
+    this.requestChains.set(opcode, run.catch(() => undefined));
+    return run;
+  }
+
   async requestSms(phone: string): Promise<string> {
-    const wait = this.waitForOpcode(OPCODES.START_AUTH);
-    this.send(OPCODES.START_AUTH, { phone, type: 'START_AUTH' });
-    const { dir, payload } = await wait;
+    const { dir, payload } = await this.request(OPCODES.START_AUTH, { phone, type: 'START_AUTH' });
     const token = findAuthToken(payload);
     if (dir === DIR.ERR || !token) {
       throw new Error(describeAuthError(payload, 'START_AUTH did not return an auth token'));
@@ -342,9 +375,7 @@ export class MaxClient extends EventEmitter {
    * either way) is what lets the caller ask for a password instead of a fresh code.
    */
   async verifyCode(authToken: string, code: string): Promise<VerifyCodeResult> {
-    const wait = this.waitForOpcode(OPCODES.CHECK_CODE);
-    this.send(OPCODES.CHECK_CODE, { token: authToken, verifyCode: code });
-    const { dir, payload } = await wait;
+    const { dir, payload } = await this.request(OPCODES.CHECK_CODE, { token: authToken, verifyCode: code });
     const token = findLongToken(payload);
     if (dir !== DIR.ERR && token) {
       return { status: 'ok', loginToken: token };
@@ -363,9 +394,7 @@ export class MaxClient extends EventEmitter {
    * confirmed live 2026-08-14 — so a following login attempt needs a fresh SMS.
    */
   async checkPassword(trackId: string, password: string): Promise<string> {
-    const wait = this.waitForOpcode(OPCODES.CHECK_PASSWORD);
-    this.send(OPCODES.CHECK_PASSWORD, { trackId, password });
-    const { dir, payload } = await wait;
+    const { dir, payload } = await this.request(OPCODES.CHECK_PASSWORD, { trackId, password });
     const token = findLongToken(payload);
     if (dir === DIR.ERR || !token) {
       throw new Error(describeAuthError(payload, 'CHECK_PASSWORD did not return a login token — was the password correct?'));
@@ -377,9 +406,7 @@ export class MaxClient extends EventEmitter {
     if (chatsCount > 50) {
       throw new Error('chatsCount must be <= 50 — the server returns an internal error above that (see ТЗ.md §2)');
     }
-    const wait = this.waitForOpcode(OPCODES.LOGIN);
-    this.send(OPCODES.LOGIN, { token, interactive: true, chatsCount });
-    const { dir, payload } = await wait;
+    const { dir, payload } = await this.request(OPCODES.LOGIN, { token, interactive: true, chatsCount });
     const sessionToken = findLongToken(payload);
     if (dir === DIR.ERR || !sessionToken) {
       throw new Error(describeAuthError(payload, 'LOGIN did not return a session token — token may have expired'));
@@ -405,13 +432,11 @@ export class MaxClient extends EventEmitter {
     attaches: unknown[] = [],
   ): Promise<{ cid: number; messageId: unknown; attaches: unknown[] }> {
     const cid = Date.now();
-    const wait = this.waitForOpcode(OPCODES.MSG_SEND);
-    this.send(OPCODES.MSG_SEND, {
+    const { dir, payload } = await this.request(OPCODES.MSG_SEND, {
       chatId: toChatId(chatId),
       message: { text, cid: BigInt(cid), elements: [], attaches, link: null },
       notify: true,
     });
-    const { dir, payload } = await wait;
     const responseMessage = (payload as { message?: { id?: unknown; attaches?: unknown[] } } | null)?.message;
     if (dir === DIR.ERR) throw new Error(describeAuthError(payload, 'MSG_SEND failed'));
     return { cid, messageId: responseMessage?.id, attaches: responseMessage?.attaches ?? [] };
@@ -419,26 +444,13 @@ export class MaxClient extends EventEmitter {
 
   /** `answerIds` — MAX's own assigned ids (from the poll's `answers[].answerId`), not Telegram option indexes. */
   async sendVote(chatId: unknown, messageId: unknown, pollId: unknown, answerIds: number[]): Promise<void> {
-    const wait = this.waitForOpcode(OPCODES.SEND_VOTE);
-    this.send(OPCODES.SEND_VOTE, { chatId: toChatId(chatId), messageId, pollId, answersIds: answerIds });
-    const { dir, payload } = await wait;
+    const { dir, payload } = await this.request(OPCODES.SEND_VOTE, { chatId: toChatId(chatId), messageId, pollId, answersIds: answerIds });
     if (dir === DIR.ERR) throw new Error(describeAuthError(payload, 'SEND_VOTE failed'));
-  }
-
-  async getPollVoters(chatId: unknown, messageId: unknown, pollId: unknown, answerId: number): Promise<{ voters: unknown[]; voteCount: number }> {
-    const wait = this.waitForOpcode(OPCODES.VOTERS_LIST_BY_ANSWER);
-    this.send(OPCODES.VOTERS_LIST_BY_ANSWER, { chatId: toChatId(chatId), messageId, pollId, answerId });
-    const { dir, payload } = await wait;
-    if (dir === DIR.ERR) throw new Error(describeAuthError(payload, 'VOTERS_LIST_BY_ANSWER failed'));
-    const p = payload as { voters?: unknown[]; voteCount?: number } | null;
-    return { voters: p?.voters ?? [], voteCount: p?.voteCount ?? 0 };
   }
 
   /** `messageId` must be the genuine MAX integer id (BigInt) — see opcodes.ts for the type pitfall across these three calls. */
   async editMessage(chatId: unknown, messageId: unknown, text: string): Promise<void> {
-    const wait = this.waitForOpcode(OPCODES.MSG_EDIT);
-    this.send(OPCODES.MSG_EDIT, { chatId: toChatId(chatId), messageId, text, elements: [], attachments: [] });
-    const { dir, payload } = await wait;
+    const { dir, payload } = await this.request(OPCODES.MSG_EDIT, { chatId: toChatId(chatId), messageId, text, elements: [], attachments: [] });
     if (dir === DIR.ERR) throw new Error(describeAuthError(payload, 'MSG_EDIT failed'));
   }
 
@@ -450,16 +462,12 @@ export class MaxClient extends EventEmitter {
    * through as-is (already a BigInt from wherever it was captured) — do not stringify.
    */
   async addReaction(chatId: unknown, messageId: unknown, emoji: string): Promise<void> {
-    const wait = this.waitForOpcode(OPCODES.MSG_REACTION);
-    this.send(OPCODES.MSG_REACTION, { chatId: toChatId(chatId), messageId, reaction: { reactionType: 'EMOJI', id: emoji } });
-    const { dir, payload } = await wait;
+    const { dir, payload } = await this.request(OPCODES.MSG_REACTION, { chatId: toChatId(chatId), messageId, reaction: { reactionType: 'EMOJI', id: emoji } });
     if (dir === DIR.ERR) throw new Error(describeAuthError(payload, 'MSG_REACTION failed'));
   }
 
   async removeReaction(chatId: unknown, messageId: unknown): Promise<void> {
-    const wait = this.waitForOpcode(OPCODES.MSG_CANCEL_REACTION);
-    this.send(OPCODES.MSG_CANCEL_REACTION, { chatId: toChatId(chatId), messageId });
-    const { dir, payload } = await wait;
+    const { dir, payload } = await this.request(OPCODES.MSG_CANCEL_REACTION, { chatId: toChatId(chatId), messageId });
     if (dir === DIR.ERR) throw new Error(describeAuthError(payload, 'MSG_CANCEL_REACTION failed'));
   }
 
@@ -475,9 +483,7 @@ export class MaxClient extends EventEmitter {
    * error, it can cost the live session.
    */
   async getReactions(chatId: unknown, messageId: unknown): Promise<Array<{ reaction: string; count: number }>> {
-    const wait = this.waitForOpcode(OPCODES.MSG_GET_REACTIONS);
-    this.send(OPCODES.MSG_GET_REACTIONS, { chatId: toChatId(chatId), messageIds: [messageId] });
-    const { dir, payload } = await wait;
+    const { dir, payload } = await this.request(OPCODES.MSG_GET_REACTIONS, { chatId: toChatId(chatId), messageIds: [messageId] });
     if (dir === DIR.ERR) throw new Error(describeAuthError(payload, 'MSG_GET_REACTIONS failed'));
     // Response shape unverified — try the single-message shape we already know from
     // MSG_REACTION, then a couple of plausible batch shapes, before giving up empty.
@@ -498,18 +504,12 @@ export class MaxClient extends EventEmitter {
    * this tries the plausible ones rather than assuming `contacts`.
    */
   async getContactInfo(contactIds: unknown[]): Promise<MaxContactInfo[]> {
-    const wait = this.waitForOpcode(OPCODES.CONTACT_INFO);
-    this.send(OPCODES.CONTACT_INFO, { contactIds });
-    const { dir, payload } = await wait;
+    const { dir, payload } = await this.request(OPCODES.CONTACT_INFO, { contactIds });
     if (dir === DIR.ERR) throw new Error(describeAuthError(payload, 'CONTACT_INFO failed'));
     const p = payload as { contacts?: MaxContactInfo[]; profiles?: MaxContactInfo[] } | null;
     if (p && Array.isArray(p.contacts)) return p.contacts;
     if (p && Array.isArray(p.profiles)) return p.profiles;
     return [];
-  }
-
-  getChats(marker = 0): void {
-    this.send(OPCODES.CHATS_LIST, { marker });
   }
 
   /**
@@ -520,9 +520,7 @@ export class MaxClient extends EventEmitter {
    * shape supplied by the user from their own reverse engineering (2026-08-09).
    */
   async getChatsList(marker: number): Promise<{ chats: unknown[]; marker: number | null }> {
-    const wait = this.waitForOpcode(OPCODES.CHATS_LIST);
-    this.send(OPCODES.CHATS_LIST, { marker: BigInt(marker) });
-    const { dir, payload } = await wait;
+    const { dir, payload } = await this.request(OPCODES.CHATS_LIST, { marker: BigInt(marker) });
     if (dir === DIR.ERR) throw new Error(describeAuthError(payload, 'CHATS_LIST failed'));
     const p = payload as { chats?: unknown[]; marker?: unknown } | null;
     const chats = Array.isArray(p?.chats) ? p.chats : [];
@@ -562,15 +560,13 @@ export class MaxClient extends EventEmitter {
    * invites members immediately.
    */
   async createGroup(title: string, userIds: number[] = [], chatType: 'CHAT' | 'CHANNEL' = 'CHAT'): Promise<{ chatId: unknown; owner: unknown }> {
-    const wait = this.waitForOpcode(OPCODES.MSG_SEND);
-    this.send(OPCODES.MSG_SEND, {
+    const { dir, payload } = await this.request(OPCODES.MSG_SEND, {
       message: {
         cid: BigInt(Date.now()),
         attaches: [{ _type: 'CONTROL', event: 'new', chatType, title, userIds }],
       },
       notify: true,
     });
-    const { dir, payload } = await wait;
     if (dir === DIR.ERR) throw new Error(describeAuthError(payload, 'Group creation failed'));
     const chat = (payload as { chat?: { id?: unknown; owner?: unknown } } | null)?.chat;
     if (chat?.id == null) throw new Error('Group creation did not return a chat id');
@@ -579,40 +575,30 @@ export class MaxClient extends EventEmitter {
 
   /** `operation: 'add' | 'remove'`. */
   async updateChatMembers(chatId: unknown, userIds: number[], operation: 'add' | 'remove', showHistory = true): Promise<void> {
-    const wait = this.waitForOpcode(OPCODES.CHAT_MEMBERS);
-    this.send(OPCODES.CHAT_MEMBERS, { chatId: toChatId(chatId), userIds, showHistory, operation });
-    const { dir, payload } = await wait;
+    const { dir, payload } = await this.request(OPCODES.CHAT_MEMBERS, { chatId: toChatId(chatId), userIds, showHistory, operation });
     if (dir === DIR.ERR) throw new Error(describeAuthError(payload, 'CHAT_MEMBERS failed'));
   }
 
   /** `avatarId` is accepted by the wire format but silently ignored server-side — user-confirmed, so not exposed here. */
   async updateChatInfo(chatId: unknown, fields: { title?: string; description?: string }): Promise<void> {
-    const wait = this.waitForOpcode(OPCODES.CHAT_SET_INFO);
-    this.send(OPCODES.CHAT_SET_INFO, { chatId: toChatId(chatId), ...fields });
-    const { dir, payload } = await wait;
+    const { dir, payload } = await this.request(OPCODES.CHAT_SET_INFO, { chatId: toChatId(chatId), ...fields });
     if (dir === DIR.ERR) throw new Error(describeAuthError(payload, 'CHAT_SET_INFO failed'));
   }
 
   async leaveChat(chatId: unknown): Promise<void> {
-    const wait = this.waitForOpcode(OPCODES.CHAT_LEAVE);
-    this.send(OPCODES.CHAT_LEAVE, { chatId: toChatId(chatId) });
-    const { dir, payload } = await wait;
+    const { dir, payload } = await this.request(OPCODES.CHAT_LEAVE, { chatId: toChatId(chatId) });
     if (dir === DIR.ERR) throw new Error(describeAuthError(payload, 'CHAT_LEAVE failed'));
   }
 
   /** `forAll: true` deletes for every participant — irreversible for them too, not just us. */
   async deleteChat(chatId: unknown, lastEventTime: number, forAll: boolean): Promise<void> {
-    const wait = this.waitForOpcode(OPCODES.CHAT_DELETE);
-    this.send(OPCODES.CHAT_DELETE, { chatId: toChatId(chatId), lastEventTime: BigInt(lastEventTime), forAll });
-    const { dir, payload } = await wait;
+    const { dir, payload } = await this.request(OPCODES.CHAT_DELETE, { chatId: toChatId(chatId), lastEventTime: BigInt(lastEventTime), forAll });
     if (dir === DIR.ERR) throw new Error(describeAuthError(payload, 'CHAT_DELETE failed'));
   }
 
   /** `forMe: true` deletes only from our own view; `false` deletes for everyone. */
   async deleteMessages(chatId: unknown, messageIds: unknown[], forMe: boolean): Promise<void> {
-    const wait = this.waitForOpcode(OPCODES.MSG_DELETE);
-    this.send(OPCODES.MSG_DELETE, { chatId: toChatId(chatId), messageIds, forMe });
-    const { dir, payload } = await wait;
+    const { dir, payload } = await this.request(OPCODES.MSG_DELETE, { chatId: toChatId(chatId), messageIds, forMe });
     if (dir === DIR.ERR) throw new Error(describeAuthError(payload, 'MSG_DELETE failed'));
   }
 
@@ -623,8 +609,7 @@ export class MaxClient extends EventEmitter {
    * here, message objects match PUSH_MESSAGE's shape exactly.
    */
   async getChatHistory(chatId: unknown, from: number, backward = 100): Promise<MaxHistoryMessage[]> {
-    const wait = this.waitForOpcode(OPCODES.CHAT_HISTORY);
-    this.send(OPCODES.CHAT_HISTORY, {
+    const { dir, payload } = await this.request(OPCODES.CHAT_HISTORY, {
       chatId: toChatId(chatId),
       // `from` is a ms timestamp (~1.7e12) — same overflow trap as cid/messageId/chatId:
       // a plain number that size packs as float64 and the server rejects it outright.
@@ -638,7 +623,6 @@ export class MaxClient extends EventEmitter {
       interactive: false,
       itemType: 'REGULAR',
     });
-    const { dir, payload } = await wait;
     if (dir === DIR.ERR) throw new Error(describeAuthError(payload, 'CHAT_HISTORY failed'));
     const messages = (payload as { messages?: MaxHistoryMessage[] } | null)?.messages;
     return Array.isArray(messages) ? messages : [];
@@ -646,9 +630,7 @@ export class MaxClient extends EventEmitter {
 
   /** Requests an upload slot for a single photo. Response shape supplied by the user, not in max-protocol-full.md. */
   async requestPhotoUpload(): Promise<{ url: string; photoIds: unknown[] }> {
-    const wait = this.waitForOpcode(OPCODES.PHOTO_UPLOAD);
-    this.send(OPCODES.PHOTO_UPLOAD, { count: 1 });
-    const { dir, payload } = await wait;
+    const { dir, payload } = await this.request(OPCODES.PHOTO_UPLOAD, { count: 1 });
     const result = payload as { url?: string; photoIds?: unknown[] } | null;
     if (dir === DIR.ERR || !result?.url) {
       throw new Error(describeAuthError(payload, 'PHOTO_UPLOAD did not return an upload url'));
@@ -658,9 +640,7 @@ export class MaxClient extends EventEmitter {
 
   /** Requests an upload slot for a single video. */
   async requestVideoUpload(): Promise<{ url: string; videoId: unknown; token: string }> {
-    const wait = this.waitForOpcode(OPCODES.VIDEO_UPLOAD);
-    this.send(OPCODES.VIDEO_UPLOAD, { count: 1, type: 0, uploaderType: 0, profile: false });
-    const { dir, payload } = await wait;
+    const { dir, payload } = await this.request(OPCODES.VIDEO_UPLOAD, { count: 1, type: 0, uploaderType: 0, profile: false });
     const slot = (payload as { info?: Array<{ url: string; videoId: unknown; token: string }> } | null)?.info?.[0];
     if (dir === DIR.ERR || !slot) {
       throw new Error(describeAuthError(payload, 'VIDEO_UPLOAD did not return an upload slot'));
@@ -675,9 +655,7 @@ export class MaxClient extends EventEmitter {
    * before — FILE_UPLOAD (0x57) simply isn't the right opcode for it at all.
    */
   async requestVoiceUploadSlot(): Promise<{ url: string; videoId: unknown; token: string }> {
-    const wait = this.waitForOpcode(OPCODES.VIDEO_UPLOAD);
-    this.send(OPCODES.VIDEO_UPLOAD, { count: 1, type: 2, uploaderType: 0, profile: false });
-    const { dir, payload } = await wait;
+    const { dir, payload } = await this.request(OPCODES.VIDEO_UPLOAD, { count: 1, type: 2, uploaderType: 0, profile: false });
     const slot = (payload as { info?: Array<{ url: string; videoId: unknown; token: string }> } | null)?.info?.[0];
     if (dir === DIR.ERR || !slot) {
       throw new Error(describeAuthError(payload, 'VIDEO_UPLOAD (voice) did not return an upload slot'));
@@ -743,9 +721,7 @@ export class MaxClient extends EventEmitter {
 
   /** Requests an upload slot for a single file (also used for GIFs — MAX only accepts those as FILE). */
   async requestFileUpload(): Promise<{ url: string; fileId: unknown; token: string }> {
-    const wait = this.waitForOpcode(OPCODES.FILE_UPLOAD);
-    this.send(OPCODES.FILE_UPLOAD, { count: 1, type: 0, uploaderType: 0, profile: false });
-    const { dir, payload } = await wait;
+    const { dir, payload } = await this.request(OPCODES.FILE_UPLOAD, { count: 1, type: 0, uploaderType: 0, profile: false });
     const slot = (payload as { info?: Array<{ url: string; fileId: unknown; token: string }> } | null)?.info?.[0];
     if (dir === DIR.ERR || !slot) {
       throw new Error(describeAuthError(payload, 'FILE_UPLOAD did not return an upload slot'));
@@ -755,9 +731,7 @@ export class MaxClient extends EventEmitter {
 
   /** Exchanges a FILE attachment's opaque token for a short-lived signed download URL. */
   async getFileDownloadUrl(chatId: unknown, messageId: unknown, fileId: unknown): Promise<string> {
-    const wait = this.waitForOpcode(OPCODES.FILE_DOWNLOAD);
-    this.send(OPCODES.FILE_DOWNLOAD, { chatId: toChatId(chatId), messageId, fileId });
-    const { dir, payload } = await wait;
+    const { dir, payload } = await this.request(OPCODES.FILE_DOWNLOAD, { chatId: toChatId(chatId), messageId, fileId });
     const url = (payload as { url?: string } | null)?.url;
     if (dir === DIR.ERR || !url) {
       throw new Error(describeAuthError(payload, 'FILE_DOWNLOAD did not return a url'));
@@ -771,9 +745,7 @@ export class MaxClient extends EventEmitter {
    * MP4_240) plus an EXTERNAL link; callers pick whichever MP4_* they want.
    */
   async getVideoPlayUrls(chatId: unknown, messageId: unknown, videoId: unknown): Promise<Record<string, string>> {
-    const wait = this.waitForOpcode(OPCODES.VIDEO_PLAY);
-    this.send(OPCODES.VIDEO_PLAY, { chatId: toChatId(chatId), messageId, videoId });
-    const { dir, payload } = await wait;
+    const { dir, payload } = await this.request(OPCODES.VIDEO_PLAY, { chatId: toChatId(chatId), messageId, videoId });
     const urls = payload as Record<string, string> | null;
     if (dir === DIR.ERR || !urls) {
       throw new Error(describeAuthError(payload, 'VIDEO_PLAY did not return any playback urls'));

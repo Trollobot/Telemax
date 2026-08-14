@@ -12,12 +12,6 @@ export interface ChatMapping {
   telegramTopicId: number;
   title?: string;
   createdAt: string;
-  // Separate from topic existence: a topic can exist (created:true once) while its
-  // history backfill failed and was never retried, since `created` only fires the
-  // first time. Absent/false on any entry written before this field existed —
-  // read as "needs a (re)backfill attempt" (hit live in prod 2026-08-09, first
-  // batch of topics predates the CHAT_HISTORY BigInt fix and stayed empty forever).
-  historySynced?: boolean;
   // ms timestamp (decimal string, same overflow reason as maxChatId) of the newest
   // history message actually delivered to Telegram so far. Lets a resumed backfill
   // (crash, redeploy, or a fresh reconnect mid-flood-wait) skip everything already
@@ -58,7 +52,6 @@ export class ChatMapStore {
     telegramTopicId: number;
     title?: string;
     createdAt: string;
-    historySynced?: boolean;
     historyBackfillCursor?: string;
   }): Promise<void> {
     const normalized: ChatMapping = { ...mapping, maxChatId: String(mapping.maxChatId) };
@@ -68,12 +61,6 @@ export class ChatMapStore {
     else all.push(normalized);
     this.cache = all;
     await this.persist(all);
-  }
-
-  async markHistorySynced(maxChatId: unknown): Promise<void> {
-    const existing = await this.getByMaxChatId(maxChatId);
-    if (!existing) return;
-    await this.upsert({ ...existing, historySynced: true });
   }
 
   async advanceHistoryCursor(maxChatId: unknown, time: number): Promise<void> {
@@ -88,16 +75,30 @@ export class ChatMapStore {
     await this.persist([]);
   }
 
-  private async load(): Promise<ChatMapping[]> {
-    if (this.cache) return this.cache;
-    try {
-      const raw = await readFile(this.filePath, 'utf8');
-      this.cache = JSON.parse(raw) as ChatMapping[];
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') this.cache = [];
-      else throw err;
-    }
-    return this.cache;
+  // Memoizes the in-flight first read. Without this, concurrent first accesses
+  // (a live-push upsert racing the startup sync) each read the file independently
+  // and each installed their OWN array as the cache — forking it, so concurrent
+  // upserts landed in different arrays and all but the last writer's entries were
+  // silently dropped from disk. Caught by the concurrent-upsert test 2026-08-14.
+  private pendingLoad: Promise<ChatMapping[]> | null = null;
+
+  private load(): Promise<ChatMapping[]> {
+    if (this.cache) return Promise.resolve(this.cache);
+    this.pendingLoad ??= (async () => {
+      try {
+        const raw = await readFile(this.filePath, 'utf8');
+        this.cache = JSON.parse(raw) as ChatMapping[];
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') this.cache = [];
+        else throw err;
+      }
+      return this.cache;
+    })().finally(() => {
+      // On success the cache short-circuits future calls; on failure this
+      // allows a retry instead of caching the rejection forever.
+      this.pendingLoad = null;
+    });
+    return this.pendingLoad;
   }
 
   private persist(mappings: ChatMapping[]): Promise<void> {

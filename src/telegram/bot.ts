@@ -1,12 +1,8 @@
-import { Telegraf } from 'telegraf';
+import type { Telegraf } from 'telegraf';
 import type { ChatMapStore } from '../store/chatMapStore.js';
 import { createLogger } from '../logger.js';
 
 const logger = createLogger('telegram');
-
-export function createTelegramBot(token: string): Telegraf {
-  return new Telegraf(token);
-}
 
 // Telegram only accepts these six fixed values for a forum topic's icon_color —
 // no arbitrary RGB, and no way to use an actual photo (Bot API limitation, not
@@ -25,8 +21,6 @@ export interface EnsuredTopic {
   topicId: number;
   /** True when this call just created the topic — callers use this to decide whether to seed it. */
   created: boolean;
-  /** False means the caller should (re)run the history backfill — independent of `created`, since a topic can exist with a backfill that never completed. */
-  historySynced: boolean;
 }
 
 // Recognized Telegram API failures we can give the group admin actionable advice
@@ -89,7 +83,7 @@ export async function ensureTopicForMaxChat(
         logger.error(`Failed to rename Telegram topic for MAX chat ${String(maxChatId)}`, err);
       }
     }
-    return { topicId: existing.telegramTopicId, created: false, historySynced: existing.historySynced === true };
+    return { topicId: existing.telegramTopicId, created: false };
   }
 
   let topic;
@@ -109,5 +103,5 @@ export async function ensureTopicForMaxChat(
     createdAt: new Date().toISOString(),
   });
   logger.info(`Created Telegram topic ${topic.message_thread_id} for MAX chat ${maxChatId}`);
-  return { topicId: topic.message_thread_id, created: true, historySynced: false };
+  return { topicId: topic.message_thread_id, created: true };
 }

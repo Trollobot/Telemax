@@ -1,9 +1,13 @@
 import express from 'express';
 import { createServer } from 'node:http';
+import { createServer as createTlsServer } from 'node:https';
+import net from 'node:net';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { WebSocketServer, type WebSocket } from 'ws';
 import { Telegraf } from 'telegraf';
 import path from 'node:path';
-import { readFile, unlink } from 'node:fs/promises';
+import { chmod, mkdir, readFile, unlink } from 'node:fs/promises';
 import { createServer as createViteServer } from 'vite';
 import { MaxClient, type MaxMessageEvent, type MaxContactInfo } from '../max/client.js';
 import { OPCODES, formatOpcode } from '../max/opcodes.js';
@@ -169,9 +173,10 @@ async function killMaxSession(): Promise<void> {
   refreshBotDescription();
 }
 
-/** Keeps the LOGIN-derived chat snapshot from going stale as messages flow in either direction. */
-function patchCachedChatLastMessage(chatId: number, lastMessage: unknown): void {
-  const chat = cachedChats.find((c) => c && typeof c === 'object' && (c as { id?: unknown }).id === chatId);
+/** Keeps the LOGIN-derived chat snapshot from going stale as messages flow in either direction. Ids compare via String() — cached ids can be number OR BigInt (channels), and a strict === across those types silently never matches. */
+function patchCachedChatLastMessage(chatId: unknown, lastMessage: unknown): void {
+  const key = String(chatId);
+  const chat = cachedChats.find((c) => c && typeof c === 'object' && String((c as { id?: unknown }).id) === key);
   if (chat) (chat as { lastMessage: unknown }).lastMessage = lastMessage;
 }
 
@@ -217,6 +222,44 @@ function pushLog(dir: string, opcode: number, length: number, payload: unknown):
   packetLogs.push(entry);
   if (packetLogs.length > 50) packetLogs.shift();
   broadcast({ type: 'log', data: entry });
+}
+
+const execFileAsync = promisify(execFile);
+const TLS_DIR = path.join(process.cwd(), '.data', 'tls');
+
+/** What /apikey should build its login link with — flips to 'https' once the panel actually boots with a certificate (not just intends to), so the link never points at a scheme the server isn't serving. */
+let panelScheme: 'http' | 'https' = 'http';
+
+/**
+ * Self-signed TLS for the web panel. Installs are typically bare-IP VPSes, so a
+ * publicly-trusted certificate isn't attainable by default — self-signed still
+ * closes the real gap: the API key, the SMS code and the MAX 2FA password used
+ * to cross the open internet as plain HTTP. The browser warns once about the
+ * unknown issuer (expected; /apikey's link says so). Generated with the openssl
+ * CLI (present in the Docker image) and persisted in .data/tls — the ./data
+ * volume — so the browser exception survives container rebuilds.
+ */
+async function loadOrCreatePanelCert(): Promise<{ key: Buffer; cert: Buffer } | null> {
+  const keyPath = path.join(TLS_DIR, 'key.pem');
+  const certPath = path.join(TLS_DIR, 'cert.pem');
+  try {
+    return { key: await readFile(keyPath), cert: await readFile(certPath) };
+  } catch {
+    // not generated yet — fall through
+  }
+  try {
+    await mkdir(TLS_DIR, { recursive: true });
+    await execFileAsync('openssl', [
+      'req', '-x509', '-newkey', 'rsa:2048', '-keyout', keyPath, '-out', certPath,
+      '-days', '3650', '-nodes', '-subj', '/CN=telemax',
+    ]);
+    await chmod(keyPath, 0o600).catch(() => {});
+    logger.info('Generated a self-signed TLS certificate for the web panel (.data/tls)');
+    return { key: await readFile(keyPath), cert: await readFile(certPath) };
+  } catch (err) {
+    logger.error('Failed to generate a self-signed TLS certificate — the panel stays on plain HTTP', err);
+    return null;
+  }
 }
 
 async function loginWithSession(session: MaxSession): Promise<void> {
@@ -294,6 +337,7 @@ async function startServer(): Promise<void> {
         getMyAccountId: () => myAccountId,
         getContactProfiles: () => contactProfiles,
         getActivePhone: () => activePhone,
+        getPanelScheme: () => panelScheme,
         triggerFullResync: () => refreshChatsAndNames().then(() => syncChatsIfPossible()),
         killEverything: killMaxSession,
       }));
@@ -306,7 +350,14 @@ async function startServer(): Promise<void> {
   // --- HTTP + WS server ---
   const app = express();
   app.use(express.json());
-  const httpServer = createServer(app);
+
+  // TLS on by default in production (self-signed — see loadOrCreatePanelCert).
+  // PANEL_TLS=off opts out for setups with their own TLS-terminating reverse
+  // proxy in front. Dev mode stays plain HTTP on localhost.
+  const wantTls = process.env.NODE_ENV === 'production' && process.env.PANEL_TLS !== 'off';
+  const tlsMaterial = wantTls ? await loadOrCreatePanelCert() : null;
+  panelScheme = tlsMaterial ? 'https' : 'http';
+  const httpServer = tlsMaterial ? createTlsServer({ key: tlsMaterial.key, cert: tlsMaterial.cert }, app) : createServer(app);
   const wss = new WebSocketServer({ noServer: true });
 
   httpServer.on('upgrade', (req, socket, head) => {
@@ -457,147 +508,12 @@ async function startServer(): Promise<void> {
     res.json({ success: true, data: await chatMapStore.list() });
   });
 
-  // One-shot poll-creation probe — sends a real POLL attach to a chat (default 0,
-  // Избранное) to confirm MSG_SEND accepts the shape. Pass ?chatId= for a real
-  // two-party chat (e.g. the user's own approved test contact "Svv") to also
-  // exercise the live push-echo -> Telegram relay path, which self-chat sends don't trigger.
-  api.post('/debug/test-poll', async (req, res) => {
-    try {
-      const chatId = req.query.chatId ?? 0;
-      const pollAttach = {
-        _type: 'POLL',
-        title: '🍕 Тест опроса',
-        answers: [
-          { text: 'Вариант A', answerId: null },
-          { text: 'Вариант B', answerId: null },
-        ],
-        settings: 0,
-      };
-      const result = await max.sendMessage(chatId, null, [pollAttach]);
-      res.type('application/json').send(jsonStringify({ success: true, result }));
-    } catch (err) {
-      res.status(502).json({ error: (err as Error).message });
-    }
-  });
-
-  // One-shot outgoing vCard-CONTACT probe — confirms the self-contained shape (no
-  // contactId, just phone/name/vcfBody) works as an outgoing MSG_SEND before trusting
-  // it in the real Telegram->MAX contact-share flow.
-  api.post('/debug/test-contact', async (req, res) => {
-    try {
-      const chatId = req.query.chatId ?? 0;
-      const firstName = String(req.query.firstName ?? 'Тест');
-      const lastName = String(req.query.lastName ?? '');
-      const phone = String(req.query.phone ?? '79990001122');
-      const contactAttach = {
-        _type: 'CONTACT',
-        firstName,
-        lastName,
-        phone,
-        vcfBody: `BEGIN:VCARD\r\nVERSION:2.1\r\nN:${lastName};${firstName};;;\r\nFN:${[firstName, lastName].filter(Boolean).join(' ')}\r\nTEL;CELL:${phone}\r\nEND:VCARD\r\n`,
-        name: firstName,
-      };
-      const result = await max.sendMessage(chatId, null, [contactAttach]);
-      res.type('application/json').send(jsonStringify({ success: true, result }));
-    } catch (err) {
-      res.status(502).json({ error: (err as Error).message });
-    }
-  });
-
-  // One-shot group-creation probe — the first MSG_SEND in this codebase with no
-  // chatId, so worth confirming live before wiring real Telegram commands to it.
-  api.post('/debug/test-group', async (req, res) => {
-    try {
-      const userIds = req.query.invite ? String(req.query.invite).split(',').map(Number) : [];
-      const result = await max.createGroup('🧪 Тест группы (бот)', userIds, 'CHAT');
-      res.type('application/json').send(jsonStringify({ success: true, result }));
-    } catch (err) {
-      res.status(502).json({ error: (err as Error).message });
-    }
-  });
-
-  // One-shot probes for the rest of group management — CHAT_SET_INFO / CHAT_MEMBERS /
-  // CHAT_LEAVE / CHAT_DELETE — all first-time-tested opcodes, same reasoning as test-group.
-  api.post('/debug/test-group-rename', async (req, res) => {
-    try {
-      const chatId = String(req.query.chatId);
-      await max.updateChatInfo(chatId, { title: String(req.query.title ?? 'renamed'), description: req.query.description ? String(req.query.description) : undefined });
-      res.json({ success: true });
-    } catch (err) {
-      res.status(502).json({ error: (err as Error).message });
-    }
-  });
-
-  api.post('/debug/test-group-members', async (req, res) => {
-    try {
-      const chatId = String(req.query.chatId);
-      const userIds = String(req.query.userIds).split(',').map(Number);
-      const operation = req.query.operation === 'remove' ? 'remove' : 'add';
-      await max.updateChatMembers(chatId, userIds, operation);
-      res.json({ success: true });
-    } catch (err) {
-      res.status(502).json({ error: (err as Error).message });
-    }
-  });
-
-  api.post('/debug/test-group-delete', async (req, res) => {
-    try {
-      const chatId = String(req.query.chatId);
-      const lastEventTime = Number(req.query.lastEventTime);
-      const forAll = req.query.forAll === 'true';
-      await max.deleteChat(chatId, lastEventTime, forAll);
-      res.json({ success: true });
-    } catch (err) {
-      res.status(502).json({ error: (err as Error).message });
-    }
-  });
-
-  // One-shot MSG_DELETE / FORWARD probes.
-  api.post('/debug/test-delete', async (req, res) => {
-    try {
-      const chatId = String(req.query.chatId);
-      const messageId = BigInt(String(req.query.messageId));
-      const forMe = req.query.forMe === 'true';
-      await max.deleteMessages(chatId, [messageId], forMe);
-      res.json({ success: true });
-    } catch (err) {
-      res.status(502).json({ error: (err as Error).message });
-    }
-  });
-
-  // One-shot CHATS_LIST probe — single page, not the pagination loop — used to
-  // sanity-check the response shape before trusting getAllChats() with the real sync.
-  api.get('/debug/chats-list', async (_req, res) => {
-    try {
-      const page = await max.getChatsList(Date.now());
-      res.type('application/json').send(jsonStringify({ success: true, count: page.chats.length, nextMarker: page.marker, chats: page.chats }));
-    } catch (err) {
-      res.status(502).json({ error: (err as Error).message });
-    }
-  });
-
-  // One-shot CONTACT_INFO probe — used to confirm the response wrapper key and
-  // field shapes before wiring phone-number fallback into name resolution.
-  api.get('/debug/contact-info/:id', async (req, res) => {
-    try {
-      const contacts = await max.getContactInfo([Number(req.params.id)]);
-      res.type('application/json').send(jsonStringify({ success: true, contacts }));
-    } catch (err) {
-      res.status(502).json({ error: (err as Error).message });
-    }
-  });
-
-  // One-shot CHAT_HISTORY probe — single MAX request (not the pagination loop), used
-  // to sanity-check the response shape live before trusting the full history backfill.
-  api.get('/debug/chat-history/:id', async (req, res) => {
-    try {
-      const count = Number(req.query.count) || 5;
-      const messages = await max.getChatHistory(req.params.id, Date.now(), count);
-      res.type('application/json').send(jsonStringify({ success: true, count: messages.length, messages }));
-    } catch (err) {
-      res.status(502).json({ error: (err as Error).message });
-    }
-  });
+  // The /api/debug/* one-shot probes that used to live here (test-poll, test-contact,
+  // test-group*, test-delete, chats-list, contact-info, chat-history) were removed
+  // 2026-08-14 after every probed opcode got wired into real bot commands — they were
+  // API-key-gated but still let a caller send messages and manage groups on the MAX
+  // account, which is needless surface on a production install. Recover from git
+  // history if a new opcode ever needs live probing again.
 
   api.post('/chats/:id/messages', async (req, res) => {
     if (!maxConnected) {
@@ -629,9 +545,53 @@ async function startServer(): Promise<void> {
     app.use(vite.middlewares);
   }
 
-  httpServer.listen(config.port, '0.0.0.0', () => {
-    logger.info(`Server listening on port ${config.port}`);
+  let listener: net.Server = httpServer;
+  if (tlsMaterial) {
+    // Single-port polyglot: a TLS ClientHello always starts with byte 0x16, so
+    // anything else on the socket is a plain-HTTP client — an old bookmark or a
+    // pre-TLS /apikey link — and gets a 301 to the same URL over https instead
+    // of a cryptic protocol error.
+    const redirectServer = createServer((req, res) => {
+      res.writeHead(301, { Location: `https://${req.headers.host ?? `localhost:${config.port}`}${req.url ?? '/'}` });
+      res.end();
+    });
+    listener = net.createServer((socket) => {
+      socket.on('error', () => socket.destroy());
+      socket.once('data', (firstChunk) => {
+        socket.pause();
+        socket.unshift(firstChunk);
+        (firstChunk[0] === 0x16 ? httpServer : redirectServer).emit('connection', socket);
+        // NOT a synchronous resume: the TLS wrap set up by the 'connection'
+        // listener needs this tick, or the handshake never sees the ClientHello
+        // and hangs forever (caught by a local smoke test before shipping).
+        process.nextTick(() => socket.resume());
+      });
+    });
+  }
+  listener.listen(config.port, '0.0.0.0', () => {
+    logger.info(`Server listening on port ${config.port}${tlsMaterial ? ' (HTTPS, self-signed)' : ''}`);
   });
+
+  // docker stop / systemd send SIGTERM (node runs as PID 1 — exec-form CMD, so it
+  // actually receives it). Stop polling Telegram and close the MAX socket cleanly
+  // instead of letting the runtime kill mid-write; the backfill cursor is persisted
+  // per message, so an in-flight backfill resumes where it left off either way.
+  const shutdown = (signal: string): void => {
+    logger.info(`Received ${signal}, shutting down`);
+    try {
+      bot?.stop(signal);
+    } catch {
+      // bot may not have launched (bad token, mid-retry) — nothing to stop
+    }
+    max.disconnect();
+    if (listener !== httpServer) httpServer.close();
+    listener.close(() => process.exit(0));
+    // Failsafe: don't let a lingering keep-alive socket hold the process past
+    // docker's own stop timeout.
+    setTimeout(() => process.exit(0), 5_000).unref();
+  };
+  process.once('SIGTERM', () => shutdown('SIGTERM'));
+  process.once('SIGINT', () => shutdown('SIGINT'));
 }
 
 // getUpdates only allows one active poller per bot token (a second instance — even a

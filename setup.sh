@@ -201,6 +201,9 @@ if [ "$PORT" != "3000" ]; then
   echo "Порт 3000 занят — использую $PORT вместо него."
 fi
 
+# .env carries every secret this install has (API key, session-encryption key,
+# bot token) — don't leave it readable to other local users.
+umask 077
 cat > .env <<EOF
 # сгенерировано setup.sh $(date -u +%Y-%m-%dT%H:%M:%SZ)
 API_KEY=$API_KEY
@@ -243,9 +246,11 @@ bold "Мост запущен."
 # которым пользуется веб-панель, просто из консоли. Ждём готовности сервера
 # (MAX подключается не мгновенно после старта, /auth/phone до этого вернёт 503).
 echo "Жду готовности сервера..."
-API_URL="http://localhost:$PORT/api"
+# Панель работает по HTTPS с самоподписанным сертификатом (генерируется контейнером
+# при первом старте) — отсюда -k у всех curl-вызовов к ней ниже.
+API_URL="https://localhost:$PORT/api"
 for attempt in 1 2 3 4 5 6 7 8 9 10; do
-  curl -s --max-time 2 "$API_URL/health" >/dev/null 2>&1 && break
+  curl -sk --max-time 2 "$API_URL/health" >/dev/null 2>&1 && break
   sleep 2
 done
 
@@ -255,7 +260,7 @@ read -rp "Номер телефона (с кодом страны, наприм�
 if [ -n "$MAX_PHONE" ]; then
   PHONE_OK=""
   for attempt in 1 2 3; do
-    PHONE_RESP=$(curl -s -X POST -H "x-api-key: $API_KEY" -H "Content-Type: application/json" \
+    PHONE_RESP=$(curl -sk -X POST -H "x-api-key: $API_KEY" -H "Content-Type: application/json" \
       -d "{\"phone\":\"$MAX_PHONE\"}" "$API_URL/auth/phone")
     if echo "$PHONE_RESP" | grep -q '"success":true'; then
       PHONE_OK=1
@@ -266,7 +271,7 @@ if [ -n "$MAX_PHONE" ]; then
   if [ -n "$PHONE_OK" ]; then
     echo "Код отправлен на $MAX_PHONE."
     read -rp "Код из SMS: " MAX_CODE
-    VERIFY_RESP=$(curl -s -X POST -H "x-api-key: $API_KEY" -H "Content-Type: application/json" \
+    VERIFY_RESP=$(curl -sk -X POST -H "x-api-key: $API_KEY" -H "Content-Type: application/json" \
       -d "{\"code\":\"$MAX_CODE\"}" "$API_URL/auth/verify")
     if echo "$VERIFY_RESP" | grep -q '"passwordRequired":true'; then
       # Some MAX accounts have a password set as a second factor on top of SMS.
@@ -279,28 +284,29 @@ if [ -n "$MAX_PHONE" ]; then
       while [ -z "$PASSWORD_OK" ]; do
         read -rsp "Пароль: " MAX_PASSWORD
         echo
-        PASSWORD_RESP=$(curl -s -X POST -H "x-api-key: $API_KEY" -H "Content-Type: application/json" \
+        PASSWORD_RESP=$(curl -sk -X POST -H "x-api-key: $API_KEY" -H "Content-Type: application/json" \
           -d "{\"password\":\"$MAX_PASSWORD\"}" "$API_URL/auth/password")
         if echo "$PASSWORD_RESP" | grep -q '"success":true'; then
           PASSWORD_OK=1
           bold "Готово — мост авторизован и подключён к MAX."
         else
-          echo "❌ Неверный пароль, попробуйте ещё раз (или Ctrl+C — тогда через веб-панель: http://$HOST:$PORT)."
+          echo "❌ Неверный пароль, попробуйте ещё раз (или Ctrl+C — тогда через веб-панель: https://$HOST:$PORT)."
         fi
       done
     elif echo "$VERIFY_RESP" | grep -q '"success":true'; then
       bold "Готово — мост авторизован и подключён к MAX."
     else
       echo "❌ Не удалось подтвердить код: $VERIFY_RESP"
-      echo "Попробуйте ещё раз через веб-панель: http://$HOST:$PORT"
+      echo "Попробуйте ещё раз через веб-панель: https://$HOST:$PORT"
     fi
   else
     echo "❌ Не удалось запросить SMS: $PHONE_RESP"
-    echo "Попробуйте через веб-панель: http://$HOST:$PORT"
+    echo "Попробуйте через веб-панель: https://$HOST:$PORT"
   fi
 else
-  echo "Ок — откройте http://$HOST:$PORT, введите ключ выше, затем номер телефона MAX и код из SMS."
+  echo "Ок — откройте https://$HOST:$PORT, введите ключ выше, затем номер телефона MAX и код из SMS."
 fi
 
 echo
-echo "Дальнейшие изменения (смена номера, повторная авторизация) удобнее делать через веб-панель: http://$HOST:$PORT"
+echo "Дальнейшие изменения (смена номера, повторная авторизация) удобнее делать через веб-панель: https://$HOST:$PORT"
+echo "Сертификат панели самоподписанный — браузер один раз предупредит «подключение не защищено»: нажмите «Дополнительно» → «Перейти на сайт»."
