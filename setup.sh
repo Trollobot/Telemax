@@ -248,7 +248,27 @@ if [ -n "$MAX_PHONE" ]; then
     read -rp "Код из SMS: " MAX_CODE
     VERIFY_RESP=$(curl -s -X POST -H "x-api-key: $API_KEY" -H "Content-Type: application/json" \
       -d "{\"code\":\"$MAX_CODE\"}" "$API_URL/auth/verify")
-    if echo "$VERIFY_RESP" | grep -q '"success":true'; then
+    if echo "$VERIFY_RESP" | grep -q '"passwordRequired":true'; then
+      # Some MAX accounts have a password set as a second factor on top of SMS.
+      # A wrong password can be retried freely — the auth session behind it
+      # doesn't expire until a correct one goes through (confirmed live 2026-08-14).
+      HINT=$(echo "$VERIFY_RESP" | grep -o '"hint":"[^"]*"' | sed 's/"hint":"//;s/"$//')
+      echo "Этот MAX-аккаунт защищён паролем (второй фактор поверх SMS)."
+      [ -n "$HINT" ] && echo "Подсказка: $HINT"
+      PASSWORD_OK=""
+      while [ -z "$PASSWORD_OK" ]; do
+        read -rsp "Пароль: " MAX_PASSWORD
+        echo
+        PASSWORD_RESP=$(curl -s -X POST -H "x-api-key: $API_KEY" -H "Content-Type: application/json" \
+          -d "{\"password\":\"$MAX_PASSWORD\"}" "$API_URL/auth/password")
+        if echo "$PASSWORD_RESP" | grep -q '"success":true'; then
+          PASSWORD_OK=1
+          bold "Готово — мост авторизован и подключён к MAX."
+        else
+          echo "❌ Неверный пароль, попробуйте ещё раз (или Ctrl+C — тогда через веб-панель: http://$HOST:$PORT)."
+        fi
+      done
+    elif echo "$VERIFY_RESP" | grep -q '"success":true'; then
       bold "Готово — мост авторизован и подключён к MAX."
     else
       echo "❌ Не удалось подтвердить код: $VERIFY_RESP"

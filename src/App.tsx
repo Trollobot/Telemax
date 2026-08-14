@@ -100,7 +100,9 @@ export default function App() {
   const [activeTab, setActiveTab] = useState('logs');
   const [phone, setPhone] = useState('');
   const [code, setCode] = useState('');
-  const [authStep, setAuthStep] = useState<'phone' | 'code' | 'done'>('phone');
+  const [password, setPassword] = useState('');
+  const [passwordHint, setPasswordHint] = useState('');
+  const [authStep, setAuthStep] = useState<'phone' | 'code' | 'password' | 'done'>('phone');
   const [authError, setAuthError] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const logsEndRef = useRef<HTMLDivElement>(null);
@@ -179,6 +181,30 @@ export default function App() {
       if (res.status === 401) return handleUnauthorized();
       const data = await res.json().catch(() => ({}));
       if (!res.ok || data.error) setAuthError(data.error || 'Failed to verify code');
+      else if (data.passwordRequired) {
+        setPasswordHint(data.hint || '');
+        setAuthStep('password');
+      } else setAuthStep('done');
+    } finally {
+      setIsLoading(false);
+      isSubmitting.current = false;
+    }
+  };
+
+  // Only reached for password-protected MAX accounts — verifyCode above
+  // returned passwordRequired instead of completing the login directly. A
+  // wrong password can be retried freely (the server keeps the same
+  // trackId), so this deliberately doesn't fall back to the code step.
+  const handleVerifyPassword = async () => {
+    if (isLoading || isSubmitting.current) return;
+    isSubmitting.current = true;
+    setIsLoading(true);
+    setAuthError('');
+    try {
+      const res = await apiFetch('/api/auth/password', { method: 'POST', body: JSON.stringify({ password }) });
+      if (res.status === 401) return handleUnauthorized();
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.error) setAuthError(data.error || 'Failed to verify password');
       else setAuthStep('done');
     } finally {
       setIsLoading(false);
@@ -386,6 +412,22 @@ export default function App() {
                           {isLoading ? 'Verifying...' : 'Verify & Login'}
                         </button>
                       </div>
+                    </div>
+                  )}
+                  {authStep === 'password' && (
+                    <div className="space-y-4">
+                      <p className="text-sm text-white/60">Этот MAX-аккаунт защищён паролем (второй фактор поверх SMS).</p>
+                      {passwordHint && <p className="text-sm text-white/60">Подсказка: {passwordHint}</p>}
+                      <input
+                        type="password"
+                        placeholder="Пароль"
+                        value={password}
+                        onChange={(e) => setPassword(e.target.value)}
+                        className="w-full bg-[#0c0d0f] border border-white/10 rounded px-4 py-3 text-sm text-white"
+                      />
+                      <button onClick={handleVerifyPassword} disabled={isLoading} className="w-full bg-green-600 hover:bg-green-500 disabled:opacity-50 text-white font-bold py-3 rounded text-sm">
+                        {isLoading ? 'Verifying...' : 'Verify & Login'}
+                      </button>
                     </div>
                   )}
                   {authStep === 'done' && (

@@ -36,6 +36,8 @@ let maxConnected = false;
 let activePhone = '';
 let pendingPhone = '';
 let pendingAuthToken: string | null = null;
+/** Set when verifyCode() comes back password_required — cleared only on a successful login, since the trackId survives a wrong password and can be retried (confirmed live 2026-08-14). */
+let pendingPasswordTrackId: string | null = null;
 let currentSession: MaxSession | null = null;
 let latestLatencyMs: number | null = null;
 let packetsSent = 0;
@@ -92,6 +94,24 @@ async function refreshChatsAndNames(): Promise<void> {
   } catch (err) {
     logger.error('Failed to fetch contact profiles via CONTACT_INFO:', err);
   }
+}
+
+/** Shared tail end of both auth paths (plain SMS, and SMS + password) — exchanges a login token for a session and persists it. */
+async function completeMaxLogin(loginToken: string): Promise<void> {
+  const { sessionToken, payload } = await max.login(loginToken);
+  applyLoginPayload(payload);
+  await refreshChatsAndNames();
+  void syncChatsIfPossible();
+  const session: MaxSession = {
+    sessionToken,
+    phone: pendingPhone,
+    deviceId: max.deviceId,
+    savedAt: new Date().toISOString(),
+  };
+  await sessionStore.save(session);
+  currentSession = session;
+  activePhone = session.phone;
+  broadcastStatus();
 }
 
 /**
@@ -371,25 +391,43 @@ async function startServer(): Promise<void> {
       return;
     }
     try {
-      const loginToken = await max.verifyCode(pendingAuthToken, String(code));
-      const { sessionToken, payload } = await max.login(loginToken);
-      applyLoginPayload(payload);
-      await refreshChatsAndNames();
-      void syncChatsIfPossible();
+      const verified = await max.verifyCode(pendingAuthToken, String(code));
+      if (verified.status === 'password_required') {
+        pendingPasswordTrackId = verified.challenge.trackId;
+        res.json({ success: true, passwordRequired: true, hint: verified.challenge.hint ?? null });
+        return;
+      }
       pendingAuthToken = null;
-      const session: MaxSession = {
-        sessionToken,
-        phone: pendingPhone,
-        deviceId: max.deviceId,
-        savedAt: new Date().toISOString(),
-      };
-      await sessionStore.save(session);
-      currentSession = session;
-      activePhone = session.phone;
-      broadcastStatus();
+      await completeMaxLogin(verified.loginToken);
       res.json({ success: true });
     } catch (err) {
       logger.error('Failed to verify SMS code', err);
+      res.status(502).json({ error: (err as Error).message });
+    }
+  });
+
+  // Only reached for password-protected accounts — verifyCode() above set
+  // pendingPasswordTrackId instead of completing the login directly.
+  api.post('/auth/password', async (req, res) => {
+    const password = req.body?.password;
+    if (!password) {
+      res.status(400).json({ error: 'password missing' });
+      return;
+    }
+    if (!pendingPasswordTrackId) {
+      res.status(400).json({ error: 'no pending password challenge — call /api/auth/verify first' });
+      return;
+    }
+    try {
+      const loginToken = await max.checkPassword(pendingPasswordTrackId, String(password));
+      pendingPasswordTrackId = null;
+      await completeMaxLogin(loginToken);
+      res.json({ success: true });
+    } catch (err) {
+      // Deliberately NOT clearing pendingPasswordTrackId here — it survives a
+      // wrong password on MAX's side, so the user can just retry the password
+      // without needing a fresh SMS code (confirmed live 2026-08-14).
+      logger.error('Failed to verify MAX password', err);
       res.status(502).json({ error: (err as Error).message });
     }
   });

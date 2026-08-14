@@ -4,10 +4,9 @@ import { pack } from 'msgpackr';
 import { readFrameHeader, encodeFrame, decompressPayload, FRAME_HEADER_SIZE } from './frame.js';
 import { decodeFramePayload, pickObject } from './msgpack.js';
 import { OPCODES, DIR, formatOpcode } from './opcodes.js';
-import { findAuthToken, findLongToken, describeAuthError } from './tokens.js';
-import { createLogger, jsonStringify, redactSecrets } from '../logger.js';
+import { findAuthToken, findLongToken, describeAuthError, extractPasswordChallenge, type PasswordChallenge } from './tokens.js';
 
-const logger = createLogger('max');
+export type VerifyCodeResult = { status: 'ok'; loginToken: string } | { status: 'password_required'; challenge: PasswordChallenge };
 
 export interface MaxMessageEvent {
   dir: number;
@@ -336,16 +335,40 @@ export class MaxClient extends EventEmitter {
     return token;
   }
 
-  async verifyCode(authToken: string, code: string): Promise<string> {
+  /**
+   * A password-protected MAX account (2FA on top of SMS) makes CHECK_CODE respond
+   * with a `passwordChallenge` instead of a login token — confirmed live 2026-08-14.
+   * Distinguishing that from a genuinely wrong SMS code (rather than just throwing
+   * either way) is what lets the caller ask for a password instead of a fresh code.
+   */
+  async verifyCode(authToken: string, code: string): Promise<VerifyCodeResult> {
     const wait = this.waitForOpcode(OPCODES.CHECK_CODE);
     this.send(OPCODES.CHECK_CODE, { token: authToken, verifyCode: code });
     const { dir, payload } = await wait;
     const token = findLongToken(payload);
+    if (dir !== DIR.ERR && token) {
+      return { status: 'ok', loginToken: token };
+    }
+    const challenge = extractPasswordChallenge(payload);
+    if (challenge) {
+      return { status: 'password_required', challenge };
+    }
+    throw new Error(describeAuthError(payload, 'CHECK_CODE did not return a login token — was the code correct?'));
+  }
+
+  /**
+   * The second factor for password-protected accounts, following up a
+   * verifyCode() that returned `password_required`. `trackId` survives a wrong
+   * password (safe to retry with the same one) but is consumed on success —
+   * confirmed live 2026-08-14 — so a following login attempt needs a fresh SMS.
+   */
+  async checkPassword(trackId: string, password: string): Promise<string> {
+    const wait = this.waitForOpcode(OPCODES.CHECK_PASSWORD);
+    this.send(OPCODES.CHECK_PASSWORD, { trackId, password });
+    const { dir, payload } = await wait;
+    const token = findLongToken(payload);
     if (dir === DIR.ERR || !token) {
-      // Temporary — need to see the actual shape of what MAX sends back on a
-      // failed CHECK_CODE, since describeAuthError found nothing usable in it.
-      logger.error(`CHECK_CODE failed — dir=${dir}, payload=${jsonStringify(redactSecrets(payload))}`);
-      throw new Error(describeAuthError(payload, 'CHECK_CODE did not return a login token — was the code correct?'));
+      throw new Error(describeAuthError(payload, 'CHECK_PASSWORD did not return a login token — was the password correct?'));
     }
     return token;
   }

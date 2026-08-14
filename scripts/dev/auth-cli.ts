@@ -16,6 +16,7 @@ import { MaxClient } from '../../src/max/client.js';
 import { SessionStore } from '../../src/store/sessionStore.js';
 
 const CODE_FILE = path.join(process.cwd(), '.data', 'sms-code.txt');
+const PASSWORD_FILE = path.join(process.cwd(), '.data', 'max-password.txt');
 const CODE_POLL_INTERVAL_MS = 500;
 const CODE_WAIT_TIMEOUT_MS = 5 * 60_000;
 
@@ -24,17 +25,17 @@ function mask(token: string): string {
   return `${token.slice(0, 6)}...${token.slice(-4)} (${token.length} chars)`;
 }
 
-async function waitForCodeFile(): Promise<string> {
-  await mkdir(path.dirname(CODE_FILE), { recursive: true });
-  await rm(CODE_FILE, { force: true });
-  console.log(`Waiting for SMS code in ${CODE_FILE} (write the digits and save) ...`);
+async function waitForFile(filePath: string, label: string): Promise<string> {
+  await mkdir(path.dirname(filePath), { recursive: true });
+  await rm(filePath, { force: true });
+  console.log(`Waiting for ${label} in ${filePath} (write it and save) ...`);
 
   const deadline = Date.now() + CODE_WAIT_TIMEOUT_MS;
   while (Date.now() < deadline) {
     try {
-      const content = (await readFile(CODE_FILE, 'utf8')).trim();
+      const content = (await readFile(filePath, 'utf8')).trim();
       if (content) {
-        await rm(CODE_FILE, { force: true });
+        await rm(filePath, { force: true });
         return content;
       }
     } catch {
@@ -42,7 +43,7 @@ async function waitForCodeFile(): Promise<string> {
     }
     await new Promise((resolve) => setTimeout(resolve, CODE_POLL_INTERVAL_MS));
   }
-  throw new Error('Timed out waiting for the SMS code');
+  throw new Error(`Timed out waiting for the ${label}`);
 }
 
 async function main(): Promise<void> {
@@ -80,9 +81,24 @@ async function main(): Promise<void> {
   const authToken = await client.requestSms(phone);
   console.log('Got auth_token:', mask(authToken));
 
-  const code = await waitForCodeFile();
+  const code = await waitForFile(CODE_FILE, 'SMS code');
   console.log('Verifying code ...');
-  const loginToken = await client.verifyCode(authToken, code);
+  const verified = await client.verifyCode(authToken, code);
+  let loginToken: string;
+  if (verified.status === 'password_required') {
+    console.log(`Password required${verified.challenge.hint ? ` (hint: ${verified.challenge.hint})` : ''}.`);
+    for (;;) {
+      const password = await waitForFile(PASSWORD_FILE, 'MAX password');
+      try {
+        loginToken = await client.checkPassword(verified.challenge.trackId, password);
+        break;
+      } catch (err) {
+        console.error('Wrong password, try again:', err instanceof Error ? err.message : err);
+      }
+    }
+  } else {
+    loginToken = verified.loginToken;
+  }
   console.log('Got login_token:', mask(loginToken));
 
   console.log('Logging in ...');

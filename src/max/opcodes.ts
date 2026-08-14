@@ -9,6 +9,14 @@ export const OPCODES = {
   START_AUTH: 0x0011,
   CHECK_CODE: 0x0012,
   LOGIN: 0x0013,
+  // Not in max-protocol-full.md — supplied by the user 2026-08-14 from a live capture.
+  // Sent instead of LOGIN when CHECK_CODE's response carries a `passwordChallenge`
+  // instead of a login token (some MAX accounts have a password set as a second
+  // factor on top of SMS). `{trackId, password}` (plaintext) -> the same 663-char
+  // login token CHECK_CODE would have returned directly; from there it's an ordinary
+  // LOGIN. trackId survives a wrong password (retry freely, error `password2fa.wrong`)
+  // but burns on success — a fresh SMS is needed for the next login attempt after that.
+  CHECK_PASSWORD: 0x0073,
   CONTACT_INFO: 0x0020,
   CHAT_INFO: 0x0030,
   CHAT_HISTORY: 0x0031,

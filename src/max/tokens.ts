@@ -46,3 +46,20 @@ export function describeAuthError(payload: unknown, fallback: string): string {
   }
   return fallback;
 }
+
+export interface PasswordChallenge {
+  trackId: string;
+  /** User-supplied password hint, e.g. a reminder phrase — shown as-is, may be empty/absent. */
+  hint?: string;
+}
+
+/** Present on CHECK_CODE's response instead of a login token when the account has a password set as a second factor (confirmed live 2026-08-14). */
+export function extractPasswordChallenge(payload: unknown): PasswordChallenge | undefined {
+  if (!payload || typeof payload !== 'object') return undefined;
+  const challenge = (payload as Record<string, unknown>).passwordChallenge;
+  if (!challenge || typeof challenge !== 'object') return undefined;
+  const trackId = (challenge as Record<string, unknown>).trackId;
+  if (typeof trackId !== 'string') return undefined;
+  const hint = (challenge as Record<string, unknown>).hint;
+  return { trackId, hint: typeof hint === 'string' ? hint : undefined };
+}
