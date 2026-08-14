@@ -63,6 +63,25 @@ fi
 bold "=== Telemax — первая настройка ==="
 echo
 
+# A leftover container from a previous attempt (e.g. .env was deleted to redo
+# setup, but the container itself was never stopped) keeps long-polling
+# Telegram with its own bot token — races the getUpdates call below and
+# silently breaks group auto-detection. Confirmed live 2026-08-14.
+if command -v docker >/dev/null 2>&1; then
+  RUNNING=$(docker compose ps --status running --format '{{.Name}}' 2>/dev/null || true)
+  if [ -n "$RUNNING" ]; then
+    echo "⚠️  Уже запущен контейнер предыдущей установки: $RUNNING"
+    echo "Пока он работает, его бот перехватывает Telegram-обновления — автоопределение"
+    echo "группы ниже не найдёт сообщение."
+    read -rp "Остановить его сейчас? [Y/n] " STOP_OLD
+    if [ "${STOP_OLD:-Y}" != "n" ] && [ "${STOP_OLD:-Y}" != "N" ]; then
+      docker compose down
+      echo "Остановлено."
+    fi
+    echo
+  fi
+fi
+
 # Fails fast on a server whose network can't reach one of the two services this
 # bridge depends on (firewall, geo-blocking, restrictive hosting policy) —
 # better to say so now than after the user has typed in a bot token. Retries a
