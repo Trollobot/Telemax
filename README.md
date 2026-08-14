@@ -76,7 +76,7 @@ docker compose down         # остановка
 
 ## Обратная связь
 
-Нашли баг, есть предложение или вопрос — заводите [Issue](https://github.com/Trollobot/Telemax/issues) в репозитории.
+Нашли баг — заводите [Issue](https://github.com/Trollobot/Telemax/issues). Есть идея, вопрос или просто хотите поделиться впечатлениями — там же есть [Discussions](https://github.com/Trollobot/Telemax/discussions).
 
 ## Поддержать проект
 
