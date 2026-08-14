@@ -1118,7 +1118,7 @@ export function wireBridge({
     await ctx.answerCbQuery('Обновление запрошено');
     try {
       await writeFile(UPDATE_REQUESTED_MARKER, new Date().toISOString(), 'utf8');
-      await ctx.editMessageText('⏳ Обновление запрошено — вотчер на сервере подхватит его в течение минуты, пересоберёт и перезапустит бота. История переписки не затрагивается.');
+      await ctx.editMessageText('⏳ Обновление запрошено — история переписки не затрагивается.');
     } catch (err) {
       logger.error('Failed to write update-requested marker', err);
       await ctx.editMessageText('❌ Не удалось запросить обновление — смотри логи контейнера.');
