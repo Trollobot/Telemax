@@ -15,6 +15,12 @@ bold() { printf '\033[1m%s\033[0m\n' "$1"; }
 # unconditionally.
 if [ "$(id -u)" = "0" ] && command -v systemctl >/dev/null 2>&1; then
   REPO_DIR="$(pwd)"
+  # systemd services run with a stripped environment (notably a different or
+  # unset $HOME), so git's "dubious ownership" check can reject the repo even
+  # when a normal interactive `git config --global` already covers it for an
+  # SSH session as the same user — hit live 2026-08-14, silently broke every
+  # update the watcher tried to run. --system doesn't depend on $HOME at all.
+  git config --system --add safe.directory "$REPO_DIR" 2>/dev/null || true
   cat > /etc/systemd/system/telemax-updater.service <<EOF
 [Unit]
 Description=Telemax update watcher (one-shot)
