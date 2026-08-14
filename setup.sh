@@ -59,9 +59,18 @@ echo
 
 # Fails fast on a server whose network can't reach one of the two services this
 # bridge depends on (firewall, geo-blocking, restrictive hosting policy) —
-# better to say so now than after the user has typed in a bot token.
+# better to say so now than after the user has typed in a bot token. Retries a
+# few times first: a single attempt right after boot can spuriously fail on a
+# transient blip (DNS not warmed up yet, a flaky first packet) even though the
+# server is perfectly reachable a couple seconds later — confirmed live.
 check_tcp() {
-  timeout 5 bash -c "cat < /dev/null > /dev/tcp/$1/$2" 2>/dev/null
+  for attempt in 1 2 3; do
+    if timeout 5 bash -c "cat < /dev/null > /dev/tcp/$1/$2" 2>/dev/null; then
+      return 0
+    fi
+    [ "$attempt" -lt 3 ] && sleep 2
+  done
+  return 1
 }
 
 echo "Проверяю связь с серверами MAX и Telegram..."
