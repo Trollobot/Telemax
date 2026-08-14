@@ -160,6 +160,19 @@ if [ -z "$TARGET_TELEGRAM_GROUP" ]; then
   done
 fi
 
+# Best-effort — needs the bot to already be a group admin with "Change Group
+# Info" rights, which setup already asked for above. setChatPhoto needs an
+# actual file upload (multipart), not a URL, unlike sendPhoto.
+AVATAR="$(dirname "$0")/assets/group-avatar.png"
+if [ -f "$AVATAR" ]; then
+  if curl -s -F "chat_id=$TARGET_TELEGRAM_GROUP" -F "photo=@$AVATAR" \
+    "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setChatPhoto" | grep -q '"ok":true'; then
+    echo "Аватарка группы установлена."
+  else
+    echo "Не удалось установить аватарку группы (не критично, можно поставить вручную)."
+  fi
+fi
+
 API_KEY=$(openssl rand -hex 24)
 MAX_SESSION_KEY=$(openssl rand -hex 32)
 
