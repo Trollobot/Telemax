@@ -26,7 +26,16 @@ echo
 
 echo "[1/5] Обновляю систему (может занять несколько минут)..."
 apt-get update -y
-apt-get upgrade -y
+# Best-effort: some VPS images ship with an unrelated package already broken
+# (seen live — initramfs-tools' dhcpcd hook failing on a missing .so that has
+# nothing to do with Telemax) and `apt-get upgrade` exits non-zero for that
+# alone even though everything Telemax actually needs still installs fine
+# afterward. Aborting the whole bootstrap over someone else's package is
+# worse than just warning and moving on.
+if ! apt-get upgrade -y; then
+  echo "⚠️  apt upgrade завершился с ошибкой (см. вывод выше) — похоже, дело в стороннем пакете, не связанном с Telemax. Продолжаю установку; если хотите разобраться отдельно, обычно помогает: dpkg --configure -a"
+fi
+dpkg --configure -a >/dev/null 2>&1 || true
 
 echo
 echo "[2/5] Проверяю git и jq..."
