@@ -167,6 +167,26 @@ if ! command -v docker >/dev/null 2>&1; then
   exit 0
 fi
 
+# Catches a busy port BEFORE the (multi-minute) build, not after — hit live:
+# a leftover container from an earlier/different install attempt held the
+# port, and the build only found out at the very last step, wasting the
+# whole build for nothing.
+if (exec 3<>"/dev/tcp/127.0.0.1/3000") 2>/dev/null; then
+  exec 3>&- 3<&-
+  echo
+  echo "❌ Порт 3000 уже занят — контейнер не сможет на нём стартовать."
+  CONFLICTING=$(docker ps --filter "publish=3000" --format '  {{.Names}} ({{.Image}}), {{.Status}}' 2>/dev/null || true)
+  if [ -n "$CONFLICTING" ]; then
+    echo "Занято контейнером:"
+    echo "$CONFLICTING"
+    echo "Если это лишняя/старая установка — остановите её и запустите setup.sh заново:"
+    echo "  docker stop <имя> && docker rm <имя>"
+  else
+    echo "Занято чем-то, не относящимся к Docker — освободите порт 3000 или измените PORT в .env, затем запустите setup.sh заново."
+  fi
+  exit 1
+fi
+
 read -rp "Собрать и запустить контейнер прямо сейчас? [Y/n] " RUN_NOW
 if [ "${RUN_NOW:-Y}" = "n" ] || [ "${RUN_NOW:-Y}" = "N" ]; then
   echo "Ок, когда будете готовы: docker compose up -d --build"
