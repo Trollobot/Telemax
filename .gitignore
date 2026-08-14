@@ -30,3 +30,4 @@ max-protocol-full.md
 # ad-hoc dev script with a real contact's MAX chat id + name hardcoded in — not
 # needed to run/deploy the app, just an old manual test
 scripts/dev/test-bridge-telegram.ts
+*.pid
