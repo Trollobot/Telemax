@@ -21,6 +21,18 @@ async function fetchTelegramFile(bot: Telegraf, fileId: string): Promise<Buffer>
   return Buffer.from(await res.arrayBuffer());
 }
 
+/**
+ * Header values must be Latin-1 (undici enforces the spec's ByteString rule and
+ * throws BEFORE the request is even sent) — but Telegram file names are routinely
+ * Cyrillic. ASCII names pass through quoted; anything else is percent-encoded via
+ * RFC 5987 `filename*` with a plain-ASCII fallback.
+ */
+function contentDispositionFor(filename: string): string {
+  const clean = filename.replace(/[\r\n"\\]/g, '_');
+  if (/^[\x20-\x7e]*$/.test(clean)) return `attachment; filename="${clean}"`;
+  return `attachment; filename="file"; filename*=UTF-8''${encodeURIComponent(clean)}`;
+}
+
 async function uploadPhotoToMax(max: MaxClient, buffer: Buffer): Promise<{ _type: 'PHOTO'; photoToken: string }> {
   const { url } = await max.requestPhotoUpload();
   const form = new FormData();
@@ -51,7 +63,7 @@ async function uploadFileToMax(max: MaxClient, buffer: Buffer, filename: string)
       'Content-Type': 'application/octet-stream',
       'Content-Range': `bytes 0-${buffer.length - 1}/${buffer.length}`,
       'Content-Length': String(buffer.length),
-      'Content-Disposition': `attachment; filename=${filename}`,
+      'Content-Disposition': contentDispositionFor(filename),
     },
     body: buffer,
   });
@@ -85,7 +97,7 @@ async function uploadVoiceToMax(max: MaxClient, buffer: Buffer, filename: string
       'Content-Type': 'application/octet-stream',
       'Content-Range': `0-${buffer.length - 1}/${buffer.length}`,
       'Content-Length': String(buffer.length),
-      'Content-Disposition': `attachment; filename=${filename}`,
+      'Content-Disposition': contentDispositionFor(filename),
     },
     body: buffer,
   });
@@ -111,7 +123,7 @@ async function uploadVideoToMax(
       'Content-Type': contentType,
       'Content-Range': `bytes 0-${buffer.length - 1}/${buffer.length}`,
       'Content-Length': String(buffer.length),
-      'Content-Disposition': `attachment; filename=${filename}`,
+      'Content-Disposition': contentDispositionFor(filename),
     },
     body: buffer,
   });

@@ -138,7 +138,13 @@ export class MessageLinkStore {
   }
 
   add(link: MessageLink): void {
-    if (link.maxMessageId == null) return;
+    if (link.maxMessageId == null) {
+      // Dropping silently already cost a debugging session (2026-08-14): without
+      // a MAX-side id every later /delete or edit on this message reports "no
+      // link" with no trace of why.
+      logger.warn(`MessageLinkStore: no MAX messageId for Telegram message ${link.telegramMessageId} — edit/delete for it won't work`);
+      return;
+    }
     const key = this.key(link.maxChatId, link.maxMessageId);
     this.byMax.set(key, link);
     this.byTelegram.set(link.telegramMessageId, link);
@@ -1464,9 +1470,15 @@ export function wireBridge({
   /** Reply to a message with /delete to remove it on MAX (and, since we sent it, on Telegram too). */
   bot.command('delete', async (ctx) => {
     const topicId = ctx.message.message_thread_id;
-    if (!topicId) return;
+    if (!topicId) {
+      // Typed in General — there's no mapped MAX chat to delete from, and silence
+      // here already cost a debugging session (2026-08-14), so say so.
+      await bot.telegram.sendMessage(targetGroupId, '/delete работает только внутри темы чата — ответь им на сообщение, которое нужно удалить.').catch(() => {});
+      return;
+    }
     const replyTo = (ctx.message as { reply_to_message?: { message_id: number } }).reply_to_message;
     if (!replyTo) {
+      logger.info(`/delete in topic ${topicId}: no reply target`);
       await bot.telegram.sendMessage(targetGroupId, 'Ответь этой командой на сообщение, которое нужно удалить. /delete me — удалить только у себя.', {
         message_thread_id: topicId,
       });
@@ -1474,12 +1486,18 @@ export function wireBridge({
     }
     const link = messageLinks.getByTelegram(replyTo.message_id);
     if (!link) {
-      await bot.telegram.sendMessage(targetGroupId, 'Не нашёл это сообщение в связке с MAX.', { message_thread_id: topicId });
+      logger.info(`/delete in topic ${topicId}: no MAX link for Telegram message ${replyTo.message_id} — relayed before the last restart, or its send never completed`);
+      await bot.telegram.sendMessage(
+        targetGroupId,
+        'Не нашёл это сообщение в связке с MAX. Связки живут в памяти: сообщения, пересланные до последнего перезапуска моста, удалить командой нельзя.',
+        { message_thread_id: topicId },
+      );
       return;
     }
     const forMe = (ctx as unknown as { payload?: string }).payload?.trim().toLowerCase() === 'me';
     try {
       await max.deleteMessages(link.maxChatId, [link.maxMessageId], forMe);
+      logger.info(`/delete: removed MAX message ${String(link.maxMessageId)} in chat ${String(link.maxChatId)} (forMe=${forMe})`);
       await bot.telegram.deleteMessage(targetGroupId, replyTo.message_id).catch((err) => logger.error('Failed to delete Telegram message', err));
     } catch (err) {
       logger.error('Failed to delete MAX message', err);
@@ -1571,6 +1589,10 @@ export function wireBridge({
 
       let attach: Record<string, unknown> | null = null;
       const largestPhoto = photo?.[photo.length - 1];
+      const kind = largestPhoto ? 'photo' : video ? 'video' : videoNote ? 'video_note' : document ? 'document' : animation ? 'animation' : voice ? 'voice' : sticker ? 'sticker' : null;
+      // INFO-level on purpose: the relay path logging nothing on success (or on a
+      // silently-skipped update) already cost a blind debugging session 2026-08-14.
+      logger.info(`TG -> MAX: message ${ctx.message.message_id} in topic ${topicId} (${kind ?? 'unsupported type'}) -> chat ${mapping.maxChatId}`);
       if (largestPhoto) {
         attach = await uploadTelegramAttachmentToMax(bot, max, largestPhoto.file_id, 'photo');
       } else if (video) {
