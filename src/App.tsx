@@ -75,7 +75,19 @@ function ApiKeyGate({ onSubmit, error }: { onSubmit: (key: string) => void; erro
 }
 
 export default function App() {
-  const [apiKey, setApiKey] = useState<string | null>(() => getStoredApiKey());
+  // Lets the bot's /apikey link (http://host:port/?key=...) log you straight
+  // in instead of just pointing at the login form — store it like a normal
+  // login and strip it from the URL bar right away so it doesn't linger in
+  // history/bookmarks.
+  const [apiKey, setApiKey] = useState<string | null>(() => {
+    const fromUrl = new URLSearchParams(window.location.search).get('key');
+    if (fromUrl) {
+      setStoredApiKey(fromUrl);
+      window.history.replaceState({}, '', window.location.pathname);
+      return fromUrl;
+    }
+    return getStoredApiKey();
+  });
   const [gateError, setGateError] = useState('');
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [status, setStatus] = useState<StatusData>({ max: false, tg: false, deviceId: '', phone: '', latencyMs: null });

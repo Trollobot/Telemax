@@ -73,6 +73,18 @@ check_tcp() {
   return 1
 }
 
+# Starting from $1, returns the first port nothing is already listening on
+# locally. Used instead of hard-failing when 3000 is taken (e.g. a leftover
+# container from an earlier install attempt) — just use the next one free.
+find_free_port() {
+  local port=$1
+  while (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; do
+    exec 3>&- 3<&-
+    port=$((port + 1))
+  done
+  echo "$port"
+}
+
 echo "Проверяю связь с серверами MAX и Telegram..."
 NETWORK_OK=1
 if check_tcp 155.212.204.150 443; then
@@ -145,13 +157,18 @@ fi
 API_KEY=$(openssl rand -hex 24)
 MAX_SESSION_KEY=$(openssl rand -hex 32)
 
+PORT=$(find_free_port 3000)
+if [ "$PORT" != "3000" ]; then
+  echo "Порт 3000 занят — использую $PORT вместо него."
+fi
+
 cat > .env <<EOF
 # сгенерировано setup.sh $(date -u +%Y-%m-%dT%H:%M:%SZ)
 API_KEY=$API_KEY
 MAX_SESSION_KEY=$MAX_SESSION_KEY
 TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN
 TARGET_TELEGRAM_GROUP=$TARGET_TELEGRAM_GROUP
-PORT=3000
+PORT=$PORT
 EOF
 
 echo
@@ -165,26 +182,6 @@ if ! command -v docker >/dev/null 2>&1; then
   echo "Docker не найден на этой машине — установите Docker и Docker Compose, затем запустите:"
   echo "  docker compose up -d --build"
   exit 0
-fi
-
-# Catches a busy port BEFORE the (multi-minute) build, not after — hit live:
-# a leftover container from an earlier/different install attempt held the
-# port, and the build only found out at the very last step, wasting the
-# whole build for nothing.
-if (exec 3<>"/dev/tcp/127.0.0.1/3000") 2>/dev/null; then
-  exec 3>&- 3<&-
-  echo
-  echo "❌ Порт 3000 уже занят — контейнер не сможет на нём стартовать."
-  CONFLICTING=$(docker ps --filter "publish=3000" --format '  {{.Names}} ({{.Image}}), {{.Status}}' 2>/dev/null || true)
-  if [ -n "$CONFLICTING" ]; then
-    echo "Занято контейнером:"
-    echo "$CONFLICTING"
-    echo "Если это лишняя/старая установка — остановите её и запустите setup.sh заново:"
-    echo "  docker stop <имя> && docker rm <имя>"
-  else
-    echo "Занято чем-то, не относящимся к Docker — освободите порт 3000 или измените PORT в .env, затем запустите setup.sh заново."
-  fi
-  exit 1
 fi
 
 read -rp "Собрать и запустить контейнер прямо сейчас? [Y/n] " RUN_NOW
@@ -202,4 +199,4 @@ HOST="${PUBLIC_IP:-<адрес-сервера>}"
 
 echo
 bold "Мост запущен."
-echo "Откройте http://$HOST:3000, введите ключ выше, затем номер телефона MAX и код из SMS."
+echo "Откройте http://$HOST:$PORT, введите ключ выше, затем номер телефона MAX и код из SMS."

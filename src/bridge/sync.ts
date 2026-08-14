@@ -530,6 +530,20 @@ async function pinInfoCard(bot: Telegraf, targetGroupId: string, messageId: numb
   }
 }
 
+/** Same lookup setup.sh does once at install time, run live for /apikey's link — best-effort, `null` just falls back to the bare key. */
+async function detectPublicIp(): Promise<string | null> {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+    const res = await fetch('https://ifconfig.me/ip', { signal: controller.signal }).finally(() => clearTimeout(timeout));
+    if (!res.ok) return null;
+    return (await res.text()).trim();
+  } catch (err) {
+    logger.error('Failed to detect public IP for /apikey link', err);
+    return null;
+  }
+}
+
 /** Picked up within a minute by update-watcher.sh on the host (see setup.sh) — writing it is the only thing the container itself does towards an update, everything else (git pull, rebuild, restart) happens outside it. */
 const UPDATE_REQUESTED_MARKER = path.join(process.cwd(), '.data', 'update-requested');
 
@@ -1074,16 +1088,22 @@ export function wireBridge({
     });
   });
 
-  /** Recovers the web-panel API_KEY without needing SSH/file access to the server — safe now that the target-group middleware above actually gates who can ask. */
+  /** Recovers the web-panel API_KEY without needing SSH/file access to the server — safe now that the target-group middleware above actually gates who can ask. Bundles it into a ready-to-open link (App.tsx reads ?key= and logs straight in) when the server's public IP can be detected, falling back to the bare key otherwise. */
   bot.command('apikey', async (ctx) => {
     const apiKey = process.env.API_KEY;
     if (!apiKey) {
       await bot.telegram.sendMessage(ctx.chat.id, 'API_KEY не задан в .env.', { message_thread_id: ctx.message.message_thread_id });
       return;
     }
-    await bot.telegram.sendMessage(ctx.chat.id, `🔑 Ключ для веб-панели:\n<code>${apiKey}</code>`, {
+    const port = process.env.PORT ?? '3000';
+    const ip = await detectPublicIp();
+    const text = ip
+      ? `🔑 Вход в веб-панель (ссылка сразу авторизует):\nhttp://${ip}:${port}/?key=${encodeURIComponent(apiKey)}`
+      : `🔑 Ключ для веб-панели (не удалось определить IP сервера — откройте панель вручную и введите ключ):\n<code>${apiKey}</code>`;
+    await bot.telegram.sendMessage(ctx.chat.id, text, {
       message_thread_id: ctx.message.message_thread_id,
       parse_mode: 'HTML',
+      link_preview_options: { is_disabled: true },
     });
   });
 
