@@ -21,6 +21,36 @@ fi
 
 bold "=== Telemax — первая настройка ==="
 echo
+
+# Fails fast on a server whose network can't reach one of the two services this
+# bridge depends on (firewall, geo-blocking, restrictive hosting policy) —
+# better to say so now than after the user has typed in a bot token.
+check_tcp() {
+  timeout 5 bash -c "cat < /dev/null > /dev/tcp/$1/$2" 2>/dev/null
+}
+
+echo "Проверяю связь с серверами MAX и Telegram..."
+NETWORK_OK=1
+if check_tcp 155.212.204.150 443; then
+  echo "  MAX (155.212.204.150:443): OK"
+else
+  echo "  MAX (155.212.204.150:443): нет связи"
+  NETWORK_OK=0
+fi
+if check_tcp api.telegram.org 443; then
+  echo "  Telegram (api.telegram.org:443): OK"
+else
+  echo "  Telegram (api.telegram.org:443): нет связи"
+  NETWORK_OK=0
+fi
+if [ "$NETWORK_OK" -eq 0 ]; then
+  echo
+  echo "Без связи хотя бы с одним из серверов мост работать не сможет. Проверьте"
+  echo "файрвол/провайдера сети (некоторые хостинги или страны блокируют MAX"
+  echo "и/или Telegram) и запустите setup.sh снова."
+  exit 1
+fi
+echo
 echo "Понадобится токен бота — создайте его через @BotFather (https://t.me/BotFather), команда /newbot."
 echo
 
