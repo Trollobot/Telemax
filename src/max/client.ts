@@ -5,6 +5,9 @@ import { readFrameHeader, encodeFrame, decompressPayload, FRAME_HEADER_SIZE } fr
 import { decodeFramePayload, pickObject } from './msgpack.js';
 import { OPCODES, DIR, formatOpcode } from './opcodes.js';
 import { findAuthToken, findLongToken, describeAuthError } from './tokens.js';
+import { createLogger, jsonStringify, redactSecrets } from '../logger.js';
+
+const logger = createLogger('max');
 
 export interface MaxMessageEvent {
   dir: number;
@@ -339,6 +342,9 @@ export class MaxClient extends EventEmitter {
     const { dir, payload } = await wait;
     const token = findLongToken(payload);
     if (dir === DIR.ERR || !token) {
+      // Temporary — need to see the actual shape of what MAX sends back on a
+      // failed CHECK_CODE, since describeAuthError found nothing usable in it.
+      logger.error(`CHECK_CODE failed — dir=${dir}, payload=${jsonStringify(redactSecrets(payload))}`);
       throw new Error(describeAuthError(payload, 'CHECK_CODE did not return a login token — was the code correct?'));
     }
     return token;
