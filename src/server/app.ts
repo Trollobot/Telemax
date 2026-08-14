@@ -671,9 +671,14 @@ async function launchTelegramBotWithRetry(bot: Telegraf, attempt = 0): Promise<v
   bot.telegram.setMyCommands(BOT_COMMANDS).catch((err) => logger.error('Failed to set bot commands', err));
   void reportIfJustUpdated(bot);
 
-  // message_reaction and poll_answer are opt-in — Telegram omits them from the default update set unless requested.
+  // message_reaction and poll_answer are opt-in — Telegram omits them from the default update set unless
+  // requested. callback_query has to be listed explicitly too once you restrict allowedUpdates at all —
+  // it's normally on by default, but an explicit list overrides that default rather than adding to it, so
+  // leaving it out here silently dropped every inline-keyboard button press (/version's Обновить/Позже)
+  // with no error anywhere: Telegram just never delivered the update. /donate's buttons never surfaced
+  // this because they're url buttons, which the client opens directly without involving the bot at all.
   bot
-    .launch({ allowedUpdates: ['message', 'edited_message', 'message_reaction', 'poll_answer'] })
+    .launch({ allowedUpdates: ['message', 'edited_message', 'message_reaction', 'poll_answer', 'callback_query'] })
     .catch((err) => retryTelegramLaunch(bot, attempt, err));
 }
 
