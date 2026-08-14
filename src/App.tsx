@@ -212,6 +212,29 @@ export default function App() {
     }
   };
 
+  // Disconnects MAX and deletes the encrypted session, same as /kill's MAX-side
+  // teardown — but Telegram topics/history are untouched, so this is safe as a
+  // plain "log out and reauthorize" action rather than something destructive.
+  const handleLogout = async () => {
+    if (isLoading || isSubmitting.current) return;
+    if (!window.confirm('Разлогинить MAX-сессию? Понадобится новая SMS-авторизация. История переписки в Telegram не затрагивается.')) return;
+    isSubmitting.current = true;
+    setIsLoading(true);
+    try {
+      const res = await apiFetch('/api/auth/logout', { method: 'POST' });
+      if (res.status === 401) return handleUnauthorized();
+      setPhone('');
+      setCode('');
+      setPassword('');
+      setPasswordHint('');
+      setAuthError('');
+      setAuthStep('phone');
+    } finally {
+      setIsLoading(false);
+      isSubmitting.current = false;
+    }
+  };
+
   useEffect(() => {
     if (!apiKey) return;
 
@@ -436,6 +459,9 @@ export default function App() {
                         <Shield size={32} />
                       </div>
                       <h3 className="text-white font-bold text-lg">Authenticated as {status.phone}</h3>
+                      <button onClick={handleLogout} disabled={isLoading} className="bg-red-600/20 hover:bg-red-600/30 disabled:opacity-50 text-red-400 font-bold py-2 px-4 rounded text-sm">
+                        Разлогиниться / сменить номер
+                      </button>
                     </div>
                   )}
                 </div>

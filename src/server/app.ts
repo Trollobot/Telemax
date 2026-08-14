@@ -436,6 +436,15 @@ async function startServer(): Promise<void> {
     }
   });
 
+  // Same MAX-side teardown /kill's bot command uses (disconnect + delete the
+  // encrypted session) — but scoped to just that, unlike /kill, which also
+  // wipes every Telegram topic. Lets the web panel offer "log out / change
+  // number" without touching chat history.
+  api.post('/auth/logout', async (_req, res) => {
+    await killMaxSession();
+    res.json({ success: true });
+  });
+
   api.get('/chats', (_req, res) => {
     const chats = cachedChats.map((chat) => ({
       ...(chat as object),
