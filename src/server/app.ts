@@ -355,6 +355,7 @@ async function startServer(): Promise<void> {
       pendingPhone = phone;
       res.json({ success: true });
     } catch (err) {
+      logger.error(`Failed to request SMS for ${phone}`, err);
       res.status(502).json({ error: (err as Error).message });
     }
   });
@@ -388,6 +389,7 @@ async function startServer(): Promise<void> {
       broadcastStatus();
       res.json({ success: true });
     } catch (err) {
+      logger.error('Failed to verify SMS code', err);
       res.status(502).json({ error: (err as Error).message });
     }
   });
