@@ -21,21 +21,29 @@ fi
 
 export DEBIAN_FRONTEND=noninteractive
 
+# Best-effort apt wrapper. Some VPS images ship with an unrelated package
+# already broken (seen live — initramfs-tools' dhcpcd hook failing on a
+# missing .so with nothing to do with Telemax) whose dpkg trigger re-fires
+# and fails on EVERY subsequent apt-get call, not just the one that first
+# surfaced it — upgrade, then installing jq, then (if left unguarded) the
+# Docker install too. The package we actually asked for still installs fine
+# each time; only that unrelated trigger's own exit code is non-zero.
+# Aborting the whole bootstrap over someone else's package is worse than
+# warning once and moving on, so every apt-get call in this script goes
+# through this instead of a bare one.
+apt_get() {
+  if ! apt-get "$@"; then
+    echo "⚠️  apt-get $* завершился с предупреждением (см. вывод выше) — похоже, дело в стороннем пакете, не связанном с Telemax. Продолжаю; если хотите разобраться отдельно, обычно помогает: dpkg --configure -a"
+    dpkg --configure -a >/dev/null 2>&1 || true
+  fi
+}
+
 bold "=== Telemax — установка на чистый сервер ==="
 echo
 
 echo "[1/5] Обновляю систему (может занять несколько минут)..."
 apt-get update -y
-# Best-effort: some VPS images ship with an unrelated package already broken
-# (seen live — initramfs-tools' dhcpcd hook failing on a missing .so that has
-# nothing to do with Telemax) and `apt-get upgrade` exits non-zero for that
-# alone even though everything Telemax actually needs still installs fine
-# afterward. Aborting the whole bootstrap over someone else's package is
-# worse than just warning and moving on.
-if ! apt-get upgrade -y; then
-  echo "⚠️  apt upgrade завершился с ошибкой (см. вывод выше) — похоже, дело в стороннем пакете, не связанном с Telemax. Продолжаю установку; если хотите разобраться отдельно, обычно помогает: dpkg --configure -a"
-fi
-dpkg --configure -a >/dev/null 2>&1 || true
+apt_get upgrade -y
 
 echo
 echo "[2/5] Проверяю git и jq..."
@@ -43,14 +51,21 @@ echo "[2/5] Проверяю git и jq..."
 # for it manually — see setup.sh).
 for pkg in git jq; do
   if ! command -v "$pkg" >/dev/null 2>&1; then
-    apt-get install -y "$pkg"
+    apt_get install -y "$pkg"
   fi
 done
 
 echo
 echo "[3/5] Проверяю Docker..."
 if ! command -v docker >/dev/null 2>&1; then
-  curl -fsSL https://get.docker.com | sh
+  # get.docker.com's own script calls apt-get install internally and can hit
+  # the exact same recurring trigger issue — don't trust its exit code alone,
+  # check whether docker actually landed afterward.
+  curl -fsSL https://get.docker.com | sh || true
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "❌ Docker всё ещё не установлен после попытки. Разберитесь с ошибкой apt выше (обычно: dpkg --configure -a), затем запустите install.sh заново."
+    exit 1
+  fi
 else
   echo "Docker уже установлен."
 fi
