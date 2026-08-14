@@ -7,8 +7,11 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-MARKER=".data/update-requested"
+# `data/`, NOT `.data/` — that's the container-internal path (docker-compose.yml
+# mounts host `./data` there); this script runs on the host itself.
+MARKER="data/update-requested"
 [ -f "$MARKER" ] || exit 0
 rm -f "$MARKER"
 
-./update.sh >> .data/update.log 2>&1
+mkdir -p data
+./update.sh >> data/update.log 2>&1
