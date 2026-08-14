@@ -205,4 +205,49 @@ HOST="${PUBLIC_IP:-<адрес-сервера>}"
 
 echo
 bold "Мост запущен."
-echo "Откройте http://$HOST:$PORT, введите ключ выше, затем номер телефона MAX и код из SMS."
+
+# Авторизация в MAX прямо здесь, без переключения в браузер — тот же /api/auth/*,
+# которым пользуется веб-панель, просто из консоли. Ждём готовности сервера
+# (MAX подключается не мгновенно после старта, /auth/phone до этого вернёт 503).
+echo "Жду готовности сервера..."
+API_URL="http://localhost:$PORT/api"
+for attempt in 1 2 3 4 5 6 7 8 9 10; do
+  curl -s --max-time 2 "$API_URL/health" >/dev/null 2>&1 && break
+  sleep 2
+done
+
+echo
+bold "Авторизация в MAX"
+read -rp "Номер телефона (с кодом страны, например +79991234567) — или просто Enter, чтобы авторизоваться позже через веб-панель: " MAX_PHONE
+if [ -n "$MAX_PHONE" ]; then
+  PHONE_OK=""
+  for attempt in 1 2 3; do
+    PHONE_RESP=$(curl -s -X POST -H "x-api-key: $API_KEY" -H "Content-Type: application/json" \
+      -d "{\"phone\":\"$MAX_PHONE\"}" "$API_URL/auth/phone")
+    if echo "$PHONE_RESP" | grep -q '"success":true'; then
+      PHONE_OK=1
+      break
+    fi
+    sleep 2
+  done
+  if [ -n "$PHONE_OK" ]; then
+    echo "Код отправлен на $MAX_PHONE."
+    read -rp "Код из SMS: " MAX_CODE
+    VERIFY_RESP=$(curl -s -X POST -H "x-api-key: $API_KEY" -H "Content-Type: application/json" \
+      -d "{\"code\":\"$MAX_CODE\"}" "$API_URL/auth/verify")
+    if echo "$VERIFY_RESP" | grep -q '"success":true'; then
+      bold "Готово — мост авторизован и подключён к MAX."
+    else
+      echo "❌ Не удалось подтвердить код: $VERIFY_RESP"
+      echo "Попробуйте ещё раз через веб-панель: http://$HOST:$PORT"
+    fi
+  else
+    echo "❌ Не удалось запросить SMS: $PHONE_RESP"
+    echo "Попробуйте через веб-панель: http://$HOST:$PORT"
+  fi
+else
+  echo "Ок — откройте http://$HOST:$PORT, введите ключ выше, затем номер телефона MAX и код из SMS."
+fi
+
+echo
+echo "Дальнейшие изменения (смена номера, повторная авторизация) удобнее делать через веб-панель: http://$HOST:$PORT"
