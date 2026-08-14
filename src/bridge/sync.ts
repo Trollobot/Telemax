@@ -591,7 +591,14 @@ export function wireBridge({
   // updates carry no `chat` at all and are separately authorized by their own
   // poll_id lookup (see bot.on('poll_answer') below), so those pass through.
   bot.use((ctx, next) => {
-    if (ctx.chat && String(ctx.chat.id) !== targetGroupId) return;
+    if (ctx.chat && String(ctx.chat.id) !== targetGroupId) {
+      if (ctx.callbackQuery) {
+        ctx.answerCbQuery('Не вы меня создали.').catch(() => {});
+      } else {
+        ctx.reply('Не вы меня создали — идите в жопу.').catch(() => {});
+      }
+      return;
+    }
     return next();
   });
 
@@ -1039,6 +1046,7 @@ export function wireBridge({
 /deletegroup — удалить группу (требует подтверждения)
 
 Обслуживание бота:
+/apikey — показать ключ для входа в веб-панель (если потерял/не сохранил при установке)
 /version — проверить версию, обновить по кнопке (раз в сутки бот сам напомнит, если вышло обновление)
 /reboot — удалить ВСЕ темы в этой Telegram-группе и пересинхронизировать всё с нуля из MAX (требует подтверждения, MAX не затрагивается)
 /kill — то же самое + разлогинить MAX-сессию (нужна новая SMS-авторизация через веб-панель). Необратимо, требует подтверждения.
@@ -1063,6 +1071,19 @@ export function wireBridge({
         ],
         { columns: 1 },
       ).reply_markup,
+    });
+  });
+
+  /** Recovers the web-panel API_KEY without needing SSH/file access to the server — safe now that the target-group middleware above actually gates who can ask. */
+  bot.command('apikey', async (ctx) => {
+    const apiKey = process.env.API_KEY;
+    if (!apiKey) {
+      await bot.telegram.sendMessage(ctx.chat.id, 'API_KEY не задан в .env.', { message_thread_id: ctx.message.message_thread_id });
+      return;
+    }
+    await bot.telegram.sendMessage(ctx.chat.id, `🔑 Ключ для веб-панели:\n<code>${apiKey}</code>`, {
+      message_thread_id: ctx.message.message_thread_id,
+      parse_mode: 'HTML',
     });
   });
 

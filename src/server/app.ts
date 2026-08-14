@@ -594,15 +594,16 @@ const BOT_DESCRIPTION = `Мост MAX (+7XXXXXXXXXX) ↔ Telegram: сообще�
 
 Ограничения:
 • Свайп-удаление в Telegram бот не видит (нет такого события в Bot API) — удаляй командой /delete (или /delete me) ответом на сообщение.
-• Голоса за опрос из MAX не появляются в виджете Telegram сами — счёт через /poll ответом на сообщение опроса.
+• Голоса за опрос из MAX сами не появляются в Telegram — счёт через /poll ответом на опрос.
 
-Команды: /help /donate /version /info /poll /delete /newgroup /invite /kick /leavegroup /deletegroup /reboot /kill`;
+Команды: /help /donate /apikey /version /info /poll /delete /newgroup /invite /kick /leavegroup /deletegroup /reboot /kill`;
 
 // Populates Telegram's "/" command menu with one-line descriptions. /help (bridge/sync.ts)
 // has the full reference — these are just enough to jog the memory from the menu.
 const BOT_COMMANDS = [
   { command: 'help', description: 'Полный список команд и ограничений' },
   { command: 'donate', description: 'Поддержать проект (рубли / TON)' },
+  { command: 'apikey', description: 'Показать ключ для веб-панели' },
   { command: 'version', description: 'Версия бота, обновление по кнопке' },
   { command: 'info', description: 'Карточка контакта/чата (просто в теме)' },
   { command: 'poll', description: 'Актуальный счёт опроса (ответом на сообщение)' },
