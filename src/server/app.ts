@@ -8,7 +8,6 @@ import { WebSocketServer, type WebSocket } from 'ws';
 import { Telegraf } from 'telegraf';
 import path from 'node:path';
 import { chmod, mkdir, readFile, unlink } from 'node:fs/promises';
-import { createServer as createViteServer } from 'vite';
 import { MaxClient, type MaxMessageEvent, type MaxContactInfo } from '../max/client.js';
 import { OPCODES, formatOpcode } from '../max/opcodes.js';
 import { extractMyAccountId, resolveChatName, type ContactProfile } from '../max/names.js';
@@ -541,6 +540,12 @@ async function startServer(): Promise<void> {
     app.use(express.static(distPath));
     app.get('*', (_req, res) => res.sendFile(path.join(distPath, 'index.html')));
   } else {
+    // Dynamic import, NOT a static top-level one: vite is a devDependency, so it
+    // doesn't exist in the production image at all. A static import crashed the
+    // container on boot (ERR_MODULE_NOT_FOUND) the moment @tailwindcss/vite left
+    // "dependencies" — it had been pulling vite into the runtime image as its
+    // peer dependency this whole time, masking the problem. Hit live 2026-08-14.
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({ server: { middlewareMode: true }, appType: 'spa' });
     app.use(vite.middlewares);
   }
