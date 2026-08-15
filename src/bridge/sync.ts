@@ -1035,11 +1035,41 @@ export function wireBridge({
     await pinInfoCard(bot, targetGroupId, messageId);
   }
 
+  /** Telegram's error when you post to a forum topic that's since been deleted. */
+  function isThreadNotFound(err: unknown): boolean {
+    const msg = err instanceof Error ? err.message : String(err);
+    return /message thread not found|thread not found|TOPIC_DELETED/i.test(msg);
+  }
+
+  /**
+   * Runs `send` against the chat's topic, and if that topic was deleted out from
+   * under us (the user removed it in Telegram), recreates it and retries once.
+   * Without this, deleting a topic silently black-holes every future message from
+   * that MAX contact — effectively a self-inflicted ban (reported live 2026-08-15).
+   * `send` may run twice, so keep it idempotent-ish; in practice the first send is
+   * the one that fails on a dead topic, so nothing has been delivered yet on retry.
+   */
+  async function deliverToTopic(chatId: unknown, send: (topicId: number, created: boolean) => Promise<void>): Promise<void> {
+    const first = await ensureTopicForMaxChat(bot, targetGroupId, chatId, chatMapStore);
+    try {
+      await send(first.topicId, first.created);
+    } catch (err) {
+      if (!isThreadNotFound(err)) throw err;
+      logger.info(`Telegram topic ${first.topicId} for MAX chat ${String(chatId)} was deleted — recreating`);
+      await chatMapStore.remove(chatId);
+      const fresh = await ensureTopicForMaxChat(bot, targetGroupId, chatId, chatMapStore);
+      await send(fresh.topicId, fresh.created);
+    }
+  }
+
   async function handleMaxPush(payload: MaxPushPayload): Promise<void> {
     const chatId = payload?.chatId;
     const message = payload?.message;
     if (chatId == null || !message) return;
     if (message.cid != null && outgoingCids.has(message.cid)) return; // our own message echoed back
+    // Banned chat (/ban): drop everything for it — no mirror, no topic recreate.
+    const banCheck = await chatMapStore.getByMaxChatId(chatId);
+    if (banCheck?.banned) return;
 
     let text = message.text;
     let attaches = Array.isArray(message.attaches) ? message.attaches : [];
@@ -1125,46 +1155,47 @@ export function wireBridge({
     const pollAttach = attaches.find((a) => (a as MaxAttachment)._type === 'POLL') as MaxAttachment | undefined;
     if (pollAttach) {
       try {
-        const { topicId, created } = await ensureTopicForMaxChat(bot, targetGroupId, chatId, chatMapStore);
-        if (created) {
-          await sendAutoInfoCard(chatId, message.sender, topicId).catch((err) => logger.error('Failed to send auto contact-info card', err));
-        }
-        const options = (pollAttach.answers ?? []).map((a) => a.text || '—');
-        const settings = pollAttach.settings ?? 0;
-        const sentPoll = await bot.telegram.sendPoll(targetGroupId, pollAttach.title || 'Опрос', options, {
-          is_anonymous: (settings & 1) !== 0,
-          allows_multiple_answers: (settings & 2) !== 0,
-          message_thread_id: topicId,
-        });
-        logger.info(`Relayed MAX poll "${pollAttach.title}" (pollId=${String(pollAttach.pollId)}) to Telegram topic ${topicId}`);
-        // MAX sends no push for votes, and Telegram's native poll widget has no API for
-        // injecting one cast on MAX's side — so it will never reflect those on its own.
-        await bot.telegram
-          .sendMessage(targetGroupId, '💡 Голоса с MAX сюда не попадают — ответь на это сообщение командой /poll, чтобы увидеть актуальный счёт.', {
+        await deliverToTopic(chatId, async (topicId, created) => {
+          if (created) {
+            await sendAutoInfoCard(chatId, message.sender, topicId).catch((err) => logger.error('Failed to send auto contact-info card', err));
+          }
+          const options = (pollAttach.answers ?? []).map((a) => a.text || '—');
+          const settings = pollAttach.settings ?? 0;
+          const sentPoll = await bot.telegram.sendPoll(targetGroupId, pollAttach.title || 'Опрос', options, {
+            is_anonymous: (settings & 1) !== 0,
+            allows_multiple_answers: (settings & 2) !== 0,
             message_thread_id: topicId,
-            reply_parameters: { message_id: sentPoll.message_id },
-          })
-          .catch((err) => logger.error('Failed to send poll reminder', err));
-        if (message.id != null) messageLinks.add({ maxChatId: chatId, maxMessageId: message.id, telegramMessageId: sentPoll.message_id });
-        if (pollAttach.pollId != null) {
-          pollLinks.add(sentPoll.poll.id, {
-            maxChatId: chatId,
-            maxMessageId: message.id,
-            maxPollId: pollAttach.pollId,
-            answerIdByOptionIndex: (pollAttach.answers ?? []).map((a, i) => Number(a.answerId ?? i + 1)),
           });
-        }
-        // A freshly created Telegram poll always starts at zero — there's no Bot API
-        // way to pre-seed a vote — so if the creator (or anyone) already voted by the
-        // time this push arrived (e.g. a client that auto-votes the creator's pick),
-        // that tally is otherwise invisible on the Telegram side. Report it right away.
-        if ((pollAttach.state?.result?.some((r) => (r.voteCount ?? 0) > 0)) && message.id != null) {
-          const key = `${String(chatId)}:${String(message.id)}`;
-          if (typeof pollAttach.version === 'number') lastRelayedPollVersion.set(key, pollAttach.version);
-          await relayPollUpdate(chatId, sentPoll.message_id, pollAttach).catch((err) =>
-            logger.error('Failed to relay initial poll tally to Telegram', err),
-          );
-        }
+          logger.info(`Relayed MAX poll "${pollAttach.title}" (pollId=${String(pollAttach.pollId)}) to Telegram topic ${topicId}`);
+          // MAX sends no push for votes, and Telegram's native poll widget has no API for
+          // injecting one cast on MAX's side — so it will never reflect those on its own.
+          await bot.telegram
+            .sendMessage(targetGroupId, '💡 Голоса с MAX сюда не попадают — ответь на это сообщение командой /poll, чтобы увидеть актуальный счёт.', {
+              message_thread_id: topicId,
+              reply_parameters: { message_id: sentPoll.message_id },
+            })
+            .catch((err) => logger.error('Failed to send poll reminder', err));
+          if (message.id != null) messageLinks.add({ maxChatId: chatId, maxMessageId: message.id, telegramMessageId: sentPoll.message_id });
+          if (pollAttach.pollId != null) {
+            pollLinks.add(sentPoll.poll.id, {
+              maxChatId: chatId,
+              maxMessageId: message.id,
+              maxPollId: pollAttach.pollId,
+              answerIdByOptionIndex: (pollAttach.answers ?? []).map((a, i) => Number(a.answerId ?? i + 1)),
+            });
+          }
+          // A freshly created Telegram poll always starts at zero — there's no Bot API
+          // way to pre-seed a vote — so if the creator (or anyone) already voted by the
+          // time this push arrived (e.g. a client that auto-votes the creator's pick),
+          // that tally is otherwise invisible on the Telegram side. Report it right away.
+          if ((pollAttach.state?.result?.some((r) => (r.voteCount ?? 0) > 0)) && message.id != null) {
+            const key = `${String(chatId)}:${String(message.id)}`;
+            if (typeof pollAttach.version === 'number') lastRelayedPollVersion.set(key, pollAttach.version);
+            await relayPollUpdate(chatId, sentPoll.message_id, pollAttach).catch((err) =>
+              logger.error('Failed to relay initial poll tally to Telegram', err),
+            );
+          }
+        });
       } catch (err) {
         logger.error('Failed to relay MAX poll to Telegram', err);
       }
@@ -1172,32 +1203,33 @@ export function wireBridge({
     }
 
     try {
-      const { topicId, created } = await ensureTopicForMaxChat(bot, targetGroupId, chatId, chatMapStore);
-      if (created) {
-        await sendAutoInfoCard(chatId, message.sender, topicId).catch((err) => logger.error('Failed to send auto contact-info card', err));
-      }
-      let textMessageId: number | undefined;
-      let attachMessageId: number | undefined;
-      if (text) textMessageId = (await bot.telegram.sendMessage(targetGroupId, text, { message_thread_id: topicId })).message_id;
-      if (attaches.length > 0) {
-        // NOT `telegramMessageId ??= await sendAttachments(...)` — `??=` short-circuits
-        // and never even CALLS sendAttachments when telegramMessageId is already set,
-        // which it always is for a forward (the "↩️ Переслано из..." prefix always
-        // produces text, even when the original was attachment-only). That silently
-        // dropped every forwarded attachment with no error anywhere (root-caused live
-        // 2026-08-13 after the catch-up path — which calls sendAttachments
-        // unconditionally — kept delivering the same messages fine).
-        const downloadCtx: DownloadContext = { max, chatId: downloadChatId, messageId: downloadMessageId };
-        attachMessageId = await sendAttachments(bot, targetGroupId, topicId, attaches, downloadCtx);
-      }
-      // A forward with both text AND an attachment sends TWO separate Telegram
-      // messages from one MAX message — track both so a later deletion removes both
-      // instead of orphaning the attachment (confirmed live 2026-08-13).
-      const telegramMessageId = textMessageId ?? attachMessageId;
-      if (telegramMessageId != null) {
-        const extraTelegramMessageIds = textMessageId != null && attachMessageId != null && attachMessageId !== telegramMessageId ? [attachMessageId] : undefined;
-        messageLinks.add({ maxChatId: chatId, maxMessageId: message.id, telegramMessageId, extraTelegramMessageIds });
-      }
+      await deliverToTopic(chatId, async (topicId, created) => {
+        if (created) {
+          await sendAutoInfoCard(chatId, message.sender, topicId).catch((err) => logger.error('Failed to send auto contact-info card', err));
+        }
+        let textMessageId: number | undefined;
+        let attachMessageId: number | undefined;
+        if (text) textMessageId = (await bot.telegram.sendMessage(targetGroupId, text, { message_thread_id: topicId })).message_id;
+        if (attaches.length > 0) {
+          // NOT `telegramMessageId ??= await sendAttachments(...)` — `??=` short-circuits
+          // and never even CALLS sendAttachments when telegramMessageId is already set,
+          // which it always is for a forward (the "↩️ Переслано из..." prefix always
+          // produces text, even when the original was attachment-only). That silently
+          // dropped every forwarded attachment with no error anywhere (root-caused live
+          // 2026-08-13 after the catch-up path — which calls sendAttachments
+          // unconditionally — kept delivering the same messages fine).
+          const downloadCtx: DownloadContext = { max, chatId: downloadChatId, messageId: downloadMessageId };
+          attachMessageId = await sendAttachments(bot, targetGroupId, topicId, attaches, downloadCtx);
+        }
+        // A forward with both text AND an attachment sends TWO separate Telegram
+        // messages from one MAX message — track both so a later deletion removes both
+        // instead of orphaning the attachment (confirmed live 2026-08-13).
+        const telegramMessageId = textMessageId ?? attachMessageId;
+        if (telegramMessageId != null) {
+          const extraTelegramMessageIds = textMessageId != null && attachMessageId != null && attachMessageId !== telegramMessageId ? [attachMessageId] : undefined;
+          messageLinks.add({ maxChatId: chatId, maxMessageId: message.id, telegramMessageId, extraTelegramMessageIds });
+        }
+      });
     } catch (err) {
       logger.error('MAX -> Telegram forward failed', err);
     }
@@ -1242,12 +1274,18 @@ export function wireBridge({
 /leavegroup — выйти из группы (требует подтверждения)
 /deletegroup — удалить группу (требует подтверждения)
 
+Контакты:
+/ban — заглушить чат: выбери из списка кнопкой, сообщения от него перестанут приходить, тема удалится
+/unban — вернуть заглушённый чат (тема появится при следующем сообщении от него)
+
 Обслуживание бота:
 /apikey — показать ключ для входа в веб-панель (если потерял/не сохранил при установке)
 Первая авторизация MAX — прямо в консоли при установке (setup.sh спросит номер и код из SMS). Всё, что потом (повторная авторизация после /kill, смена номера) — через веб-панель по ссылке из /apikey.
 /version — проверить версию, обновить по кнопке (раз в сутки бот сам напомнит, если вышло обновление)
 /reboot — удалить ВСЕ темы в этой Telegram-группе и пересинхронизировать всё с нуля из MAX (требует подтверждения, MAX не затрагивается)
 /kill — то же самое + разлогинить MAX-сессию (нужна новая SMS-авторизация через веб-панель). Необратимо, требует подтверждения.
+
+🔒 Команды выполняются только у администраторов группы. Обычные участники могут читать и писать (участвовать в обсуждении), но не командовать ботом.
 
 ⚠️ Ограничения платформы:
 • Свайп-удаление подхватывается только для СВОИХ сообщений и тех, что отправлены после последнего запуска моста — если не удалилось, добей командой /delete.
@@ -1326,6 +1364,59 @@ export function wireBridge({
   bot.action('tlmx_dismiss', async (ctx) => {
     await ctx.answerCbQuery('Ок');
     await ctx.editMessageText('⏰ Отложено — напомню при следующей ежедневной проверке.');
+  });
+
+  // /ban — mute a MAX chat: pick it from a button list, and its incoming messages
+  // stop being mirrored (its topic is deleted). Persistent (survives restart) and
+  // reversible via /unban. Distinct from just deleting a topic by hand, which is now
+  // auto-healed instead — /ban is the deliberate "I don't want this contact" switch.
+  bot.command('ban', async (ctx) => {
+    const active = (await chatMapStore.list()).filter((m) => !m.banned);
+    if (active.length === 0) {
+      await bot.telegram.sendMessage(ctx.chat.id, 'Нет активных чатов для бана.', { message_thread_id: ctx.message.message_thread_id });
+      return;
+    }
+    const buttons = active.slice(0, 90).map((m) => Markup.button.callback(m.title || `MAX chat ${m.maxChatId}`, `tlmx_ban:${m.maxChatId}`));
+    await bot.telegram.sendMessage(ctx.chat.id, '🚫 Кого забанить? Сообщения от выбранного чата приходить перестанут, его тема удалится. Вернуть можно через /unban.', {
+      message_thread_id: ctx.message.message_thread_id,
+      reply_markup: Markup.inlineKeyboard(buttons, { columns: 1 }).reply_markup,
+    });
+  });
+
+  bot.action(/^tlmx_ban:(.+)$/, async (ctx) => {
+    const maxChatId = ctx.match?.[1];
+    if (!maxChatId) return;
+    const mapping = await chatMapStore.getByMaxChatId(maxChatId);
+    await chatMapStore.setBanned(maxChatId, true);
+    if (mapping) {
+      await bot.telegram.deleteForumTopic(targetGroupId, mapping.telegramTopicId).catch((err) => logger.error('Failed to delete topic on ban', err));
+    }
+    await ctx.answerCbQuery('Забанен');
+    await ctx.editMessageText(`🚫 Забанен: ${mapping?.title ?? maxChatId}. Сообщения больше не приходят. Вернуть — /unban.`).catch(() => {});
+  });
+
+  // /unban — reverse a ban. Just flips the flag; the topic comes back on the next
+  // incoming message from that chat (the recreate-on-thread-not-found path handles it).
+  bot.command('unban', async (ctx) => {
+    const banned = (await chatMapStore.list()).filter((m) => m.banned);
+    if (banned.length === 0) {
+      await bot.telegram.sendMessage(ctx.chat.id, 'Забаненных чатов нет.', { message_thread_id: ctx.message.message_thread_id });
+      return;
+    }
+    const buttons = banned.slice(0, 90).map((m) => Markup.button.callback(m.title || `MAX chat ${m.maxChatId}`, `tlmx_unban:${m.maxChatId}`));
+    await bot.telegram.sendMessage(ctx.chat.id, '♻️ Кого разбанить?', {
+      message_thread_id: ctx.message.message_thread_id,
+      reply_markup: Markup.inlineKeyboard(buttons, { columns: 1 }).reply_markup,
+    });
+  });
+
+  bot.action(/^tlmx_unban:(.+)$/, async (ctx) => {
+    const maxChatId = ctx.match?.[1];
+    if (!maxChatId) return;
+    const mapping = await chatMapStore.getByMaxChatId(maxChatId);
+    await chatMapStore.setBanned(maxChatId, false);
+    await ctx.answerCbQuery('Разбанен');
+    await ctx.editMessageText(`♻️ Разбанен: ${mapping?.title ?? maxChatId}. Тема вернётся при следующем сообщении от него.`).catch(() => {});
   });
 
   /** Contact card for the person/group on the other end of this topic — name, phone, country, registration date, and (best-effort) their avatar. */

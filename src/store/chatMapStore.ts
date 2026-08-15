@@ -17,6 +17,11 @@ export interface ChatMapping {
   // (crash, redeploy, or a fresh reconnect mid-flood-wait) skip everything already
   // sent instead of replaying the whole chat and duplicating messages.
   historyBackfillCursor?: string;
+  // Set by /ban: incoming MAX messages for this chat are dropped (not mirrored) and
+  // its Telegram topic is deleted. The mapping is KEPT (banned=true) so the ban
+  // survives restarts; /unban flips this back and the next message recreates the
+  // topic (via the thread-not-found auto-recreate path in bridge/sync.ts).
+  banned?: boolean;
 }
 
 /** Persistent MAX chatId <-> Telegram forum topicId mapping (ТЗ.md §1.4). Not secret — plain JSON is fine. */
@@ -53,6 +58,7 @@ export class ChatMapStore {
     title?: string;
     createdAt: string;
     historyBackfillCursor?: string;
+    banned?: boolean;
   }): Promise<void> {
     const normalized: ChatMapping = { ...mapping, maxChatId: String(mapping.maxChatId) };
     const all = await this.load();
@@ -61,6 +67,23 @@ export class ChatMapStore {
     else all.push(normalized);
     this.cache = all;
     await this.persist(all);
+  }
+
+  /** Flags/unflags a chat as banned (/ban, /unban). No-op if the chat has no mapping. */
+  async setBanned(maxChatId: unknown, banned: boolean): Promise<void> {
+    const existing = await this.getByMaxChatId(maxChatId);
+    if (!existing) return;
+    await this.upsert({ ...existing, banned });
+  }
+
+  /** Drops a mapping entirely — used only to force a fresh topic when the current one was deleted in Telegram (see the recreate path in bridge/sync.ts). */
+  async remove(maxChatId: unknown): Promise<void> {
+    const key = String(maxChatId);
+    const all = await this.load();
+    const filtered = all.filter((m) => String(m.maxChatId) !== key);
+    if (filtered.length === all.length) return;
+    this.cache = filtered;
+    await this.persist(filtered);
   }
 
   async advanceHistoryCursor(maxChatId: unknown, time: number): Promise<void> {

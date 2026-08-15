@@ -619,7 +619,7 @@ function buildBotDescription(): string {
 Ограничения:
 • Голоса за опрос из MAX сами не появляются в Telegram — счёт через /poll ответом на опрос.
 
-Команды: /help /donate /apikey /version /info /poll /delete /newgroup /invite /kick /leavegroup /deletegroup /reboot /kill`;
+Команды: /help /donate /apikey /version /info /poll /delete /newgroup /invite /kick /leavegroup /deletegroup /ban /unban /reboot /kill`;
 }
 
 /** Best-effort refresh once the phone number becomes known (or changes) — the initial setMyDescription at Telegram launch may well have fired before MAX auth finished. */
@@ -645,6 +645,8 @@ const BOT_COMMANDS = [
   { command: 'setdesc', description: 'Изменить описание группы: /setdesc <текст>' },
   { command: 'leavegroup', description: 'Выйти из группы (требует подтверждения)' },
   { command: 'deletegroup', description: 'Удалить группу (требует подтверждения)' },
+  { command: 'ban', description: 'Заглушить чат (выбор кнопкой из списка)' },
+  { command: 'unban', description: 'Вернуть заглушённый чат' },
   { command: 'reboot', description: 'Пересоздать все темы с нуля (требует подтверждения)' },
   { command: 'kill', description: 'Разлогинить MAX и стереть все данные (необратимо)' },
 ];
