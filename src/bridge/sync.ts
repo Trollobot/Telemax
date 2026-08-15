@@ -10,6 +10,7 @@ import { ensureTopicForMaxChat } from '../telegram/bot.js';
 import { downloadMaxAttachment, describeAttachment, type MaxAttachment, type DownloadContext } from './attachments.js';
 import { uploadTelegramAttachmentToMax } from './upload.js';
 import { checkVersion, shortSha, type VersionStatus } from './version.js';
+import { toTelegramReaction } from '../max/reactions.js';
 import { createLogger, jsonStringify } from '../logger.js';
 
 const logger = createLogger('bridge');
@@ -780,7 +781,9 @@ export function wireBridge({
 
   async function probeMessageState(link: MessageLink): Promise<'alive' | 'gone' | 'unknown'> {
     const relayed = lastRelayedReaction.get(`${String(link.maxChatId)}:${String(link.maxMessageId)}`);
-    const reaction = relayed ? [{ type: 'emoji' as const, emoji: relayed.emoji as TelegramEmoji }] : [];
+    // relayed.emoji is stored in MAX form (it's compared against MAX getReactions in
+    // pollReactionRemovals); convert to Telegram's bare form when re-affirming here.
+    const reaction = relayed ? [{ type: 'emoji' as const, emoji: toTelegramReaction(relayed.emoji) as TelegramEmoji }] : [];
     try {
       await bot.telegram.setMessageReaction(targetGroupId, link.telegramMessageId, reaction);
       return 'alive'; // ok — the message exists (reaction re-affirmed, or empty no-op accepted)
@@ -882,7 +885,7 @@ export function wireBridge({
       // Telegram only accepts a fixed emoji set (TelegramEmoji); MAX's is presumably wider,
       // so an unsupported one will reject at the API call — caught below, not fatal.
       await bot.telegram.setMessageReaction(targetGroupId, link.telegramMessageId, [
-        { type: 'emoji', emoji: chat.lastReaction as TelegramEmoji },
+        { type: 'emoji', emoji: toTelegramReaction(chat.lastReaction) as TelegramEmoji },
       ]);
     } catch (err) {
       logger.error('Failed to relay MAX reaction to Telegram', err);

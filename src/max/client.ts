@@ -5,6 +5,7 @@ import { readFrameHeader, encodeFrame, decompressPayload, FRAME_HEADER_SIZE } fr
 import { decodeFramePayload, pickObject } from './msgpack.js';
 import { OPCODES, DIR, formatOpcode } from './opcodes.js';
 import { MAX_TLS_CA } from './ca.js';
+import { toMaxReaction } from './reactions.js';
 import { findAuthToken, findLongToken, describeAuthError, extractPasswordChallenge, type PasswordChallenge } from './tokens.js';
 
 export type VerifyCodeResult = { status: 'ok'; loginToken: string } | { status: 'password_required'; challenge: PasswordChallenge };
@@ -462,7 +463,7 @@ export class MaxClient extends EventEmitter {
    * through as-is (already a BigInt from wherever it was captured) — do not stringify.
    */
   async addReaction(chatId: unknown, messageId: unknown, emoji: string): Promise<void> {
-    const { dir, payload } = await this.request(OPCODES.MSG_REACTION, { chatId: toChatId(chatId), messageId, reaction: { reactionType: 'EMOJI', id: emoji } });
+    const { dir, payload } = await this.request(OPCODES.MSG_REACTION, { chatId: toChatId(chatId), messageId, reaction: { reactionType: 'EMOJI', id: toMaxReaction(emoji) } });
     if (dir === DIR.ERR) throw new Error(describeAuthError(payload, 'MSG_REACTION failed'));
   }
 
