@@ -615,8 +615,9 @@ function buildBotDescription(): string {
   const phoneLabel = activePhone ? ` (${activePhone})` : '';
   return `Мост MAX${phoneLabel} ↔ Telegram: сообщения, файлы, голосовые, стикеры, опросы, пересылка. Звонки — только уведомления, без аудио.
 
+Удаление: свайпом своего сообщения (подхватится сам), реакцией 👎 на своё, или /delete ответом (/delete me — только у себя).
+
 Ограничения:
-• Свайп-удаление в Telegram бот не видит (нет такого события в Bot API) — удаляй командой /delete (или /delete me) ответом на сообщение.
 • Голоса за опрос из MAX сами не появляются в Telegram — счёт через /poll ответом на опрос.
 
 Команды: /help /donate /apikey /version /info /poll /delete /newgroup /invite /kick /leavegroup /deletegroup /reboot /kill`;
