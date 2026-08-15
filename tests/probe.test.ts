@@ -21,7 +21,9 @@ describe('probeIntervalMs (decay ladder)', () => {
   it('is monotonic — intervals never shrink with age', () => {
     const samples = [0, 60_000, 5 * 60_000, 30 * 60_000, 3 * 60 * 60_000];
     const intervals = samples.map((a) => probeIntervalMs(a) ?? Infinity);
-    for (let i = 1; i < intervals.length; i++) expect(intervals[i]).toBeGreaterThanOrEqual(intervals[i - 1]);
+    for (let i = 1; i < intervals.length; i++) {
+      expect(intervals[i] as number).toBeGreaterThanOrEqual(intervals[i - 1] as number);
+    }
   });
 });
 
