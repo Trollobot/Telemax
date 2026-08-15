@@ -1,5 +1,6 @@
 import path from 'node:path';
 import { writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { Markup, type Telegraf } from 'telegraf';
 import type { ChatAction, TelegramEmoji } from 'telegraf/types';
 import type { MaxClient, MaxMessageEvent, MaxHistoryMessage } from '../max/client.js';
@@ -624,6 +625,8 @@ async function detectPublicIp(): Promise<string | null> {
 
 /** Picked up within a minute by update-watcher.sh on the host (see setup.sh) — writing it is the only thing the container itself does towards an update, everything else (git pull, rebuild, restart) happens outside it. */
 const UPDATE_REQUESTED_MARKER = path.join(process.cwd(), '.data', 'update-requested');
+/** Written by update.sh while it runs (data/ is the same mount as .data/) — lets the /version button refuse a second request mid-update. */
+const UPDATE_IN_PROGRESS_MARKER = path.join(process.cwd(), '.data', 'update-in-progress');
 
 /** Shared by /version and the daily scheduled check — same text/buttons either way. */
 function formatVersionMessage(status: VersionStatus): { text: string; replyMarkup?: ReturnType<typeof Markup.inlineKeyboard>['reply_markup'] } {
@@ -1272,6 +1275,16 @@ export function wireBridge({
   });
 
   bot.action('tlmx_update', async (ctx) => {
+    // Guard against re-triggering while one is already in flight: a fresh /version
+    // still shows a live "Обновить" button even mid-update (the container hasn't been
+    // rebuilt yet, so it still looks out-of-date). update-requested = queued but not
+    // yet picked up by the host watcher; update-in-progress = update.sh is running.
+    // flock in update-watcher.sh is the hard backstop; this is the friendly heads-up.
+    if (existsSync(UPDATE_REQUESTED_MARKER) || existsSync(UPDATE_IN_PROGRESS_MARKER)) {
+      await ctx.answerCbQuery('Обновление уже идёт');
+      await ctx.editMessageText('⏳ Обновление уже запущено — дождись сообщения о завершении.').catch(() => {});
+      return;
+    }
     await ctx.answerCbQuery('Обновление запрошено');
     try {
       await writeFile(UPDATE_REQUESTED_MARKER, new Date().toISOString(), 'utf8');

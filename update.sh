@@ -19,6 +19,13 @@ set +a
 # world-readable — tighten it on every update so old installs get fixed too.
 [ -f .env ] && chmod 600 .env
 
+# In-progress flag the container can see (data/ is mounted at /app/.data): the bot's
+# "Обновить" button reads it to refuse a second request while one is already running.
+# Cleared on ANY exit (success, failure, or crash) so it never gets stuck.
+mkdir -p data
+touch data/update-in-progress
+trap 'rm -f data/update-in-progress' EXIT
+
 notify() {
   [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TARGET_TELEGRAM_GROUP:-}" ] || return 0
   curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
