@@ -22,22 +22,22 @@ async function fetchTelegramFile(bot: Telegraf, fileId: string): Promise<Buffer>
 }
 
 /**
- * MAX's upload endpoint takes the bytes after `filename=` LITERALLY — no
- * unquoting, no RFC 5987 parsing. The first version of this helper quoted ASCII
- * names and used `filename*` for the rest, and MAX stored names like
- * `"file"_ filename__UTF-8__Доплаты.xlsx` verbatim (confirmed live 2026-08-15) —
- * which then ALSO broke relaying those files back to Telegram, because a literal
- * quote in a filename breaks telegraf's multipart header.
- *
- * So: no quoting at all (matches the pre-2026-08-14 behavior that produced clean
- * names), control chars/quotes replaced, and non-ASCII passed as raw UTF-8 bytes
- * re-encoded latin1 — undici validates header values as ByteString (every char
- * ≤ 0xFF), and this is exactly how raw UTF-8 bytes travel in a header. MAX's own
- * clients send raw UTF-8 there, so the server stores and displays it correctly.
+ * MAX's upload endpoint URL-DECODES the value after `filename=` and reads it as
+ * UTF-8 — nothing else works. Established empirically across three live rounds
+ * (2026-08-15):
+ *   - quoted/RFC 5987 forms: no parsing at all, the boilerplate got glued into
+ *     the stored name (`"file"_ filename__UTF-8__Доплаты.xlsx`) — but crucially
+ *     the percent-encoded part came back as readable Cyrillic WITH spaces, which
+ *     is what gave the decoding behavior away;
+ *   - raw UTF-8 bytes (latin1-smuggled past undici's ByteString check): stored
+ *     as Latin-1 mojibake (`ÐÐ_Ñ_Ð²...`).
+ * Percent-encoding is also plain ASCII, so undici's header validation is happy
+ * without any tricks. encodeURIComponent leaves `(1)`-style parens intact and
+ * MAX decodes %20 back to spaces — ASCII names round-trip unchanged.
  */
 function contentDispositionFor(filename: string): string {
   const clean = filename.replace(/[\r\n"\\]/g, '_');
-  return `attachment; filename=${Buffer.from(clean, 'utf8').toString('latin1')}`;
+  return `attachment; filename=${encodeURIComponent(clean)}`;
 }
 
 async function uploadPhotoToMax(max: MaxClient, buffer: Buffer): Promise<{ _type: 'PHOTO'; photoToken: string }> {
