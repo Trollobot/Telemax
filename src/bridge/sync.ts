@@ -1084,6 +1084,9 @@ export function wireBridge({
       try {
         logger.info(`Telegram topic for MAX chat ${key} was deleted — recreating and restoring its history`);
         const newTopicId = await recreateTopicForChat(bot, targetGroupId, chatId, chatMapStore);
+        // Same pinned contact-info card a freshly-created topic gets — sent first so
+        // it sits at the top above the restored history, exactly like a from-scratch topic.
+        await sendAutoInfoCard(chatId, undefined, newTopicId).catch((err) => logger.error('Failed to send auto contact-info card on restore', err));
         const history = await fetchFullHistory(max, chatId, null);
         if (history.length > 0) {
           await backfillHistoryToTelegram(bot, targetGroupId, newTopicId, history, max, chatId, messageLinks, chatMapStore, getChats());
