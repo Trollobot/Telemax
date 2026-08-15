@@ -5,6 +5,15 @@ services:
       args:
         GIT_COMMIT: ${GIT_COMMIT:-unknown}
     restart: unless-stopped
+    # Hard cap on container stdout: the default json-file driver grows without
+    # limit between container recreations. 10m x 3 bounds it at ~30 MB total;
+    # relay tracing is INFO-level and proportional to actual message traffic,
+    # so this ceiling is effectively unreachable in normal use anyway.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     ports:
       - "${PORT:-3000}:${PORT:-3000}"
     env_file:

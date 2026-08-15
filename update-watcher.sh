@@ -14,4 +14,7 @@ MARKER="data/update-requested"
 rm -f "$MARKER"
 
 mkdir -p data
-./update.sh >> data/update.log 2>&1
+# Overwrite, not append: every run dumps the full image-build output (~100-200 KB),
+# and only the LAST run's log is ever useful for diagnostics — appending just
+# grew the file forever.
+./update.sh > data/update.log 2>&1
