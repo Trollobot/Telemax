@@ -496,6 +496,19 @@ async function resolveForwardContent(
   };
 }
 
+/** Telegram's error when you post to a forum topic that's since been deleted. */
+function isThreadNotFound(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /message thread not found|thread not found|TOPIC_DELETED/i.test(msg);
+}
+
+/** Forces a fresh topic for a chat: drops the stale mapping so ensureTopicForMaxChat recreates it, and returns the new topic id. Used to heal a topic the user deleted in Telegram. */
+async function recreateTopicForChat(bot: Telegraf, groupId: string, chatId: unknown, chatMapStore: ChatMapStore): Promise<number> {
+  await chatMapStore.remove(chatId);
+  const { topicId } = await ensureTopicForMaxChat(bot, groupId, chatId, chatMapStore);
+  return topicId;
+}
+
 async function backfillHistoryToTelegram(
   bot: Telegraf,
   groupId: string,
@@ -507,6 +520,9 @@ async function backfillHistoryToTelegram(
   chatMapStore: ChatMapStore,
   chats: unknown[],
 ): Promise<void> {
+  // May change mid-run if the topic turns out to be deleted (recreated on the fly).
+  let currentTopicId = topicId;
+  let recreatedOnce = false;
   for (const msg of messages) {
     const forwarded = await resolveForwardContent(max, chats, msg.link);
     const text = forwarded ? forwarded.text : msg.text;
@@ -515,36 +531,48 @@ async function backfillHistoryToTelegram(
       await chatMapStore.advanceHistoryCursor(maxChatId, msg.time);
       continue;
     }
-    try {
-      let textMessageId: number | undefined;
-      let attachMessageId: number | undefined;
-      if (text) {
-        const sent = await withFloodRetry(() => bot.telegram.sendMessage(groupId, text, { message_thread_id: topicId }));
-        textMessageId = sent.message_id;
-        await sleep(HISTORY_SEND_DELAY_MS);
+    // One retry: if the topic was deleted, recreate it (once per run) and re-send
+    // this same message. Without this, catch-up after a restart silently drops every
+    // message for a chat whose topic was removed (the cursor advances regardless).
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        let textMessageId: number | undefined;
+        let attachMessageId: number | undefined;
+        if (text) {
+          const sent = await withFloodRetry(() => bot.telegram.sendMessage(groupId, text, { message_thread_id: currentTopicId }));
+          textMessageId = sent.message_id;
+          await sleep(HISTORY_SEND_DELAY_MS);
+        }
+        if (attaches.length > 0) {
+          const downloadCtx: DownloadContext = {
+            max,
+            chatId: forwarded?.sourceChatId ?? maxChatId,
+            messageId: forwarded?.sourceMessageId ?? msg.id,
+          };
+          attachMessageId = await withFloodRetry(() => sendAttachments(bot, groupId, currentTopicId, attaches, downloadCtx));
+          await sleep(HISTORY_SEND_DELAY_MS);
+        }
+        // A forward with both text AND an attachment sends TWO separate Telegram
+        // messages from one MAX message — track both so a later deletion removes both
+        // instead of orphaning the attachment (confirmed live 2026-08-13).
+        const telegramMessageId = textMessageId ?? attachMessageId;
+        if (telegramMessageId != null && msg.id != null) {
+          const extraTelegramMessageIds = textMessageId != null && attachMessageId != null && attachMessageId !== telegramMessageId ? [attachMessageId] : undefined;
+          messageLinks.add({ maxChatId, maxMessageId: msg.id, telegramMessageId, extraTelegramMessageIds });
+        }
+        break; // delivered
+      } catch (err) {
+        if (isThreadNotFound(err) && !recreatedOnce) {
+          recreatedOnce = true;
+          logger.info(`Backfill topic for MAX chat ${String(maxChatId)} was deleted — recreating and retrying`);
+          currentTopicId = await recreateTopicForChat(bot, groupId, maxChatId, chatMapStore);
+          continue; // retry this same message against the fresh topic
+        }
+        logger.error(`Failed to backfill MAX message ${String(msg.id)} in chat ${String(maxChatId)}`, err);
+        break;
       }
-      if (attaches.length > 0) {
-        const downloadCtx: DownloadContext = {
-          max,
-          chatId: forwarded?.sourceChatId ?? maxChatId,
-          messageId: forwarded?.sourceMessageId ?? msg.id,
-        };
-        attachMessageId = await withFloodRetry(() => sendAttachments(bot, groupId, topicId, attaches, downloadCtx));
-        await sleep(HISTORY_SEND_DELAY_MS);
-      }
-      // A forward with both text AND an attachment sends TWO separate Telegram
-      // messages from one MAX message — track both so a later deletion removes both
-      // instead of orphaning the attachment (confirmed live 2026-08-13).
-      const telegramMessageId = textMessageId ?? attachMessageId;
-      if (telegramMessageId != null && msg.id != null) {
-        const extraTelegramMessageIds = textMessageId != null && attachMessageId != null && attachMessageId !== telegramMessageId ? [attachMessageId] : undefined;
-        messageLinks.add({ maxChatId, maxMessageId: msg.id, telegramMessageId, extraTelegramMessageIds });
-      }
-    } catch (err) {
-      logger.error(`Failed to backfill MAX message ${String(msg.id)} in chat ${String(maxChatId)}`, err);
-    } finally {
-      await chatMapStore.advanceHistoryCursor(maxChatId, msg.time);
     }
+    await chatMapStore.advanceHistoryCursor(maxChatId, msg.time);
   }
 }
 
@@ -1035,12 +1063,6 @@ export function wireBridge({
     await pinInfoCard(bot, targetGroupId, messageId);
   }
 
-  /** Telegram's error when you post to a forum topic that's since been deleted. */
-  function isThreadNotFound(err: unknown): boolean {
-    const msg = err instanceof Error ? err.message : String(err);
-    return /message thread not found|thread not found|TOPIC_DELETED/i.test(msg);
-  }
-
   /**
    * Runs `send` against the chat's topic, and if that topic was deleted out from
    * under us (the user removed it in Telegram), recreates it and retries once.
@@ -1056,9 +1078,9 @@ export function wireBridge({
     } catch (err) {
       if (!isThreadNotFound(err)) throw err;
       logger.info(`Telegram topic ${first.topicId} for MAX chat ${String(chatId)} was deleted — recreating`);
-      await chatMapStore.remove(chatId);
-      const fresh = await ensureTopicForMaxChat(bot, targetGroupId, chatId, chatMapStore);
-      await send(fresh.topicId, fresh.created);
+      const freshTopicId = await recreateTopicForChat(bot, targetGroupId, chatId, chatMapStore);
+      // recreateTopicForChat dropped the mapping and made a brand-new topic, so treat it as created=true.
+      await send(freshTopicId, true);
     }
   }
 
@@ -2027,6 +2049,9 @@ export async function syncAllChatsToTelegram(
     if (c.status && c.status !== 'ACTIVE') continue;
 
     try {
+      // Banned chats (/ban) stay muted through a full resync too — don't recreate their topic.
+      const existing = await chatMapStore.getByMaxChatId(c.id);
+      if (existing?.banned) continue;
       const name = resolveDisplayName(chat);
       const { topicId, created } = await ensureTopicForMaxChat(bot, targetGroupId, c.id, chatMapStore, name);
       if (created) {
