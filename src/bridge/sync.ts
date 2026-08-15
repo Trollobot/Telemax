@@ -1529,6 +1529,15 @@ export function wireBridge({
     const location = (ctx.message as { location?: { latitude: number; longitude: number } }).location;
     const contact = (ctx.message as { contact?: { phone_number: string; first_name: string; last_name?: string } }).contact;
 
+    // INFO-level on purpose, and BEFORE any branch: silent relay paths already
+    // cost two blind debugging sessions (2026-08-14/15). The text branch returns
+    // long before the attach branches, so this can't live further down.
+    const kind =
+      location ? 'location' : contact ? 'contact' : poll ? 'poll' : text ? 'text'
+      : photo?.length ? 'photo' : video ? 'video' : videoNote ? 'video_note' : document ? 'document'
+      : animation ? 'animation' : voice ? 'voice' : sticker ? 'sticker' : 'unsupported type';
+    logger.info(`TG -> MAX: message ${ctx.message.message_id} in topic ${topicId} (${kind}) -> chat ${mapping.maxChatId}`);
+
     try {
       if (location) {
         const locationAttach = { _type: 'LOCATION', latitude: location.latitude, longitude: location.longitude, zoom: 14 };
@@ -1589,10 +1598,6 @@ export function wireBridge({
 
       let attach: Record<string, unknown> | null = null;
       const largestPhoto = photo?.[photo.length - 1];
-      const kind = largestPhoto ? 'photo' : video ? 'video' : videoNote ? 'video_note' : document ? 'document' : animation ? 'animation' : voice ? 'voice' : sticker ? 'sticker' : null;
-      // INFO-level on purpose: the relay path logging nothing on success (or on a
-      // silently-skipped update) already cost a blind debugging session 2026-08-14.
-      logger.info(`TG -> MAX: message ${ctx.message.message_id} in topic ${topicId} (${kind ?? 'unsupported type'}) -> chat ${mapping.maxChatId}`);
       if (largestPhoto) {
         attach = await uploadTelegramAttachmentToMax(bot, max, largestPhoto.file_id, 'photo');
       } else if (video) {
