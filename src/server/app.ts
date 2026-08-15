@@ -606,14 +606,13 @@ async function startServer(): Promise<void> {
 const TELEGRAM_RETRY_DELAYS_MS = [2_000, 5_000, 15_000, 30_000, 60_000];
 
 // Shown in the bot's Telegram profile (Bot API 512-char limit on setMyDescription).
-// The two caveats are platform-level, not bugs — worth surfacing here since neither
-// is discoverable from the UI itself. A function, not a constant, since the phone
-// number isn't known yet at first launch (or ever, before the very first auth) —
-// this used to hardcode the developer's own production number, which leaked into
-// every other install of this project. Confirmed live 2026-08-14.
+// MUST NOT contain the MAX phone number or anything account-specific: setMyDescription
+// is PUBLIC — visible to anyone who opens the bot's profile or DMs it (shown in the
+// empty chat before /start), including anyone who adds the bot to their own group.
+// It used to embed the active phone number here, which leaked it to any such viewer
+// (confirmed 2026-08-15). The owner already sees their number via /help inside the group.
 function buildBotDescription(): string {
-  const phoneLabel = activePhone ? ` (${activePhone})` : '';
-  return `Мост MAX${phoneLabel} ↔ Telegram: сообщения, файлы, голосовые, стикеры, опросы, пересылка. Звонки — только уведомления, без аудио.
+  return `Мост MAX ↔ Telegram: сообщения, файлы, голосовые, стикеры, опросы, пересылка. Звонки — только уведомления, без аудио.
 
 Удаление: свайпом своего сообщения (подхватится сам), реакцией 👎 на своё, или /delete ответом (/delete me — только у себя).
 

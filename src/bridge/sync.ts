@@ -702,6 +702,34 @@ export function wireBridge({
     return next();
   });
 
+  // Regular messages/reactions/votes are participation — anyone in the group can do
+  // them (adding people to the group for a shared discussion is a legitimate use).
+  // But every BOT COMMAND (/kill, /reboot, /apikey, group management, …) is
+  // admin-only: a plain member must not be able to wipe the session, leak the web
+  // panel key, or manage MAX groups just by being in the chat. Commands and inline
+  // button presses go through here; everything else falls straight through.
+  bot.use(async (ctx, next) => {
+    const text = (ctx.message as { text?: string } | undefined)?.text;
+    const isCommand = typeof text === 'string' && text.startsWith('/');
+    const isCallback = Boolean(ctx.callbackQuery);
+    if (!isCommand && !isCallback) return next();
+
+    const userId = ctx.from?.id;
+    if (userId == null) return; // anonymous group post / no sender — fail closed
+    try {
+      const member = await ctx.telegram.getChatMember(targetGroupId, userId);
+      if (member.status === 'creator' || member.status === 'administrator') return next();
+    } catch (err) {
+      logger.error('Failed to check admin status for a bot command', err);
+      return; // can't verify — fail closed
+    }
+    if (isCallback) {
+      await ctx.answerCbQuery('Управлять ботом может только администратор группы.').catch(() => {});
+    } else {
+      await ctx.reply('Управлять ботом может только администратор группы.').catch(() => {});
+    }
+  });
+
   const outgoingCids = new RecentCids();
   const messageLinks = new MessageLinkStore();
   const pollLinks = new PollLinkStore();
