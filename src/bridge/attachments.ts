@@ -141,7 +141,12 @@ export async function downloadMaxAttachment(att: MaxAttachment, ctx: DownloadCon
       const url = await ctx.max.getFileDownloadUrl(ctx.chatId, ctx.messageId, att.fileId);
       const buffer = await downloadUrl(url);
       if (!buffer) return null;
-      return { buffer, filename: att.name ?? `file_${Date.now()}`, kind: 'document' };
+      // A literal quote in a MAX-side filename breaks telegraf's multipart
+      // Content-Disposition — Telegram's server drops the connection mid-response
+      // and sendDocument dies with "invalid json response body" (hit live
+      // 2026-08-15 with names an earlier upload bug had quoted).
+      const safeName = (att.name ?? `file_${Date.now()}`).replace(/[\r\n"\\]/g, '_');
+      return { buffer, filename: safeName, kind: 'document' };
     } catch (err) {
       logger.error(`FILE_DOWNLOAD failed for fileId ${String(att.fileId)} (chatId=${String(ctx.chatId)}, messageId=${String(ctx.messageId)})`, err);
       return null;

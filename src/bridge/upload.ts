@@ -22,15 +22,22 @@ async function fetchTelegramFile(bot: Telegraf, fileId: string): Promise<Buffer>
 }
 
 /**
- * Header values must be Latin-1 (undici enforces the spec's ByteString rule and
- * throws BEFORE the request is even sent) — but Telegram file names are routinely
- * Cyrillic. ASCII names pass through quoted; anything else is percent-encoded via
- * RFC 5987 `filename*` with a plain-ASCII fallback.
+ * MAX's upload endpoint takes the bytes after `filename=` LITERALLY — no
+ * unquoting, no RFC 5987 parsing. The first version of this helper quoted ASCII
+ * names and used `filename*` for the rest, and MAX stored names like
+ * `"file"_ filename__UTF-8__Доплаты.xlsx` verbatim (confirmed live 2026-08-15) —
+ * which then ALSO broke relaying those files back to Telegram, because a literal
+ * quote in a filename breaks telegraf's multipart header.
+ *
+ * So: no quoting at all (matches the pre-2026-08-14 behavior that produced clean
+ * names), control chars/quotes replaced, and non-ASCII passed as raw UTF-8 bytes
+ * re-encoded latin1 — undici validates header values as ByteString (every char
+ * ≤ 0xFF), and this is exactly how raw UTF-8 bytes travel in a header. MAX's own
+ * clients send raw UTF-8 there, so the server stores and displays it correctly.
  */
 function contentDispositionFor(filename: string): string {
   const clean = filename.replace(/[\r\n"\\]/g, '_');
-  if (/^[\x20-\x7e]*$/.test(clean)) return `attachment; filename="${clean}"`;
-  return `attachment; filename="file"; filename*=UTF-8''${encodeURIComponent(clean)}`;
+  return `attachment; filename=${Buffer.from(clean, 'utf8').toString('latin1')}`;
 }
 
 async function uploadPhotoToMax(max: MaxClient, buffer: Buffer): Promise<{ _type: 'PHOTO'; photoToken: string }> {
