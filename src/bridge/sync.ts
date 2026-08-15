@@ -502,10 +502,11 @@ function isThreadNotFound(err: unknown): boolean {
   return /message thread not found|thread not found|TOPIC_DELETED/i.test(msg);
 }
 
-/** Forces a fresh topic for a chat: drops the stale mapping so ensureTopicForMaxChat recreates it, and returns the new topic id. Used to heal a topic the user deleted in Telegram. */
+/** Forces a fresh topic for a chat: drops the stale mapping so ensureTopicForMaxChat recreates it, and returns the new topic id. Reuses the deleted topic's stored title so the recreated one keeps the contact's name/nick instead of the bare "MAX chat <id>" fallback. Used to heal a topic the user deleted in Telegram. */
 async function recreateTopicForChat(bot: Telegraf, groupId: string, chatId: unknown, chatMapStore: ChatMapStore): Promise<number> {
+  const title = (await chatMapStore.getByMaxChatId(chatId))?.title;
   await chatMapStore.remove(chatId);
-  const { topicId } = await ensureTopicForMaxChat(bot, groupId, chatId, chatMapStore);
+  const { topicId } = await ensureTopicForMaxChat(bot, groupId, chatId, chatMapStore, title);
   return topicId;
 }
 
