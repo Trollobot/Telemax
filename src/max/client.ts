@@ -486,14 +486,27 @@ export class MaxClient extends EventEmitter {
   async getReactions(chatId: unknown, messageId: unknown): Promise<Array<{ reaction: string; count: number }>> {
     const { dir, payload } = await this.request(OPCODES.MSG_GET_REACTIONS, { chatId: toChatId(chatId), messageIds: [messageId] });
     if (dir === DIR.ERR) throw new Error(describeAuthError(payload, 'MSG_GET_REACTIONS failed'));
-    // Response shape unverified — try the single-message shape we already know from
-    // MSG_REACTION, then a couple of plausible batch shapes, before giving up empty.
+    // Real shape confirmed live 2026-08-15: `{messagesReactions: {"<messageId>": {counters:[...]}}}`.
+    // The old reactionInfo/reactions guesses NEVER matched, so this always returned []
+    // — which made pollReactionRemovals think every relayed reaction had been removed
+    // and strip it in Telegram after ~60s ("reactions disappear over time"). Keep the
+    // old shapes as fallbacks, but this branch is the one that fires.
+    type Counters = Array<{ reaction: string; count: number }>;
     const p = payload as
-      | { reactionInfo?: { counters?: Array<{ reaction: string; count: number }> } }
-      | { reactions?: Array<{ counters?: Array<{ reaction: string; count: number }> }> }
+      | { messagesReactions?: Record<string, { counters?: Counters }> }
+      | { reactionInfo?: { counters?: Counters } }
+      | { reactions?: Array<{ counters?: Counters }> }
       | null;
+    if (p && 'messagesReactions' in p && p.messagesReactions) {
+      const byId = p.messagesReactions[String(messageId)];
+      if (byId?.counters) return byId.counters;
+      // We only ever ask for one messageId, so the sole entry is ours even if the
+      // key's string form doesn't match exactly.
+      const first = Object.values(p.messagesReactions)[0];
+      if (first?.counters) return first.counters;
+    }
     if (p && 'reactionInfo' in p && p.reactionInfo?.counters) return p.reactionInfo.counters;
-    if (p && 'reactions' in p && p.reactions?.[0]?.counters) return p.reactions[0].counters as Array<{ reaction: string; count: number }>;
+    if (p && 'reactions' in p && p.reactions?.[0]?.counters) return p.reactions[0].counters;
     return [];
   }
 
