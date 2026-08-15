@@ -1063,13 +1063,44 @@ export function wireBridge({
     await pinInfoCard(bot, targetGroupId, messageId);
   }
 
+  // Chats currently being recreated+restored, so a burst of messages to a
+  // just-deleted topic triggers exactly one recreate, not one per message.
+  const restoringChats = new Set<string>();
+
   /**
-   * Runs `send` against the chat's topic, and if that topic was deleted out from
-   * under us (the user removed it in Telegram), recreates it and retries once.
-   * Without this, deleting a topic silently black-holes every future message from
-   * that MAX contact — effectively a self-inflicted ban (reported live 2026-08-15).
-   * `send` may run twice, so keep it idempotent-ish; in practice the first send is
-   * the one that fails on a dead topic, so nothing has been delivered yet on retry.
+   * Recreates a deleted topic and refills it with the chat's full MAX history,
+   * oldest-first — so a deleted topic comes back as the whole conversation, not an
+   * empty shell (reported live 2026-08-15). The message that triggered this is
+   * already in that history (newest), so it lands last, in order — nothing is sent
+   * separately, hence no duplicate. Fire-and-forget: the backfill is flood-paced
+   * and can take a while; the guard set keeps concurrent pushes from re-triggering.
+   */
+  function restoreDeletedTopic(chatId: unknown): void {
+    const key = String(chatId);
+    if (restoringChats.has(key)) return;
+    restoringChats.add(key);
+    void (async () => {
+      try {
+        logger.info(`Telegram topic for MAX chat ${key} was deleted — recreating and restoring its history`);
+        const newTopicId = await recreateTopicForChat(bot, targetGroupId, chatId, chatMapStore);
+        const history = await fetchFullHistory(max, chatId, null);
+        if (history.length > 0) {
+          await backfillHistoryToTelegram(bot, targetGroupId, newTopicId, history, max, chatId, messageLinks, chatMapStore, getChats());
+        }
+      } catch (err) {
+        logger.error(`Failed to recreate/restore deleted topic for MAX chat ${key}`, err);
+      } finally {
+        restoringChats.delete(key);
+      }
+    })();
+  }
+
+  /**
+   * Runs `send` against the chat's topic. If that topic was deleted out from under
+   * us (the user removed it in Telegram), recreates it and restores the full chat
+   * history into the fresh topic instead of re-sending just this one message —
+   * without this, deleting a topic silently black-holes every future message from
+   * that MAX contact (reported live 2026-08-15).
    */
   async function deliverToTopic(chatId: unknown, send: (topicId: number, created: boolean) => Promise<void>): Promise<void> {
     const first = await ensureTopicForMaxChat(bot, targetGroupId, chatId, chatMapStore);
@@ -1077,10 +1108,9 @@ export function wireBridge({
       await send(first.topicId, first.created);
     } catch (err) {
       if (!isThreadNotFound(err)) throw err;
-      logger.info(`Telegram topic ${first.topicId} for MAX chat ${String(chatId)} was deleted — recreating`);
-      const freshTopicId = await recreateTopicForChat(bot, targetGroupId, chatId, chatMapStore);
-      // recreateTopicForChat dropped the mapping and made a brand-new topic, so treat it as created=true.
-      await send(freshTopicId, true);
+      // Don't re-send `send` here: the triggering message is already part of the
+      // history the restore replays, so a separate send would duplicate it.
+      restoreDeletedTopic(chatId);
     }
   }
 
