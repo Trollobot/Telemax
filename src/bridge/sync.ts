@@ -57,6 +57,36 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * Decay ladder for the deletion probe — how long to wait between pings for one of
+ * our own relayed messages, by its age. Dense right after send (≈90% of deletions
+ * land in the first couple of minutes), thinning out over hours, then `null` = stop
+ * probing (a message untouched for 6h is almost never deleted, and pinging it forever
+ * is pure waste). Pure + exported so the ladder is unit-testable without timers.
+ */
+export function probeIntervalMs(ageMs: number): number | null {
+  if (ageMs < 2 * 60_000) return 15_000;
+  if (ageMs < 15 * 60_000) return 60_000;
+  if (ageMs < 60 * 60_000) return 5 * 60_000;
+  if (ageMs < 6 * 60 * 60_000) return 30 * 60_000;
+  return null;
+}
+
+/**
+ * Classifies a failed empty-`setMessageReaction` probe from its error text. A live
+ * message errors `REACTION_EMPTY` (Telegram found it, then rejected the empty set);
+ * a deleted one errors `message to react not found`. Returns 'gone' ONLY on the
+ * exact not-found shapes — never on 429/network/anything else, because a false
+ * 'gone' would irreversibly delete a still-live message on MAX. Confirmed live
+ * 2026-08-15. Pure + exported for unit testing.
+ */
+export function classifyProbeResult(errText: string): 'alive' | 'gone' | 'unknown' {
+  const t = errText.toLowerCase();
+  if (t.includes('reaction_empty')) return 'alive';
+  if (t.includes('message to react not found') || t.includes('message not found') || t.includes('message to delete not found')) return 'gone';
+  return 'unknown';
+}
+
 /** Telegram's flood-control 429 carries how long to wait — honor it instead of failing the send. */
 async function withFloodRetry<T>(fn: () => Promise<T>): Promise<T> {
   for (;;) {
@@ -124,6 +154,15 @@ interface MessageLink {
   // deleting that MAX message only knew to delete the prefix, leaving the
   // attachment orphaned. Confirmed live 2026-08-13.
   extraTelegramMessageIds?: number[];
+  // True when WE sent this to MAX (Telegram->MAX, i.e. our own message). Drives
+  // both the 👎-delete gesture and the deletion probe: only our own messages get
+  // deleted forAll / probed, since MAX->Telegram deletions already arrive natively
+  // as a REMOVED push (handleMaxPush) and deleting someone else's message on MAX
+  // for everyone isn't ours to do.
+  outgoing?: boolean;
+  // Epoch ms this link was created — the probe uses it to place the message on the
+  // decay ladder (hot right after send, cooling off over hours).
+  createdAt?: number;
 }
 
 /** Bidirectional, bounded MAX messageId <-> Telegram message_id correlation — needed for edit/react to know which message on the other side to touch. In-memory only: lost on restart, same trade-off as the rest of this bridge's runtime state. */
@@ -145,6 +184,7 @@ export class MessageLinkStore {
       logger.warn(`MessageLinkStore: no MAX messageId for Telegram message ${link.telegramMessageId} — edit/delete for it won't work`);
       return;
     }
+    link.createdAt ??= Date.now();
     const key = this.key(link.maxChatId, link.maxMessageId);
     this.byMax.set(key, link);
     this.byTelegram.set(link.telegramMessageId, link);
@@ -169,6 +209,25 @@ export class MessageLinkStore {
 
   getByTelegram(telegramMessageId: number): MessageLink | undefined {
     return this.byTelegram.get(telegramMessageId);
+  }
+
+  /** Snapshot of our own (outgoing) links — the deletion probe only watches these. Returned as an array so the caller can iterate without holding the live map. */
+  outgoingLinks(): MessageLink[] {
+    const out: MessageLink[] = [];
+    for (const link of this.byMax.values()) if (link.outgoing) out.push(link);
+    return out;
+  }
+
+  /** Drops a single link once the probe confirms its Telegram message is gone, so it isn't pinged again. */
+  remove(maxChatId: unknown, maxMessageId: unknown): void {
+    const key = this.key(maxChatId, maxMessageId);
+    const link = this.byMax.get(key);
+    if (!link) return;
+    this.byMax.delete(key);
+    this.byTelegram.delete(link.telegramMessageId);
+    for (const extraId of link.extraTelegramMessageIds ?? []) this.byTelegram.delete(extraId);
+    const idx = this.order.indexOf(key);
+    if (idx >= 0) this.order.splice(idx, 1);
   }
 
   /** Wipes every link — used by /reboot to force a full from-scratch resync. */
@@ -683,6 +742,67 @@ export function wireBridge({
       } catch (err) {
         logger.error(`Failed to poll MAX reactions for chat ${relayed.chatId} message ${String(relayed.messageId)}`, err);
       }
+    }
+  }
+
+  /**
+   * Deletion probe. Bot API never notifies a bot that a message was deleted, so we
+   * poll our OWN relayed messages with an (invisible) setMessageReaction and read the
+   * error text: a live message answers REACTION_EMPTY, a deleted one "message to react
+   * not found" (classifyProbeResult). A gone message is mirror-deleted on MAX forAll —
+   * it's ours. Only outgoing messages are watched: MAX->Telegram deletions already
+   * arrive as a REMOVED push, and deleting someone else's MAX message for everyone
+   * isn't ours to do. The decay ladder (probeIntervalMs) concentrates pings right
+   * after send, where ~90% of deletions happen.
+   *
+   * Shares lastRelayedReaction with the reaction machinery instead of fighting it:
+   * if a MAX user reacted to our message, the bot has placed that emoji on the
+   * Telegram side, and a bare empty probe would WIPE it. So the probe re-affirms the
+   * current relayed reaction ([emoji]) rather than clearing it ([]) — idempotent, so
+   * the reaction survives while existence is still checked by the same call.
+   */
+  const PROBE_TICK_MS = 15_000;
+  const PROBE_MAX_PER_TICK = 12; // comfortably under Telegram's ~30 req/s global cap
+  const probeLastAt = new Map<string, number>();
+  setInterval(() => void runProbeTick(), PROBE_TICK_MS);
+
+  async function probeMessageState(link: MessageLink): Promise<'alive' | 'gone' | 'unknown'> {
+    const relayed = lastRelayedReaction.get(`${String(link.maxChatId)}:${String(link.maxMessageId)}`);
+    const reaction = relayed ? [{ type: 'emoji' as const, emoji: relayed.emoji as TelegramEmoji }] : [];
+    try {
+      await bot.telegram.setMessageReaction(targetGroupId, link.telegramMessageId, reaction);
+      return 'alive'; // ok — the message exists (reaction re-affirmed, or empty no-op accepted)
+    } catch (err) {
+      return classifyProbeResult(String((err as { response?: { description?: string } })?.response?.description ?? (err as Error)?.message ?? ''));
+    }
+  }
+
+  async function runProbeTick(): Promise<void> {
+    const now = Date.now();
+    const due: MessageLink[] = [];
+    for (const link of messageLinks.outgoingLinks()) {
+      const key = `${String(link.maxChatId)}:${String(link.maxMessageId)}`;
+      const interval = probeIntervalMs(now - (link.createdAt ?? now));
+      if (interval == null) {
+        probeLastAt.delete(key); // cooled off — stop probing (the link itself lives on for /delete & edit)
+        continue;
+      }
+      if (now - (probeLastAt.get(key) ?? 0) >= interval) due.push(link);
+    }
+    for (const link of due.slice(0, PROBE_MAX_PER_TICK)) {
+      const key = `${String(link.maxChatId)}:${String(link.maxMessageId)}`;
+      probeLastAt.set(key, Date.now());
+      const state = await probeMessageState(link);
+      if (state !== 'gone') continue;
+      try {
+        await max.deleteMessages(link.maxChatId, [link.maxMessageId], false); // forAll — it's ours
+        messageLinks.remove(link.maxChatId, link.maxMessageId);
+        probeLastAt.delete(key);
+        logger.info(`probe-delete: Telegram message ${link.telegramMessageId} gone -> removed MAX message ${String(link.maxMessageId)} (forAll)`);
+      } catch (err) {
+        logger.error(`Probe saw Telegram message ${link.telegramMessageId} deleted but failed to mirror-delete on MAX`, err);
+      }
+      await sleep(200); // space out consecutive mirror-deletes
     }
   }
 
@@ -1543,7 +1663,7 @@ export function wireBridge({
         const locationAttach = { _type: 'LOCATION', latitude: location.latitude, longitude: location.longitude, zoom: 14 };
         const { cid, messageId } = await max.sendMessage(mapping.maxChatId, null, [locationAttach]);
         rememberOutgoingSend(mapping.maxChatId, cid);
-        messageLinks.add({ maxChatId: mapping.maxChatId, maxMessageId: messageId, telegramMessageId: ctx.message.message_id });
+        messageLinks.add({ maxChatId: mapping.maxChatId, maxMessageId: messageId, telegramMessageId: ctx.message.message_id, outgoing: true });
         return;
       }
 
@@ -1562,7 +1682,7 @@ export function wireBridge({
         };
         const { cid, messageId } = await max.sendMessage(mapping.maxChatId, null, [contactAttach]);
         rememberOutgoingSend(mapping.maxChatId, cid);
-        messageLinks.add({ maxChatId: mapping.maxChatId, maxMessageId: messageId, telegramMessageId: ctx.message.message_id });
+        messageLinks.add({ maxChatId: mapping.maxChatId, maxMessageId: messageId, telegramMessageId: ctx.message.message_id, outgoing: true });
         return;
       }
 
@@ -1576,7 +1696,7 @@ export function wireBridge({
         };
         const { cid, messageId, attaches } = await max.sendMessage(mapping.maxChatId, null, [pollAttach]);
         rememberOutgoingSend(mapping.maxChatId, cid);
-        messageLinks.add({ maxChatId: mapping.maxChatId, maxMessageId: messageId, telegramMessageId: ctx.message.message_id });
+        messageLinks.add({ maxChatId: mapping.maxChatId, maxMessageId: messageId, telegramMessageId: ctx.message.message_id, outgoing: true });
         const createdPoll = attaches.find((a) => (a as MaxAttachment)._type === 'POLL') as MaxAttachment | undefined;
         if (createdPoll?.pollId != null) {
           pollLinks.add(poll.id, {
@@ -1592,7 +1712,7 @@ export function wireBridge({
       if (text) {
         const { cid, messageId } = await max.sendMessage(mapping.maxChatId, text);
         rememberOutgoingSend(mapping.maxChatId, cid);
-        messageLinks.add({ maxChatId: mapping.maxChatId, maxMessageId: messageId, telegramMessageId: ctx.message.message_id });
+        messageLinks.add({ maxChatId: mapping.maxChatId, maxMessageId: messageId, telegramMessageId: ctx.message.message_id, outgoing: true });
         return;
       }
 
@@ -1632,7 +1752,7 @@ export function wireBridge({
 
       const { cid, messageId } = await max.sendMessage(mapping.maxChatId, caption, [attach]);
       rememberOutgoingSend(mapping.maxChatId, cid);
-      messageLinks.add({ maxChatId: mapping.maxChatId, maxMessageId: messageId, telegramMessageId: ctx.message.message_id });
+      messageLinks.add({ maxChatId: mapping.maxChatId, maxMessageId: messageId, telegramMessageId: ctx.message.message_id, outgoing: true });
     } catch (err) {
       logger.error('Telegram -> MAX forward failed', err);
     }
@@ -1654,6 +1774,11 @@ export function wireBridge({
     }
   });
 
+  // 👎 is the only one of the user's requested delete-emojis (🗑/❌/👎) that Telegram
+  // actually accepts as a reaction — 🗑 and ❌ return REACTION_INVALID (confirmed live
+  // 2026-08-15). Reacting 👎 to one of OUR OWN relayed messages means "delete this".
+  const DELETE_REACTION_EMOJIS = new Set(['👎']);
+
   bot.on('message_reaction', async (ctx) => {
     const update = ctx.messageReaction;
     const link = messageLinks.getByTelegram(update.message_id);
@@ -1662,6 +1787,23 @@ export function wireBridge({
     const oldEmojis = new Set(update.old_reaction.filter((r) => r.type === 'emoji').map((r) => r.emoji));
     const newEmojis = update.new_reaction.filter((r) => r.type === 'emoji').map((r) => r.emoji);
     const added = newEmojis.find((e) => !oldEmojis.has(e));
+
+    // 👎 on our OWN message = delete on both sides (forAll — it's ours to remove).
+    // Scoped to outgoing only: on an incoming (MAX-origin) copy a genuine 👎 still
+    // relays as an ordinary reaction below instead of deleting anything.
+    if (added && DELETE_REACTION_EMOJIS.has(added) && link.outgoing) {
+      try {
+        await max.deleteMessages(link.maxChatId, [link.maxMessageId], false);
+        for (const id of [link.telegramMessageId, ...(link.extraTelegramMessageIds ?? [])]) {
+          await bot.telegram.deleteMessage(targetGroupId, id).catch((err) => logger.error(`Failed to delete Telegram message ${id} after 👎`, err));
+        }
+        messageLinks.remove(link.maxChatId, link.maxMessageId);
+        logger.info(`👎-delete: removed MAX message ${String(link.maxMessageId)} in chat ${String(link.maxChatId)} (forAll)`);
+      } catch (err) {
+        logger.error('Failed to delete MAX message after 👎 reaction', err);
+      }
+      return;
+    }
 
     try {
       if (added) {
