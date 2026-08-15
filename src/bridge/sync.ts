@@ -83,7 +83,19 @@ export function probeIntervalMs(ageMs: number): number | null {
 export function classifyProbeResult(errText: string): 'alive' | 'gone' | 'unknown' {
   const t = errText.toLowerCase();
   if (t.includes('reaction_empty')) return 'alive';
-  if (t.includes('message to react not found') || t.includes('message not found') || t.includes('message to delete not found')) return 'gone';
+  if (
+    t.includes('message to react not found') ||
+    t.includes('message not found') ||
+    t.includes('message to delete not found') ||
+    // A deleted USER message answers MESSAGE_ID_INVALID, not the "not found" shape a
+    // bot's own deleted message returns — confirmed live 2026-08-15. Safe as 'gone'
+    // here: we only ever probe an id we ourselves recorded, a live one answers
+    // REACTION_EMPTY, and a rate-limit answers 429 — so a previously-valid id going
+    // invalid means the message was deleted.
+    t.includes('message_id_invalid')
+  ) {
+    return 'gone';
+  }
   return 'unknown';
 }
 

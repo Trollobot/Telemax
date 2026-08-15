@@ -31,10 +31,11 @@ describe('classifyProbeResult', () => {
     expect(classifyProbeResult('400: bad request: reaction_empty')).toBe('alive');
   });
 
-  it('reports a deleted message only from an exact not-found shape', () => {
-    expect(classifyProbeResult('Bad Request: message to react not found')).toBe('gone');
+  it('reports a deleted message from the known not-found / invalid-id shapes', () => {
+    expect(classifyProbeResult('Bad Request: message to react not found')).toBe('gone'); // deleted bot message
     expect(classifyProbeResult('Bad Request: message not found')).toBe('gone');
     expect(classifyProbeResult('Bad Request: message to delete not found')).toBe('gone');
+    expect(classifyProbeResult('Bad Request: MESSAGE_ID_INVALID')).toBe('gone'); // deleted USER message (confirmed live 2026-08-15)
   });
 
   it('NEVER reports gone on rate-limit or network errors (would delete a live message)', () => {
