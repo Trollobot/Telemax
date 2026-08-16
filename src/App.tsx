@@ -44,6 +44,19 @@ function formatUptime(seconds: number): string {
   return `${h}h ${m}m`;
 }
 
+// Human-readable current proxy mode for the "Сейчас:" line, with credentials stripped.
+function proxyDisplay(url: string): string {
+  if (!url) return 'напрямую (без прокси)';
+  try {
+    const u = new URL(url);
+    u.username = '';
+    u.password = '';
+    return `через прокси ${u.toString()}`;
+  } catch {
+    return `через прокси ${url}`;
+  }
+}
+
 function ApiKeyGate({ onSubmit, error }: { onSubmit: (key: string) => void; error: string }) {
   const [value, setValue] = useState('');
   return (
@@ -106,6 +119,7 @@ export default function App() {
   const [authStep, setAuthStep] = useState<'phone' | 'code' | 'password' | 'done'>('phone');
   const [authError, setAuthError] = useState('');
   const [proxyUrl, setProxyUrl] = useState('');
+  const [proxyActive, setProxyActive] = useState('');
   const [proxyStatus, setProxyStatus] = useState('');
   const [proxyBusy, setProxyBusy] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
@@ -270,6 +284,7 @@ export default function App() {
         return;
       }
       setProxyStatus('Сохранено. Перезапускаю…');
+      setProxyActive(proxyUrl.trim()); // reflect the new mode immediately; restart applies it
       await apiFetch('/api/system/restart', { method: 'POST' }).catch(() => {});
     } finally {
       setProxyBusy(false);
@@ -315,7 +330,11 @@ export default function App() {
 
     apiFetch('/api/proxy')
       .then((r: Response) => (r.ok ? r.json() : { proxy: '' }))
-      .then((body: { proxy?: string }) => !cancelled && setProxyUrl(body.proxy ?? ''))
+      .then((body: { proxy?: string }) => {
+        if (cancelled) return;
+        setProxyUrl(body.proxy ?? '');
+        setProxyActive(body.proxy ?? '');
+      })
       .catch(() => {});
 
     // Reconnect with a small delay when the socket drops (server redeploy/restart) —
@@ -541,13 +560,18 @@ export default function App() {
                     <span className="font-mono text-slate-300">http://…</span> (можно с логином:паролем@).
                     Применяется после перезапуска.
                   </p>
+                  <div className="text-xs mb-3">
+                    <span className="text-slate-500">Сейчас: </span>
+                    <span className={proxyActive ? 'text-blue-300 font-mono' : 'text-green-400'}>{proxyDisplay(proxyActive)}</span>
+                  </div>
                   <input
                     type="text"
-                    placeholder="socks5://user:pass@host:1080 (пусто — без прокси)"
+                    placeholder="socks5://user:pass@host:1080 (пусто — напрямую)"
                     value={proxyUrl}
                     onChange={(e) => setProxyUrl(e.target.value)}
                     className="w-full bg-[#0c0d0f] border border-white/10 rounded px-4 py-3 text-sm text-white font-mono"
                   />
+                  <p className="text-[11px] text-slate-500 mt-2">Пусто = напрямую, без прокси</p>
                   {proxyStatus && <div className="mt-3 text-sm text-slate-300">{proxyStatus}</div>}
                   <div className="flex gap-2 mt-4">
                     <button onClick={handleTestProxy} disabled={proxyBusy} className="w-1/2 bg-white/10 hover:bg-white/20 disabled:opacity-50 text-white font-bold py-3 rounded text-sm">

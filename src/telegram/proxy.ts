@@ -1,6 +1,6 @@
 import type { Agent } from 'node:http';
 import path from 'node:path';
-import { mkdir, readFile, writeFile, rm } from 'node:fs/promises';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { SocksProxyAgent } from 'socks-proxy-agent';
 import { createLogger } from '../logger.js';
@@ -56,34 +56,39 @@ export function buildTelegramProxyAgent(proxyUrl: string): Agent | undefined {
   throw new Error(`TELEGRAM_PROXY has an unsupported scheme "${scheme}" — use http://, https:// or socks5://`);
 }
 
-/** The panel-set override from ./data, or '' if none is saved. */
-export async function readPersistedProxy(): Promise<string> {
+/**
+ * The panel-set override from ./data: the file's trimmed content, or null if the
+ * panel never set one. An empty string is a real value — a deliberate "go direct"
+ * chosen in the panel — and is kept distinct from null (no override at all).
+ */
+async function readProxyOverride(): Promise<string | null> {
   try {
     return (await readFile(PROXY_FILE, 'utf8')).trim();
   } catch {
-    return '';
+    return null;
   }
-}
-
-/** Persists (or clears, on empty) the panel-set proxy override. Applied on next start. */
-export async function writePersistedProxy(proxyUrl: string): Promise<void> {
-  const clean = proxyUrl.trim();
-  if (!clean) {
-    await rm(PROXY_FILE, { force: true });
-    return;
-  }
-  await mkdir(path.dirname(PROXY_FILE), { recursive: true });
-  await writeFile(PROXY_FILE, clean, 'utf8');
 }
 
 /**
- * The effective proxy URL: the panel-set override in ./data wins over the
- * TELEGRAM_PROXY env var, so a change made in the panel survives restarts and takes
- * precedence without touching .env. Empty string means go direct.
+ * Persists the panel-set proxy override. Always writes the file — even for an empty
+ * value, which is a deliberate "go direct" from the panel and must survive restarts.
+ * (Deleting it used to silently revert to the TELEGRAM_PROXY env var, so the panel
+ * could switch a proxy on or change it but never turn it OFF.) Applied on next start.
+ */
+export async function writePersistedProxy(proxyUrl: string): Promise<void> {
+  await mkdir(path.dirname(PROXY_FILE), { recursive: true });
+  await writeFile(PROXY_FILE, proxyUrl.trim(), 'utf8');
+}
+
+/**
+ * The effective proxy URL. Once the panel has set anything (the ./data file exists),
+ * it wins outright — including an empty value, which means go direct. Only while the
+ * panel has never touched it does the TELEGRAM_PROXY env var apply. Empty = direct.
  */
 export async function resolveTelegramProxy(): Promise<string> {
-  const persisted = await readPersistedProxy();
-  return persisted || (process.env.TELEGRAM_PROXY ?? '').trim();
+  const override = await readProxyOverride();
+  if (override !== null) return override;
+  return (process.env.TELEGRAM_PROXY ?? '').trim();
 }
 
 // Built once at startup (initTelegramProxy) and shared everywhere via the getters
