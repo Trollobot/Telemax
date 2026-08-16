@@ -265,42 +265,55 @@ echo
 echo "Если этот сервер выходит в Telegram только через прокси (напр. домашний"
 echo "сервер, где прямой доступ к api.telegram.org закрыт) — укажите его. MAX при"
 echo "этом идёт напрямую. Форматы: socks5://[логин:пароль@]хост:порт или"
-echo "http://[логин:пароль@]хост:порт."
+echo "http://[логин:пароль@]хост:порт. Ошибётесь — проверка ниже даст поправить."
 read -rp "Прокси для Telegram (Enter — без прокси): " TELEGRAM_PROXY
-TG_PROXY_ARGS=()
-if [ -n "$TELEGRAM_PROXY" ]; then
-  TG_PROXY_ARGS=(--proxy "$TELEGRAM_PROXY")
-fi
 
 echo
 echo "Проверяю связь с серверами MAX и Telegram..."
-NETWORK_OK=1
+
+# MAX is fatal: it's always direct, so nothing the user could re-type fixes a blocked
+# MAX — a firewall/geo-block is an environment problem, not a typo.
 if check_tcp 155.212.204.150 443; then
   echo "  MAX (155.212.204.150:443): OK"
 else
   echo "  MAX (155.212.204.150:443): нет связи"
-  NETWORK_OK=0
-fi
-if [ -n "$TELEGRAM_PROXY" ]; then
-  if curl -sS "${TG_PROXY_ARGS[@]}" --max-time 8 -o /dev/null https://api.telegram.org 2>/dev/null; then
-    echo "  Telegram (через прокси): OK"
-  else
-    echo "  Telegram (через прокси): нет связи — проверьте адрес/логин/пароль прокси"
-    NETWORK_OK=0
-  fi
-elif check_tcp api.telegram.org 443; then
-  echo "  Telegram (api.telegram.org:443): OK"
-else
-  echo "  Telegram (api.telegram.org:443): нет связи"
-  NETWORK_OK=0
-fi
-if [ "$NETWORK_OK" -eq 0 ]; then
   echo
-  echo "Без связи хотя бы с одним из серверов мост работать не сможет. Проверьте"
-  echo "файрвол/провайдера сети (некоторые хостинги или страны блокируют MAX"
-  echo "и/или Telegram) и запустите setup.sh снова."
+  echo "Без связи с сервером MAX мост работать не сможет — обычно это файрвол хостинга"
+  echo "или гео-блокировка. Проверьте сеть сервера и запустите setup.sh снова."
   exit 1
 fi
+
+# Telegram is NOT fatal: the usual cause is a mistyped proxy (or a host that needs a
+# proxy at all) — both fixable right here. So loop and let the user re-enter the proxy
+# and re-check instead of aborting, with an explicit "skip" escape so a genuinely
+# blocked host isn't a dead end (the proxy can still be set later in the panel).
+while true; do
+  TG_PROXY_ARGS=()
+  if [ -n "$TELEGRAM_PROXY" ]; then
+    TG_PROXY_ARGS=(--proxy "$TELEGRAM_PROXY")
+    if curl -sS "${TG_PROXY_ARGS[@]}" --max-time 8 -o /dev/null https://api.telegram.org 2>/dev/null; then
+      echo "  Telegram (через прокси): OK"
+      break
+    fi
+    echo "  Telegram через прокси недоступен — возможно, неверный адрес/логин/пароль прокси."
+  else
+    if check_tcp api.telegram.org 443; then
+      echo "  Telegram (api.telegram.org:443): OK"
+      break
+    fi
+    echo "  Telegram напрямую недоступен (частая причина на хостингах в РФ — блокировка; помогает прокси)."
+  fi
+  echo "    • впишите прокси (socks5://… или http://…) и Enter — перепроверю через него;"
+  echo "    • пустой Enter — перепроверить напрямую, без прокси;"
+  echo "    • skip — продолжить установку без проверки (прокси можно задать позже в панели)."
+  read -rp "  > " TG_INPUT
+  if [ "$TG_INPUT" = "skip" ]; then
+    echo "  Пропускаю проверку Telegram. Мост поднимется, но без связи с Telegram пересылки"
+    echo "  не будет — задайте прокси в веб-панели (Configuration → Telegram-прокси)."
+    break
+  fi
+  TELEGRAM_PROXY="$TG_INPUT"
+done
 echo
 echo "Понадобится токен бота — создайте его через @BotFather (https://t.me/BotFather), команда /newbot."
 echo
