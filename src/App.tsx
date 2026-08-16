@@ -105,6 +105,9 @@ export default function App() {
   const [passwordHint, setPasswordHint] = useState('');
   const [authStep, setAuthStep] = useState<'phone' | 'code' | 'password' | 'done'>('phone');
   const [authError, setAuthError] = useState('');
+  const [proxyUrl, setProxyUrl] = useState('');
+  const [proxyStatus, setProxyStatus] = useState('');
+  const [proxyBusy, setProxyBusy] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const logsEndRef = useRef<HTMLDivElement>(null);
   const isSubmitting = useRef(false);
@@ -236,6 +239,43 @@ export default function App() {
     }
   };
 
+  // Telegram proxy: test a value live before committing it. MAX always stays direct;
+  // saving persists to ./data and restarts the process to apply (Telegraf binds its
+  // agent at construction), and compose's restart policy brings the container back.
+  const handleTestProxy = async () => {
+    setProxyBusy(true);
+    setProxyStatus('Проверяю…');
+    try {
+      const res = await apiFetch('/api/proxy/test', { method: 'POST', body: JSON.stringify({ proxy: proxyUrl }) });
+      if (res.status === 401) return handleUnauthorized();
+      const data = await res.json().catch(() => ({}));
+      setProxyStatus(data.ok ? '✅ Прокси доступен' : `❌ ${data.error || 'нет связи'}`);
+    } catch {
+      setProxyStatus('❌ ошибка проверки');
+    } finally {
+      setProxyBusy(false);
+    }
+  };
+
+  const handleSaveProxyRestart = async () => {
+    if (!window.confirm('Сохранить прокси и перезапустить мост? MAX останется напрямую. Перерыв в работе — несколько секунд.')) return;
+    setProxyBusy(true);
+    setProxyStatus('Сохраняю…');
+    try {
+      const res = await apiFetch('/api/proxy', { method: 'POST', body: JSON.stringify({ proxy: proxyUrl }) });
+      if (res.status === 401) return handleUnauthorized();
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.error) {
+        setProxyStatus(`❌ ${data.error || 'не сохранено'}`);
+        return;
+      }
+      setProxyStatus('Сохранено. Перезапускаю…');
+      await apiFetch('/api/system/restart', { method: 'POST' }).catch(() => {});
+    } finally {
+      setProxyBusy(false);
+    }
+  };
+
   useEffect(() => {
     if (!apiKey) return;
 
@@ -271,6 +311,11 @@ export default function App() {
     apiFetch('/api/chats')
       .then((r: Response) => (r.ok ? r.json() : { data: { chats: [] } }))
       .then((body: { data?: { chats?: MaxChat[] } }) => !cancelled && setMaxChats(body.data?.chats ?? []))
+      .catch(() => {});
+
+    apiFetch('/api/proxy')
+      .then((r: Response) => (r.ok ? r.json() : { proxy: '' }))
+      .then((body: { proxy?: string }) => !cancelled && setProxyUrl(body.proxy ?? ''))
       .catch(() => {});
 
     // Reconnect with a small delay when the socket drops (server redeploy/restart) —
@@ -418,7 +463,7 @@ export default function App() {
             )}
 
             {activeTab === 'config' && (
-              <div className="flex-1 bg-[#0f1012] rounded-lg border border-white/5 p-8 flex flex-col items-center justify-center">
+              <div className="flex-1 bg-[#0f1012] rounded-lg border border-white/5 p-8 flex flex-col items-center gap-6 overflow-auto">
                 <div className="max-w-md w-full bg-[#141518] p-6 rounded-lg border border-white/10 shadow-xl">
                   <h2 className="text-lg font-bold text-white mb-6 flex items-center gap-2">
                     <Shield className="text-blue-500" /> MAX Authentication
@@ -484,6 +529,34 @@ export default function App() {
                       </button>
                     </div>
                   )}
+                </div>
+
+                <div className="max-w-md w-full bg-[#141518] p-6 rounded-lg border border-white/10 shadow-xl">
+                  <h2 className="text-lg font-bold text-white mb-2 flex items-center gap-2">
+                    <Server className="text-blue-500" size={20} /> Telegram-прокси
+                  </h2>
+                  <p className="text-xs text-slate-400 mb-4">
+                    Если сервер выходит в Telegram только через прокси. MAX всегда идёт напрямую.
+                    Форматы: <span className="font-mono text-slate-300">socks5://…</span> или{' '}
+                    <span className="font-mono text-slate-300">http://…</span> (можно с логином:паролем@).
+                    Применяется после перезапуска.
+                  </p>
+                  <input
+                    type="text"
+                    placeholder="socks5://user:pass@host:1080 (пусто — без прокси)"
+                    value={proxyUrl}
+                    onChange={(e) => setProxyUrl(e.target.value)}
+                    className="w-full bg-[#0c0d0f] border border-white/10 rounded px-4 py-3 text-sm text-white font-mono"
+                  />
+                  {proxyStatus && <div className="mt-3 text-sm text-slate-300">{proxyStatus}</div>}
+                  <div className="flex gap-2 mt-4">
+                    <button onClick={handleTestProxy} disabled={proxyBusy} className="w-1/2 bg-white/10 hover:bg-white/20 disabled:opacity-50 text-white font-bold py-3 rounded text-sm">
+                      Проверить
+                    </button>
+                    <button onClick={handleSaveProxyRestart} disabled={proxyBusy} className="w-1/2 bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white font-bold py-3 rounded text-sm">
+                      Сохранить и перезапустить
+                    </button>
+                  </div>
                 </div>
               </div>
             )}

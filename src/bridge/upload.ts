@@ -5,6 +5,8 @@
  * reverse-engineering on 2026-08-07 — not in max-protocol-full.md.
  */
 import { gzipSync } from 'node:zlib';
+import https from 'node:https';
+import type { Agent } from 'node:http';
 import type { Telegraf } from 'telegraf';
 // undici's own FormData, not the global one: maxFetch runs on undici's fetch, and
 // the npm package's types are nominally incompatible with @types/node's bundled
@@ -12,13 +14,41 @@ import type { Telegraf } from 'telegraf';
 import { FormData } from 'undici';
 import type { MaxClient } from '../max/client.js';
 import { maxFetch } from '../max/ca.js';
+import { getTelegramProxyAgent } from '../telegram/proxy.js';
 import { renderTgsToWebm } from './lottie.js';
 
 async function fetchTelegramFile(bot: Telegraf, fileId: string): Promise<Buffer> {
+  // getFileLink is a Bot API call — it already goes through Telegraf's (possibly
+  // proxied) client. Only the download of the returned api.telegram.org/file/… URL
+  // bypasses Telegraf, so it's the one spot that needs the proxy applied by hand.
   const link = await bot.telegram.getFileLink(fileId);
-  const res = await fetch(link.toString());
-  if (!res.ok) throw new Error(`Failed to download Telegram file: ${res.status}`);
-  return Buffer.from(await res.arrayBuffer());
+  const agent = getTelegramProxyAgent();
+  if (!agent) {
+    const res = await fetch(link.toString());
+    if (!res.ok) throw new Error(`Failed to download Telegram file: ${res.status}`);
+    return Buffer.from(await res.arrayBuffer());
+  }
+  // Native fetch (undici) can't take an http.Agent, so when a proxy is configured we
+  // pull the file through node's https with the same agent Telegraf uses.
+  return downloadViaAgent(link.toString(), agent);
+}
+
+function downloadViaAgent(url: string, agent: Agent): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const req = https.get(url, { agent, timeout: 30_000 }, (res) => {
+      if (res.statusCode && res.statusCode >= 400) {
+        res.resume();
+        reject(new Error(`Failed to download Telegram file: ${res.statusCode}`));
+        return;
+      }
+      const chunks: Buffer[] = [];
+      res.on('data', (c) => chunks.push(c as Buffer));
+      res.on('end', () => resolve(Buffer.concat(chunks)));
+      res.on('error', reject);
+    });
+    req.on('timeout', () => req.destroy(new Error('Telegram file download timed out')));
+    req.on('error', reject);
+  });
 }
 
 /**

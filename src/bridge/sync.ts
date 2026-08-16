@@ -10,6 +10,7 @@ import type { ChatMapStore } from '../store/chatMapStore.js';
 import { ensureTopicForMaxChat } from '../telegram/bot.js';
 import { downloadMaxAttachment, describeAttachment, type MaxAttachment, type DownloadContext } from './attachments.js';
 import { uploadTelegramAttachmentToMax } from './upload.js';
+import { reportBridgeError } from './errorReporter.js';
 import { checkVersion, shortSha, type VersionStatus } from './version.js';
 import { toTelegramReaction } from '../max/reactions.js';
 import { createLogger, jsonStringify } from '../logger.js';
@@ -1117,7 +1118,15 @@ export function wireBridge({
     try {
       await send(first.topicId, first.created);
     } catch (err) {
-      if (!isThreadNotFound(err)) throw err;
+      if (!isThreadNotFound(err)) {
+        // A real delivery failure (bot lost its rights, Telegram unreachable, …) —
+        // tell the operator, throttled so a stuck chat can't spam the group.
+        reportBridgeError(
+          'tg-deliver',
+          `⚠️ Не удаётся доставить сообщение в Telegram: ${(err as Error).message}. Проверьте права бота и связь с Telegram.`,
+        );
+        throw err;
+      }
       // Don't re-send `send` here: the triggering message is already part of the
       // history the restore replays, so a separate send would duplicate it.
       restoreDeletedTopic(chatId);

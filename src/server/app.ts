@@ -15,10 +15,20 @@ import { extractMyAccountId, resolveChatName, type ContactProfile } from '../max
 import { SessionStore, type MaxSession } from '../store/sessionStore.js';
 import { ChatMapStore } from '../store/chatMapStore.js';
 import { wireBridge, syncAllChatsToTelegram, MessageLinkStore } from '../bridge/sync.js';
+import { configureErrorReporter, reportBridgeError, resetErrorKey } from '../bridge/errorReporter.js';
 import { shortSha } from '../bridge/version.js';
 import { createLogger, jsonStringify, redactSecrets } from '../logger.js';
 import { config } from './config.js';
 import { isValidApiKey, requireApiKey } from './authMiddleware.js';
+import {
+  buildTelegramProxyAgent,
+  getResolvedProxyUrl,
+  getTelegramProxyAgent,
+  initTelegramProxy,
+  redactProxyUrl,
+  writePersistedProxy,
+} from '../telegram/proxy.js';
+import https from 'node:https';
 
 const logger = createLogger('server');
 const startedAt = Date.now();
@@ -33,9 +43,18 @@ dns.setDefaultResultOrder('ipv4first');
 
 // One bad handler shouldn't take down MAX auth, the Telegram bot, and every other
 // in-flight session — log and keep running instead of letting Node's default
-// "crash the process" behavior undo all the reconnect/retry work elsewhere.
-process.on('unhandledRejection', (reason) => logger.error('Unhandled rejection:', reason));
-process.on('uncaughtException', (err) => logger.error('Uncaught exception:', err));
+// "crash the process" behavior undo all the reconnect/retry work elsewhere. The
+// operator also gets a throttled heads-up in Telegram — deliberately generic (no raw
+// error text) so a token/URL in the message can't leak into the group; details stay
+// in the container logs.
+process.on('unhandledRejection', (reason) => {
+  logger.error('Unhandled rejection:', reason);
+  reportBridgeError('unhandled-rejection', '⚠️ Внутренняя ошибка моста — подробности в логах контейнера (docker compose logs).');
+});
+process.on('uncaughtException', (err) => {
+  logger.error('Uncaught exception:', err);
+  reportBridgeError('uncaught-exception', '⚠️ Внутренняя ошибка моста — подробности в логах контейнера (docker compose logs).');
+});
 
 const sessionStore = new SessionStore();
 const chatMapStore = new ChatMapStore();
@@ -293,9 +312,24 @@ async function startServer(): Promise<void> {
   currentSession = await sessionStore.load();
 
   // --- MAX client wiring ---
+  // A brief MAX drop during a reconnect is normal and shouldn't ping the group — only
+  // a sustained outage (still down 60s later) earns an operator notice, paired with a
+  // "recovered" once it's back.
+  let maxDownTimer: ReturnType<typeof setTimeout> | null = null;
+  let maxDownReported = false;
+
   max.on('connected', () => {
     maxConnected = true;
     broadcastStatus();
+    if (maxDownTimer) {
+      clearTimeout(maxDownTimer);
+      maxDownTimer = null;
+    }
+    if (maxDownReported) {
+      maxDownReported = false;
+      resetErrorKey('max-down');
+      reportBridgeError('max-up', '✅ Связь с MAX восстановлена.');
+    }
   });
 
   max.on('ready', () => {
@@ -305,6 +339,13 @@ async function startServer(): Promise<void> {
   max.on('disconnected', () => {
     maxConnected = false;
     broadcastStatus();
+    if (maxDownTimer == null && !maxDownReported) {
+      maxDownTimer = setTimeout(() => {
+        maxDownTimer = null;
+        maxDownReported = true;
+        reportBridgeError('max-down', '❌ Потеряна связь с MAX. Пытаюсь переподключиться…');
+      }, 60_000);
+    }
   });
 
   max.on('error', (err: Error) => logger.error('MAX client error:', err.message));
@@ -332,6 +373,11 @@ async function startServer(): Promise<void> {
 
   max.connect();
 
+  // Resolve the Telegram proxy (env var or panel-set override in ./data) before the
+  // bot is built — Telegraf binds its agent at construction time, so this has to run
+  // first. No-op when no proxy is configured.
+  await initTelegramProxy();
+
   // --- Telegram bot (optional — bridge stays dormant without credentials) ---
   if (config.telegramEnabled) {
     bot = createBotSafely(config.telegramBotToken);
@@ -350,6 +396,11 @@ async function startServer(): Promise<void> {
         killEverything: killMaxSession,
       }));
       launchTelegramBotWithRetry(bot);
+      // Route throttled operator error notices (MAX down, delivery failures, internal
+      // errors) to the target group. Captured in a const so the closure keeps the
+      // non-null bot even though the module-level `bot` is nullable.
+      const notifyBot = bot;
+      configureErrorReporter((text) => notifyBot.telegram.sendMessage(config.targetTelegramGroup, text));
     }
   } else {
     logger.warn('TELEGRAM_BOT_TOKEN / TARGET_TELEGRAM_GROUP not set — Telegram bridge stays disabled');
@@ -420,6 +471,38 @@ async function startServer(): Promise<void> {
   api.post('/system/start', (_req, res) => {
     max.connect();
     res.json({ success: true });
+  });
+
+  // Restarts the whole process to apply config that's only read at startup (the
+  // Telegram proxy). compose's `restart: unless-stopped` brings the container right
+  // back, so from the operator's side this is just "apply & reconnect".
+  api.post('/system/restart', (_req, res) => {
+    res.json({ success: true });
+    logger.warn('Restart requested from the web panel — exiting so the container comes back up');
+    setTimeout(() => process.exit(0), 300);
+  });
+
+  // --- Telegram proxy config (see src/telegram/proxy.ts) ---
+  api.get('/proxy', (_req, res) => {
+    res.json({ proxy: getResolvedProxyUrl() });
+  });
+
+  api.post('/proxy/test', async (req, res) => {
+    const url = typeof req.body?.proxy === 'string' ? req.body.proxy : '';
+    res.json(await testTelegramProxyReachable(url));
+  });
+
+  api.post('/proxy', async (req, res) => {
+    const url = typeof req.body?.proxy === 'string' ? req.body.proxy.trim() : '';
+    try {
+      buildTelegramProxyAgent(url); // validates scheme/format — throws on garbage
+    } catch (err) {
+      res.status(400).json({ error: (err as Error).message });
+      return;
+    }
+    await writePersistedProxy(url);
+    logger.info(url ? `Telegram proxy saved (${redactProxyUrl(url)}) — applies on restart` : 'Telegram proxy cleared — applies on restart');
+    res.json({ success: true, restartRequired: true });
   });
 
   api.post('/auth/phone', async (req, res) => {
@@ -763,9 +846,32 @@ async function launchTelegramBotWithRetry(bot: Telegraf, attempt = 0): Promise<v
     .catch((err) => retryTelegramLaunch(bot, attempt, err));
 }
 
+/** Tries to reach api.telegram.org through the given proxy URL (empty = direct). Backs
+ * the panel's "test" button before a proxy is saved. Never throws — returns a verdict. */
+async function testTelegramProxyReachable(proxyUrl: string): Promise<{ ok: boolean; error?: string }> {
+  let agent: ReturnType<typeof buildTelegramProxyAgent>;
+  try {
+    agent = buildTelegramProxyAgent(proxyUrl);
+  } catch (err) {
+    return { ok: false, error: (err as Error).message };
+  }
+  return new Promise((resolve) => {
+    const req = https.get('https://api.telegram.org/', { agent, timeout: 8000 }, (res) => {
+      res.resume();
+      resolve({ ok: true });
+    });
+    req.on('timeout', () => {
+      req.destroy();
+      resolve({ ok: false, error: 'таймаут подключения' });
+    });
+    req.on('error', (err) => resolve({ ok: false, error: err.message }));
+  });
+}
+
 function createBotSafely(token: string): Telegraf | null {
   try {
-    return new Telegraf(token);
+    const agent = getTelegramProxyAgent();
+    return new Telegraf(token, agent ? { telegram: { agent } } : undefined);
   } catch (err) {
     logger.error('Failed to create Telegram bot:', err);
     return null;

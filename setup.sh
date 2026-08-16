@@ -256,6 +256,23 @@ find_free_port() {
   echo "$port"
 }
 
+# Ask about a Telegram proxy BEFORE the reachability check: on a host where Telegram
+# is reachable only through a proxy (e.g. a home server with no direct route to
+# api.telegram.org), a direct check would falsely fail and abort setup. MAX always
+# stays direct. The value doubles as its own validation via the check below and is
+# written to .env as TELEGRAM_PROXY (the container's Telegraf client picks it up).
+echo
+echo "Если этот сервер выходит в Telegram только через прокси (напр. домашний"
+echo "сервер, где прямой доступ к api.telegram.org закрыт) — укажите его. MAX при"
+echo "этом идёт напрямую. Форматы: socks5://[логин:пароль@]хост:порт или"
+echo "http://[логин:пароль@]хост:порт."
+read -rp "Прокси для Telegram (Enter — без прокси): " TELEGRAM_PROXY
+TG_PROXY_ARGS=()
+if [ -n "$TELEGRAM_PROXY" ]; then
+  TG_PROXY_ARGS=(--proxy "$TELEGRAM_PROXY")
+fi
+
+echo
 echo "Проверяю связь с серверами MAX и Telegram..."
 NETWORK_OK=1
 if check_tcp 155.212.204.150 443; then
@@ -264,7 +281,14 @@ else
   echo "  MAX (155.212.204.150:443): нет связи"
   NETWORK_OK=0
 fi
-if check_tcp api.telegram.org 443; then
+if [ -n "$TELEGRAM_PROXY" ]; then
+  if curl -sS "${TG_PROXY_ARGS[@]}" --max-time 8 -o /dev/null https://api.telegram.org 2>/dev/null; then
+    echo "  Telegram (через прокси): OK"
+  else
+    echo "  Telegram (через прокси): нет связи — проверьте адрес/логин/пароль прокси"
+    NETWORK_OK=0
+  fi
+elif check_tcp api.telegram.org 443; then
   echo "  Telegram (api.telegram.org:443): OK"
 else
   echo "  Telegram (api.telegram.org:443): нет связи"
@@ -300,7 +324,7 @@ if command -v jq >/dev/null 2>&1; then
   read -rp "Сделали? Нажмите Enter, когда отправите сообщение в группу... "
   echo "Ищу группу..."
   for attempt in 1 2 3 4 5; do
-    UPDATES=$(curl -s "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?limit=100" || true)
+    UPDATES=$(curl -s "${TG_PROXY_ARGS[@]}" "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?limit=100" || true)
     TARGET_TELEGRAM_GROUP=$(echo "$UPDATES" | jq -r '
       [.result[] | (.message // .channel_post // empty)
        | select(.chat.type == "supergroup" or .chat.type == "group")
@@ -331,7 +355,7 @@ fi
 # actual file upload (multipart), not a URL, unlike sendPhoto.
 AVATAR="$(dirname "$0")/assets/group-avatar.png"
 if [ -f "$AVATAR" ]; then
-  if curl -s -F "chat_id=$TARGET_TELEGRAM_GROUP" -F "photo=@$AVATAR" \
+  if curl -s "${TG_PROXY_ARGS[@]}" -F "chat_id=$TARGET_TELEGRAM_GROUP" -F "photo=@$AVATAR" \
     "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/setChatPhoto" | grep -q '"ok":true'; then
     echo "Аватарка группы установлена."
   else
@@ -357,6 +381,7 @@ MAX_SESSION_KEY=$MAX_SESSION_KEY
 TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN
 TARGET_TELEGRAM_GROUP=$TARGET_TELEGRAM_GROUP
 PORT=$PORT
+TELEGRAM_PROXY=$TELEGRAM_PROXY
 EOF
 
 echo
