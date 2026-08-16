@@ -666,7 +666,13 @@ function formatVersionMessage(status: VersionStatus): { text: string; replyMarku
   if (!status.updateAvailable) {
     return { text: `📦 Текущая версия: ${currentLabel}\n\n✅ Это последняя версия.` };
   }
-  const text = `📦 Текущая версия: ${currentLabel}\n🆕 Доступна новая: ${shortSha(status.latest.sha)} — ${status.latest.message}\n\nОбновить сейчас? Пересборка и перезапуск займут пару минут, история переписки не затрагивается.`;
+  const CHANGELOG_CAP = 12;
+  const shown = (status.changelog ?? []).slice(0, CHANGELOG_CAP);
+  const more = (status.changelog ?? []).length - shown.length;
+  const header = shown.length
+    ? `🆕 Доступна новая: ${shortSha(status.latest.sha)}\n\nЧто нового:\n${shown.map((m) => `• ${m}`).join('\n')}${more > 0 ? `\n…и ещё ${more}` : ''}`
+    : `🆕 Доступна новая: ${shortSha(status.latest.sha)} — ${status.latest.message}`;
+  const text = `📦 Текущая версия: ${currentLabel}\n${header}\n\nОбновить сейчас? Пересборка и перезапуск займут пару минут, история переписки не затрагивается.`;
   const replyMarkup = Markup.inlineKeyboard([
     Markup.button.callback('🔄 Обновить', 'tlmx_update'),
     Markup.button.callback('⏰ Позже', 'tlmx_dismiss'),
