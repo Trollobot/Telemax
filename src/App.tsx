@@ -52,7 +52,9 @@ function ApiKeyGate({ onSubmit, error }: { onSubmit: (key: string) => void; erro
         <h2 className="text-lg font-bold text-white mb-2 flex items-center gap-2">
           <KeyRound className="text-blue-500" size={20} /> API Key
         </h2>
-        <p className="text-xs text-slate-500 mb-4">Требуется для доступа к бриджу (см. API_KEY на сервере).</p>
+        <p className="text-xs text-slate-500 mb-4">
+          Ключ печатается в консоли при установке (setup.sh). Если потеряли — он лежит в файле <code className="text-slate-400">.env</code> в папке установки: <code className="text-slate-400">grep API_KEY .env</code>. Либо спросите бота командой <code className="text-slate-400">/apikey</code> в вашей Telegram-группе.
+        </p>
         {error && <div className="mb-3 p-2 bg-red-500/20 border border-red-500/50 rounded text-red-400 text-xs">{error}</div>}
         <input
           type="password"
