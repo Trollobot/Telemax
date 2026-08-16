@@ -8,6 +8,106 @@ cd "$(dirname "$0")"
 
 bold() { printf '\033[1m%s\033[0m\n' "$1"; }
 
+# Waits until the container's HTTPS panel answers /health. MAX connects a moment
+# after the container starts, so /auth/* would 503 if we asked too early. Expects
+# API_URL set. Panel uses a self-signed cert generated on first start — hence -k.
+wait_for_server() {
+  echo "Жду готовности сервера..."
+  for attempt in 1 2 3 4 5 6 7 8 9 10; do
+    curl -sk --max-time 2 "$API_URL/health" >/dev/null 2>&1 && break
+    sleep 2
+  done
+}
+
+# Interactive MAX auth (phone -> SMS -> optional cloud password) against the running
+# container's /api/auth/*, the same endpoints the web panel uses. Runs both on a
+# fresh install and on the re-auth path below (an already-configured install where
+# auth was never finished). Expects API_URL, API_KEY, HOST, PORT set; sets AUTHED=1
+# on success.
+run_max_auth() {
+  echo
+  echo "════════════════════════════════════════════════════════════════"
+  bold "  ШАГ АВТОРИЗАЦИИ MAX — БЕЗ НЕГО МОСТ НЕ ЗАРАБОТАЕТ"
+  echo "════════════════════════════════════════════════════════════════"
+  echo "Введите номер MAX и код из SMS. Если пропустить (просто Enter) —"
+  echo "контейнер останется запущенным, но НЕ подключённым к аккаунту, пока"
+  echo "вы не авторизуетесь позже через веб-панель."
+  echo
+  AUTHED=""
+  read -rp "Номер телефона MAX (с кодом страны, напр. +79991234567), или Enter чтобы позже: " MAX_PHONE
+  if [ -n "$MAX_PHONE" ]; then
+    PHONE_OK=""
+    for attempt in 1 2 3; do
+      PHONE_RESP=$(curl -sk -X POST -H "x-api-key: $API_KEY" -H "Content-Type: application/json" \
+        -d "{\"phone\":\"$MAX_PHONE\"}" "$API_URL/auth/phone")
+      if echo "$PHONE_RESP" | grep -q '"success":true'; then
+        PHONE_OK=1
+        break
+      fi
+      sleep 2
+    done
+    if [ -n "$PHONE_OK" ]; then
+      echo "Код отправлен на $MAX_PHONE."
+      read -rp "Код из SMS: " MAX_CODE
+      VERIFY_RESP=$(curl -sk -X POST -H "x-api-key: $API_KEY" -H "Content-Type: application/json" \
+        -d "{\"code\":\"$MAX_CODE\"}" "$API_URL/auth/verify")
+      if echo "$VERIFY_RESP" | grep -q '"passwordRequired":true'; then
+        # Some MAX accounts have a password set as a second factor on top of SMS.
+        # A wrong password can be retried freely — the auth session behind it
+        # doesn't expire until a correct one goes through (confirmed live 2026-08-14).
+        HINT=$(echo "$VERIFY_RESP" | grep -o '"hint":"[^"]*"' | sed 's/"hint":"//;s/"$//')
+        echo "Этот MAX-аккаунт защищён паролем (второй фактор поверх SMS)."
+        [ -n "$HINT" ] && echo "Подсказка: $HINT"
+        PASSWORD_OK=""
+        while [ -z "$PASSWORD_OK" ]; do
+          read -rsp "Пароль: " MAX_PASSWORD
+          echo
+          PASSWORD_RESP=$(curl -sk -X POST -H "x-api-key: $API_KEY" -H "Content-Type: application/json" \
+            -d "{\"password\":\"$MAX_PASSWORD\"}" "$API_URL/auth/password")
+          if echo "$PASSWORD_RESP" | grep -q '"success":true'; then
+            PASSWORD_OK=1
+            AUTHED=1
+            bold "Готово — мост авторизован и подключён к MAX."
+          else
+            echo "❌ Неверный пароль, попробуйте ещё раз (или Ctrl+C — тогда через веб-панель: https://$HOST:$PORT)."
+          fi
+        done
+      elif echo "$VERIFY_RESP" | grep -q '"success":true'; then
+        AUTHED=1
+        bold "Готово — мост авторизован и подключён к MAX."
+      else
+        echo "❌ Не удалось подтвердить код: $VERIFY_RESP"
+        echo "Попробуйте ещё раз через веб-панель: https://$HOST:$PORT"
+      fi
+    else
+      echo "❌ Не удалось запросить SMS: $PHONE_RESP"
+      echo "Попробуйте через веб-панель: https://$HOST:$PORT"
+    fi
+  else
+    echo "Ок — авторизацию можно завершить позже через веб-панель (см. ниже)."
+  fi
+}
+
+# Big, unmissable closing summary — authed vs not, plus the panel URL and key.
+# Expects AUTHED, HOST, PORT, API_KEY.
+print_final_status() {
+  echo
+  echo "════════════════════════════════════════════════════════════════"
+  if [ -n "$AUTHED" ]; then
+    bold "  ✅ ГОТОВО. Мост авторизован, запущен и подключён к MAX."
+  else
+    bold "  ⚠️  МОСТ ЗАПУЩЕН, НО MAX ПОКА НЕ АВТОРИЗОВАН"
+    echo "  Без авторизации сообщения не будут пересылаться. Завершите её:"
+    echo "  откройте https://$HOST:$PORT, введите ключ ниже, затем номер и код из SMS."
+  fi
+  echo "════════════════════════════════════════════════════════════════"
+  echo "  Веб-панель:  https://$HOST:$PORT"
+  echo "  Ключ входа:  $API_KEY"
+  echo "  (сертификат самоподписанный — браузер предупредит один раз:"
+  echo "   «Дополнительно» → «Перейти на сайт». Ключ можно вернуть командой /apikey у бота.)"
+  echo "════════════════════════════════════════════════════════════════"
+}
+
 # Runs on every invocation, even on an already-configured install (the .env
 # check below exits before the rest of setup) — an update pulled in via the
 # watcher itself needs the watcher already installed to have gotten here, and
@@ -50,8 +150,54 @@ else
 fi
 
 if [ -f .env ]; then
-  echo ".env уже существует — настройка не нужна."
-  echo "Если хотите начать заново: удалите .env и запустите setup.sh снова."
+  # Already configured — but the MAX auth step might never have been finished
+  # (interrupted mid-flow, or only the bot/group part was done, or the account
+  # has a cloud password and the person bailed at that prompt). Re-running the
+  # installer used to just say "нечего делать" and exit, leaving the web panel as
+  # the only recovery path. Instead: check whether MAX is actually authorized and,
+  # if not, offer to finish it right here in the console.
+  set -a
+  # shellcheck disable=SC1091
+  . ./.env 2>/dev/null || true
+  set +a
+  PORT="${PORT:-3000}"
+  API_URL="https://localhost:$PORT/api"
+  PUBLIC_IP=$(curl -s --max-time 3 ifconfig.me || true)
+  HOST="${PUBLIC_IP:-<адрес-сервера>}"
+
+  if ! command -v docker >/dev/null 2>&1; then
+    echo ".env уже существует, но Docker недоступен на этой машине —"
+    echo "запустите контейнер там, где есть Docker, и авторизуйтесь через веб-панель."
+    exit 0
+  fi
+
+  if [ -z "$(docker compose ps --status running --format '{{.Name}}' 2>/dev/null)" ]; then
+    read -rp ".env есть, но контейнер не запущен. Запустить сейчас? [Y/n] " RUN_NOW
+    if [ "${RUN_NOW:-Y}" = "n" ] || [ "${RUN_NOW:-Y}" = "N" ]; then
+      echo "Ок. Когда будете готовы: docker compose up -d, затем ./setup.sh или веб-панель."
+      exit 0
+    fi
+    GIT_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo unknown) docker compose up -d --build
+  fi
+
+  wait_for_server
+  # /api/status returns the active phone once MAX is authorized; empty until then.
+  STATUS=$(curl -sk --max-time 3 -H "x-api-key: ${API_KEY:-}" "$API_URL/status" 2>/dev/null || true)
+  if echo "$STATUS" | grep -q '"phone":"[^"]'; then
+    echo "✅ Уже настроено и авторизовано в MAX. Ничего делать не нужно."
+    echo "   Веб-панель: https://$HOST:$PORT"
+    exit 0
+  fi
+
+  echo
+  bold "⚠️  .env есть, но MAX ещё не авторизован — шаг авторизации не завершён."
+  read -rp "Пройти авторизацию сейчас? [Y/n] " DO_AUTH
+  if [ "${DO_AUTH:-Y}" = "n" ] || [ "${DO_AUTH:-Y}" = "N" ]; then
+    echo "Ок — можно позже через веб-панель: https://$HOST:$PORT (ключ: /apikey у бота или grep API_KEY .env)."
+    exit 0
+  fi
+  run_max_auth
+  print_final_status
   exit 0
 fi
 
@@ -243,91 +389,8 @@ echo
 bold "Контейнер собран и запущен. Остался ОДИН обязательный шаг ниже."
 
 # Авторизация в MAX прямо здесь, без переключения в браузер — тот же /api/auth/*,
-# которым пользуется веб-панель, просто из консоли. Ждём готовности сервера
-# (MAX подключается не мгновенно после старта, /auth/phone до этого вернёт 503).
-echo "Жду готовности сервера..."
-# Панель работает по HTTPS с самоподписанным сертификатом (генерируется контейнером
-# при первом старте) — отсюда -k у всех curl-вызовов к ней ниже.
+# которым пользуется веб-панель, просто из консоли.
 API_URL="https://localhost:$PORT/api"
-for attempt in 1 2 3 4 5 6 7 8 9 10; do
-  curl -sk --max-time 2 "$API_URL/health" >/dev/null 2>&1 && break
-  sleep 2
-done
-
-echo
-echo "════════════════════════════════════════════════════════════════"
-bold "  ШАГ АВТОРИЗАЦИИ MAX — БЕЗ НЕГО МОСТ НЕ ЗАРАБОТАЕТ"
-echo "════════════════════════════════════════════════════════════════"
-echo "Введите номер MAX и код из SMS. Если пропустить (просто Enter) —"
-echo "контейнер останется запущенным, но НЕ подключённым к аккаунту, пока"
-echo "вы не авторизуетесь позже через веб-панель."
-echo
-AUTHED=""
-read -rp "Номер телефона MAX (с кодом страны, напр. +79991234567), или Enter чтобы позже: " MAX_PHONE
-if [ -n "$MAX_PHONE" ]; then
-  PHONE_OK=""
-  for attempt in 1 2 3; do
-    PHONE_RESP=$(curl -sk -X POST -H "x-api-key: $API_KEY" -H "Content-Type: application/json" \
-      -d "{\"phone\":\"$MAX_PHONE\"}" "$API_URL/auth/phone")
-    if echo "$PHONE_RESP" | grep -q '"success":true'; then
-      PHONE_OK=1
-      break
-    fi
-    sleep 2
-  done
-  if [ -n "$PHONE_OK" ]; then
-    echo "Код отправлен на $MAX_PHONE."
-    read -rp "Код из SMS: " MAX_CODE
-    VERIFY_RESP=$(curl -sk -X POST -H "x-api-key: $API_KEY" -H "Content-Type: application/json" \
-      -d "{\"code\":\"$MAX_CODE\"}" "$API_URL/auth/verify")
-    if echo "$VERIFY_RESP" | grep -q '"passwordRequired":true'; then
-      # Some MAX accounts have a password set as a second factor on top of SMS.
-      # A wrong password can be retried freely — the auth session behind it
-      # doesn't expire until a correct one goes through (confirmed live 2026-08-14).
-      HINT=$(echo "$VERIFY_RESP" | grep -o '"hint":"[^"]*"' | sed 's/"hint":"//;s/"$//')
-      echo "Этот MAX-аккаунт защищён паролем (второй фактор поверх SMS)."
-      [ -n "$HINT" ] && echo "Подсказка: $HINT"
-      PASSWORD_OK=""
-      while [ -z "$PASSWORD_OK" ]; do
-        read -rsp "Пароль: " MAX_PASSWORD
-        echo
-        PASSWORD_RESP=$(curl -sk -X POST -H "x-api-key: $API_KEY" -H "Content-Type: application/json" \
-          -d "{\"password\":\"$MAX_PASSWORD\"}" "$API_URL/auth/password")
-        if echo "$PASSWORD_RESP" | grep -q '"success":true'; then
-          PASSWORD_OK=1
-          AUTHED=1
-          bold "Готово — мост авторизован и подключён к MAX."
-        else
-          echo "❌ Неверный пароль, попробуйте ещё раз (или Ctrl+C — тогда через веб-панель: https://$HOST:$PORT)."
-        fi
-      done
-    elif echo "$VERIFY_RESP" | grep -q '"success":true'; then
-      AUTHED=1
-      bold "Готово — мост авторизован и подключён к MAX."
-    else
-      echo "❌ Не удалось подтвердить код: $VERIFY_RESP"
-      echo "Попробуйте ещё раз через веб-панель: https://$HOST:$PORT"
-    fi
-  else
-    echo "❌ Не удалось запросить SMS: $PHONE_RESP"
-    echo "Попробуйте через веб-панель: https://$HOST:$PORT"
-  fi
-else
-  echo "Ок — авторизацию можно завершить позже через веб-панель (см. ниже)."
-fi
-
-echo
-echo "════════════════════════════════════════════════════════════════"
-if [ -n "$AUTHED" ]; then
-  bold "  ✅ ГОТОВО. Мост авторизован, запущен и подключён к MAX."
-else
-  bold "  ⚠️  МОСТ ЗАПУЩЕН, НО MAX ПОКА НЕ АВТОРИЗОВАН"
-  echo "  Без авторизации сообщения не будут пересылаться. Завершите её:"
-  echo "  откройте https://$HOST:$PORT, введите ключ ниже, затем номер и код из SMS."
-fi
-echo "════════════════════════════════════════════════════════════════"
-echo "  Веб-панель:  https://$HOST:$PORT"
-echo "  Ключ входа:  $API_KEY"
-echo "  (сертификат самоподписанный — браузер предупредит один раз:"
-echo "   «Дополнительно» → «Перейти на сайт». Ключ можно вернуть командой /apikey у бота.)"
-echo "════════════════════════════════════════════════════════════════"
+wait_for_server
+run_max_auth
+print_final_status

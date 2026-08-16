@@ -1,4 +1,5 @@
 import express from 'express';
+import dns from 'node:dns';
 import { createServer } from 'node:http';
 import { createServer as createTlsServer } from 'node:https';
 import net from 'node:net';
@@ -21,6 +22,14 @@ import { isValidApiKey, requireApiKey } from './authMiddleware.js';
 
 const logger = createLogger('server');
 const startedAt = Date.now();
+
+// Prefer IPv4 when a host resolves to both. On dual-stack servers where IPv6 has no
+// working route to Telegram (common in RU — Telegram is blocked over v6 while v4
+// stays reachable), Node's default order would try the dead v6 address first and the
+// bot would hang connecting to api.telegram.org — messages silently stop flowing
+// (reported live 2026-08-16, user had to pin v4 in /etc/hosts). Still falls back to
+// v6 when there's no A record, so v6-only hosts keep working.
+dns.setDefaultResultOrder('ipv4first');
 
 // One bad handler shouldn't take down MAX auth, the Telegram bot, and every other
 // in-flight session — log and keep running instead of letting Node's default
