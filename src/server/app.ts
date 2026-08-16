@@ -7,7 +7,7 @@ import { promisify } from 'node:util';
 import { WebSocketServer, type WebSocket } from 'ws';
 import { Telegraf } from 'telegraf';
 import path from 'node:path';
-import { chmod, mkdir, readFile, unlink } from 'node:fs/promises';
+import { chmod, mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
 import { MaxClient, type MaxMessageEvent, type MaxContactInfo } from '../max/client.js';
 import { OPCODES, formatOpcode } from '../max/opcodes.js';
 import { extractMyAccountId, resolveChatName, type ContactProfile } from '../max/names.js';
@@ -666,6 +666,45 @@ async function reportIfJustUpdated(bot: Telegraf): Promise<void> {
   await bot.telegram.sendMessage(config.targetTelegramGroup, `✅ Обновлено до ${shortSha(commit)}.`).catch((err) => logger.error('Failed to send post-update notice', err));
 }
 
+const WELCOME_SENT_MARKER = path.join(process.cwd(), '.data', 'welcome-sent');
+
+/**
+ * On launch, verify the bot can actually reach the configured group and give the
+ * user the "it's connected" signal they otherwise lack — the #1 confusion for new
+ * installs (a correctly-set-up bridge is silent until MAX messages start flowing).
+ * If the group is unreachable (bot not added, wrong id), there's no Telegram channel
+ * to warn the owner — Telegram bots can't DM someone who hasn't messaged them first —
+ * so the best we can do is a loud log line, which the README troubleshooting points at.
+ * The welcome itself is posted once ever (marker in .data) so restarts/updates don't spam.
+ */
+async function announceGroupReadyOnce(bot: Telegraf): Promise<void> {
+  const groupId = config.targetTelegramGroup;
+  try {
+    await bot.telegram.getChat(groupId);
+  } catch (err) {
+    logger.error(
+      `Не удаётся получить доступ к Telegram-группе ${groupId}. Проверьте, что бот добавлен в неё администратором с правом «Управление темами». Пока это не исправлено, мост не сможет пересылать сообщения.`,
+      err instanceof Error ? err.message : err,
+    );
+    return;
+  }
+  try {
+    await readFile(WELCOME_SENT_MARKER);
+    return; // already welcomed this install
+  } catch {
+    // first successful launch into the group — send the one-time welcome
+  }
+  try {
+    await bot.telegram.sendMessage(
+      groupId,
+      '✅ Telemax подключён к этой группе.\n\nЕсли ещё не завершили вход в MAX — сделайте это в веб-панели (ключ входа: команда /apikey). Полный список команд — /help.',
+    );
+    await writeFile(WELCOME_SENT_MARKER, new Date().toISOString(), 'utf8').catch(() => {});
+  } catch (err) {
+    logger.error('Failed to send group welcome message', err);
+  }
+}
+
 function retryTelegramLaunch(bot: Telegraf, attempt: number, reason: unknown): void {
   tgActive = false;
   broadcastStatus();
@@ -702,6 +741,7 @@ async function launchTelegramBotWithRetry(bot: Telegraf, attempt = 0): Promise<v
   bot.telegram.setMyDescription(buildBotDescription()).catch((err) => logger.error('Failed to set bot description', err));
   bot.telegram.setMyCommands(BOT_COMMANDS).catch((err) => logger.error('Failed to set bot commands', err));
   void reportIfJustUpdated(bot);
+  void announceGroupReadyOnce(bot);
 
   // message_reaction and poll_answer are opt-in — Telegram omits them from the default update set unless
   // requested. callback_query has to be listed explicitly too once you restrict allowedUpdates at all —
