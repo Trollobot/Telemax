@@ -351,8 +351,9 @@ async function sendAttachments(
       firstMessageId ??= sent.message_id;
       continue;
     }
-    // Chat-lifecycle CONTROL events with no useful rendering (notably `system`, which
-    // MAX sends when a chat is deleted/cleared) shouldn't be relayed as a
+    // Chat-lifecycle CONTROL events with no useful rendering (notably `system` — a
+    // history-clear/other system marker, NOT a chat deletion; deletion is a CHAT_UPDATE
+    // with status:CLOSED, handled in handleMaxChatUpdate) shouldn't be relayed as a
     // "[системное событие: system]" junk message. The meaningful ones (new/join/leave/
     // title) still fall through and render normally.
     if (att._type === 'CONTROL' && !['new', 'join', 'leave', 'title'].includes(String(att.event))) {
@@ -947,8 +948,28 @@ export function wireBridge({
    * appearing on unrelated resyncs (hence the dedup above).
    */
   async function handleMaxChatUpdate(payload: unknown): Promise<void> {
-    const chat = (payload as { chat?: { id?: unknown; lastReactedMessageId?: unknown; lastReaction?: string } } | null)?.chat;
-    if (!chat || chat.id == null || chat.lastReactedMessageId == null || !chat.lastReaction) return;
+    const chat = (payload as { chat?: { id?: unknown; status?: string; lastReactedMessageId?: unknown; lastReaction?: string } } | null)?.chat;
+    if (!chat || chat.id == null) return;
+
+    // Chat/dialog deletion: a CHAT_UPDATE (0x0087) whose chat.status === "CLOSED" (a live
+    // chat is "ACTIVE"; owner/participants are also zeroed out). Mirror it — delete the
+    // Telegram topic and drop the mapping. The chatId is inside chat.id (NOT top-level).
+    // Confirmed live 2026-08-17. (Distinct from the CONTROL attach event:"system", which
+    // is a history-clear/other system event, not a deletion.)
+    if (chat.status === 'CLOSED') {
+      const mapping = await chatMapStore.getByMaxChatId(chat.id);
+      if (mapping) {
+        await bot.telegram
+          .deleteForumTopic(targetGroupId, mapping.telegramTopicId)
+          .catch((err) => logger.error('Failed to delete Telegram topic on MAX chat deletion', err));
+        await chatMapStore.remove(chat.id);
+        logger.info(`MAX chat ${String(chat.id)} deleted (status CLOSED) — removed Telegram topic ${mapping.telegramTopicId}`);
+      }
+      return;
+    }
+
+    // Reaction adds (see comment above): piggyback on the "chat updated" push.
+    if (chat.lastReactedMessageId == null || !chat.lastReaction) return;
     const link = messageLinks.getByMax(chat.id, chat.lastReactedMessageId);
     if (!link) return;
 
