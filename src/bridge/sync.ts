@@ -943,6 +943,8 @@ export function wireBridge({
       // user. Logged in case it turns out to be conditional (e.g. group chats,
       // a different client version) — CHAT_UPDATE below is what's actually wired up.
       logger.info(`${formatOpcode(event.opcode)} payload:`, jsonStringify(event.payload));
+    } else {
+      logger.info(`[dbg] unhandled opcode ${formatOpcode(event.opcode)}`);
     }
   });
 
@@ -957,6 +959,7 @@ export function wireBridge({
   async function handleMaxChatUpdate(payload: unknown): Promise<void> {
     const chat = (payload as { chat?: { id?: unknown; status?: string; lastReactedMessageId?: unknown; lastReaction?: string } } | null)?.chat;
     if (!chat || chat.id == null) return;
+    if (!chat.lastReaction) logger.info(`[dbg] CHAT_UPDATE id=${String(chat.id)} status=${String(chat.status)}`);
 
     // Chat/dialog deletion: a CHAT_UPDATE (0x0087) whose chat.status === "CLOSED" (a live
     // chat is "ACTIVE"; owner/participants are also zeroed out). Mirror it — delete the

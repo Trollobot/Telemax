@@ -73,8 +73,13 @@ export function resolveChatName(chat: unknown, myAccountId: number | null, conta
   if (c.id === 0) return 'Избранное';
   if (c.options?.SERVICE_CHAT) return 'MAX (системный)';
 
-  if (c.type === 'DIALOG') {
-    const participantIds = c.participants ? Object.keys(c.participants).map(Number) : [];
+  // A 1:1 dialog: type 'DIALOG', or a two-participant chat (dialogs created via
+  // createDialog come back as type 'CHAT' with an empty title — without this they'd
+  // render as the "CHAT <id>" fallback instead of the other person's name).
+  const participantIds = c.participants ? Object.keys(c.participants).map(Number) : [];
+  const looksLikeDialog =
+    c.type === 'DIALOG' || (!c.title && participantIds.length === 2 && myAccountId != null && participantIds.includes(myAccountId));
+  if (looksLikeDialog) {
     const otherId = participantIds.find((id) => id !== myAccountId);
     if (otherId != null) return resolveContactDisplayName(otherId, contactProfiles.get(otherId));
   }
