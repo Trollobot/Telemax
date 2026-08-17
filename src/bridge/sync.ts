@@ -604,11 +604,17 @@ async function sendContactInfoCard(
   participantCount: number | undefined,
   otherId: number | undefined,
   profile: ContactProfile | undefined,
+  participantNames?: string[],
 ): Promise<number> {
   if (chatType !== 'DIALOG' || otherId == null) {
     const sent = await bot.telegram.sendMessage(
       targetGroupId,
-      [`ℹ️ ${fallbackTitle}`, chatType ? `Тип: ${chatType}` : null, participantCount != null ? `Участников: ${participantCount}` : null]
+      [
+        `ℹ️ ${fallbackTitle}`,
+        chatType ? `Тип: ${chatType}` : null,
+        participantCount != null ? `Участников: ${participantCount}` : null,
+        participantNames && participantNames.length ? `Состав: ${participantNames.join(', ')}` : null,
+      ]
         .filter(Boolean)
         .join('\n'),
       { message_thread_id: topicId },
@@ -1149,8 +1155,21 @@ export function wireBridge({
    * without this, deleting a topic silently black-holes every future message from
    * that MAX contact (reported live 2026-08-15).
    */
+  /** A real display name for a chat from the cached snapshot, or undefined when only a
+   * generic fallback ("CHAT <id>", "MAX chat <id>", "MAX ID <id>") is available — so we
+   * never name/rename a topic TO a fallback. Names a topic at creation (the CONTROL
+   * 'new' push creates it before a resync would) and keeps it current on later messages. */
+  function resolveTopicTitle(chatId: unknown): string | undefined {
+    const key = String(chatId);
+    const chat = getChats().find((c) => c && typeof c === 'object' && String((c as { id?: unknown }).id) === key);
+    if (!chat) return undefined;
+    const name = resolveChatName(chat, getMyAccountId(), getContactProfiles());
+    if (!name || /^(CHAT|DIALOG|Chat|GROUP|CHANNEL) -?\d+$/.test(name) || /^MAX (chat|ID)\b/i.test(name)) return undefined;
+    return name.slice(0, 128);
+  }
+
   async function deliverToTopic(chatId: unknown, send: (topicId: number, created: boolean) => Promise<void>): Promise<void> {
-    const first = await ensureTopicForMaxChat(bot, targetGroupId, chatId, chatMapStore);
+    const first = await ensureTopicForMaxChat(bot, targetGroupId, chatId, chatMapStore, resolveTopicTitle(chatId));
     try {
       await send(first.topicId, first.created);
     } catch (err) {
@@ -1676,7 +1695,24 @@ export function wireBridge({
 
     const { chat, otherId, profile } = resolveDialogContact(mapping.maxChatId);
     const count = chat?.participants ? Object.keys(chat.participants).length : undefined;
-    await sendContactInfoCard(bot, targetGroupId, topicId, chat?.title || mapping.title || 'Чат', chat?.type, count, otherId, profile);
+    // For a group/channel, list the participants by name (fetch any uncached in one batch).
+    let participantNames: string[] | undefined;
+    if (chat?.participants && chat.type !== 'DIALOG') {
+      const ids = Object.keys(chat.participants).map(Number).filter((id) => !Number.isNaN(id));
+      const uncached = ids.filter((id) => !getContactProfiles().has(id));
+      if (uncached.length > 0) {
+        try {
+          for (const c of await max.getContactInfo(uncached)) {
+            const cid = Number((c as { id?: unknown }).id);
+            if (!Number.isNaN(cid)) getContactProfiles().set(cid, c);
+          }
+        } catch (err) {
+          logger.error('Failed to fetch participant profiles for /info', err);
+        }
+      }
+      participantNames = ids.slice(0, 50).map((id) => resolveContactDisplayName(id, getContactProfiles().get(id)));
+    }
+    await sendContactInfoCard(bot, targetGroupId, topicId, chat?.title || mapping.title || 'Чат', chat?.type, count, otherId, profile, participantNames);
   });
 
   /** Formats a poll's current tally — MAX sends no push for votes, so callers always pull it live via CHAT_HISTORY first. */
