@@ -943,8 +943,8 @@ export function wireBridge({
       // user. Logged in case it turns out to be conditional (e.g. group chats,
       // a different client version) — CHAT_UPDATE below is what's actually wired up.
       logger.info(`${formatOpcode(event.opcode)} payload:`, jsonStringify(event.payload));
-    } else {
-      logger.info(`[dbg] unhandled opcode ${formatOpcode(event.opcode)}`);
+    } else if (event.opcode !== OPCODES.PING) {
+      logger.info(`[dbg] unhandled opcode ${formatOpcode(event.opcode)} ${jsonStringify(event.payload)}`);
     }
   });
 
@@ -959,7 +959,7 @@ export function wireBridge({
   async function handleMaxChatUpdate(payload: unknown): Promise<void> {
     const chat = (payload as { chat?: { id?: unknown; status?: string; lastReactedMessageId?: unknown; lastReaction?: string } } | null)?.chat;
     if (!chat || chat.id == null) return;
-    if (!chat.lastReaction) logger.info(`[dbg] CHAT_UPDATE id=${String(chat.id)} status=${String(chat.status)}`);
+    if (!chat.lastReaction) logger.info('[dbg] CHAT_UPDATE:', jsonStringify(chat));
 
     // Chat/dialog deletion: a CHAT_UPDATE (0x0087) whose chat.status === "CLOSED" (a live
     // chat is "ACTIVE"; owner/participants are also zeroed out). Mirror it — delete the
@@ -1183,6 +1183,8 @@ export function wireBridge({
 
     let text = message.text;
     let attaches = Array.isArray(message.attaches) ? message.attaches : [];
+    const dbgCtrl = (attaches as Array<{ _type?: string }>).find((a) => a?._type === 'CONTROL');
+    if (dbgCtrl) logger.info(`[dbg] PUSH CONTROL chat=${String(chatId)} status=${String((message as { status?: string }).status)} ${jsonStringify(dbgCtrl)}`);
     // Attachments in a forward were uploaded against the ORIGINAL message/chat, not the
     // wrapper — FILE_DOWNLOAD/VIDEO_PLAY need those ids, not the wrapper's own.
     let downloadChatId: unknown = chatId;
