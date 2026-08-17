@@ -316,12 +316,19 @@ async function sendAttachments(
   topicId: number,
   attaches: MaxAttachment[],
   downloadCtx: DownloadContext,
+  replyParameters?: { message_id: number; allow_sending_without_reply: boolean },
 ): Promise<number | undefined> {
   let firstMessageId: number | undefined;
   for (const att of attaches) {
     let sent;
+    // Native reply (reply_parameters) applies only to the FIRST message this MAX message
+    // produces — subsequent attaches follow it normally.
+    const opts =
+      firstMessageId === undefined && replyParameters
+        ? { message_thread_id: topicId, reply_parameters: replyParameters }
+        : { message_thread_id: topicId };
     if (att._type === 'LOCATION' && att.latitude != null && att.longitude != null) {
-      sent = await bot.telegram.sendLocation(groupId, att.latitude, att.longitude, { message_thread_id: topicId });
+      sent = await bot.telegram.sendLocation(groupId, att.latitude, att.longitude, opts);
       firstMessageId ??= sent.message_id;
       continue;
     }
@@ -346,8 +353,8 @@ async function sendAttachments(
       }
       sent =
         phone != null
-          ? await bot.telegram.sendContact(groupId, `+${String(phone)}`, displayName, { message_thread_id: topicId })
-          : await bot.telegram.sendMessage(groupId, `👤 Контакт: ${displayName}`, { message_thread_id: topicId });
+          ? await bot.telegram.sendContact(groupId, `+${String(phone)}`, displayName, opts)
+          : await bot.telegram.sendMessage(groupId, `👤 Контакт: ${displayName}`, opts);
       firstMessageId ??= sent.message_id;
       continue;
     }
@@ -361,41 +368,41 @@ async function sendAttachments(
     }
     const downloaded = await downloadMaxAttachment(att, downloadCtx);
     if (!downloaded) {
-      sent = await bot.telegram.sendMessage(groupId, describeAttachment(att), { message_thread_id: topicId });
+      sent = await bot.telegram.sendMessage(groupId, describeAttachment(att), opts);
     } else {
       const source = { source: downloaded.buffer, filename: downloaded.filename };
       if (downloaded.kind === 'photo') {
-        sent = await bot.telegram.sendPhoto(groupId, source, { message_thread_id: topicId });
+        sent = await bot.telegram.sendPhoto(groupId, source, opts);
       } else if (downloaded.kind === 'video') {
-        sent = await bot.telegram.sendVideo(groupId, source, { message_thread_id: topicId });
+        sent = await bot.telegram.sendVideo(groupId, source, opts);
       } else if (downloaded.kind === 'video_note') {
         try {
           // sendVideoNote is the only way Telegram renders the round "circle" bubble —
           // sendVideo would show the same file as a regular rectangular player instead.
-          sent = await bot.telegram.sendVideoNote(groupId, source, { message_thread_id: topicId });
+          sent = await bot.telegram.sendVideoNote(groupId, source, opts);
         } catch (err) {
           logger.error('sendVideoNote failed, falling back to sendVideo', err);
-          sent = await bot.telegram.sendVideo(groupId, source, { message_thread_id: topicId });
+          sent = await bot.telegram.sendVideo(groupId, source, opts);
         }
       } else if (downloaded.kind === 'voice') {
         try {
           // Telegram's voice bubble is picky about codec (wants OGG/OPUS) — MAX's actual
           // encoding is unconfirmed, so fall back to a regular playable audio file rather
           // than losing the message if sendVoice rejects the format.
-          sent = await bot.telegram.sendVoice(groupId, source, { message_thread_id: topicId });
+          sent = await bot.telegram.sendVoice(groupId, source, opts);
         } catch (err) {
           logger.error('sendVoice failed, falling back to sendAudio', err);
-          sent = await bot.telegram.sendAudio(groupId, source, { message_thread_id: topicId });
+          sent = await bot.telegram.sendAudio(groupId, source, opts);
         }
       } else if (downloaded.kind === 'sticker') {
         try {
-          sent = await bot.telegram.sendSticker(groupId, source, { message_thread_id: topicId });
+          sent = await bot.telegram.sendSticker(groupId, source, opts);
         } catch (err) {
           logger.error('sendSticker failed, falling back to sendDocument', err);
-          sent = await bot.telegram.sendDocument(groupId, source, { message_thread_id: topicId });
+          sent = await bot.telegram.sendDocument(groupId, source, opts);
         }
       } else {
-        sent = await bot.telegram.sendDocument(groupId, source, { message_thread_id: topicId });
+        sent = await bot.telegram.sendDocument(groupId, source, opts);
       }
     }
     firstMessageId ??= sent.message_id;
@@ -1210,17 +1217,24 @@ export function wireBridge({
       text = original?.text ? `${prefix}\n${original.text}` : prefix;
     }
 
-    // A reply we RECEIVE: link.type==='REPLY', with link.message the FULL quoted message
+    // A reply we RECEIVE: link.type==='REPLY', link.message is the FULL quoted message
     // (its id is link.message.id — the incoming shape carries `message`, unlike the
-    // OUTGOING reply which carries `messageId`). Unlike FORWARD, the wrapper keeps its
-    // own text/attaches — link.message is just what it replies to. We prefix a short
-    // quote so the reply is visible. (Native Telegram reply_parameters would be nicer
-    // but needs threading through every send path — a later refinement.)
+    // OUTGOING reply which carries `messageId`). Prefer a NATIVE Telegram reply (a jump
+    // to the original) by resolving the quoted MAX message to its Telegram id via the
+    // link store; fall back to a text-quote prefix only when it isn't there (the store is
+    // in-memory, lost on restart / bounded to the last 500).
+    let replyParameters: { message_id: number; allow_sending_without_reply: boolean } | undefined;
     if (message.link?.type === 'REPLY') {
-      const quotedText = typeof message.link.message?.text === 'string' ? message.link.message.text : '';
-      const snippet = quotedText ? `«${quotedText.slice(0, 80)}${quotedText.length > 80 ? '…' : ''}»` : 'сообщение';
-      const prefix = `↩️ В ответ на ${snippet}:`;
-      text = text ? `${prefix}\n${text}` : prefix;
+      const quotedId = message.link.message?.id;
+      const linked = quotedId != null ? messageLinks.getByMax(chatId, quotedId) : undefined;
+      if (linked) {
+        replyParameters = { message_id: linked.telegramMessageId, allow_sending_without_reply: true };
+      } else {
+        const quotedText = typeof message.link.message?.text === 'string' ? message.link.message.text : '';
+        const snippet = quotedText ? `«${quotedText.slice(0, 80)}${quotedText.length > 80 ? '…' : ''}»` : 'сообщение';
+        const prefix = `↩️ В ответ на ${snippet}:`;
+        text = text ? `${prefix}\n${text}` : prefix;
+      }
     }
 
     // Edits AND deletions both arrive as a repeat PUSH_MESSAGE carrying the SAME
@@ -1322,7 +1336,13 @@ export function wireBridge({
         }
         let textMessageId: number | undefined;
         let attachMessageId: number | undefined;
-        if (text) textMessageId = (await bot.telegram.sendMessage(targetGroupId, text, { message_thread_id: topicId })).message_id;
+        if (text)
+          textMessageId = (
+            await bot.telegram.sendMessage(targetGroupId, text, {
+              message_thread_id: topicId,
+              ...(replyParameters ? { reply_parameters: replyParameters } : {}),
+            })
+          ).message_id;
         if (attaches.length > 0) {
           // NOT `telegramMessageId ??= await sendAttachments(...)` — `??=` short-circuits
           // and never even CALLS sendAttachments when telegramMessageId is already set,
@@ -1332,7 +1352,9 @@ export function wireBridge({
           // 2026-08-13 after the catch-up path — which calls sendAttachments
           // unconditionally — kept delivering the same messages fine).
           const downloadCtx: DownloadContext = { max, chatId: downloadChatId, messageId: downloadMessageId };
-          attachMessageId = await sendAttachments(bot, targetGroupId, topicId, attaches, downloadCtx);
+          // The reply goes on the text message when there is one; only a media-only reply
+          // threads reply_parameters into the first attachment.
+          attachMessageId = await sendAttachments(bot, targetGroupId, topicId, attaches, downloadCtx, text ? undefined : replyParameters);
         }
         // A forward with both text AND an attachment sends TWO separate Telegram
         // messages from one MAX message — track both so a later deletion removes both
