@@ -208,6 +208,19 @@ function patchCachedChatLastMessage(chatId: unknown, lastMessage: unknown): void
   if (chat) (chat as { lastMessage: unknown }).lastMessage = lastMessage;
 }
 
+/** Adds or replaces a chat in the cached snapshot from a live full CHAT_UPDATE — so a
+ * freshly-created group/dialog (not in the last CHATS_LIST) is immediately nameable and
+ * visible in /info, instead of falling back to "MAX chat <id>". */
+function upsertCachedChat(chat: unknown): void {
+  if (!chat || typeof chat !== 'object') return;
+  const id = (chat as { id?: unknown }).id;
+  if (id == null) return;
+  const key = String(id);
+  const idx = cachedChats.findIndex((c) => c && typeof c === 'object' && String((c as { id?: unknown }).id) === key);
+  if (idx >= 0) cachedChats[idx] = chat;
+  else cachedChats.push(chat);
+}
+
 interface UiLogEntry {
   time: string;
   opcode: string;
@@ -390,6 +403,13 @@ async function startServer(): Promise<void> {
     if (event.opcode === OPCODES.PUSH_MESSAGE || (event.opcode === OPCODES.MSG_SEND && event.dir === 0x01)) {
       const p = event.payload as { chatId?: number; message?: unknown } | null;
       if (p?.chatId != null && p.message) patchCachedChatLastMessage(p.chatId, p.message);
+    } else if (event.opcode === OPCODES.CHAT_UPDATE) {
+      // A full chat snapshot (creation/rename/members) carries participants; a
+      // reaction-only CHAT_UPDATE doesn't. Upsert only the full ones — so a freshly
+      // created chat lands in the cache (nameable + visible in /info) without a resync,
+      // and a reaction update doesn't clobber a full cached chat with a partial one.
+      const chat = (event.payload as { chat?: { participants?: unknown } } | null)?.chat;
+      if (chat && chat.participants != null) upsertCachedChat(chat);
     }
   });
 
