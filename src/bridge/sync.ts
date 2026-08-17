@@ -351,6 +351,13 @@ async function sendAttachments(
       firstMessageId ??= sent.message_id;
       continue;
     }
+    // Chat-lifecycle CONTROL events with no useful rendering (notably `system`, which
+    // MAX sends when a chat is deleted/cleared) shouldn't be relayed as a
+    // "[системное событие: system]" junk message. The meaningful ones (new/join/leave/
+    // title) still fall through and render normally.
+    if (att._type === 'CONTROL' && !['new', 'join', 'leave', 'title'].includes(String(att.event))) {
+      continue;
+    }
     const downloaded = await downloadMaxAttachment(att, downloadCtx);
     if (!downloaded) {
       sent = await bot.telegram.sendMessage(groupId, describeAttachment(att), { message_thread_id: topicId });
