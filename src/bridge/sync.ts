@@ -5,7 +5,7 @@ import { Markup, type Telegraf } from 'telegraf';
 import type { ChatAction, TelegramEmoji } from 'telegraf/types';
 import type { MaxClient, MaxMessageEvent, MaxHistoryMessage } from '../max/client.js';
 import { OPCODES, formatOpcode } from '../max/opcodes.js';
-import { resolveContactDisplayName, type ContactProfile } from '../max/names.js';
+import { resolveContactDisplayName, resolveChatName, type ContactProfile } from '../max/names.js';
 import type { ChatMapStore } from '../store/chatMapStore.js';
 import { ensureTopicForMaxChat } from '../telegram/bot.js';
 import { downloadMaxAttachment, describeAttachment, type MaxAttachment, type DownloadContext } from './attachments.js';
@@ -943,8 +943,6 @@ export function wireBridge({
       // user. Logged in case it turns out to be conditional (e.g. group chats,
       // a different client version) — CHAT_UPDATE below is what's actually wired up.
       logger.info(`${formatOpcode(event.opcode)} payload:`, jsonStringify(event.payload));
-    } else if (event.opcode !== OPCODES.PING) {
-      logger.info(`[dbg] unhandled opcode ${formatOpcode(event.opcode)} ${jsonStringify(event.payload)}`);
     }
   });
 
@@ -957,29 +955,28 @@ export function wireBridge({
    * appearing on unrelated resyncs (hence the dedup above).
    */
   async function handleMaxChatUpdate(payload: unknown): Promise<void> {
-    const chat = (payload as { chat?: { id?: unknown; status?: string; lastReactedMessageId?: unknown; lastReaction?: string } } | null)?.chat;
+    const rawChat = (payload as { chat?: unknown } | null)?.chat;
+    const chat = rawChat as { id?: unknown; lastReactedMessageId?: unknown; lastReaction?: string } | undefined;
     if (!chat || chat.id == null) return;
-    if (!chat.lastReaction) logger.info('[dbg] CHAT_UPDATE:', jsonStringify(chat));
 
-    // Chat/dialog deletion: a CHAT_UPDATE (0x0087) whose chat.status === "CLOSED" (a live
-    // chat is "ACTIVE"; owner/participants are also zeroed out). Mirror it — delete the
-    // Telegram topic and drop the mapping. The chatId is inside chat.id (NOT top-level).
-    // Confirmed live 2026-08-17. (Distinct from the CONTROL attach event:"system", which
-    // is a history-clear/other system event, not a deletion.)
-    if (chat.status === 'CLOSED') {
+    // Not a reaction update → a chat state change (creation/rename/members). If we have a
+    // topic for it and this event's full chat object (which carries title/participants)
+    // resolves to a real name, rename the topic — fixes freshly-created groups/dialogs
+    // that got the "MAX chat <id>" fallback because the chat wasn't yet in cachedChats
+    // when their topic was created (the CONTROL 'new' push creates the topic first).
+    if (chat.lastReactedMessageId == null || !chat.lastReaction) {
       const mapping = await chatMapStore.getByMaxChatId(chat.id);
-      if (mapping) {
-        await bot.telegram
-          .deleteForumTopic(targetGroupId, mapping.telegramTopicId)
-          .catch((err) => logger.error('Failed to delete Telegram topic on MAX chat deletion', err));
-        await chatMapStore.remove(chat.id);
-        logger.info(`MAX chat ${String(chat.id)} deleted (status CLOSED) — removed Telegram topic ${mapping.telegramTopicId}`);
-      }
+      if (!mapping) return;
+      const name = resolveChatName(rawChat, getMyAccountId(), getContactProfiles());
+      if (!name || name === mapping.title || /^(CHAT|DIALOG|Chat|MAX chat|MAX ID) /i.test(name)) return;
+      await bot.telegram
+        .editForumTopic(targetGroupId, mapping.telegramTopicId, { name: name.slice(0, 128) })
+        .catch((err) => logger.error('Failed to rename topic on chat update', err));
+      await chatMapStore.upsert({ ...mapping, title: name });
+      logger.info(`Renamed topic ${mapping.telegramTopicId} for MAX chat ${String(chat.id)} -> "${name}"`);
       return;
     }
 
-    // Reaction adds (see comment above): piggyback on the "chat updated" push.
-    if (chat.lastReactedMessageId == null || !chat.lastReaction) return;
     const link = messageLinks.getByMax(chat.id, chat.lastReactedMessageId);
     if (!link) return;
 
@@ -1183,8 +1180,25 @@ export function wireBridge({
 
     let text = message.text;
     let attaches = Array.isArray(message.attaches) ? message.attaches : [];
-    const dbgCtrl = (attaches as Array<{ _type?: string }>).find((a) => a?._type === 'CONTROL');
-    if (dbgCtrl) logger.info(`[dbg] PUSH CONTROL chat=${String(chatId)} status=${String((message as { status?: string }).status)} ${jsonStringify(dbgCtrl)}`);
+    // Chat deletion: MAX signals it as a PUSH_MESSAGE carrying a CONTROL attach with
+    // event:"system" and message "Чат закрыт" (confirmed live 2026-08-17 — NOT a
+    // CHAT_UPDATE status:CLOSED as first assumed). Mirror it: delete the Telegram topic
+    // and drop the mapping. Other "system" events (e.g. a history clear) carry different
+    // text and fall through to the relay-skip in sendAttachments.
+    const controlAttach = (attaches as Array<{ _type?: string; event?: string; message?: string; shortMessage?: string }>).find(
+      (a) => a?._type === 'CONTROL',
+    );
+    if (controlAttach?.event === 'system' && /закрыт/i.test(String(controlAttach.message ?? controlAttach.shortMessage ?? ''))) {
+      const mapping = await chatMapStore.getByMaxChatId(chatId);
+      if (mapping) {
+        await bot.telegram
+          .deleteForumTopic(targetGroupId, mapping.telegramTopicId)
+          .catch((err) => logger.error('Failed to delete Telegram topic on MAX chat deletion', err));
+        await chatMapStore.remove(chatId);
+        logger.info(`MAX chat ${String(chatId)} deleted ("Чат закрыт") — removed Telegram topic ${mapping.telegramTopicId}`);
+      }
+      return;
+    }
     // Attachments in a forward were uploaded against the ORIGINAL message/chat, not the
     // wrapper — FILE_DOWNLOAD/VIDEO_PLAY need those ids, not the wrapper's own.
     let downloadChatId: unknown = chatId;
