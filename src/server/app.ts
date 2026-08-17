@@ -142,6 +142,7 @@ async function completeMaxLogin(loginToken: string): Promise<void> {
   await sessionStore.save(session);
   currentSession = session;
   activePhone = session.phone;
+  notifyMaxSessionRestored();
   broadcastStatus();
   refreshBotDescription();
 }
@@ -289,6 +290,18 @@ async function loadOrCreatePanelCert(): Promise<{ key: Buffer; cert: Buffer } | 
   }
 }
 
+// Set once we've told the group the MAX session was lost, so a "restored" notice only
+// fires after an actual loss — and only once.
+let maxSessionLostReported = false;
+
+/** After a reported session loss, tells the group it's back — on resume or re-auth. */
+function notifyMaxSessionRestored(): void {
+  if (!maxSessionLostReported) return;
+  maxSessionLostReported = false;
+  resetErrorKey('max-session-lost');
+  reportBridgeError('max-session-ok', '✅ MAX-авторизация восстановлена.');
+}
+
 async function loginWithSession(session: MaxSession): Promise<void> {
   try {
     const { payload } = await max.login(session.sessionToken);
@@ -296,6 +309,7 @@ async function loginWithSession(session: MaxSession): Promise<void> {
     activePhone = session.phone;
     currentSession = session;
     logger.info(`Resumed session for ${session.phone}`);
+    notifyMaxSessionRestored();
     await refreshChatsAndNames();
     void syncChatsIfPossible();
   } catch (err) {
@@ -303,6 +317,14 @@ async function loginWithSession(session: MaxSession): Promise<void> {
     currentSession = null;
     activePhone = '';
     await sessionStore.clear();
+    // The socket is still up (no `disconnected` event fired), so the max-down alarm
+    // never triggers for a session rejection — but the bridge is functionally dead
+    // until someone re-authenticates. Tell the group explicitly (throttled).
+    reportBridgeError(
+      'max-session-lost',
+      '❌ MAX-сессия отклонена — нужна повторная авторизация (номер + код из SMS) через веб-панель (ссылка: команда /apikey). Пока переписка не пересылается.',
+    );
+    maxSessionLostReported = true;
   }
   broadcastStatus();
   refreshBotDescription();
