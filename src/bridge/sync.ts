@@ -1511,11 +1511,29 @@ export function wireBridge({
   // --- Control panel (src/bridge/panel.ts): a pinned inline-button menu in the group's
   // General topic. The reused leaves (help/version/apikey/link/ban/unban) delegate to
   // the same logic the slash commands use; startDialog creates a MAX dialog + its topic.
-  const startDialog = async (recipientUserId: string, name: string): Promise<{ ok: boolean; error?: string; topicName: string }> => {
+  const startDialog = async (
+    recipientUserId: string,
+    name: string,
+  ): Promise<{ ok: boolean; error?: string; topicName: string; chatLink?: string; existed?: boolean }> => {
     try {
-      const { chatId } = await max.createDialog(recipientUserId);
-      await ensureTopicForMaxChat(bot, targetGroupId, chatId, chatMapStore, name);
-      return { ok: true, topicName: name };
+      // Reuse an existing 1:1 dialog with this contact instead of creating a duplicate —
+      // MAX happily makes a second dialog for the same pair otherwise. A dialog is the
+      // chat whose participants are exactly {me, contact}.
+      const myId = String(getMyAccountId());
+      const target = String(recipientUserId);
+      const existing = getChats().find((c) => {
+        const parts = (c as { participants?: Record<string, unknown> } | null)?.participants;
+        if (!parts) return false;
+        const keys = Object.keys(parts);
+        return keys.length === 2 && keys.includes(target) && keys.includes(myId);
+      });
+      const existed = existing != null;
+      const chatId = existed ? (existing as { id?: unknown }).id : (await max.createDialog(recipientUserId)).chatId;
+      const { topicId } = await ensureTopicForMaxChat(bot, targetGroupId, chatId, chatMapStore, name);
+      // Deep link that opens the topic in the user's Telegram (private supergroup form:
+      // strip the -100 prefix). The bot can't force-switch the client, but this is one tap.
+      const chatLink = `https://t.me/c/${targetGroupId.replace(/^-100/, '')}/${topicId}`;
+      return { ok: true, topicName: name, chatLink, existed };
     } catch (err) {
       logger.error('Panel startDialog failed', err);
       return { ok: false, error: (err as Error).message, topicName: name };

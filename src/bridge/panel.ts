@@ -25,8 +25,11 @@ export interface ControlPanelDeps {
     sendBanList: LeafSender;
     sendUnbanList: LeafSender;
   };
-  /** Creates a MAX dialog with the contact and its Telegram topic (createDialog + ensureTopic + title). */
-  startDialog: (recipientUserId: string, name: string) => Promise<{ ok: boolean; error?: string; topicName: string }>;
+  /** Reuses or creates a MAX dialog with the contact and its Telegram topic; returns a deep link to open it. */
+  startDialog: (
+    recipientUserId: string,
+    name: string,
+  ) => Promise<{ ok: boolean; error?: string; topicName: string; chatLink?: string; existed?: boolean }>;
 }
 
 // The panel message id is remembered in ./data so the same pinned message is edited
@@ -354,10 +357,18 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
     const uid = ctx.match?.[1];
     if (!uid) return;
     const name = shownContacts.get(uid)?.name ?? `MAX ${uid}`;
-    await ctx.answerCbQuery('Создаю чат…');
-    const res = await startDialog(uid, name).catch((err) => ({ ok: false, error: (err as Error).message, topicName: name }));
+    await ctx.answerCbQuery('Открываю чат…');
+    const res = await startDialog(uid, name).catch((err) => ({
+      ok: false,
+      error: (err as Error).message,
+      topicName: name,
+      chatLink: undefined as string | undefined,
+      existed: false,
+    }));
     if (res.ok) {
-      await ctx.editMessageText(`✅ Чат с «${res.topicName}» создан — пишите в его теме.`).catch(() => {});
+      const verb = res.existed ? 'уже был — открыл' : 'создан';
+      const markup = res.chatLink ? Markup.inlineKeyboard([Markup.button.url('➡️ Открыть чат', res.chatLink)]).reply_markup : undefined;
+      await ctx.editMessageText(`✅ Чат с «${res.topicName}» ${verb}.`, markup ? { reply_markup: markup } : {}).catch(() => {});
     } else {
       await ctx.editMessageText(`❌ Не удалось создать чат: ${res.error ?? 'ошибка'}`).catch(() => {});
     }
