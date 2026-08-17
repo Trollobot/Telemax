@@ -431,11 +431,16 @@ export class MaxClient extends EventEmitter {
     chatId: unknown,
     text: string | null,
     attaches: unknown[] = [],
+    replyTo?: { messageId: unknown; chatId: unknown },
   ): Promise<{ cid: number; messageId: unknown; attaches: unknown[] }> {
     const cid = Date.now();
+    // Outgoing reply link shape is {type, messageId, chatId} — note this differs from
+    // the INCOMING reply link ({type, message, chatId}); MAX uses two shapes (confirmed
+    // 2026-08-16). messageId is the quoted MAX message's id (BigInt from the link store).
+    const link = replyTo ? { type: 'REPLY', messageId: replyTo.messageId, chatId: toChatId(replyTo.chatId) } : null;
     const { dir, payload } = await this.request(OPCODES.MSG_SEND, {
       chatId: toChatId(chatId),
-      message: { text, cid: BigInt(cid), elements: [], attaches, link: null },
+      message: { text, cid: BigInt(cid), elements: [], attaches, link },
       notify: true,
     });
     const responseMessage = (payload as { message?: { id?: unknown; attaches?: unknown[] } } | null)?.message;
@@ -524,6 +529,87 @@ export class MaxClient extends EventEmitter {
     if (p && Array.isArray(p.contacts)) return p.contacts;
     if (p && Array.isArray(p.profiles)) return p.profiles;
     return [];
+  }
+
+  /**
+   * Finds a contact by phone number (CONTACT_INFO_BY_PHONE, 0x002E). The field is
+   * `phone` (NOT phoneNumber — the server rejects that with "Field requirement failed:
+   * phone"); the leading `+` is optional. Response `{contact}` — a single contact, or
+   * null if none. Shapes from the user's live reverse engineering (2026-08-16);
+   * response wrapper unconfirmed beyond `contact`, so try the plausible keys.
+   */
+  async searchContactByPhone(phone: string): Promise<MaxContactInfo | null> {
+    const { dir, payload } = await this.request(OPCODES.CONTACT_INFO_BY_PHONE, { phone });
+    if (dir === DIR.ERR) {
+      // "not found" comes back as an ERROR frame ({error:"not.found"}), not an empty
+      // result — for us that just means the number isn't a MAX user, so return null.
+      // Any OTHER error is real and propagates. (Contrast CONTACT_SEARCH, which returns
+      // an empty list without erroring.)
+      const err = (payload as { error?: string } | null)?.error;
+      if (err === 'not.found') return null;
+      throw new Error(describeAuthError(payload, 'CONTACT_INFO_BY_PHONE failed'));
+    }
+    // On success the payload is always a single-key map `{contact: {...}}`.
+    return (payload as { contact?: MaxContactInfo } | null)?.contact ?? null;
+  }
+
+  /**
+   * Searches the account's LOCAL address book by name/nickname (CONTACT_SEARCH, 0x0025;
+   * field is `count`, not limit). Response: `{result: [{contact, presence?, …}], total}`
+   * — the contact is nested under `.contact`. NOTE: this only sees the local address
+   * book, so an empty book returns total:0 even for an existing user — for a global
+   * name search use publicSearch(). Shapes from the user (2026-08-16).
+   */
+  async searchContactByName(query: string, count = 10): Promise<MaxContactInfo[]> {
+    const { dir, payload } = await this.request(OPCODES.CONTACT_SEARCH, { query, count });
+    if (dir === DIR.ERR) throw new Error(describeAuthError(payload, 'CONTACT_SEARCH failed'));
+    const p = payload as { result?: Array<{ contact?: MaxContactInfo }> } | null;
+    return (p?.result ?? []).map((r) => r.contact).filter((c): c is MaxContactInfo => c != null);
+  }
+
+  /**
+   * Global directory search by name/nickname (PUBLIC_SEARCH, 0x003C) — unlike
+   * CONTACT_SEARCH (local address book only), this hits the whole MAX catalog, so it's
+   * what "find contact by name" should use. Request/response shape UNCONFIRMED — assumed
+   * to mirror CONTACT_SEARCH (`{result: [{contact}], total}`); verify live. Returns the
+   * matched contacts.
+   */
+  async publicSearch(query: string, count = 10): Promise<MaxContactInfo[]> {
+    const { dir, payload } = await this.request(OPCODES.PUBLIC_SEARCH, { query, count });
+    if (dir === DIR.ERR) throw new Error(describeAuthError(payload, 'PUBLIC_SEARCH failed'));
+    const p = payload as { result?: Array<{ contact?: MaxContactInfo }>; contacts?: MaxContactInfo[] } | null;
+    if (p && Array.isArray(p.result)) return p.result.map((r) => r.contact).filter((c): c is MaxContactInfo => c != null);
+    if (p && Array.isArray(p.contacts)) return p.contacts;
+    return [];
+  }
+
+  /**
+   * Opens a new 1:1 dialog with a contact. MAX has no "create dialog" opcode — like
+   * createGroup it's a MSG_SEND (0x40) with NO top-level chatId, carrying a CONTROL
+   * attach; the only difference from a group is `chatType: 'DIALOG'` and the recipient
+   * in `userIds` (there is NO recipientId/peerId field — confirmed live 2026-08-16,
+   * the server rejects those with "Illegal control message to start new chat"). The
+   * text is empty: the dialog is created by the control event, and the first real
+   * message is sent afterwards to the returned chatId via a normal sendMessage.
+   * notify:false so merely creating it doesn't ping the recipient. The new dialog's id
+   * is NEGATIVE (e.g. -77903811502699) — fine for the BigInt chat-id pipeline. chatId
+   * comes back both top-level (`chatId`) and on `chat.id`. Shape from the user's
+   * reverse engineering (2026-08-16).
+   */
+  async createDialog(recipientUserId: unknown): Promise<{ chatId: unknown }> {
+    const { dir, payload } = await this.request(OPCODES.MSG_SEND, {
+      message: {
+        text: '',
+        cid: BigInt(Date.now()),
+        attaches: [{ _type: 'CONTROL', event: 'new', chatType: 'DIALOG', userIds: [Number(recipientUserId)] }],
+      },
+      notify: false,
+    });
+    if (dir === DIR.ERR) throw new Error(describeAuthError(payload, 'Dialog creation failed'));
+    const p = payload as { chatId?: unknown; chat?: { id?: unknown } } | null;
+    const chatId = p?.chatId ?? p?.chat?.id ?? null;
+    if (chatId == null) throw new Error('Dialog creation did not return a chat id');
+    return { chatId };
   }
 
   /**

@@ -18,6 +18,14 @@ export const OPCODES = {
   // but burns on success — a fresh SMS is needed for the next login attempt after that.
   CHECK_PASSWORD: 0x0073,
   CONTACT_INFO: 0x0020,
+  // Contact search — supplied by the user 2026-08-16. Search by name/nick ({query, count})
+  // and lookup by phone ({phone} — field is `phone`, not phoneNumber; `+` optional).
+  CONTACT_SEARCH: 0x0025,
+  CONTACT_INFO_BY_PHONE: 0x002e,
+  // Global directory search by name — CONTACT_SEARCH (0x0025) only hits the account's
+  // LOCAL address book (empty book => total:0 even for existing users). Supplied by the
+  // user 2026-08-16.
+  PUBLIC_SEARCH: 0x003c,
   CHAT_INFO: 0x0030,
   CHAT_HISTORY: 0x0031,
   // Not in max-protocol-full.md — supplied by the user 2026-08-10.

@@ -11,6 +11,7 @@ import { ensureTopicForMaxChat } from '../telegram/bot.js';
 import { downloadMaxAttachment, describeAttachment, type MaxAttachment, type DownloadContext } from './attachments.js';
 import { uploadTelegramAttachmentToMax } from './upload.js';
 import { reportBridgeError } from './errorReporter.js';
+import { wireControlPanel } from './panel.js';
 import { checkVersion, shortSha, type VersionStatus } from './version.js';
 import { toTelegramReaction } from '../max/reactions.js';
 import { createLogger, jsonStringify } from '../logger.js';
@@ -1181,6 +1182,19 @@ export function wireBridge({
       text = original?.text ? `${prefix}\n${original.text}` : prefix;
     }
 
+    // A reply we RECEIVE: link.type==='REPLY', with link.message the FULL quoted message
+    // (its id is link.message.id — the incoming shape carries `message`, unlike the
+    // OUTGOING reply which carries `messageId`). Unlike FORWARD, the wrapper keeps its
+    // own text/attaches — link.message is just what it replies to. We prefix a short
+    // quote so the reply is visible. (Native Telegram reply_parameters would be nicer
+    // but needs threading through every send path — a later refinement.)
+    if (message.link?.type === 'REPLY') {
+      const quotedText = typeof message.link.message?.text === 'string' ? message.link.message.text : '';
+      const snippet = quotedText ? `«${quotedText.slice(0, 80)}${quotedText.length > 80 ? '…' : ''}»` : 'сообщение';
+      const prefix = `↩️ В ответ на ${snippet}:`;
+      text = text ? `${prefix}\n${text}` : prefix;
+    }
+
     // Edits AND deletions both arrive as a repeat PUSH_MESSAGE carrying the SAME
     // message.id — not separate opcodes. Distinguished only by `status`: "EDITED"
     // vs "REMOVED" (undefined/absent means a genuinely new message). Confirmed by
@@ -1319,9 +1333,9 @@ export function wireBridge({
   }
 
   /** Full command reference + the two platform-level gaps that aren't discoverable from the UI. Doubles as the bot profile's setMyDescription text (server/app.ts), just with room to actually explain each command instead of a 512-char squeeze. */
-  bot.command('help', async (ctx) => {
+  function buildHelpText(): string {
     const phone = getActivePhone();
-    const text = `🌉 Мост MAX${phone ? ` (${phone})` : ''} ↔ Telegram
+    return `🌉 Мост MAX${phone ? ` (${phone})` : ''} ↔ Telegram
 
 Сообщения, файлы, голосовые, стикеры и опросы синхронизируются в обе стороны автоматически — команды нужны только для управления. Обычная пересылка сообщений (drag-forward) в тему тоже работает сама — прилетит в привязанный MAX-чат с пометкой «↩️ Переслано от/из...». Звонки — только текстовые уведомления (входящий звонит / завершённый / пропущенный), без передачи аудио — для этого нужен WebRTC, вне рамок Bot API-моста.
 
@@ -1350,6 +1364,7 @@ export function wireBridge({
 /unban — вернуть заглушённый чат (тема появится при следующем сообщении от него)
 
 Обслуживание бота:
+/panel — 🎛 пульт управления: меню с кнопками (найти контакт, чаты, веб-панель, пауза MAX, обновление). Он же закреплён в General.
 /apikey — показать ключ для входа в веб-панель (если потерял/не сохранил при установке)
 Первая авторизация MAX — прямо в консоли при установке (setup.sh спросит номер и код из SMS). Всё, что потом (повторная авторизация после /kill, смена номера) — через веб-панель по ссылке из /apikey.
 /version — проверить версию, обновить по кнопке (раз в сутки бот сам напомнит, если вышло обновление)
@@ -1363,7 +1378,10 @@ export function wireBridge({
 • Голоса за опрос из MAX не отражаются в виджете Telegram сами — актуальный счёт смотри через /poll.
 
 💛 Поддержать проект — /donate`;
-    await bot.telegram.sendMessage(ctx.chat.id, text, { message_thread_id: ctx.message.message_thread_id });
+  }
+
+  bot.command('help', async (ctx) => {
+    await bot.telegram.sendMessage(ctx.chat.id, buildHelpText(), { message_thread_id: ctx.message.message_thread_id });
   });
 
   bot.command('donate', async (ctx) => {
@@ -1488,6 +1506,78 @@ export function wireBridge({
     await chatMapStore.setBanned(maxChatId, false);
     await ctx.answerCbQuery('Разбанен');
     await ctx.editMessageText(`♻️ Разбанен: ${mapping?.title ?? maxChatId}. Тема вернётся при следующем сообщении от него.`).catch(() => {});
+  });
+
+  // --- Control panel (src/bridge/panel.ts): a pinned inline-button menu in the group's
+  // General topic. The reused leaves (help/version/apikey/link/ban/unban) delegate to
+  // the same logic the slash commands use; startDialog creates a MAX dialog + its topic.
+  const startDialog = async (recipientUserId: string, name: string): Promise<{ ok: boolean; error?: string; topicName: string }> => {
+    try {
+      const { chatId } = await max.createDialog(recipientUserId);
+      await ensureTopicForMaxChat(bot, targetGroupId, chatId, chatMapStore, name);
+      return { ok: true, topicName: name };
+    } catch (err) {
+      logger.error('Panel startDialog failed', err);
+      return { ok: false, error: (err as Error).message, topicName: name };
+    }
+  };
+  wireControlPanel({
+    bot,
+    targetGroupId,
+    max,
+    getActivePhone,
+    triggerFullResync,
+    startDialog,
+    leaves: {
+      sendHelp: (chatId) => bot.telegram.sendMessage(chatId, buildHelpText()).then(() => {}),
+      sendVersion: async (chatId) => {
+        const { text, replyMarkup } = formatVersionMessage(await checkVersion());
+        await bot.telegram.sendMessage(chatId, text, { reply_markup: replyMarkup });
+      },
+      sendApiKey: async (chatId) => {
+        const key = process.env.API_KEY;
+        await bot.telegram.sendMessage(chatId, key ? `🔑 Ключ веб-панели:\n<code>${key}</code>` : 'API_KEY не задан в .env.', {
+          parse_mode: 'HTML',
+          link_preview_options: { is_disabled: true },
+        });
+      },
+      sendLoginLink: async (chatId) => {
+        const apiKey = process.env.API_KEY;
+        if (!apiKey) {
+          await bot.telegram.sendMessage(chatId, 'API_KEY не задан в .env.');
+          return;
+        }
+        const port = process.env.PORT ?? '3000';
+        const ip = await detectPublicIp();
+        const scheme = getPanelScheme();
+        const certNote =
+          scheme === 'https'
+            ? '\n\n🔒 Сертификат самоподписанный — браузер предупредит один раз: «Дополнительно» → «Перейти на сайт».'
+            : '';
+        const text = ip
+          ? `🔗 Вход в веб-панель (ссылка сразу авторизует):\n${scheme}://${ip}:${port}/?key=${encodeURIComponent(apiKey)}${certNote}`
+          : `🔗 Не удалось определить IP сервера — откройте панель вручную и введите ключ (кнопка «API-ключ»).${certNote}`;
+        await bot.telegram.sendMessage(chatId, text, { parse_mode: 'HTML', link_preview_options: { is_disabled: true } });
+      },
+      sendBanList: async (chatId) => {
+        const active = (await chatMapStore.list()).filter((m) => !m.banned);
+        if (active.length === 0) {
+          await bot.telegram.sendMessage(chatId, 'Нет активных чатов для бана.');
+          return;
+        }
+        const buttons = active.slice(0, 90).map((m) => Markup.button.callback(m.title || `MAX chat ${m.maxChatId}`, `tlmx_ban:${m.maxChatId}`));
+        await bot.telegram.sendMessage(chatId, '🚫 Кого забанить?', { reply_markup: Markup.inlineKeyboard(buttons, { columns: 1 }).reply_markup });
+      },
+      sendUnbanList: async (chatId) => {
+        const banned = (await chatMapStore.list()).filter((m) => m.banned);
+        if (banned.length === 0) {
+          await bot.telegram.sendMessage(chatId, 'Забаненных чатов нет.');
+          return;
+        }
+        const buttons = banned.slice(0, 90).map((m) => Markup.button.callback(m.title || `MAX chat ${m.maxChatId}`, `tlmx_unban:${m.maxChatId}`));
+        await bot.telegram.sendMessage(chatId, '♻️ Кого разбанить?', { reply_markup: Markup.inlineKeyboard(buttons, { columns: 1 }).reply_markup });
+      },
+    },
   });
 
   /** Contact card for the person/group on the other end of this topic — name, phone, country, registration date, and (best-effort) their avatar. */
@@ -1859,6 +1949,17 @@ export function wireBridge({
     const rawCaption = (ctx.message as { caption?: string }).caption ?? '';
     const text = forwardPrefix ? (rawText ? `${forwardPrefix}\n${rawText}` : undefined) : rawText;
     const caption = forwardPrefix ? (rawCaption ? `${forwardPrefix}\n${rawCaption}` : forwardPrefix) : rawCaption;
+    // Native reply relay: a genuine reply to a mirrored message → resolve its MAX
+    // message via the link store and pass an outgoing reply link ({messageId, chatId})
+    // to MSG_SEND. In forum topics reply_to_message can point at the topic-root message
+    // with no real reply, so ignore that (id === topicId). Links are in-memory, so a
+    // reply to something from before the last restart just relays without the link.
+    const replyToMessage = (ctx.message as { reply_to_message?: { message_id: number } }).reply_to_message;
+    let replyLink: { messageId: unknown; chatId: unknown } | undefined;
+    if (replyToMessage && replyToMessage.message_id !== topicId) {
+      const linked = messageLinks.getByTelegram(replyToMessage.message_id);
+      if (linked) replyLink = { messageId: linked.maxMessageId, chatId: linked.maxChatId };
+    }
     const photo = (ctx.message as { photo?: Array<{ file_id: string }> }).photo;
     const document = (ctx.message as { document?: { file_id: string; file_name?: string } }).document;
     // GIFs — MAX only takes these as FILE. Telegram represents a forwarded GIF as `document`
@@ -1933,7 +2034,7 @@ export function wireBridge({
       }
 
       if (text) {
-        const { cid, messageId } = await max.sendMessage(mapping.maxChatId, text);
+        const { cid, messageId } = await max.sendMessage(mapping.maxChatId, text, [], replyLink);
         rememberOutgoingSend(mapping.maxChatId, cid);
         messageLinks.add({ maxChatId: mapping.maxChatId, maxMessageId: messageId, telegramMessageId: ctx.message.message_id, outgoing: true });
         return;
@@ -1973,7 +2074,7 @@ export function wireBridge({
       }
       if (!attach) return; // nothing we know how to forward
 
-      const { cid, messageId } = await max.sendMessage(mapping.maxChatId, caption, [attach]);
+      const { cid, messageId } = await max.sendMessage(mapping.maxChatId, caption, [attach], replyLink);
       rememberOutgoingSend(mapping.maxChatId, cid);
       messageLinks.add({ maxChatId: mapping.maxChatId, maxMessageId: messageId, telegramMessageId: ctx.message.message_id, outgoing: true });
     } catch (err) {

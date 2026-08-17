@@ -723,6 +723,7 @@ function refreshBotDescription(): void {
 // Populates Telegram's "/" command menu with one-line descriptions. /help (bridge/sync.ts)
 // has the full reference — these are just enough to jog the memory from the menu.
 const BOT_COMMANDS = [
+  { command: 'panel', description: '🎛 Пульт управления (меню с кнопками)' },
   { command: 'help', description: 'Полный список команд и ограничений' },
   { command: 'donate', description: 'Поддержать проект (рубли / TON)' },
   { command: 'apikey', description: 'Показать ключ для веб-панели' },
