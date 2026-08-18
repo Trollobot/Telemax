@@ -117,11 +117,34 @@ export function createBugReports(deps: BugReportsDeps): BugReports {
   async function relayTopicReply(ctx: Context): Promise<boolean> {
     if (!enabled) return false;
     if (String(ctx.chat?.id) !== targetGroupId) return false;
-    const message = ctx.message as { message_thread_id?: number; message_id?: number } | undefined;
+    const message = ctx.message as
+      | {
+          message_thread_id?: number;
+          message_id?: number;
+          forum_topic_created?: unknown;
+          forum_topic_edited?: unknown;
+          forum_topic_closed?: unknown;
+          forum_topic_reopened?: unknown;
+          pinned_message?: unknown;
+        }
+      | undefined;
     const topicId = message?.message_thread_id;
     if (topicId == null || message?.message_id == null) return false;
     const report = await store.getByTopicId(topicId);
     if (!report) return false; // not a bug-report topic — let the normal relay handle it
+    // Telegram drops forum service messages (topic created/edited/closed/reopened, pins)
+    // into the topic — the bot itself just created this one on open. They aren't the
+    // maintainer talking and copyMessage can't copy them, so consume without relaying
+    // (otherwise the copy fails and posts a spurious "не удалось доставить" warning).
+    if (
+      message.forum_topic_created ||
+      message.forum_topic_edited ||
+      message.forum_topic_closed ||
+      message.forum_topic_reopened ||
+      message.pinned_message
+    ) {
+      return true;
+    }
     try {
       await bot.telegram.copyMessage(report.reporterChatId, targetGroupId, message.message_id);
     } catch (err) {
