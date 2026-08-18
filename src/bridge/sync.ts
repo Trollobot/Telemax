@@ -1617,10 +1617,32 @@ export function wireBridge({
       });
       const existed = existing != null;
       const chatId = existed ? (existing as { id?: unknown }).id : (await max.createDialog(recipientUserId)).chatId;
-      const { topicId } = await ensureTopicForMaxChat(bot, targetGroupId, chatId, chatMapStore, name);
+      const { topicId, created } = await ensureTopicForMaxChat(bot, targetGroupId, chatId, chatMapStore, name);
+      let finalTopicId = topicId;
+      // A reused mapping can point to a topic the operator deleted in Telegram. The relay
+      // path self-heals on the next message (the isThreadNotFound catch in deliverToTopic),
+      // but startDialog only builds a deep link and never writes to the topic — so without
+      // this it hands back a dead link and never recreates (reported live 2026-08-18: find
+      // contact -> start chat -> delete the topic in TG -> find again -> "Открыть чат" led
+      // nowhere). Probe with a no-op rename: topic alive -> harmless; gone -> recreate it
+      // (with its contact-info card up top, exactly like restoreDeletedTopic).
+      if (!created) {
+        try {
+          await bot.telegram.editForumTopic(targetGroupId, topicId, { name });
+        } catch (err) {
+          if (isThreadNotFound(err)) {
+            finalTopicId = await recreateTopicForChat(bot, targetGroupId, chatId, chatMapStore);
+            await sendAutoInfoCard(chatId, undefined, finalTopicId).catch((e) =>
+              logger.error('Failed to send contact-info card on startDialog topic recreate', e),
+            );
+          }
+          // Any other error (e.g. Telegram "topic not modified" when the name is unchanged)
+          // just means the topic is alive — keep the existing id.
+        }
+      }
       // Deep link that opens the topic in the user's Telegram (private supergroup form:
       // strip the -100 prefix). The bot can't force-switch the client, but this is one tap.
-      const chatLink = `https://t.me/c/${targetGroupId.replace(/^-100/, '')}/${topicId}`;
+      const chatLink = `https://t.me/c/${targetGroupId.replace(/^-100/, '')}/${finalTopicId}`;
       return { ok: true, topicName: name, chatLink, existed };
     } catch (err) {
       logger.error('Panel startDialog failed', err);
