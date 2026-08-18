@@ -13,6 +13,7 @@ import { uploadTelegramAttachmentToMax } from './upload.js';
 import { reportBridgeError } from './errorReporter.js';
 import { wireControlPanel } from './panel.js';
 import { createBugReports, BUGREPORT_BOT_HANDLE, type BugReports } from './bugReports.js';
+import { createTelemetry } from './telemetry.js';
 import { checkVersion, shortSha, type VersionStatus } from './version.js';
 import { toTelegramReaction } from '../max/reactions.js';
 import { createLogger, jsonStringify } from '../logger.js';
@@ -934,12 +935,18 @@ export function wireBridge({
   const VERSION_CHECK_MAX_MS = 28 * 60 * 60 * 1000;
   scheduleVersionCheck();
 
+  // Anonymous install counter (opt out with TELEMETRY=off). Pinged once shortly after boot so
+  // a fresh install registers without waiting up to a day, then on every version-check tick.
+  const telemetry = createTelemetry();
+  setTimeout(() => void telemetry.ping(), 60_000);
+
   function scheduleVersionCheck(): void {
     const delay = VERSION_CHECK_MIN_MS + Math.random() * (VERSION_CHECK_MAX_MS - VERSION_CHECK_MIN_MS);
     setTimeout(() => void runScheduledVersionCheck().finally(scheduleVersionCheck), delay);
   }
 
   async function runScheduledVersionCheck(): Promise<void> {
+    void telemetry.ping();
     const status = await checkVersion();
     if (!status.updateAvailable) return;
     const { text, replyMarkup } = formatVersionMessage(status);

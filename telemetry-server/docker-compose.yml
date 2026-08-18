@@ -1,0 +1,13 @@
+# Maintainer-only install counter — NOT part of a normal Telemax deployment.
+# Deploy on the monitoring host (the DDNS points here):
+#   cd telemetry-server && echo "STATS_KEY=<random>" > .env && docker compose up -d --build
+services:
+  telemetry:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "3100:3100"
+    env_file:
+      - .env
+    volumes:
+      - ./data:/data
