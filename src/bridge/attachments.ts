@@ -89,6 +89,11 @@ export interface DownloadContext {
   max: MaxClient;
   chatId: unknown;
   messageId: unknown;
+  // For a forward whose source chat we can't access (link.chatId comes back as 0), the file
+  // is still reachable via the chat the forward LANDED in — our dialog with the forwarder.
+  // FILE_DOWNLOAD/VIDEO_PLAY retry with these when the primary (source) ids are denied.
+  fallbackChatId?: unknown;
+  fallbackMessageId?: unknown;
 }
 
 // Every URL that reaches this helper is a MAX-owned host (photo/sticker/file/video
@@ -104,6 +109,41 @@ async function downloadUrl(url: string): Promise<Buffer | null> {
   } catch (err) {
     logger.error(`downloadUrl threw for ${url}`, err);
     return null;
+  }
+}
+
+/** Runs a chat-scoped download (FILE_DOWNLOAD / VIDEO_PLAY) against the primary ids; if that
+ * is denied and the context carries fallback ids (a forward's recipient chat), retries there.
+ * Returns null when every attempt fails. */
+async function withDownloadFallback<T>(
+  ctx: DownloadContext,
+  label: string,
+  attempt: (chatId: unknown, messageId: unknown) => Promise<T>,
+): Promise<T | null> {
+  try {
+    return await attempt(ctx.chatId, ctx.messageId);
+  } catch (primaryErr) {
+    const hasFallback =
+      ctx.fallbackChatId != null &&
+      (String(ctx.fallbackChatId) !== String(ctx.chatId) || String(ctx.fallbackMessageId) !== String(ctx.messageId));
+    if (!hasFallback) {
+      logger.error(`${label} failed (chatId=${String(ctx.chatId)}, messageId=${String(ctx.messageId)})`, primaryErr);
+      return null;
+    }
+    logger.info(
+      `${label} denied on source chat ${String(ctx.chatId)} — retrying via recipient chat ${String(ctx.fallbackChatId)} (msg ${String(ctx.fallbackMessageId)})`,
+    );
+    try {
+      const out = await attempt(ctx.fallbackChatId, ctx.fallbackMessageId);
+      logger.info(`${label} succeeded via recipient chat ${String(ctx.fallbackChatId)}`);
+      return out;
+    } catch (fallbackErr) {
+      logger.error(
+        `${label} failed on both source (chatId=${String(ctx.chatId)}) and recipient (chatId=${String(ctx.fallbackChatId)})`,
+        fallbackErr,
+      );
+      return null;
+    }
   }
 }
 
@@ -137,20 +177,18 @@ export async function downloadMaxAttachment(att: MaxAttachment, ctx: DownloadCon
   }
 
   if (att._type === 'FILE' && att.fileId != null) {
-    try {
-      const url = await ctx.max.getFileDownloadUrl(ctx.chatId, ctx.messageId, att.fileId);
-      const buffer = await downloadUrl(url);
-      if (!buffer) return null;
-      // A literal quote in a MAX-side filename breaks telegraf's multipart
-      // Content-Disposition — Telegram's server drops the connection mid-response
-      // and sendDocument dies with "invalid json response body" (hit live
-      // 2026-08-15 with names an earlier upload bug had quoted).
-      const safeName = (att.name ?? `file_${Date.now()}`).replace(/[\r\n"\\]/g, '_');
-      return { buffer, filename: safeName, kind: 'document' };
-    } catch (err) {
-      logger.error(`FILE_DOWNLOAD failed for fileId ${String(att.fileId)} (chatId=${String(ctx.chatId)}, messageId=${String(ctx.messageId)})`, err);
-      return null;
-    }
+    const fileId = att.fileId;
+    const url = await withDownloadFallback(ctx, `FILE_DOWNLOAD fileId ${String(fileId)}`, (chatId, messageId) =>
+      ctx.max.getFileDownloadUrl(chatId, messageId, fileId),
+    );
+    if (!url) return null;
+    const buffer = await downloadUrl(url);
+    if (!buffer) return null;
+    // A literal quote in a MAX-side filename breaks telegraf's multipart Content-Disposition —
+    // Telegram's server drops the connection mid-response and sendDocument dies with "invalid
+    // json response body" (hit live 2026-08-15 with names an earlier upload bug had quoted).
+    const safeName = (att.name ?? `file_${Date.now()}`).replace(/[\r\n"\\]/g, '_');
+    return { buffer, filename: safeName, kind: 'document' };
   }
 
   if (att._type === 'AUDIO' && att.url) {
@@ -160,20 +198,19 @@ export async function downloadMaxAttachment(att: MaxAttachment, ctx: DownloadCon
   }
 
   if (att._type === 'VIDEO' && att.videoId != null) {
-    try {
-      const urls = await ctx.max.getVideoPlayUrls(ctx.chatId, ctx.messageId, att.videoId);
-      const mp4Key = Object.keys(urls)
-        .filter((k) => k.startsWith('MP4_'))
-        .sort((a, b) => Number(b.slice(4)) - Number(a.slice(4)))[0]; // highest resolution first
-      const url = mp4Key ? urls[mp4Key] : undefined;
-      if (!url) return null;
-      const buffer = await downloadUrl(url);
-      if (!buffer) return null;
-      return { buffer, filename: `video_${String(att.videoId)}.mp4`, kind: att.videoType === 1 ? 'video_note' : 'video' };
-    } catch (err) {
-      logger.error(`VIDEO_PLAY failed for videoId ${String(att.videoId)} (chatId=${String(ctx.chatId)}, messageId=${String(ctx.messageId)})`, err);
-      return null;
-    }
+    const videoId = att.videoId;
+    const urls = await withDownloadFallback(ctx, `VIDEO_PLAY videoId ${String(videoId)}`, (chatId, messageId) =>
+      ctx.max.getVideoPlayUrls(chatId, messageId, videoId),
+    );
+    if (!urls) return null;
+    const mp4Key = Object.keys(urls)
+      .filter((k) => k.startsWith('MP4_'))
+      .sort((a, b) => Number(b.slice(4)) - Number(a.slice(4)))[0]; // highest resolution first
+    const url = mp4Key ? urls[mp4Key] : undefined;
+    if (!url) return null;
+    const buffer = await downloadUrl(url);
+    if (!buffer) return null;
+    return { buffer, filename: `video_${String(videoId)}.mp4`, kind: att.videoType === 1 ? 'video_note' : 'video' };
   }
 
   return null;

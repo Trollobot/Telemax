@@ -1266,6 +1266,8 @@ export function wireBridge({
     // wrapper — FILE_DOWNLOAD/VIDEO_PLAY need those ids, not the wrapper's own.
     let downloadChatId: unknown = chatId;
     let downloadMessageId: unknown = message.id;
+    let fallbackChatId: unknown;
+    let fallbackMessageId: unknown;
 
     // A forward we RECEIVE: the wrapper message's own text/attaches are empty — the
     // real content is in link.message. Confirmed live 2026-08-13. (Sending a forward
@@ -1274,6 +1276,14 @@ export function wireBridge({
     if (message.link?.type === 'FORWARD') {
       const original = message.link.message;
       attaches = Array.isArray(original?.attaches) ? original.attaches : [];
+      // Files live on the ORIGINAL message/chat (the source), which works when we're in that
+      // chat — so keep it as the primary download context. But a forward from a chat we're
+      // NOT in arrives with link.chatId = 0 (source hidden) and FILE_DOWNLOAD there is denied.
+      // Keep the RECIPIENT chat (the dialog the forward landed in) + this wrapper message id
+      // as a fallback: the file is present in our own chat with the forwarder. (Тимур ->
+      // Владимир -> нам: докачиваем через наш диалог с Владимиром, не через скрытый чат Тимура.)
+      fallbackChatId = chatId;
+      fallbackMessageId = message.id;
       if (message.link.chatId != null) downloadChatId = message.link.chatId;
       if (original?.id != null) downloadMessageId = original.id;
       const senderId = typeof original?.sender === 'number' ? original.sender : Number(original?.sender);
@@ -1433,7 +1443,7 @@ export function wireBridge({
           // dropped every forwarded attachment with no error anywhere (root-caused live
           // 2026-08-13 after the catch-up path — which calls sendAttachments
           // unconditionally — kept delivering the same messages fine).
-          const downloadCtx: DownloadContext = { max, chatId: downloadChatId, messageId: downloadMessageId };
+          const downloadCtx: DownloadContext = { max, chatId: downloadChatId, messageId: downloadMessageId, fallbackChatId, fallbackMessageId };
           // The reply goes on the text message when there is one; only a media-only reply
           // threads reply_parameters into the first attachment.
           attachMessageId = await sendAttachments(bot, targetGroupId, topicId, attaches, downloadCtx, text ? undefined : replyParameters);
