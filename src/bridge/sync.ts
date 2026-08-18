@@ -12,6 +12,7 @@ import { downloadMaxAttachment, describeAttachment, type MaxAttachment, type Dow
 import { uploadTelegramAttachmentToMax } from './upload.js';
 import { reportBridgeError } from './errorReporter.js';
 import { wireControlPanel } from './panel.js';
+import { createBugReports, BUGREPORT_BOT_HANDLE, type BugReports } from './bugReports.js';
 import { checkVersion, shortSha, type VersionStatus } from './version.js';
 import { toTelegramReaction } from '../max/reactions.js';
 import { createLogger, jsonStringify } from '../logger.js';
@@ -742,6 +743,13 @@ export function wireBridge({
   triggerFullResync,
   killEverything,
 }: BridgeOptions): WiredBridge {
+  // Bug-report channel: private DMs from outsiders become bug reports. The inbox is only
+  // ON where BUGREPORT_INBOX is set (the maintainer's prod bot); everywhere else the flag
+  // is unset and outsiders just get a redirect stub to the maintainer's bot. Created before
+  // the middlewares so the first one can route private chats into it.
+  const bugReportInboxEnabled = !!process.env.BUGREPORT_INBOX && !/^(0|false|off)$/i.test(process.env.BUGREPORT_INBOX);
+  const bugReports: BugReports = createBugReports({ bot, targetGroupId, enabled: bugReportInboxEnabled });
+
   // Every update Telegraf would otherwise route to a command/action/message
   // handler below passes through here first. /reboot and /kill only gate on
   // typing a confirmation phrase — and that phrase is public (open-source repo,
@@ -751,8 +759,14 @@ export function wireBridge({
   // BE the trust boundary; this is what actually enforces that. poll_answer
   // updates carry no `chat` at all and are separately authorized by their own
   // poll_id lookup (see bot.on('poll_answer') below), so those pass through.
-  bot.use((ctx, next) => {
+  bot.use(async (ctx, next) => {
     if (ctx.chat && String(ctx.chat.id) !== targetGroupId) {
+      // A private DM from an outsider isn't an attack surface — it's a bug report (or a
+      // redirect to where reports go). Only non-target GROUPS/channels get the hard reject.
+      if (ctx.chat.type === 'private') {
+        await bugReports.handleIncomingPrivate(ctx);
+        return;
+      }
       if (ctx.callbackQuery) {
         ctx.answerCbQuery('Не вы меня создали.').catch(() => {});
       } else {
@@ -1488,6 +1502,8 @@ export function wireBridge({
 • Свайп-удаление подхватывается только для СВОИХ сообщений и тех, что отправлены после последнего запуска моста — если не удалилось, добей командой /delete.
 • Голоса за опрос из MAX не отражаются в виджете Telegram сами — актуальный счёт смотри через /poll.
 
+🐞 Нашли баг или есть вопрос? Пишите: https://t.me/${BUGREPORT_BOT_HANDLE}
+
 💛 Поддержать проект — /donate`;
   }
 
@@ -2114,6 +2130,14 @@ export function wireBridge({
       logger.error('Failed to delete MAX message', err);
       await bot.telegram.sendMessage(targetGroupId, 'Не удалось удалить сообщение.', { message_thread_id: topicId });
     }
+  });
+
+  // Outbound bug-report leg: a message the maintainer typed in a bug-report topic goes to
+  // that reporter's DM, not to MAX. Registered before the MAX relay below so it consumes
+  // those topics first; everything else falls through to the normal relay via next().
+  bot.on('message', async (ctx, next) => {
+    if (await bugReports.relayTopicReply(ctx)) return;
+    return next();
   });
 
   bot.on('message', async (ctx) => {
