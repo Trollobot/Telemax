@@ -1096,6 +1096,26 @@ export function wireBridge({
     const { chat, otherId, profile } = resolveDialogContact(String(chatId));
     if (chat) {
       const count = chat.participants ? Object.keys(chat.participants).length : undefined;
+      // A 1:1 created via createDialog comes back typed CHAT, not DIALOG (a 2-participant
+      // chat with no title is a dialog). Render it as a contact card, not a generic group
+      // card — fetching the contact profile if it isn't cached yet, so the card shows the
+      // person's name/phone instead of "MAX chat <id>" / "Тип: CHAT".
+      const looksLikeDialog = chat.type === 'DIALOG' || (!chat.title && count === 2 && otherId != null);
+      if (looksLikeDialog && otherId != null) {
+        let dialogProfile = profile;
+        if (!dialogProfile) {
+          try {
+            const contacts = await max.getContactInfo([otherId]);
+            dialogProfile = contacts[0];
+            if (dialogProfile) getContactProfiles().set(otherId, dialogProfile);
+          } catch (err) {
+            logger.error(`Failed to fetch CONTACT_INFO for dialog contact ${otherId}`, err);
+          }
+        }
+        const messageId = await sendContactInfoCard(bot, targetGroupId, topicId, chat.title || `MAX chat ${String(chatId)}`, 'DIALOG', count, otherId, dialogProfile);
+        await pinInfoCard(bot, targetGroupId, messageId);
+        return;
+      }
       const messageId = await sendContactInfoCard(bot, targetGroupId, topicId, chat.title || `MAX chat ${String(chatId)}`, chat.type, count, otherId, profile);
       await pinInfoCard(bot, targetGroupId, messageId);
       return;
@@ -1620,28 +1640,38 @@ export function wireBridge({
       });
       const existed = existing != null;
       const chatId = existed ? (existing as { id?: unknown }).id : (await max.createDialog(recipientUserId)).chatId;
-      const { topicId, created } = await ensureTopicForMaxChat(bot, targetGroupId, chatId, chatMapStore, name);
-      let finalTopicId = topicId;
+      const ensured = await ensureTopicForMaxChat(bot, targetGroupId, chatId, chatMapStore, name);
+      let finalTopicId = ensured.topicId;
+      let created = ensured.created;
       // A reused mapping can point to a topic the operator deleted in Telegram. The relay
       // path self-heals on the next message (the isThreadNotFound catch in deliverToTopic),
       // but startDialog only builds a deep link and never writes to the topic — so without
       // this it hands back a dead link and never recreates (reported live 2026-08-18: find
       // contact -> start chat -> delete the topic in TG -> find again -> "Открыть чат" led
       // nowhere). Probe with a no-op rename: topic alive -> harmless; gone -> recreate it
-      // (with its contact-info card up top, exactly like restoreDeletedTopic).
+      // named after the contact. recreateTopicForChat would reuse the stale mapping's
+      // fallback title ("CHAT -<id>"), so recreate explicitly with `name`.
       if (!created) {
         try {
-          await bot.telegram.editForumTopic(targetGroupId, topicId, { name });
+          await bot.telegram.editForumTopic(targetGroupId, finalTopicId, { name });
         } catch (err) {
           if (isThreadNotFound(err)) {
-            finalTopicId = await recreateTopicForChat(bot, targetGroupId, chatId, chatMapStore);
-            await sendAutoInfoCard(chatId, undefined, finalTopicId).catch((e) =>
-              logger.error('Failed to send contact-info card on startDialog topic recreate', e),
-            );
+            await chatMapStore.remove(chatId);
+            finalTopicId = (await ensureTopicForMaxChat(bot, targetGroupId, chatId, chatMapStore, name)).topicId;
+            created = true;
           }
           // Any other error (e.g. Telegram "topic not modified" when the name is unchanged)
           // just means the topic is alive — keep the existing id.
         }
+      }
+      // Freshly created or recreated -> give it the pinned contact-info card. A createDialog
+      // 1:1 comes back typed CHAT (not DIALOG), which sendAutoInfoCard now renders as a
+      // proper contact card; passing recipientUserId as the sender hint covers the case
+      // where the new chat isn't in cachedChats yet.
+      if (created) {
+        await sendAutoInfoCard(chatId, recipientUserId, finalTopicId).catch((e) =>
+          logger.error('Failed to send contact-info card on startDialog', e),
+        );
       }
       // Deep link that opens the topic in the user's Telegram (private supergroup form:
       // strip the -100 prefix). The bot can't force-switch the client, but this is one tap.
