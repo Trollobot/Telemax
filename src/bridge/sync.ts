@@ -513,10 +513,13 @@ async function resolveForwardContent(
   };
 }
 
-/** Telegram's error when you post to a forum topic that's since been deleted. */
+/** Telegram's error when you touch a forum topic that's since been deleted. The exact
+ * code depends on the method: sendMessage/sendPhoto to a dead thread answer "message
+ * thread not found", while editForumTopic answers TOPIC_ID_INVALID (seen live 2026-08-18
+ * from startDialog's liveness probe). Both mean the same thing — recreate the topic. */
 function isThreadNotFound(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
-  return /message thread not found|thread not found|TOPIC_DELETED/i.test(msg);
+  return /message thread not found|thread not found|TOPIC_DELETED|TOPIC_ID_INVALID/i.test(msg);
 }
 
 /** Forces a fresh topic for a chat: drops the stale mapping so ensureTopicForMaxChat recreates it, and returns the new topic id. Reuses the deleted topic's stored title so the recreated one keeps the contact's name/nick instead of the bare "MAX chat <id>" fallback. Used to heal a topic the user deleted in Telegram. */
