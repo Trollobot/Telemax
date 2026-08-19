@@ -14,6 +14,8 @@
 <!-- TODO: положи картинку docs/img/og.png (1200×630) и раскомментируй: -->
 <!-- <meta property="og:image" content="https://trollobot.github.io/Telemax/img/og.png"> -->
 <meta name="twitter:card" content="summary_large_image">
+<link rel="icon" type="image/png" href="icon.png">
+<link rel="apple-touch-icon" href="icon.png">
 <style>
   :root{
     --paper:#f5ecd9; --paper-2:#faf4e6; --card:#fffdf8;
@@ -128,7 +130,10 @@
 
 <header class="nav">
   <div class="wrap">
-    <span class="brand">Tele<span class="dot">max</span></span>
+    <span class="brand" style="display:inline-flex;align-items:center;gap:9px">
+      <img src="icon.png" alt="Telemax" width="30" height="30" style="border-radius:8px;display:block">
+      <span>Tele<span class="dot">max</span></span>
+    </span>
     <span class="spacer"></span>
     <a class="navlink" href="#features">Возможности</a>
     <a class="navlink" href="#how">Установка</a>
