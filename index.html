@@ -94,15 +94,16 @@
   .step p{color:var(--muted);margin:0;font-size:.94rem}
   code{background:var(--terra-tint);color:var(--terra-dark);padding:2px 7px;border-radius:6px;
     font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.88em}
-  /* screenshots */
-  .shots{display:grid;grid-template-columns:repeat(2,1fr);gap:18px}
-  @media(max-width:640px){.shots{grid-template-columns:1fr}}
-  .shot{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;box-shadow:var(--shadow)}
-  .shot .ph{aspect-ratio:16/10;display:flex;align-items:center;justify-content:center;text-align:center;
-    background:repeating-linear-gradient(45deg,var(--paper-2),var(--paper-2) 13px,var(--card) 13px,var(--card) 26px);
-    border-bottom:1px solid var(--line);color:var(--faint);padding:20px;font-weight:700;font-family:var(--serif)}
-  .shot .cap{padding:13px 16px;font-size:.92rem;color:var(--muted)}
-  .shot .cap b{color:var(--ink)}
+  /* screenshots — mobile (portrait) + web panel (wide) */
+  .phones{display:grid;grid-template-columns:repeat(4,1fr);gap:18px}
+  @media(max-width:760px){.phones{grid-template-columns:repeat(2,1fr);max-width:520px;margin-left:auto;margin-right:auto}}
+  @media(max-width:400px){.phones{grid-template-columns:1fr;max-width:280px}}
+  .phone{margin:0}
+  .phone img{width:100%;display:block;border-radius:16px;border:1px solid var(--line);box-shadow:var(--shadow);background:#0d1117}
+  .phone figcaption{text-align:center;font-size:.86rem;color:var(--muted);margin-top:10px}
+  .webshot{margin:0 auto;max-width:840px}
+  .webshot img{width:100%;display:block;border-radius:12px;border:1px solid var(--line);box-shadow:var(--shadow);background:#0d1117}
+  .webshot figcaption{text-align:center;font-size:.9rem;color:var(--muted);margin-top:12px}
   /* support */
   .support-box{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);
     padding:34px;text-align:center;box-shadow:var(--shadow)}
@@ -253,12 +254,15 @@
     <div class="wrap">
       <div class="kicker">Как это выглядит</div>
       <h2>Скриншоты</h2>
-      <div class="shots" style="margin-top:26px">
-        <div class="shot"><div class="ph">Форум-темы: каждый MAX-чат — своя тема</div><div class="cap"><b>Telegram-группа</b> — вся переписка Макса в одном окне</div></div>
-        <div class="shot"><div class="ph">Пульт управления /panel</div><div class="cap"><b>Меню кнопками</b> — поиск контактов, старт чата, управление</div></div>
-        <div class="shot"><div class="ph">Карточка контакта</div><div class="cap"><b>Кто на другом конце</b> — имя, ник, телефон закреплены в теме</div></div>
-        <div class="shot"><div class="ph">Веб-панель мониторинга</div><div class="cap"><b>Статус и метрики</b> — подключение MAX/Telegram в реальном времени</div></div>
+      <p class="sub" style="margin:.2em 0 22px">В Telegram каждый MAX-чат становится темой — вся переписка в одном окне:</p>
+      <div class="phones">
+        <figure class="phone"><img src="topics.png" alt="Telegram-группа с форум-темами: каждый MAX-чат — своя тема" loading="lazy"><figcaption>Форум-темы: чат = тема</figcaption></figure>
+        <figure class="phone"><img src="panel.png" alt="Пульт управления /panel с кнопками в Telegram" loading="lazy"><figcaption>Пульт /panel</figcaption></figure>
+        <figure class="phone"><img src="search.png" alt="Поиск контакта MAX по номеру или нику" loading="lazy"><figcaption>Поиск контакта</figcaption></figure>
+        <figure class="phone"><img src="contact.png" alt="Карточка контакта, закреплённая в теме" loading="lazy"><figcaption>Карточка контакта</figcaption></figure>
       </div>
+      <p class="sub" style="margin:36px 0 18px">И веб-панель мониторинга — статус подключения, метрики, авторизация:</p>
+      <figure class="webshot"><img src="webpanel.png" alt="Веб-панель мониторинга Telemax: статус MAX/Telegram, метрики, аутентификация" loading="lazy"><figcaption>Веб-панель — статус MAX/Telegram и метрики в реальном времени</figcaption></figure>
     </div>
   </section>
 
