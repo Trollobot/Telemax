@@ -16,7 +16,7 @@ import { SessionStore, type MaxSession } from '../store/sessionStore.js';
 import { ChatMapStore } from '../store/chatMapStore.js';
 import { wireBridge, syncAllChatsToTelegram, MessageLinkStore } from '../bridge/sync.js';
 import { configureErrorReporter, reportBridgeError, resetErrorKey } from '../bridge/errorReporter.js';
-import { shortSha } from '../bridge/version.js';
+import { getAppVersion } from '../bridge/version.js';
 import { createLogger, jsonStringify, redactSecrets } from '../logger.js';
 import { config } from './config.js';
 import { isValidApiKey, requireApiKey } from './authMiddleware.js';
@@ -315,6 +315,25 @@ function notifyMaxSessionRestored(): void {
   reportBridgeError('max-session-ok', '✅ MAX-авторизация восстановлена.');
 }
 
+/** Forces a clean MAX socket and resolves once it has finished INIT (the 'ready' event).
+ * Used before (re)authentication: a socket left over from a rejected session refuses
+ * START_AUTH with "Недопустимое состояние сессии", so instead of requiring a manual
+ * container restart (hit live 2026-08-18), we reconnect a fresh socket first. */
+function freshConnectForAuth(timeoutMs = 15000): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const onReady = (): void => {
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      max.off('ready', onReady);
+      reject(new Error('MAX не ответил при переподключении для авторизации'));
+    }, timeoutMs);
+    max.once('ready', onReady);
+    max.connect(); // tears down any stale socket and starts a fresh INIT
+  });
+}
+
 async function loginWithSession(session: MaxSession): Promise<void> {
   try {
     const { payload } = await max.login(session.sessionToken);
@@ -554,11 +573,17 @@ async function startServer(): Promise<void> {
       return;
     }
     const phone = String(rawPhone).replace(/[^\d+]/g, '');
-    if (!maxConnected) {
-      res.status(503).json({ error: 'MAX is disconnected' });
-      return;
-    }
     try {
+      // No active session (first login, re-auth after a session loss, or change-number
+      // after logout): reconnect a FRESH socket first. A socket left over from a rejected
+      // session refuses START_AUTH ("Недопустимое состояние сессии") and used to need a
+      // manual container restart (hit live 2026-08-18). With an active session, leave it.
+      if (!currentSession) {
+        await freshConnectForAuth();
+      } else if (!maxConnected) {
+        res.status(503).json({ error: 'MAX is disconnected' });
+        return;
+      }
       pendingAuthToken = await max.requestSms(phone);
       pendingPhone = phone;
       res.json({ success: true });
@@ -798,7 +823,7 @@ async function reportIfJustUpdated(bot: Telegraf): Promise<void> {
   }
   await unlink(UPDATE_COMPLETED_MARKER).catch(() => {});
   if (!commit) return;
-  await bot.telegram.sendMessage(config.targetTelegramGroup, `✅ Обновлено до ${shortSha(commit)}.`).catch((err) => logger.error('Failed to send post-update notice', err));
+  await bot.telegram.sendMessage(config.targetTelegramGroup, `✅ Обновлено до v${getAppVersion()}.`).catch((err) => logger.error('Failed to send post-update notice', err));
 }
 
 const WELCOME_SENT_MARKER = path.join(process.cwd(), '.data', 'welcome-sent');

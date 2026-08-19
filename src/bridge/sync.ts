@@ -14,7 +14,7 @@ import { reportBridgeError } from './errorReporter.js';
 import { wireControlPanel } from './panel.js';
 import { createBugReports, BUGREPORT_BOT_HANDLE, type BugReports } from './bugReports.js';
 import { createTelemetry } from './telemetry.js';
-import { checkVersion, shortSha, type VersionStatus } from './version.js';
+import { checkVersion, type VersionStatus } from './version.js';
 import { toTelegramReaction } from '../max/reactions.js';
 import { createLogger, jsonStringify } from '../logger.js';
 
@@ -687,7 +687,7 @@ const UPDATE_IN_PROGRESS_MARKER = path.join(process.cwd(), '.data', 'update-in-p
 
 /** Shared by /version and the daily scheduled check — same text/buttons either way. */
 function formatVersionMessage(status: VersionStatus): { text: string; replyMarkup?: ReturnType<typeof Markup.inlineKeyboard>['reply_markup'] } {
-  const currentLabel = status.current ? shortSha(status.current) : 'неизвестна (образ собран без GIT_COMMIT)';
+  const currentLabel = status.current === 'unknown' ? 'неизвестна' : `v${status.current}`;
   if (!status.latest) {
     return { text: `📦 Текущая версия: ${currentLabel}\n\n⚠️ Не удалось проверить обновления на GitHub — сеть недоступна или лимит запросов.` };
   }
@@ -698,8 +698,8 @@ function formatVersionMessage(status: VersionStatus): { text: string; replyMarku
   const shown = (status.changelog ?? []).slice(0, CHANGELOG_CAP);
   const more = (status.changelog ?? []).length - shown.length;
   const header = shown.length
-    ? `🆕 Доступна новая: ${shortSha(status.latest.sha)}\n\nЧто нового:\n${shown.map((m) => `• ${m}`).join('\n')}${more > 0 ? `\n…и ещё ${more}` : ''}`
-    : `🆕 Доступна новая: ${shortSha(status.latest.sha)} — ${status.latest.message}`;
+    ? `🆕 Доступна ${status.latest.tag}\n\nЧто нового:\n${shown.map((m) => `• ${m}`).join('\n')}${more > 0 ? `\n…и ещё ${more}` : ''}`
+    : `🆕 Доступна ${status.latest.tag}`;
   const text = `📦 Текущая версия: ${currentLabel}\n${header}\n\nОбновить сейчас? Пересборка и перезапуск займут пару минут, история переписки не затрагивается.`;
   const replyMarkup = Markup.inlineKeyboard([
     Markup.button.callback('🔄 Обновить', 'tlmx_update'),

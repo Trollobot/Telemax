@@ -2,7 +2,7 @@ import path from 'node:path';
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { Markup, type Telegraf, type Context } from 'telegraf';
 import type { MaxClient, MaxContactInfo } from '../max/client.js';
-import { getCurrentCommit, shortSha } from './version.js';
+import { getAppVersion } from './version.js';
 import { createLogger } from '../logger.js';
 
 const logger = createLogger('panel');
@@ -75,8 +75,7 @@ function isOnMax(c: MaxContactInfo): boolean {
 type View = { text: string; markup: ReturnType<typeof Markup.inlineKeyboard>['reply_markup'] };
 
 function rootView(phone: string): View {
-  const commit = getCurrentCommit();
-  const version = commit ? shortSha(commit) : 'dev';
+  const version = getAppVersion();
   let status: string;
   if (isPaused()) {
     status =

@@ -1,7 +1,7 @@
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
-import { getCurrentCommit, shortSha } from './version.js';
+import { getAppVersion } from './version.js';
 import { createLogger } from '../logger.js';
 
 const logger = createLogger('telemetry');
@@ -47,8 +47,7 @@ export function createTelemetry(): Telemetry {
     if (isDisabled()) return;
     try {
       const installId = await getInstallId();
-      const commit = getCurrentCommit();
-      const version = commit ? shortSha(commit) : 'dev';
+      const version = getAppVersion();
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), PING_TIMEOUT_MS);
       await fetch(TELEMETRY_URL, {
