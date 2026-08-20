@@ -171,8 +171,17 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
         await bot.telegram.editMessageText(targetGroupId, stored, undefined, text, { reply_markup: markup });
         await bot.telegram.pinChatMessage(targetGroupId, stored, { disable_notification: true }).catch(() => {});
         return;
-      } catch {
-        // Message was deleted — fall through and post a fresh one.
+      } catch (err) {
+        // "message is not modified" means the panel already exists and is current — Telegram just
+        // refuses a no-op edit (the panel text is unchanged since last start). Re-pin the existing
+        // one and keep it, instead of posting a FRESH panel — which notifies the group AND piles up
+        // a duplicate pinned panel on every restart/update (each update.sh restart hit this).
+        // Only a genuinely deleted/uneditable message falls through to a fresh post.
+        if (/not modified/i.test((err as Error)?.message ?? '')) {
+          await bot.telegram.pinChatMessage(targetGroupId, stored, { disable_notification: true }).catch(() => {});
+          return;
+        }
+        // Message was deleted / uneditable — fall through and post a fresh one.
       }
     }
     await postAndPin().catch((err) => logger.error('Failed to post control panel', err));
