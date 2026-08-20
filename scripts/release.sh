@@ -22,6 +22,9 @@ MIRROR_SSH="${MIRROR_SSH:-root@46.8.238.57}"
 MIRROR_REPO_PATH="${MIRROR_REPO_PATH:-/opt/telemax-mirror/web/Telemax.git}"
 MIRROR_WEB_PATH="${MIRROR_WEB_PATH:-/opt/telemax-mirror/web}"
 MIRROR_GIT_URL="ssh://${MIRROR_SSH}${MIRROR_REPO_PATH}"
+# Public HTTP base of the mirror — used to read back the current latest.json so the per-version
+# changelog map accumulates across releases (see scripts/build-latest-json.mjs).
+MIRROR_HTTP_URL="${MIRROR_HTTP_URL:-http://zergont-gate.duckdns.org:3200}"
 
 echo ">> Releasing ${TAG}"
 
@@ -38,14 +41,16 @@ git push origin "${TAG}"
 echo ">> [2/4] push to mirror (${MIRROR_GIT_URL})"
 git push "${MIRROR_GIT_URL}" "+refs/heads/main:refs/heads/main" "+refs/tags/*:refs/tags/*"
 
-echo ">> [3/4] build latest.json (changelog since previous tag, newest-first)"
+echo ">> [3/4] build latest.json (cumulative per-version changelog)"
 PREV_TAG=$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || echo "")
 RANGE="${TAG}"
 [ -n "${PREV_TAG}" ] && RANGE="${PREV_TAG}..${TAG}"
-CHANGELOG_JSON=$(git log --format='%s' "${RANGE}" \
+# This version's notes: commit subjects since the previous tag, minus the release-bump commit itself.
+NEW_NOTES_JSON=$(git log --format='%s' "${RANGE}" | grep -viE '^Релиз |^Release ' \
   | node -e "const l=require('fs').readFileSync(0,'utf8').split('\n').filter(Boolean); process.stdout.write(JSON.stringify(l))")
-LATEST_JSON=$(node -e "process.stdout.write(JSON.stringify({tag:process.argv[1],version:process.argv[2],changelog:JSON.parse(process.argv[3])}))" \
-  "${TAG}" "${VERSION}" "${CHANGELOG_JSON}")
+# Accumulate into the map already published on the mirror so multi-version jumps keep every release.
+EXISTING_JSON=$(curl -fsS "${MIRROR_HTTP_URL}/latest.json" 2>/dev/null || echo '{}')
+LATEST_JSON=$(node scripts/build-latest-json.mjs "${VERSION}" "${TAG}" "${NEW_NOTES_JSON}" "${EXISTING_JSON}")
 echo "   ${LATEST_JSON}"
 
 echo ">> [4/4] upload latest.json + install.sh to mirror + refresh dumb-http index"

@@ -1395,6 +1395,11 @@ export function wireBridge({
             })
             .catch((err) => logger.error('Failed to send poll reminder', err));
           if (message.id != null) messageLinks.add({ maxChatId: chatId, maxMessageId: message.id, telegramMessageId: sentPoll.message_id });
+          // Advance the backfill cursor so a reconnect's catch-up doesn't re-post this poll
+          // (same reason as the regular-message path below).
+          void chatMapStore.advanceHistoryCursor(chatId, Date.now()).catch((err) =>
+            logger.error('Failed to advance history cursor after incoming poll', err),
+          );
           if (pollAttach.pollId != null) {
             pollLinks.add(sentPoll.poll.id, {
               maxChatId: chatId,
@@ -1455,6 +1460,16 @@ export function wireBridge({
         if (telegramMessageId != null) {
           const extraTelegramMessageIds = textMessageId != null && attachMessageId != null && attachMessageId !== telegramMessageId ? [attachMessageId] : undefined;
           messageLinks.add({ maxChatId: chatId, maxMessageId: message.id, telegramMessageId, extraTelegramMessageIds });
+          // Advance the backfill cursor for this live incoming message. Without it, a MAX
+          // reconnect's catch-up re-reads the message (it sits past the stale cursor) and
+          // relays it to Telegram a SECOND time — the mirror image of the rememberOutgoingSend
+          // fix for the Telegram -> MAX direction (see the cursor note near outgoingCids).
+          // Date.now() (receipt time), like that path, since the push payload carries no
+          // message time; the cursor is exclusive (fetchFullHistory: `time > cursor`), so this
+          // never skips messages that arrive while the bridge is offline.
+          void chatMapStore.advanceHistoryCursor(chatId, Date.now()).catch((err) =>
+            logger.error('Failed to advance history cursor after incoming message', err),
+          );
         }
       });
     } catch (err) {

@@ -121,10 +121,14 @@ async function fetchChangelog(base: string, head: string): Promise<string[]> {
   }
 }
 
-/** Latest version from the self-hosted mirror's `/latest.json` (`{ tag, version, changelog }`),
- * used only as a fallback when GitHub's tags API can't be reached. The mirror already bundles the
- * changelog (there's no compare API to call when GitHub is the thing that's down). */
-async function fetchLatestFromMirror(): Promise<(LatestVersionInfo & { changelog: string[] }) | null> {
+/** Latest version from the self-hosted mirror's `/latest.json`, used only as a fallback when
+ * GitHub's tags API can't be reached. `changelog` is the newest release's notes; `changelogs` maps
+ * version -> notes for the last several releases so an install several versions behind can still be
+ * shown EVERY skipped version's changes (the GitHub compare API does this dynamically, but the
+ * mirror is static — hence the per-version map that checkVersion assembles against `current`). */
+async function fetchLatestFromMirror(): Promise<
+  (LatestVersionInfo & { changelog: string[]; changelogs: Record<string, string[]> }) | null
+> {
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), GITHUB_API_TIMEOUT_MS);
@@ -135,18 +139,42 @@ async function fetchLatestFromMirror(): Promise<(LatestVersionInfo & { changelog
       logger.error(`Mirror /latest.json returned ${res.status} ${res.statusText}`);
       return null;
     }
-    const payload = (await res.json()) as { tag?: unknown; version?: unknown; changelog?: unknown };
+    const payload = (await res.json()) as { tag?: unknown; version?: unknown; changelog?: unknown; changelogs?: unknown };
     if (typeof payload.tag !== 'string' || typeof payload.version !== 'string') return null;
     const v = parseSemver(payload.version);
     if (!v) return null;
     const changelog = Array.isArray(payload.changelog)
       ? payload.changelog.filter((x): x is string => typeof x === 'string')
       : [];
-    return { tag: payload.tag, version: v.join('.'), changelog };
+    const changelogs: Record<string, string[]> = {};
+    if (payload.changelogs && typeof payload.changelogs === 'object') {
+      for (const [ver, notes] of Object.entries(payload.changelogs as Record<string, unknown>)) {
+        if (Array.isArray(notes)) changelogs[ver] = notes.filter((x): x is string => typeof x === 'string');
+      }
+    }
+    return { tag: payload.tag, version: v.join('.'), changelog, changelogs };
   } catch (err) {
     logger.error('Failed to fetch latest from mirror', err);
     return null;
   }
+}
+
+/** Flattens the mirror's per-version changelog map into a single newest-first list of every release
+ * strictly newer than `current` — so a multi-version jump shows all skipped versions' notes, not
+ * just the latest. Falls back to `fallback` (the newest release's notes) when the map is empty. */
+function assembleMirrorChangelog(
+  changelogs: Record<string, string[]>,
+  current: string,
+  fallback: string[],
+): string[] {
+  const currentSemver = parseSemver(current);
+  const versions = Object.keys(changelogs)
+    .map((ver) => ({ ver, semver: parseSemver(ver) }))
+    .filter((x): x is { ver: string; semver: [number, number, number] } => x.semver != null)
+    .filter((x) => currentSemver == null || cmpSemver(x.semver, currentSemver) > 0)
+    .sort((a, b) => cmpSemver(b.semver, a.semver)); // newest first
+  if (versions.length === 0) return fallback;
+  return versions.flatMap((x) => [`v${x.ver}`, ...(changelogs[x.ver] ?? [])]);
 }
 
 /** Compares the running release (package.json version) against the highest tag on GitHub, falling
@@ -176,7 +204,9 @@ export async function checkVersion(): Promise<VersionStatus> {
       current,
       latest: { tag: mirror.tag, version: mirror.version },
       updateAvailable,
-      changelog: updateAvailable ? mirror.changelog : [],
+      // Cumulative: every version between `current` and latest, so a multi-version jump isn't
+      // reduced to just the newest release's notes (as the GitHub compare API would show).
+      changelog: updateAvailable ? assembleMirrorChangelog(mirror.changelogs, current, mirror.changelog) : [],
     };
   }
 
