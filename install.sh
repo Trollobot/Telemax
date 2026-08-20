@@ -34,10 +34,15 @@ export DEBIAN_FRONTEND=noninteractive
 # Aborting the whole bootstrap over someone else's package is worse than
 # warning once and moving on, so every apt-get call in this script goes
 # through this instead of a bare one.
+# `</dev/null` on every apt/dpkg call is critical under `curl | bash`: bash reads THIS script from
+# stdin (the pipe), and a package maintainer script that reads stdin during `apt upgrade` (grub,
+# cloud-init, …) would otherwise consume the rest of the script and the install silently stops after
+# that step (hit live on a fresh Ubuntu 24.04 box). Giving apt its own empty stdin keeps the pipe
+# — and the rest of this script — intact for bash.
 apt_get() {
-  if ! apt-get "$@"; then
+  if ! apt-get "$@" </dev/null; then
     echo "⚠️  apt-get $* завершился с предупреждением (см. вывод выше) — похоже, дело в стороннем пакете, не связанном с Telemax. Продолжаю; если хотите разобраться отдельно, обычно помогает: dpkg --configure -a"
-    dpkg --configure -a >/dev/null 2>&1 || true
+    dpkg --configure -a >/dev/null 2>&1 </dev/null || true
   fi
 }
 
@@ -45,7 +50,7 @@ bold "=== Telemax — установка на чистый сервер ==="
 echo
 
 echo "[1/5] Обновляю систему (может занять несколько минут)..."
-apt-get update -y
+apt-get update -y </dev/null
 apt_get upgrade -y
 
 echo
@@ -93,7 +98,7 @@ else
   # Keep origin pointing at GitHub (the canonical source) so ordinary updates prefer it once it's
   # back; the mirror stays the fallback (see update.sh).
   git -C "$INSTALL_DIR" remote set-url origin "$REPO_URL"
-fi
+fi </dev/null  # same stdin guard as the apt calls — keep git off the curl|bash pipe
 
 cd "$INSTALL_DIR"
 echo
