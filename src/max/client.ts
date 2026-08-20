@@ -385,7 +385,16 @@ export class MaxClient extends EventEmitter {
     if (challenge) {
       return { status: 'password_required', challenge };
     }
-    throw new Error(describeAuthError(payload, 'CHECK_CODE did not return a login token — was the code correct?'));
+    // No login token AND no password challenge. Besides a wrong/stale code, the other common cause
+    // is a number that isn't registered in MAX yet — a fresh number pushes MAX into its REGISTRATION
+    // flow (create account), which returns no login token. The bridge only LOGS IN to an existing
+    // account, so spell both out instead of only blaming the code.
+    throw new Error(
+      describeAuthError(
+        payload,
+        'Код не подтверждён. Проверьте, что код верный и свежий — и что номер уже зарегистрирован в приложении MAX: мост подключает существующий аккаунт, а не создаёт новый.',
+      ),
+    );
   }
 
   /**
