@@ -41,8 +41,20 @@ trap on_error ERR
 notify "🔄 Начинаю обновление..."
 
 STEP="git pull"
-echo "[update] $(date -u +%Y-%m-%dT%H:%M:%SZ) pulling latest main..."
-git pull --ff-only
+# Self-hosted read-only mirror to fall back to when GitHub is unreachable (account flagged, or
+# GitHub filtered on this network). Overridable via env so the mirror can move without a code
+# change. Must serve the same `main` + tags as origin — the release script pushes to both.
+MIRROR_GIT_URL="${MIRROR_GIT_URL:-http://zergont-gate.duckdns.org:3200/Telemax.git}"
+echo "[update] $(date -u +%Y-%m-%dT%H:%M:%SZ) pulling latest main from origin (GitHub)..."
+if git pull --ff-only; then
+  echo "[update] pulled from origin (GitHub)"
+else
+  echo "[update] origin unreachable — falling back to mirror: ${MIRROR_GIT_URL}"
+  git fetch "$MIRROR_GIT_URL" main
+  git merge --ff-only FETCH_HEAD
+  git fetch "$MIRROR_GIT_URL" "+refs/tags/*:refs/tags/*" || true
+  echo "[update] updated from mirror"
+fi
 
 # Written before the rebuild/restart so the NEW container's own startup can
 # read it and report back in Telegram (app.ts's reportIfJustUpdated) — just

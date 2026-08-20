@@ -6,6 +6,11 @@ const logger = createLogger('version');
 
 const REPO = 'Trollobot/Telemax';
 const GITHUB_API_TIMEOUT_MS = 8000;
+/** Self-hosted fallback mirror, used only when GitHub's API is unreachable/blocked (e.g. the
+ * account gets flagged, or GitHub is filtered on the install's network). Overridable via env so
+ * the mirror can move without a code change. Serves `/latest.json` (version manifest) and
+ * `/Telemax.git` (a read-only git mirror that update.sh falls back to). */
+const MIRROR_BASE_URL = (process.env.MIRROR_BASE_URL || 'http://zergont-gate.duckdns.org:3200').replace(/\/+$/, '');
 
 export interface LatestVersionInfo {
   /** Git tag on GitHub, e.g. "v0.3.2". */
@@ -116,15 +121,64 @@ async function fetchChangelog(base: string, head: string): Promise<string[]> {
   }
 }
 
-/** Compares the running release (package.json version) against the highest tag on GitHub.
- * Release/tag-based, so it works for every build — including images built without GIT_COMMIT.
- * `updateAvailable` is only true when the latest tag is strictly newer, never a false positive. */
+/** Latest version from the self-hosted mirror's `/latest.json` (`{ tag, version, changelog }`),
+ * used only as a fallback when GitHub's tags API can't be reached. The mirror already bundles the
+ * changelog (there's no compare API to call when GitHub is the thing that's down). */
+async function fetchLatestFromMirror(): Promise<(LatestVersionInfo & { changelog: string[] }) | null> {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), GITHUB_API_TIMEOUT_MS);
+    const res = await fetch(`${MIRROR_BASE_URL}/latest.json`, { signal: controller.signal }).finally(() =>
+      clearTimeout(timeout),
+    );
+    if (!res.ok) {
+      logger.error(`Mirror /latest.json returned ${res.status} ${res.statusText}`);
+      return null;
+    }
+    const payload = (await res.json()) as { tag?: unknown; version?: unknown; changelog?: unknown };
+    if (typeof payload.tag !== 'string' || typeof payload.version !== 'string') return null;
+    const v = parseSemver(payload.version);
+    if (!v) return null;
+    const changelog = Array.isArray(payload.changelog)
+      ? payload.changelog.filter((x): x is string => typeof x === 'string')
+      : [];
+    return { tag: payload.tag, version: v.join('.'), changelog };
+  } catch (err) {
+    logger.error('Failed to fetch latest from mirror', err);
+    return null;
+  }
+}
+
+/** Compares the running release (package.json version) against the highest tag on GitHub, falling
+ * back to the self-hosted mirror when GitHub is unreachable. Release/tag-based, so it works for
+ * every build — including images built without GIT_COMMIT. `updateAvailable` is only true when the
+ * latest known version is strictly newer, never a false positive. */
 export async function checkVersion(): Promise<VersionStatus> {
   const current = getAppVersion();
-  const latest = await fetchLatestTag();
   const currentSemver = parseSemver(current);
-  const latestSemver = latest ? parseSemver(latest.version) : null;
-  const updateAvailable = latestSemver != null && currentSemver != null && cmpSemver(latestSemver, currentSemver) > 0;
-  const changelog = updateAvailable && latest ? await fetchChangelog(`v${current}`, latest.tag) : [];
-  return { current, latest, updateAvailable, changelog };
+
+  // Primary source: GitHub tags (+ compare API for the changelog).
+  const ghLatest = await fetchLatestTag();
+  if (ghLatest) {
+    const latestSemver = parseSemver(ghLatest.version);
+    const updateAvailable = latestSemver != null && currentSemver != null && cmpSemver(latestSemver, currentSemver) > 0;
+    const changelog = updateAvailable ? await fetchChangelog(`v${current}`, ghLatest.tag) : [];
+    return { current, latest: ghLatest, updateAvailable, changelog };
+  }
+
+  // Fallback: self-hosted mirror (GitHub blocked/down/flagged).
+  const mirror = await fetchLatestFromMirror();
+  if (mirror) {
+    logger.info(`GitHub unreachable — using mirror for version check (latest ${mirror.tag})`);
+    const latestSemver = parseSemver(mirror.version);
+    const updateAvailable = latestSemver != null && currentSemver != null && cmpSemver(latestSemver, currentSemver) > 0;
+    return {
+      current,
+      latest: { tag: mirror.tag, version: mirror.version },
+      updateAvailable,
+      changelog: updateAvailable ? mirror.changelog : [],
+    };
+  }
+
+  return { current, latest: null, updateAvailable: false, changelog: [] };
 }
