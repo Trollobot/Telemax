@@ -329,39 +329,66 @@ echo "  1. Создайте Telegram-группу (или возьмите су�
 echo "     настройки группы → Темы → включить."
 echo "  2. Добавьте бота в группу администратором — ОБЯЗАТЕЛЬНО включите ему право"
 echo "     «Управление темами» (Manage Topics), оно не входит в базовый набор прав."
-echo "  3. Отправьте в группу любое сообщение — id вычислю сам, ничего искать не нужно."
+echo "  3. Всё — id группы я определю сам, как только бот станет админом. Если групп несколько — дам выбрать."
 echo
 
 TARGET_TELEGRAM_GROUP=""
-if command -v jq >/dev/null 2>&1; then
-  read -rp "Сделали? Нажмите Enter, когда отправите сообщение в группу... "
-  echo "Ищу группу..."
-  for attempt in 1 2 3 4 5; do
-    UPDATES=$(curl -s "${TG_PROXY_ARGS[@]}" "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?limit=100" || true)
-    TARGET_TELEGRAM_GROUP=$(echo "$UPDATES" | jq -r '
-      [.result[] | (.message // .channel_post // empty)
-       | select(.chat.type == "supergroup" or .chat.type == "group")
-       | .chat.id] | last // empty' 2>/dev/null || true)
-    if [ -n "$TARGET_TELEGRAM_GROUP" ]; then
-      echo "Нашёл группу, id: $TARGET_TELEGRAM_GROUP"
-      break
-    fi
-    echo "  Пока не вижу сообщений от бота в группе, жду 3с и пробую снова ($attempt/5)..."
-    sleep 3
-  done
-else
-  echo "(jq не найден — автоопределение пропущено, введите id вручную)"
+if ! command -v jq >/dev/null 2>&1; then
+  echo "❌ Не найден jq — без него не могу определить группу. Установите: apt-get install -y jq — и запустите setup.sh заново."
+  exit 1
 fi
 
-if [ -z "$TARGET_TELEGRAM_GROUP" ]; then
-  echo
-  echo "Не нашёл автоматически. Id группы можно узнать, например, переслав любое"
-  echo "сообщение из неё боту @getidsbot."
-  read -rp "Id группы (TARGET_TELEGRAM_GROUP, вида -100...): " TARGET_TELEGRAM_GROUP
-  while [ -z "$TARGET_TELEGRAM_GROUP" ]; do
-    read -rp "Id не может быть пустым, введите ещё раз: " TARGET_TELEGRAM_GROUP
+read -rp "Сделали? Нажмите Enter, когда бот добавлен в группу администратором... "
+while [ -z "$TARGET_TELEGRAM_GROUP" ]; do
+  echo "Ищу группу..."
+  TG_GROUPS=""
+  for attempt in 1 2 3 4 5 6; do
+    UPDATES=$(curl -s "${TG_PROXY_ARGS[@]}" "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?limit=100" || true)
+    # Собираем группы, которые бот «видел» — из сообщений И из события my_chat_member
+    # (бота добавили/сделали админом). Второе приходит на обязательном шаге «сделать
+    # админом», не зависит от того, отправит ли пользователь сообщение и попадёт ли в окно.
+    TG_GROUPS=$(echo "$UPDATES" | jq -r '
+      [ .result[]
+        | ( (.message // .channel_post // .my_chat_member // empty) | .chat )
+        | select(.type == "supergroup" or .type == "group")
+        | {id, title: (.title // "без названия")} ]
+      | unique_by(.id) | .[] | "\(.id)\t\(.title)"' 2>/dev/null || true)
+    [ -n "$TG_GROUPS" ] && break
+    echo "  Пока не вижу бота в группе, жду 3с ($attempt/6)..."
+    sleep 3
   done
-fi
+
+  if [ -z "$TG_GROUPS" ]; then
+    echo
+    echo "Пока не нашёл. Проверьте, что:"
+    echo "  • бот ДОБАВЛЕН в нужную группу;"
+    echo "  • бот — АДМИНИСТРАТОР с правом «Управление темами» (Manage Topics);"
+    echo "  • если всё так — отправьте в группу любое сообщение."
+    read -rp "Поправьте и нажмите Enter, чтобы попробовать снова... "
+    continue
+  fi
+
+  mapfile -t GROUP_LINES <<< "$TG_GROUPS"
+  if [ "${#GROUP_LINES[@]}" -eq 1 ]; then
+    TARGET_TELEGRAM_GROUP="${GROUP_LINES[0]%%$'\t'*}"
+    echo "Нашёл группу: «${GROUP_LINES[0]#*$'\t'}» ($TARGET_TELEGRAM_GROUP)"
+  else
+    echo
+    echo "Бот состоит в нескольких группах — выберите целевую:"
+    for i in "${!GROUP_LINES[@]}"; do
+      printf "  %d) %s  (%s)\n" "$((i + 1))" "${GROUP_LINES[$i]#*$'\t'}" "${GROUP_LINES[$i]%%$'\t'*}"
+    done
+    while [ -z "$TARGET_TELEGRAM_GROUP" ]; do
+      read -rp "Номер: " choice
+      if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#GROUP_LINES[@]}" ]; then
+        TARGET_TELEGRAM_GROUP="${GROUP_LINES[$((choice - 1))]%%$'\t'*}"
+        echo "Выбрана: «${GROUP_LINES[$((choice - 1))]#*$'\t'}» ($TARGET_TELEGRAM_GROUP)"
+      else
+        echo "  Нет такого номера, попробуйте ещё раз."
+      fi
+    done
+  fi
+done
 
 # Best-effort — needs the bot to already be a group admin with "Change Group
 # Info" rights, which setup already asked for above. setChatPhoto needs an
