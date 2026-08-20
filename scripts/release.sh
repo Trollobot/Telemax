@@ -9,7 +9,7 @@
 # NOT part of a normal deployment — installs never run this.
 #
 #   Usage:  ./scripts/release.sh
-#   Env:    MIRROR_SSH (default root@46.8.238.57)
+#   Env:    MIRROR_SSH (default root@zergont-gate.duckdns.org)
 #           MIRROR_REPO_PATH (default /opt/telemax-mirror/web/Telemax.git)
 #           MIRROR_WEB_PATH  (default /opt/telemax-mirror/web)
 set -euo pipefail
@@ -18,7 +18,7 @@ cd "$(dirname "$0")/.."
 VERSION=$(node -p "require('./package.json').version")
 TAG="v${VERSION}"
 
-MIRROR_SSH="${MIRROR_SSH:-root@46.8.238.57}"
+MIRROR_SSH="${MIRROR_SSH:-root@zergont-gate.duckdns.org}"
 MIRROR_REPO_PATH="${MIRROR_REPO_PATH:-/opt/telemax-mirror/web/Telemax.git}"
 MIRROR_WEB_PATH="${MIRROR_WEB_PATH:-/opt/telemax-mirror/web}"
 MIRROR_GIT_URL="ssh://${MIRROR_SSH}${MIRROR_REPO_PATH}"
