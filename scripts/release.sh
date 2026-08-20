@@ -48,8 +48,11 @@ LATEST_JSON=$(node -e "process.stdout.write(JSON.stringify({tag:process.argv[1],
   "${TAG}" "${VERSION}" "${CHANGELOG_JSON}")
 echo "   ${LATEST_JSON}"
 
-echo ">> [4/4] upload latest.json to mirror + refresh dumb-http index"
+echo ">> [4/4] upload latest.json + install.sh to mirror + refresh dumb-http index"
 ssh "${MIRROR_SSH}" "cat > ${MIRROR_WEB_PATH}/latest.json" <<<"${LATEST_JSON}"
+# Serve the bootstrap script from the mirror too, so a fresh install works while GitHub is down:
+#   curl -fsSL http://<mirror>/install.sh | bash
+scp -q install.sh "${MIRROR_SSH}:${MIRROR_WEB_PATH}/install.sh"
 ssh "${MIRROR_SSH}" "cd ${MIRROR_REPO_PATH} && git update-server-info"
 
 echo ">> Done. Released ${TAG} to GitHub + mirror."

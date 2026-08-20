@@ -10,6 +10,9 @@
 set -euo pipefail
 
 REPO_URL="https://github.com/Trollobot/Telemax.git"
+# Read-only fallback mirror for when GitHub is unreachable (account flagged, or GitHub filtered on
+# this network). Overridable via env so the mirror can move without editing this script.
+MIRROR_GIT_URL="${MIRROR_GIT_URL:-http://zergont-gate.duckdns.org:3200/Telemax.git}"
 INSTALL_DIR="/opt/telemax"
 
 bold() { printf '\033[1m%s\033[0m\n' "$1"; }
@@ -75,9 +78,21 @@ echo
 echo "[4/5] Скачиваю проект в $INSTALL_DIR..."
 if [ -d "$INSTALL_DIR/.git" ]; then
   echo "Уже склонировано — обновляю до последней версии..."
-  git -C "$INSTALL_DIR" pull --ff-only
+  # GIT_TERMINAL_PROMPT=0 so a flagged/unreachable GitHub fails fast instead of hanging on a
+  # credential prompt; then fall back to the mirror.
+  GIT_TERMINAL_PROMPT=0 git -C "$INSTALL_DIR" pull --ff-only || {
+    echo "GitHub недоступен — обновляю с резервного зеркала..."
+    git -C "$INSTALL_DIR" fetch "$MIRROR_GIT_URL" main
+    git -C "$INSTALL_DIR" merge --ff-only FETCH_HEAD
+  }
+elif GIT_TERMINAL_PROMPT=0 git clone "$REPO_URL" "$INSTALL_DIR"; then
+  : # cloned from GitHub
 else
-  git clone "$REPO_URL" "$INSTALL_DIR"
+  echo "GitHub недоступен — устанавливаю с резервного зеркала..."
+  git clone "$MIRROR_GIT_URL" "$INSTALL_DIR"
+  # Keep origin pointing at GitHub (the canonical source) so ordinary updates prefer it once it's
+  # back; the mirror stays the fallback (see update.sh).
+  git -C "$INSTALL_DIR" remote set-url origin "$REPO_URL"
 fi
 
 cd "$INSTALL_DIR"
