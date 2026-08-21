@@ -58,7 +58,7 @@ process.on('uncaughtException', (err) => {
 
 const sessionStore = new SessionStore();
 const chatMapStore = new ChatMapStore();
-const max = new MaxClient();
+const max = new MaxClient({ host: config.maxHost, sni: config.maxSni });
 
 let bot: Telegraf | null = null;
 let messageLinks: MessageLinkStore | null = null;
@@ -336,10 +336,18 @@ function freshConnectForAuth(timeoutMs = 15000): Promise<void> {
 
 async function loginWithSession(session: MaxSession): Promise<void> {
   try {
-    const { payload } = await max.login(session.sessionToken);
+    const { sessionToken, payload } = await max.login(session.sessionToken);
     applyLoginPayload(payload);
     activePhone = session.phone;
-    currentSession = session;
+    // MAX rotates the session token on every LOGIN and eventually invalidates the previous
+    // one. The fresh-auth path (completeMaxLogin) already persists the new token; a resumed
+    // login must do the same — otherwise every reconnect keeps presenting the ORIGINAL token
+    // and, once its grace window lapses, MAX rejects it, surfacing as a spurious "re-auth
+    // required" every few hours on instances whose socket cycles regularly (a stable box
+    // rarely reconnects, so it never bit the maintainer).
+    const refreshed: MaxSession = { ...session, sessionToken, savedAt: new Date().toISOString() };
+    await sessionStore.save(refreshed);
+    currentSession = refreshed;
     logger.info(`Resumed session for ${session.phone}`);
     notifyMaxSessionRestored();
     await refreshChatsAndNames();

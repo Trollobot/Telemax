@@ -72,7 +72,14 @@ export interface MaxClientOptions {
   pingIntervalMs?: number;
 }
 
-const DEFAULT_HOST = '155.212.204.150';
+// Connect by hostname, NOT a hardcoded IPv4 literal. A literal bypasses DNS entirely,
+// so an IPv6-only host can't use DNS64/NAT64 (that only kicks in on a name lookup) and
+// is left depending on flaky CLAT/464XLAT — the cause of the ~4h reconnect churn seen on
+// an IPv6-only client (the gateway hard-caps the translated session). Resolving the name
+// hands IPv6-only hosts the DNS64-synthesized AAAA (native IPv6 → NAT64, stable) and keeps
+// IPv4/dual-stack hosts on the same endpoint as before, auto-following server IP changes.
+// Pin the literal via MAX_HOST=155.212.204.150 if DNS for oneme.ru is ever unreachable.
+const DEFAULT_HOST = 'api2.oneme.ru';
 const DEFAULT_PORT = 443;
 const DEFAULT_SNI = 'api2.oneme.ru';
 const DEFAULT_PING_INTERVAL_MS = 50_000;
@@ -143,13 +150,24 @@ export class MaxClient extends EventEmitter {
     this.buffer = Buffer.alloc(0);
     this.seq = 1;
 
+    // `ca` REPLACES Node's default trust store for this socket, so MAX_TLS_CA re-includes
+    // the bundled roots alongside the Russian state chain MAX's cert actually needs (scoped
+    // here instead of NODE_EXTRA_CA_CERTS — see ca.ts).
+    // autoSelectFamily (Happy Eyeballs): race IPv6 and IPv4, keep whichever connects first. On
+    // an IPv6-only host only the DNS64-synthesized AAAA is reachable; on dual-stack this avoids
+    // stalling on a dead address family. Default-true on Node 22, set explicitly so it doesn't
+    // hinge on that default. (Typed as an intersection because @types/node's tls.ConnectionOptions
+    // doesn't yet declare the net-level autoSelectFamily field that Node accepts at runtime.)
+    const socketOpts: tls.ConnectionOptions & { autoSelectFamily?: boolean } = {
+      servername: this.opts.sni,
+      rejectUnauthorized: this.opts.rejectUnauthorized,
+      ca: MAX_TLS_CA,
+      autoSelectFamily: true,
+    };
     this.socket = tls.connect(
       this.opts.port,
       this.opts.host,
-      // `ca` REPLACES Node's default trust store for this socket, so MAX_TLS_CA
-      // re-includes the bundled roots alongside the Russian state chain MAX's
-      // cert actually needs (scoped here instead of NODE_EXTRA_CA_CERTS — see ca.ts).
-      { servername: this.opts.sni, rejectUnauthorized: this.opts.rejectUnauthorized, ca: MAX_TLS_CA },
+      socketOpts,
       () => {
         this.reconnectAttempt = 0;
         this.emit('connected');
