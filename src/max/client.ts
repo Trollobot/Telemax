@@ -457,6 +457,34 @@ export class MaxClient extends EventEmitter {
     return { cid, messageId: responseMessage?.id, attaches: responseMessage?.attaches ?? [] };
   }
 
+  /**
+   * Opens a 1:1 dialog with a FRESH contact (never messaged before) by sending the first message
+   * with a top-level `userId` (NOT `chatId`) — MAX creates the dialog server-side and returns its
+   * real positive `chatId` in the response. This is how the official app's "Открыть чат" works
+   * (confirmed live 2026-08-21). The old createDialog `CONTROL {event:'new', chatType:'DIALOG'}` hack
+   * created a GROUP instead (the server doesn't recognize DIALOG in a control attach — it fell back
+   * to a group with a negative id). `text` MUST be non-empty (the server rejects an empty first
+   * message with "Message text must not be empty").
+   */
+  async sendToNewDialog(
+    userId: unknown,
+    text: string,
+    attaches: unknown[] = [],
+    replyTo?: { messageId: unknown; chatId: unknown },
+  ): Promise<{ cid: number; messageId: unknown; chatId: unknown; attaches: unknown[] }> {
+    const cid = Date.now();
+    const link = replyTo ? { type: 'REPLY', messageId: replyTo.messageId, chatId: toChatId(replyTo.chatId) } : null;
+    const { dir, payload } = await this.request(OPCODES.MSG_SEND, {
+      userId: Number(userId),
+      message: { text, cid: BigInt(cid), elements: [], attaches, link },
+      notify: true,
+    });
+    if (dir === DIR.ERR) throw new Error(describeAuthError(payload, 'Open-dialog send failed'));
+    const p = payload as { chatId?: unknown; message?: { id?: unknown; attaches?: unknown[] } } | null;
+    if (p?.chatId == null) throw new Error('Open-dialog send did not return a chat id');
+    return { cid, messageId: p.message?.id, chatId: p.chatId, attaches: p.message?.attaches ?? [] };
+  }
+
   /** `answerIds` — MAX's own assigned ids (from the poll's `answers[].answerId`), not Telegram option indexes. */
   async sendVote(chatId: unknown, messageId: unknown, pollId: unknown, answerIds: number[]): Promise<void> {
     const { dir, payload } = await this.request(OPCODES.SEND_VOTE, { chatId: toChatId(chatId), messageId, pollId, answersIds: answerIds });
@@ -592,34 +620,6 @@ export class MaxClient extends EventEmitter {
     return [];
   }
 
-  /**
-   * Opens a new 1:1 dialog with a contact. MAX has no "create dialog" opcode — like
-   * createGroup it's a MSG_SEND (0x40) with NO top-level chatId, carrying a CONTROL
-   * attach; the only difference from a group is `chatType: 'DIALOG'` and the recipient
-   * in `userIds` (there is NO recipientId/peerId field — confirmed live 2026-08-16,
-   * the server rejects those with "Illegal control message to start new chat"). The
-   * text is empty: the dialog is created by the control event, and the first real
-   * message is sent afterwards to the returned chatId via a normal sendMessage.
-   * notify:false so merely creating it doesn't ping the recipient. The new dialog's id
-   * is NEGATIVE (e.g. -77903811502699) — fine for the BigInt chat-id pipeline. chatId
-   * comes back both top-level (`chatId`) and on `chat.id`. Shape from the user's
-   * reverse engineering (2026-08-16).
-   */
-  async createDialog(recipientUserId: unknown): Promise<{ chatId: unknown }> {
-    const { dir, payload } = await this.request(OPCODES.MSG_SEND, {
-      message: {
-        text: '',
-        cid: BigInt(Date.now()),
-        attaches: [{ _type: 'CONTROL', event: 'new', chatType: 'DIALOG', userIds: [Number(recipientUserId)] }],
-      },
-      notify: false,
-    });
-    if (dir === DIR.ERR) throw new Error(describeAuthError(payload, 'Dialog creation failed'));
-    const p = payload as { chatId?: unknown; chat?: { id?: unknown } } | null;
-    const chatId = p?.chatId ?? p?.chat?.id ?? null;
-    if (chatId == null) throw new Error('Dialog creation did not return a chat id');
-    return { chatId };
-  }
 
   /**
    * One page of the account's full chat list (not the capped ≤50 LOGIN snapshot).

@@ -1687,7 +1687,13 @@ export function wireBridge({
         return keys.length === 2 && keys.includes(target) && keys.includes(myId);
       });
       const existed = existing != null;
-      const chatId = existed ? (existing as { id?: unknown }).id : (await max.createDialog(recipientUserId)).chatId;
+      // Fresh contact: DON'T create a chat up front — MAX makes a GROUP if we do (the old
+      // createDialog CONTROL hack was exactly this bug). Instead map the topic to a
+      // "pending:<userId>" sentinel; the first outbound message opens the real 1:1 dialog via
+      // max.sendToNewDialog and rewrites the mapping (see the pending branch in the relay below).
+      // This mirrors the app's "Открыть чат" — the dialog only exists once you send. An existing
+      // 1:1 is reused by its real id as before.
+      const chatId = existed ? (existing as { id?: unknown }).id : `pending:${recipientUserId}`;
       const ensured = await ensureTopicForMaxChat(bot, targetGroupId, chatId, chatMapStore, name);
       let finalTopicId = ensured.topicId;
       let created = ensured.created;
@@ -1720,6 +1726,13 @@ export function wireBridge({
         await sendAutoInfoCard(chatId, recipientUserId, finalTopicId).catch((e) =>
           logger.error('Failed to send contact-info card on startDialog', e),
         );
+      }
+      // Fresh contact: flag the mapping as a pending dialog so the first outbound message opens the
+      // real 1:1 via max.sendToNewDialog. Done here (after the liveness probe may have recreated the
+      // mapping) so pendingUserId survives on the final entry.
+      if (!existed) {
+        const pending = await chatMapStore.getByMaxChatId(chatId);
+        if (pending) await chatMapStore.upsert({ ...pending, pendingUserId: String(recipientUserId) });
       }
       // Deep link that opens the topic in the user's Telegram (private supergroup form:
       // strip the -100 prefix). The bot can't force-switch the client, but this is one tap.
@@ -2177,6 +2190,11 @@ export function wireBridge({
     if (!topicId) return;
     const mapping = await chatMapStore.getByTopicId(topicId);
     if (!mapping) return;
+    // Forum service messages (topic created/edited/closed/reopened) carry no user content — ignore
+    // them so they don't relay to MAX or trip the pending-dialog first-message handling (the
+    // forum_topic_created that fires right after "Начать чат" was tripping a spurious hint).
+    const svc = ctx.message as unknown as Record<string, unknown>;
+    if (svc.forum_topic_created || svc.forum_topic_edited || svc.forum_topic_closed || svc.forum_topic_reopened) return;
 
     const forwardPrefix = describeForwardOrigin((ctx.message as { forward_origin?: TelegramForwardOrigin }).forward_origin);
     const rawText = (ctx.message as { text?: string; caption?: string }).text;
@@ -2217,6 +2235,43 @@ export function wireBridge({
     logger.info(`TG -> MAX: message ${ctx.message.message_id} in topic ${topicId} (${kind}) -> chat ${mapping.maxChatId}`);
 
     try {
+      // PENDING dialog: the panel's "Начать чат" mapped this topic to a FRESH contact with no MAX
+      // dialog yet. The FIRST message opens the real 1:1 via MSG_SEND{userId} (max.sendToNewDialog),
+      // which returns the real positive chatId — we then rewrite the pending mapping into a real one.
+      // MAX needs non-empty text for a first message; media/files go in follow-ups once it exists.
+      if (mapping.pendingUserId) {
+        const hasAttachment = !!(
+          photo?.length || document || animation || video || videoNote || voice || sticker || poll || location || contact
+        );
+        if (!text || hasAttachment) {
+          await bot.telegram.sendMessage(
+            targetGroupId,
+            '✍️ Первое сообщение новому контакту отправьте текстом — так MAX открывает личку. Файлы и медиа шлите следующими сообщениями.',
+            { message_thread_id: topicId },
+          );
+          return;
+        }
+        const opened = await max.sendToNewDialog(mapping.pendingUserId, text, [], replyLink);
+        await chatMapStore.remove(mapping.maxChatId); // drop the "pending:<userId>" sentinel entry
+        await chatMapStore.upsert({
+          maxChatId: opened.chatId,
+          telegramTopicId: topicId,
+          title: mapping.title,
+          createdAt: mapping.createdAt,
+        });
+        rememberOutgoingSend(opened.chatId, opened.cid);
+        messageLinks.add({
+          maxChatId: opened.chatId,
+          maxMessageId: opened.messageId,
+          telegramMessageId: ctx.message.message_id,
+          outgoing: true,
+        });
+        logger.info(
+          `Opened new MAX 1:1 dialog ${String(opened.chatId)} with user ${mapping.pendingUserId} (topic ${topicId})`,
+        );
+        return;
+      }
+
       if (location) {
         const locationAttach = { _type: 'LOCATION', latitude: location.latitude, longitude: location.longitude, zoom: 14 };
         const { cid, messageId } = await max.sendMessage(mapping.maxChatId, null, [locationAttach]);

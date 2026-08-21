@@ -22,6 +22,12 @@ export interface ChatMapping {
   // survives restarts; /unban flips this back and the next message recreates the
   // topic (via the thread-not-found auto-recreate path in bridge/sync.ts).
   banned?: boolean;
+  // Set while this mapping is a PENDING 1:1 dialog: the panel's "Начать чат" created a topic for a
+  // fresh contact, but MAX has no dialog yet (a 1:1 is only created by the first message). Holds the
+  // contact's userId; the first outbound message opens the real dialog (client.sendToNewDialog) and
+  // rewrites this into a real maxChatId. Until then maxChatId is a "pending:<userId>" sentinel so the
+  // store's maxChatId keying still works.
+  pendingUserId?: string;
 }
 
 /** Persistent MAX chatId <-> Telegram forum topicId mapping (ТЗ.md §1.4). Not secret — plain JSON is fine. */
@@ -59,6 +65,7 @@ export class ChatMapStore {
     createdAt: string;
     historyBackfillCursor?: string;
     banned?: boolean;
+    pendingUserId?: string;
   }): Promise<void> {
     const normalized: ChatMapping = { ...mapping, maxChatId: String(mapping.maxChatId) };
     const all = await this.load();
