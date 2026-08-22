@@ -535,23 +535,25 @@ async function recreateTopicForChat(bot: Telegraf, groupId: string, chatId: unkn
 }
 
 /**
- * For a GROUP chat (>2 participants), a one-line "who sent this" prefix so a Telegram topic isn't an
- * anonymous stream — resolves the sender to a display name ("🧑 Вы:" for our own account). Returns ''
- * for 1:1 dialogs (the topic already IS the contact) and when the sender can't be determined. `profiles`
- * is the live contact cache when available (handleMaxPush); backfill passes none and does a direct lookup.
+ * A one-line "who sent this" prefix so a Telegram topic isn't an anonymous stream. OUR OWN messages
+ * get "🧑 Вы:" EVERYWHERE — including 1:1 backfill and messages sent from the MAX app — so a synced
+ * history isn't an undifferentiated stream where our own lines look identical to the contact's. Other
+ * people get "👤 Name:" only in GROUP chats (>2 participants); in a 1:1 the topic already IS the
+ * contact, so their messages stay unprefixed. Returns '' when the sender can't be determined.
+ * `profiles` is the live contact cache when available (handleMaxPush); backfill passes none.
  */
-async function groupSenderPrefix(
+async function resolveAuthorPrefix(
   chat: unknown,
   senderId: unknown,
   myAccountId: number | null,
   max: MaxClient,
   profiles?: Map<number, ContactProfile>,
 ): Promise<string> {
-  const participants = (chat as { participants?: Record<string, unknown> } | null)?.participants;
-  if (!participants || Object.keys(participants).length <= 2) return ''; // 1:1 dialog (or unknown) — no prefix
   const id = typeof senderId === 'number' ? senderId : Number(senderId);
   if (Number.isNaN(id)) return '';
   if (myAccountId != null && id === myAccountId) return '🧑 Вы:\n';
+  const participants = (chat as { participants?: Record<string, unknown> } | null)?.participants;
+  if (!participants || Object.keys(participants).length <= 2) return ''; // 1:1 (or unknown) — contact's line stays plain
   let profile = profiles?.get(id);
   if (!profile) {
     try {
@@ -590,7 +592,7 @@ async function backfillHistoryToTelegram(
     }
     // Group chats: prefix the author so the topic isn't an anonymous stream (1:1 needs none).
     const chat = chats.find((c) => c && typeof c === 'object' && String((c as { id?: unknown }).id) === String(maxChatId));
-    const authorPrefix = await groupSenderPrefix(chat, (msg as { sender?: unknown }).sender, myAccountId, max);
+    const authorPrefix = await resolveAuthorPrefix(chat, (msg as { sender?: unknown }).sender, myAccountId, max);
     if (authorPrefix) text = text ? `${authorPrefix}${text}` : authorPrefix;
     // One retry: if the topic was deleted, recreate it (once per run) and re-send
     // this same message. Without this, catch-up after a restart silently drops every
@@ -637,6 +639,38 @@ async function backfillHistoryToTelegram(
   }
 }
 
+/**
+ * Roster for a GROUP chat's info card: each participant as {id, name, isSelf}. Batch-fetches any
+ * uncached profiles in one CONTACT_INFO round trip. Returns undefined for 1:1 dialogs (no roster).
+ * Capped at 80 lines to stay under Telegram's message limit; the card notes any overflow.
+ */
+async function buildRoster(
+  participants: Record<string, unknown> | undefined,
+  chatType: string | undefined,
+  max: MaxClient,
+  myAccountId: number | null,
+  profiles: Map<number, ContactProfile>,
+): Promise<Array<{ id: number; name: string; isSelf: boolean }> | undefined> {
+  if (!participants || chatType === 'DIALOG') return undefined;
+  const ids = Object.keys(participants).map(Number).filter((id) => !Number.isNaN(id));
+  const uncached = ids.filter((id) => !profiles.has(id));
+  if (uncached.length > 0) {
+    try {
+      for (const c of await max.getContactInfo(uncached)) {
+        const cid = Number((c as { id?: unknown }).id);
+        if (!Number.isNaN(cid)) profiles.set(cid, c);
+      }
+    } catch (err) {
+      logger.error('Failed to fetch participant profiles for the roster', err);
+    }
+  }
+  return ids.slice(0, 80).map((id) => ({
+    id,
+    name: resolveContactDisplayName(id, profiles.get(id)),
+    isSelf: myAccountId != null && id === myAccountId,
+  }));
+}
+
 /** Builds and sends the contact/chat card — shared by the /info command and the auto-send on first contact with a new chat. Returns the sent message's id so auto-send callers can pin it. */
 async function sendContactInfoCard(
   bot: Telegraf,
@@ -647,21 +681,17 @@ async function sendContactInfoCard(
   participantCount: number | undefined,
   otherId: number | undefined,
   profile: ContactProfile | undefined,
-  participantNames?: string[],
+  roster?: Array<{ id: number; name: string; isSelf: boolean }>,
 ): Promise<number> {
   if (chatType !== 'DIALOG' || otherId == null) {
-    const sent = await bot.telegram.sendMessage(
-      targetGroupId,
-      [
-        `ℹ️ ${fallbackTitle}`,
-        chatType ? `Тип: ${chatType}` : null,
-        participantCount != null ? `Участников: ${participantCount}` : null,
-        participantNames && participantNames.length ? `Состав: ${participantNames.join(', ')}` : null,
-      ]
-        .filter(Boolean)
-        .join('\n'),
-      { message_thread_id: topicId },
-    );
+    const lines = [`ℹ️ ${fallbackTitle}`];
+    if (participantCount != null) lines.push(`Участников: ${participantCount}`);
+    if (roster && roster.length) {
+      lines.push('Состав:');
+      for (const p of roster) lines.push(`• ${p.isSelf ? '🧑 Вы' : `👤 ${p.name}`} — MAX ID ${p.id}`);
+      if (participantCount != null && participantCount > roster.length) lines.push(`…и ещё ${participantCount - roster.length}`);
+    }
+    const sent = await bot.telegram.sendMessage(targetGroupId, lines.join('\n'), { message_thread_id: topicId });
     return sent.message_id;
   }
 
@@ -1168,7 +1198,8 @@ export function wireBridge({
         await pinInfoCard(bot, targetGroupId, messageId);
         return;
       }
-      const messageId = await sendContactInfoCard(bot, targetGroupId, topicId, chat.title || `MAX chat ${String(chatId)}`, chat.type, count, otherId, profile);
+      const roster = await buildRoster(chat.participants, chat.type, max, getMyAccountId(), getContactProfiles());
+      const messageId = await sendContactInfoCard(bot, targetGroupId, topicId, chat.title || `MAX chat ${String(chatId)}`, chat.type, count, otherId, profile, roster);
       await pinInfoCard(bot, targetGroupId, messageId);
       return;
     }
@@ -1460,7 +1491,7 @@ export function wireBridge({
     // Group chats: prefix the author so the topic isn't an anonymous stream (1:1 needs none). For an
     // attachment-only group message the prefix becomes the text, so the file still shows who sent it.
     const senderChat = getChats().find((c) => c && typeof c === 'object' && String((c as { id?: unknown }).id) === String(chatId));
-    const authorPrefix = await groupSenderPrefix(senderChat, message.sender, getMyAccountId(), max, getContactProfiles());
+    const authorPrefix = await resolveAuthorPrefix(senderChat, message.sender, getMyAccountId(), max, getContactProfiles());
     if (authorPrefix) text = text ? `${authorPrefix}${text}` : authorPrefix;
 
     try {
@@ -1815,24 +1846,8 @@ export function wireBridge({
 
     const { chat, otherId, profile } = resolveDialogContact(mapping.maxChatId);
     const count = chat?.participants ? Object.keys(chat.participants).length : undefined;
-    // For a group/channel, list the participants by name (fetch any uncached in one batch).
-    let participantNames: string[] | undefined;
-    if (chat?.participants && chat.type !== 'DIALOG') {
-      const ids = Object.keys(chat.participants).map(Number).filter((id) => !Number.isNaN(id));
-      const uncached = ids.filter((id) => !getContactProfiles().has(id));
-      if (uncached.length > 0) {
-        try {
-          for (const c of await max.getContactInfo(uncached)) {
-            const cid = Number((c as { id?: unknown }).id);
-            if (!Number.isNaN(cid)) getContactProfiles().set(cid, c);
-          }
-        } catch (err) {
-          logger.error('Failed to fetch participant profiles for /info', err);
-        }
-      }
-      participantNames = ids.slice(0, 50).map((id) => resolveContactDisplayName(id, getContactProfiles().get(id)));
-    }
-    await sendContactInfoCard(bot, targetGroupId, topicId, chat?.title || mapping.title || 'Чат', chat?.type, count, otherId, profile, participantNames);
+    const roster = await buildRoster(chat?.participants, chat?.type, max, getMyAccountId(), getContactProfiles());
+    await sendContactInfoCard(bot, targetGroupId, topicId, chat?.title || mapping.title || 'Чат', chat?.type, count, otherId, profile, roster);
   });
 
   /** Formats a poll's current tally — MAX sends no push for votes, so callers always pull it live via CHAT_HISTORY first. */
@@ -2511,7 +2526,8 @@ export async function syncAllChatsToTelegram(
         const otherId = participantIds.find((id) => id !== myAccountId);
         const participantCount = c.participants ? participantIds.length : undefined;
         try {
-          const messageId = await sendContactInfoCard(bot, targetGroupId, topicId, name, c.type, participantCount, otherId, otherId != null ? contactProfiles.get(otherId) : undefined);
+          const roster = await buildRoster(c.participants, c.type, max, myAccountId, contactProfiles);
+          const messageId = await sendContactInfoCard(bot, targetGroupId, topicId, name, c.type, participantCount, otherId, otherId != null ? contactProfiles.get(otherId) : undefined, roster);
           await pinInfoCard(bot, targetGroupId, messageId);
         } catch (err) {
           logger.error('Failed to send auto contact-info card', err);
