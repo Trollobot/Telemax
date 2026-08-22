@@ -54,12 +54,12 @@ apt-get update -y </dev/null
 apt_get upgrade -y
 
 echo
-echo "[2/5] Проверяю git, jq и gnupg..."
-# jq: used by setup.sh to auto-detect the Telegram group id (no need to hunt
-# for it manually — see setup.sh). gnupg: used by update.sh to verify the signed
-# release tag before building (v0.4 signed-update trust — see update.sh).
-for pkg in git jq gnupg; do
-  if ! command -v "${pkg/gnupg/gpg}" >/dev/null 2>&1; then
+echo "[2/5] Проверяю git и jq..."
+# jq: used by setup.sh to auto-detect the Telegram group id (no need to hunt for it
+# manually — see setup.sh). (update.sh's release-signature check uses ssh-keygen, which
+# ships with openssh and is already present on any host you can SSH into — no extra pkg.)
+for pkg in git jq; do
+  if ! command -v "$pkg" >/dev/null 2>&1; then
     apt_get install -y "$pkg"
   fi
 done

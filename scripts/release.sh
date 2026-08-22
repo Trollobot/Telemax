@@ -34,20 +34,18 @@ if ! git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
   exit 1
 fi
 
-# Signed-release trust (v0.4): once the maintainer's public key is pinned in the repo
-# (release-signing-key.asc), refuse to publish a tag that isn't validly signed by it — so neither
-# GitHub nor the mirror can ever carry code that update.sh's verify-tag would (correctly) reject.
-# Create signed tags with:  git tag -s vX.Y.Z   (needs the private key + gpg on this machine).
-if [ -f release-signing-key.asc ]; then
-  VERIFY_HOME=$(mktemp -d)
-  GNUPGHOME="$VERIFY_HOME" gpg --quiet --import release-signing-key.asc >/dev/null 2>&1 || true
-  if ! GNUPGHOME="$VERIFY_HOME" git -c gpg.program=gpg verify-tag "${TAG}" >/dev/null 2>&1; then
-    rm -rf "$VERIFY_HOME"
-    echo "!! Tag ${TAG} is not validly signed by the pinned release key. Sign it: git tag -s -f ${TAG}" >&2
+# Signed-release trust (v0.4): once the maintainer's key is pinned in the repo (allowed_signers),
+# refuse to publish a tag that isn't validly SSH-signed by it — so neither GitHub nor the mirror can
+# ever carry code that update.sh's verify-tag would (correctly) reject. Sign tags with the neutral
+# release identity so no personal email leaks into public history:
+#   git -c gpg.format=ssh -c user.signingkey=~/.ssh/id_ed25519.pub \
+#       -c user.name='Telemax Release' -c user.email=release@telemax tag -s vX.Y.Z -m vX.Y.Z
+if [ -f allowed_signers ]; then
+  if ! git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=allowed_signers verify-tag "${TAG}" >/dev/null 2>&1; then
+    echo "!! Tag ${TAG} is not validly signed by the pinned release key (see the git tag -s line above)." >&2
     exit 1
   fi
-  rm -rf "$VERIFY_HOME"
-  echo ">> release signature OK: ${TAG}"
+  echo ">> release signature OK (ssh): ${TAG}"
 fi
 
 echo ">> [1/4] push to GitHub (origin)"

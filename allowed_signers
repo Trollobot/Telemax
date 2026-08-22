@@ -1,0 +1,8 @@
+# Telemax release-signing key (SSH signature format, git >= 2.34).
+# update.sh verifies every release tag against this key BEFORE building — the transport
+# (GitHub or the self-hosted mirror) is untrusted; only a tag signed by the maintainer's
+# key is accepted, so a compromised source can't auto-deploy code. Tags are created with
+# the neutral tagger identity "Telemax Release <release@telemax>" (no personal email in the
+# public history); that identity is the principal below. To rotate: add a new line, and sign
+# with the new key from the next release on.
+release@telemax namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILE1HMFVabDZUp6fRrnnt2lMgTY57ghrMP1pp+dE5MIe
