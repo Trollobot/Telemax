@@ -534,6 +534,37 @@ async function recreateTopicForChat(bot: Telegraf, groupId: string, chatId: unkn
   return topicId;
 }
 
+/**
+ * For a GROUP chat (>2 participants), a one-line "who sent this" prefix so a Telegram topic isn't an
+ * anonymous stream — resolves the sender to a display name ("🧑 Вы:" for our own account). Returns ''
+ * for 1:1 dialogs (the topic already IS the contact) and when the sender can't be determined. `profiles`
+ * is the live contact cache when available (handleMaxPush); backfill passes none and does a direct lookup.
+ */
+async function groupSenderPrefix(
+  chat: unknown,
+  senderId: unknown,
+  myAccountId: number | null,
+  max: MaxClient,
+  profiles?: Map<number, ContactProfile>,
+): Promise<string> {
+  const participants = (chat as { participants?: Record<string, unknown> } | null)?.participants;
+  if (!participants || Object.keys(participants).length <= 2) return ''; // 1:1 dialog (or unknown) — no prefix
+  const id = typeof senderId === 'number' ? senderId : Number(senderId);
+  if (Number.isNaN(id)) return '';
+  if (myAccountId != null && id === myAccountId) return '🧑 Вы:\n';
+  let profile = profiles?.get(id);
+  if (!profile) {
+    try {
+      const contacts = await max.getContactInfo([id]);
+      profile = contacts[0];
+      if (profile && profiles) profiles.set(id, profile);
+    } catch (err) {
+      logger.error(`Failed to resolve group sender ${id} for the author prefix`, err);
+    }
+  }
+  return `👤 ${resolveContactDisplayName(id, profile)}:\n`;
+}
+
 async function backfillHistoryToTelegram(
   bot: Telegraf,
   groupId: string,
@@ -544,18 +575,23 @@ async function backfillHistoryToTelegram(
   messageLinks: MessageLinkStore,
   chatMapStore: ChatMapStore,
   chats: unknown[],
+  myAccountId: number | null,
 ): Promise<void> {
   // May change mid-run if the topic turns out to be deleted (recreated on the fly).
   let currentTopicId = topicId;
   let recreatedOnce = false;
   for (const msg of messages) {
     const forwarded = await resolveForwardContent(max, chats, msg.link);
-    const text = forwarded ? forwarded.text : msg.text;
+    let text = forwarded ? forwarded.text : msg.text;
     const attaches = forwarded ? forwarded.attaches : Array.isArray(msg.attaches) ? (msg.attaches as MaxAttachment[]) : [];
     if (!text && attaches.length === 0) {
       await chatMapStore.advanceHistoryCursor(maxChatId, msg.time);
       continue;
     }
+    // Group chats: prefix the author so the topic isn't an anonymous stream (1:1 needs none).
+    const chat = chats.find((c) => c && typeof c === 'object' && String((c as { id?: unknown }).id) === String(maxChatId));
+    const authorPrefix = await groupSenderPrefix(chat, (msg as { sender?: unknown }).sender, myAccountId, max);
+    if (authorPrefix) text = text ? `${authorPrefix}${text}` : authorPrefix;
     // One retry: if the topic was deleted, recreate it (once per run) and re-send
     // this same message. Without this, catch-up after a restart silently drops every
     // message for a chat whose topic was removed (the cursor advances regardless).
@@ -1177,7 +1213,7 @@ export function wireBridge({
         await sendAutoInfoCard(chatId, undefined, newTopicId).catch((err) => logger.error('Failed to send auto contact-info card on restore', err));
         const history = await fetchFullHistory(max, chatId, null);
         if (history.length > 0) {
-          await backfillHistoryToTelegram(bot, targetGroupId, newTopicId, history, max, chatId, messageLinks, chatMapStore, getChats());
+          await backfillHistoryToTelegram(bot, targetGroupId, newTopicId, history, max, chatId, messageLinks, chatMapStore, getChats(), getMyAccountId());
         }
       } catch (err) {
         logger.error(`Failed to recreate/restore deleted topic for MAX chat ${key}`, err);
@@ -1420,6 +1456,12 @@ export function wireBridge({
       }
       return;
     }
+
+    // Group chats: prefix the author so the topic isn't an anonymous stream (1:1 needs none). For an
+    // attachment-only group message the prefix becomes the text, so the file still shows who sent it.
+    const senderChat = getChats().find((c) => c && typeof c === 'object' && String((c as { id?: unknown }).id) === String(chatId));
+    const authorPrefix = await groupSenderPrefix(senderChat, message.sender, getMyAccountId(), max, getContactProfiles());
+    if (authorPrefix) text = text ? `${authorPrefix}${text}` : authorPrefix;
 
     try {
       await deliverToTopic(chatId, async (topicId, created) => {
@@ -2480,7 +2522,7 @@ export async function syncAllChatsToTelegram(
       const history = await fetchFullHistory(max, c.id, cursor);
       if (history.length > 0) {
         logger.info(`${cursor == null ? 'Backfilling' : 'Catching up on'} ${history.length} messages for MAX chat ${String(c.id)}`);
-        await backfillHistoryToTelegram(bot, targetGroupId, topicId, history, max, c.id, messageLinks, chatMapStore, chats);
+        await backfillHistoryToTelegram(bot, targetGroupId, topicId, history, max, c.id, messageLinks, chatMapStore, chats, myAccountId);
       }
     } catch (err) {
       logger.error(`Failed to sync MAX chat ${c.id} to Telegram`, err);
