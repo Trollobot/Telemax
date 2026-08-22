@@ -3,7 +3,6 @@ import { writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { Markup, type Telegraf } from 'telegraf';
 import type { ChatAction, TelegramEmoji } from 'telegraf/types';
-import { Agent, fetch as undiciFetch } from 'undici';
 import type { MaxClient, MaxMessageEvent, MaxHistoryMessage } from '../max/client.js';
 import { OPCODES, formatOpcode } from '../max/opcodes.js';
 import { resolveContactDisplayName, resolveChatName, type ContactProfile } from '../max/names.js';
@@ -11,6 +10,7 @@ import type { ChatMapStore } from '../store/chatMapStore.js';
 import { ensureTopicForMaxChat } from '../telegram/bot.js';
 import { downloadMaxAttachment, describeAttachment, type MaxAttachment, type DownloadContext } from './attachments.js';
 import { uploadTelegramAttachmentToMax } from './upload.js';
+import { canRenderAnimatedStickers } from './lottie.js';
 import { reportBridgeError } from './errorReporter.js';
 import { wireControlPanel } from './panel.js';
 import { createBugReports, BUGREPORT_BOT_HANDLE, type BugReports } from './bugReports.js';
@@ -668,32 +668,6 @@ async function pinInfoCard(bot: Telegraf, targetGroupId: string, messageId: numb
   }
 }
 
-// ifconfig.me is dual-stack; Node's built-in fetch (undici) doesn't reliably honor the process
-// ipv4-first DNS order, so it can answer over IPv6 and echo back the server's IPv6 address. That IPv6
-// then lands in the /apikey panel link — unbracketed (a broken URL) and pointing at a family the panel
-// doesn't even serve (it listens on 0.0.0.0, IPv4 only). Pin this one probe to IPv4 so the login link
-// is always a reachable IPv4 URL. Reported live: a dual-stack user's panel button handed out IPv6.
-const ipv4OnlyDispatcher = new Agent({ connect: { family: 4 } });
-
-/** Same lookup setup.sh does once at install time, run live for /apikey's link — best-effort, `null` just falls back to the bare key. */
-async function detectPublicIp(): Promise<string | null> {
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 5000);
-    const res = await undiciFetch('https://ifconfig.me/ip', {
-      signal: controller.signal,
-      dispatcher: ipv4OnlyDispatcher,
-    }).finally(() => clearTimeout(timeout));
-    if (!res.ok) return null;
-    const ip = (await res.text()).trim();
-    // Safety net: should be IPv4 given the dispatcher above, but never emit a bare IPv6 into a URL.
-    return ip.includes(':') ? `[${ip}]` : ip;
-  } catch (err) {
-    logger.error('Failed to detect public IP for /apikey link', err);
-    return null;
-  }
-}
-
 /** Picked up within a minute by update-watcher.sh on the host (see setup.sh) — writing it is the only thing the container itself does towards an update, everything else (git pull, rebuild, restart) happens outside it. */
 const UPDATE_REQUESTED_MARKER = path.join(process.cwd(), '.data', 'update-requested');
 /** Written by update.sh while it runs (data/ is the same mount as .data/) — lets the /version button refuse a second request mid-update. */
@@ -732,8 +706,6 @@ export interface BridgeOptions {
   getMyAccountId: () => number | null;
   getContactProfiles: () => Map<number, ContactProfile>;
   getActivePhone: () => string;
-  /** 'https' once the panel booted with its (self-signed) certificate, 'http' when TLS is off or cert setup failed — /apikey builds its login link with it. */
-  getPanelScheme: () => 'http' | 'https';
   /** Refetches MAX's chat list and re-runs the full backfill sync — used by /reboot after wiping local state. Fire-and-forget on the caller's side (server/app.ts already guards against overlapping runs). */
   triggerFullResync: () => Promise<void>;
   /** Disconnects from MAX and deletes the encrypted session — used by /kill. Awaited (unlike triggerFullResync) since /kill's own confirmation message should only go out once this has actually finished. */
@@ -756,7 +728,6 @@ export function wireBridge({
   getMyAccountId,
   getContactProfiles,
   getActivePhone,
-  getPanelScheme,
   triggerFullResync,
   killEverything,
   auth,
@@ -1584,29 +1555,6 @@ export function wireBridge({
   });
 
   /** Recovers the web-panel API_KEY without needing SSH/file access to the server — safe now that the target-group middleware above actually gates who can ask. Bundles it into a ready-to-open link (App.tsx reads ?key= and logs straight in) when the server's public IP can be detected, falling back to the bare key otherwise. */
-  bot.command('apikey', async (ctx) => {
-    const apiKey = process.env.API_KEY;
-    if (!apiKey) {
-      await bot.telegram.sendMessage(ctx.chat.id, 'API_KEY не задан в .env.', { message_thread_id: ctx.message.message_thread_id });
-      return;
-    }
-    const port = process.env.PORT ?? '3000';
-    const ip = await detectPublicIp();
-    const scheme = getPanelScheme();
-    const certNote =
-      scheme === 'https'
-        ? '\n\n🔒 Сертификат самоподписанный — браузер один раз предупредит «подключение не защищено»: жми «Дополнительно» → «Перейти на сайт».'
-        : '';
-    const text = ip
-      ? `🔑 Вход в веб-панель (ссылка сразу авторизует):\n${scheme}://${ip}:${port}/?key=${encodeURIComponent(apiKey)}${certNote}`
-      : `🔑 Ключ для веб-панели (не удалось определить IP сервера — откройте панель вручную и введите ключ):\n<code>${apiKey}</code>${certNote}`;
-    await bot.telegram.sendMessage(ctx.chat.id, text, {
-      message_thread_id: ctx.message.message_thread_id,
-      parse_mode: 'HTML',
-      link_preview_options: { is_disabled: true },
-    });
-  });
-
   // In-Telegram MAX login. In a DM the private-chat auth flow already handles /login; this group
   // handler just hands over the deep link into that DM, so the SMS code and 2FA password never
   // touch the group chat.
@@ -1794,31 +1742,6 @@ export function wireBridge({
       sendVersion: async (chatId) => {
         const { text, replyMarkup } = formatVersionMessage(await checkVersion());
         await bot.telegram.sendMessage(chatId, text, { reply_markup: replyMarkup });
-      },
-      sendApiKey: async (chatId) => {
-        const key = process.env.API_KEY;
-        await bot.telegram.sendMessage(chatId, key ? `🔑 Ключ веб-панели:\n<code>${key}</code>` : 'API_KEY не задан в .env.', {
-          parse_mode: 'HTML',
-          link_preview_options: { is_disabled: true },
-        });
-      },
-      sendLoginLink: async (chatId) => {
-        const apiKey = process.env.API_KEY;
-        if (!apiKey) {
-          await bot.telegram.sendMessage(chatId, 'API_KEY не задан в .env.');
-          return;
-        }
-        const port = process.env.PORT ?? '3000';
-        const ip = await detectPublicIp();
-        const scheme = getPanelScheme();
-        const certNote =
-          scheme === 'https'
-            ? '\n\n🔒 Сертификат самоподписанный — браузер предупредит один раз: «Дополнительно» → «Перейти на сайт».'
-            : '';
-        const text = ip
-          ? `🔗 Вход в веб-панель (ссылка сразу авторизует):\n${scheme}://${ip}:${port}/?key=${encodeURIComponent(apiKey)}${certNote}`
-          : `🔗 Не удалось определить IP сервера — откройте панель вручную и введите ключ (кнопка «API-ключ»).${certNote}`;
-        await bot.telegram.sendMessage(chatId, text, { parse_mode: 'HTML', link_preview_options: { is_disabled: true } });
       },
       sendBanList: async (chatId) => {
         const active = (await chatMapStore.list()).filter((m) => !m.banned);
@@ -2259,7 +2182,7 @@ export function wireBridge({
     const video = (ctx.message as { video?: { file_id: string; file_name?: string } }).video;
     const videoNote = (ctx.message as { video_note?: { file_id: string } }).video_note;
     const voice = (ctx.message as { voice?: { file_id: string; duration?: number } }).voice;
-    const sticker = (ctx.message as { sticker?: { file_id: string; is_animated?: boolean; is_video?: boolean } }).sticker;
+    const sticker = (ctx.message as { sticker?: { file_id: string; is_animated?: boolean; is_video?: boolean; thumbnail?: { file_id: string } } }).sticker;
     const poll = (ctx.message as { poll?: { id: string; question: string; options: Array<{ text: string }>; is_anonymous: boolean; allows_multiple_answers: boolean } }).poll;
     const location = (ctx.message as { location?: { latitude: number; longitude: number } }).location;
     const contact = (ctx.message as { contact?: { phone_number: string; first_name: string; last_name?: string } }).contact;
@@ -2395,7 +2318,13 @@ export function wireBridge({
         if (sticker.is_video) {
           attach = await uploadTelegramAttachmentToMax(bot, max, sticker.file_id, 'video', 'sticker.webm');
         } else if (sticker.is_animated) {
-          attach = await uploadTelegramAttachmentToMax(bot, max, sticker.file_id, 'sticker_animated');
+          // Animated .tgs needs a headless-Chromium render (see lottie.ts). On a "slim" image without
+          // Chromium, fall back to the sticker's static thumbnail so something still comes through.
+          if (canRenderAnimatedStickers()) {
+            attach = await uploadTelegramAttachmentToMax(bot, max, sticker.file_id, 'sticker_animated');
+          } else if (sticker.thumbnail?.file_id) {
+            attach = await uploadTelegramAttachmentToMax(bot, max, sticker.thumbnail.file_id, 'photo');
+          }
         } else {
           attach = await uploadTelegramAttachmentToMax(bot, max, sticker.file_id, 'photo');
         }

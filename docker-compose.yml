@@ -4,6 +4,9 @@ services:
       context: .
       args:
         GIT_COMMIT: ${GIT_COMMIT:-unknown}
+        # full (default) = animated stickers play as video (needs Chromium+ffmpeg, ~1.4 GB extra).
+        # slim = animated stickers relay as a static image; much smaller/faster image. Set by setup.sh.
+        STICKERS: ${STICKERS:-full}
     restart: unless-stopped
     # Hard cap on container stdout: the default json-file driver grows without
     # limit between container recreations. 10m x 3 bounds it at ~30 MB total;
@@ -14,8 +17,6 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
-    ports:
-      - "${PORT:-3000}:${PORT:-3000}"
     env_file:
       - .env
     volumes:

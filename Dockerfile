@@ -14,15 +14,15 @@ ENV NODE_ENV=production
 # commit is actually running vs what's latest on GitHub.
 ARG GIT_COMMIT=unknown
 ENV GIT_COMMIT=$GIT_COMMIT
-# chromium + ffmpeg: rendering Telegram's animated (.tgs/Lottie) stickers to a
-# short WebM so they can go through the ordinary VIDEO_UPLOAD pipeline — MAX has
-# no confirmed native sticker-upload opcode, but its own animated stickers arrive
-# as autoplaying VIDEO attaches, so this gets the same "plays in the feed" result.
-# Uses puppeteer-core (no bundled Chromium download) against this system package
-# instead, keeping the image smaller.
-# openssl: generates the web panel's self-signed TLS certificate on first start
-# (see loadOrCreatePanelCert in src/server/app.ts).
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates chromium ffmpeg openssl && rm -rf /var/lib/apt/lists/*
+# Animated-sticker rendering (.tgs/Lottie → short WebM via headless Chromium + ffmpeg, so it can go
+# through the ordinary VIDEO_UPLOAD pipeline and autoplay in the feed like MAX's own animated stickers)
+# is OPTIONAL — chromium + ffmpeg together weigh ~1.4 GB. Build with --build-arg STICKERS=slim to skip
+# them (image ~0.3 GB); animated stickers then relay as their static thumbnail instead of a playable
+# video. STICKERS=full (default) installs them. ca-certificates is always needed for TLS.
+ARG STICKERS=full
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && if [ "$STICKERS" = "full" ]; then apt-get install -y --no-install-recommends chromium ffmpeg; fi \
+    && rm -rf /var/lib/apt/lists/*
 ENV CHROMIUM_PATH=/usr/bin/chromium
 # MAX's TLS chain goes through Russia's state CA (Минцифры "Russian Trusted
 # Root/Sub CA"), which no standard trust store includes. Deliberately NOT
@@ -36,5 +36,5 @@ COPY certs ./certs
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 COPY --from=build /app/dist ./dist
-EXPOSE 3000
+# Headless bridge (v0.4): no inbound web server — MAX is an outbound socket, Telegram is long-polled.
 CMD ["node", "dist/server.mjs"]

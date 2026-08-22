@@ -1,37 +1,20 @@
-import express from 'express';
 import dns from 'node:dns';
-import { createServer } from 'node:http';
-import { createServer as createTlsServer } from 'node:https';
-import net from 'node:net';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
-import { WebSocketServer, type WebSocket } from 'ws';
 import { Telegraf } from 'telegraf';
 import path from 'node:path';
-import { chmod, mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
+import { readFile, unlink, writeFile } from 'node:fs/promises';
 import { MaxClient, type MaxMessageEvent, type MaxContactInfo } from '../max/client.js';
-import { OPCODES, formatOpcode } from '../max/opcodes.js';
+import { OPCODES } from '../max/opcodes.js';
 import { extractMyAccountId, resolveChatName, type ContactProfile } from '../max/names.js';
 import { SessionStore, type MaxSession } from '../store/sessionStore.js';
 import { ChatMapStore } from '../store/chatMapStore.js';
 import { wireBridge, syncAllChatsToTelegram, MessageLinkStore } from '../bridge/sync.js';
 import { configureErrorReporter, reportBridgeError, resetErrorKey } from '../bridge/errorReporter.js';
 import { getAppVersion } from '../bridge/version.js';
-import { createLogger, jsonStringify, redactSecrets } from '../logger.js';
+import { createLogger } from '../logger.js';
 import { config } from './config.js';
-import { isValidApiKey, requireApiKey } from './authMiddleware.js';
-import {
-  buildTelegramProxyAgent,
-  getResolvedProxyUrl,
-  getTelegramProxyAgent,
-  initTelegramProxy,
-  redactProxyUrl,
-  writePersistedProxy,
-} from '../telegram/proxy.js';
-import https from 'node:https';
+import { getTelegramProxyAgent, initTelegramProxy } from '../telegram/proxy.js';
 
 const logger = createLogger('server');
-const startedAt = Date.now();
 
 // Prefer IPv4 when a host resolves to both. On dual-stack servers where IPv6 has no
 // working route to Telegram (common in RU — Telegram is blocked over v6 while v4
@@ -74,9 +57,6 @@ let pendingAuthToken: string | null = null;
 /** Set when verifyCode() comes back password_required — cleared only on a successful login, since the trackId survives a wrong password and can be retried (confirmed live 2026-08-14). */
 let pendingPasswordTrackId: string | null = null;
 let currentSession: MaxSession | null = null;
-let latestLatencyMs: number | null = null;
-let packetsSent = 0;
-let packetsReceived = 0;
 // LOGIN's embedded chat list is capped at chatsCount (<=50) and, live, has also
 // been observed to just omit chats a later resumed-session LOGIN included —
 // cachedChats gets replaced with the real, fully-paginated CHATS_LIST result
@@ -148,7 +128,6 @@ async function completeMaxLogin(loginToken: string): Promise<void> {
   activePhone = session.phone;
   lastKnownPhone = session.phone;
   notifyMaxSessionRestored();
-  broadcastStatus();
   refreshBotDescription();
 }
 
@@ -237,7 +216,6 @@ async function killMaxSession(): Promise<void> {
   myAccountId = null;
   contactProfiles = new Map();
   maxConnected = false;
-  broadcastStatus();
   refreshBotDescription();
 }
 
@@ -259,88 +237,6 @@ function upsertCachedChat(chat: unknown): void {
   const idx = cachedChats.findIndex((c) => c && typeof c === 'object' && String((c as { id?: unknown }).id) === key);
   if (idx >= 0) cachedChats[idx] = chat;
   else cachedChats.push(chat);
-}
-
-interface UiLogEntry {
-  time: string;
-  opcode: string;
-  dir: string;
-  size: string;
-  payload: string;
-}
-
-const packetLogs: UiLogEntry[] = [];
-const uiClients = new Set<WebSocket>();
-
-function broadcast(message: unknown): void {
-  const data = JSON.stringify(message);
-  for (const client of uiClients) {
-    if (client.readyState === client.OPEN) client.send(data);
-  }
-}
-
-function broadcastStatus(): void {
-  broadcast({
-    type: 'status',
-    data: {
-      max: maxConnected,
-      tg: tgActive,
-      deviceId: max.deviceId,
-      phone: activePhone,
-      latencyMs: latestLatencyMs,
-    },
-  });
-}
-
-function pushLog(dir: string, opcode: number, length: number, payload: unknown): void {
-  const entry: UiLogEntry = {
-    time: new Date().toISOString().substring(11, 23),
-    opcode: formatOpcode(opcode),
-    dir,
-    size: `${length} B`,
-    payload: jsonStringify(redactSecrets(payload)),
-  };
-  packetLogs.push(entry);
-  if (packetLogs.length > 50) packetLogs.shift();
-  broadcast({ type: 'log', data: entry });
-}
-
-const execFileAsync = promisify(execFile);
-const TLS_DIR = path.join(process.cwd(), '.data', 'tls');
-
-/** What /apikey should build its login link with — flips to 'https' once the panel actually boots with a certificate (not just intends to), so the link never points at a scheme the server isn't serving. */
-let panelScheme: 'http' | 'https' = 'http';
-
-/**
- * Self-signed TLS for the web panel. Installs are typically bare-IP VPSes, so a
- * publicly-trusted certificate isn't attainable by default — self-signed still
- * closes the real gap: the API key, the SMS code and the MAX 2FA password used
- * to cross the open internet as plain HTTP. The browser warns once about the
- * unknown issuer (expected; /apikey's link says so). Generated with the openssl
- * CLI (present in the Docker image) and persisted in .data/tls — the ./data
- * volume — so the browser exception survives container rebuilds.
- */
-async function loadOrCreatePanelCert(): Promise<{ key: Buffer; cert: Buffer } | null> {
-  const keyPath = path.join(TLS_DIR, 'key.pem');
-  const certPath = path.join(TLS_DIR, 'cert.pem');
-  try {
-    return { key: await readFile(keyPath), cert: await readFile(certPath) };
-  } catch {
-    // not generated yet — fall through
-  }
-  try {
-    await mkdir(TLS_DIR, { recursive: true });
-    await execFileAsync('openssl', [
-      'req', '-x509', '-newkey', 'rsa:2048', '-keyout', keyPath, '-out', certPath,
-      '-days', '3650', '-nodes', '-subj', '/CN=telemax',
-    ]);
-    await chmod(keyPath, 0o600).catch(() => {});
-    logger.info('Generated a self-signed TLS certificate for the web panel (.data/tls)');
-    return { key: await readFile(keyPath), cert: await readFile(certPath) };
-  } catch (err) {
-    logger.error('Failed to generate a self-signed TLS certificate — the panel stays on plain HTTP', err);
-    return null;
-  }
 }
 
 // Set once we've told the group the MAX session was lost, so a "restored" notice only
@@ -446,7 +342,6 @@ async function loginWithSession(session: MaxSession): Promise<void> {
   } finally {
     resumeInFlight = false;
   }
-  broadcastStatus();
   refreshBotDescription();
 }
 
@@ -463,7 +358,6 @@ async function startServer(): Promise<void> {
 
   max.on('connected', () => {
     maxConnected = true;
-    broadcastStatus();
     if (maxDownTimer) {
       clearTimeout(maxDownTimer);
       maxDownTimer = null;
@@ -481,7 +375,6 @@ async function startServer(): Promise<void> {
 
   max.on('disconnected', () => {
     maxConnected = false;
-    broadcastStatus();
     if (maxDownTimer == null && !maxDownReported) {
       maxDownTimer = setTimeout(() => {
         maxDownTimer = null;
@@ -493,21 +386,7 @@ async function startServer(): Promise<void> {
 
   max.on('error', (err: Error) => logger.error('MAX client error:', err.message));
 
-  max.on('latency', (ms: number) => {
-    latestLatencyMs = ms;
-    broadcastStatus();
-  });
-
-  max.on('sent', ({ opcode, payload, length }: { opcode: number; payload: unknown; length: number }) => {
-    packetsSent += 1;
-    pushLog('TX', opcode, length, payload);
-  });
-
   max.on('message', (event: MaxMessageEvent) => {
-    packetsReceived += 1;
-    const dirLabel = event.dir === 0x03 ? 'ERR' : event.dir === 0x01 ? 'RX' : 'PUSH';
-    pushLog(dirLabel, event.opcode, event.length, event.payload);
-
     if (event.opcode === OPCODES.PUSH_MESSAGE || (event.opcode === OPCODES.MSG_SEND && event.dir === 0x01)) {
       const p = event.payload as { chatId?: number; message?: unknown } | null;
       if (p?.chatId != null && p.message) patchCachedChatLastMessage(p.chatId, p.message);
@@ -541,7 +420,6 @@ async function startServer(): Promise<void> {
         getMyAccountId: () => myAccountId,
         getContactProfiles: () => contactProfiles,
         getActivePhone: () => activePhone,
-        getPanelScheme: () => panelScheme,
         triggerFullResync: () => refreshChatsAndNames().then(() => syncChatsIfPossible()),
         killEverything: killMaxSession,
         auth: {
@@ -562,260 +440,14 @@ async function startServer(): Promise<void> {
     logger.warn('TELEGRAM_BOT_TOKEN / TARGET_TELEGRAM_GROUP not set — Telegram bridge stays disabled');
   }
 
-  // --- HTTP + WS server ---
-  const app = express();
-  app.use(express.json());
+  // No inbound server: the bridge is headless (v0.4). Auth, status and control all live in
+  // the Telegram bot now (see /login, the /panel menu). MAX runs over an outbound TCP socket
+  // and Telegram over long-polling, so nothing needs to listen on a port.
 
-  // TLS on by default in production (self-signed — see loadOrCreatePanelCert).
-  // PANEL_TLS=off opts out for setups with their own TLS-terminating reverse
-  // proxy in front. Dev mode stays plain HTTP on localhost.
-  const wantTls = process.env.NODE_ENV === 'production' && process.env.PANEL_TLS !== 'off';
-  const tlsMaterial = wantTls ? await loadOrCreatePanelCert() : null;
-  panelScheme = tlsMaterial ? 'https' : 'http';
-  const httpServer = tlsMaterial ? createTlsServer({ key: tlsMaterial.key, cert: tlsMaterial.cert }, app) : createServer(app);
-  const wss = new WebSocketServer({ noServer: true });
-
-  httpServer.on('upgrade', (req, socket, head) => {
-    if (req.url?.startsWith('/ws')) {
-      const key = new URL(req.url, 'http://localhost').searchParams.get('apiKey');
-      if (!isValidApiKey(config.apiKey, key)) {
-        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
-        socket.destroy();
-        return;
-      }
-      wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
-    } else {
-      socket.destroy();
-    }
-  });
-
-  wss.on('connection', (ws) => {
-    uiClients.add(ws);
-    ws.send(JSON.stringify({ type: 'init_logs', data: packetLogs }));
-    ws.send(
-      JSON.stringify({
-        type: 'status',
-        data: { max: maxConnected, tg: tgActive, deviceId: max.deviceId, phone: activePhone, latencyMs: latestLatencyMs },
-      }),
-    );
-    ws.on('close', () => uiClients.delete(ws));
-  });
-
-  app.get('/api/health', (_req, res) => res.json({ ok: true }));
-
-  const api = express.Router();
-  api.use(requireApiKey(config.apiKey));
-
-  api.get('/status', (_req, res) => {
-    res.json({
-      maxOnline: maxConnected,
-      tgActive,
-      deviceId: max.deviceId,
-      phone: activePhone,
-      latencyMs: latestLatencyMs,
-      uptimeSeconds: Math.floor((Date.now() - startedAt) / 1000),
-      packetsSent,
-      packetsReceived,
-    });
-  });
-
-  api.post('/system/stop', (_req, res) => {
-    max.disconnect();
-    res.json({ success: true });
-  });
-
-  api.post('/system/start', (_req, res) => {
-    max.connect();
-    res.json({ success: true });
-  });
-
-  // Restarts the whole process to apply config that's only read at startup (the
-  // Telegram proxy). compose's `restart: unless-stopped` brings the container right
-  // back, so from the operator's side this is just "apply & reconnect".
-  api.post('/system/restart', (_req, res) => {
-    res.json({ success: true });
-    logger.warn('Restart requested from the web panel — exiting so the container comes back up');
-    setTimeout(() => process.exit(0), 300);
-  });
-
-  // --- Telegram proxy config (see src/telegram/proxy.ts) ---
-  api.get('/proxy', (_req, res) => {
-    res.json({ proxy: getResolvedProxyUrl() });
-  });
-
-  api.post('/proxy/test', async (req, res) => {
-    const url = typeof req.body?.proxy === 'string' ? req.body.proxy : '';
-    res.json(await testTelegramProxyReachable(url));
-  });
-
-  api.post('/proxy', async (req, res) => {
-    const url = typeof req.body?.proxy === 'string' ? req.body.proxy.trim() : '';
-    try {
-      buildTelegramProxyAgent(url); // validates scheme/format — throws on garbage
-    } catch (err) {
-      res.status(400).json({ error: (err as Error).message });
-      return;
-    }
-    await writePersistedProxy(url);
-    logger.info(url ? `Telegram proxy saved (${redactProxyUrl(url)}) — applies on restart` : 'Telegram proxy cleared — applies on restart');
-    res.json({ success: true, restartRequired: true });
-  });
-
-  api.post('/auth/phone', async (req, res) => {
-    const rawPhone = req.body?.phone;
-    if (!rawPhone) {
-      res.status(400).json({ error: 'phone missing' });
-      return;
-    }
-    try {
-      await maxAuthRequestSms(String(rawPhone));
-      res.json({ success: true });
-    } catch (err) {
-      const msg = (err as Error).message;
-      logger.error('Failed to request SMS', err);
-      res.status(msg === 'MAX is disconnected' ? 503 : 502).json({ error: msg });
-    }
-  });
-
-  api.post('/auth/verify', async (req, res) => {
-    const code = req.body?.code;
-    if (!code) {
-      res.status(400).json({ error: 'code missing' });
-      return;
-    }
-    if (!pendingAuthToken) {
-      res.status(400).json({ error: 'no pending auth — call /api/auth/phone first' });
-      return;
-    }
-    try {
-      const result = await maxAuthVerifyCode(String(code));
-      if ('passwordRequired' in result) {
-        res.json({ success: true, passwordRequired: true, hint: result.hint });
-        return;
-      }
-      res.json({ success: true });
-    } catch (err) {
-      logger.error('Failed to verify SMS code', err);
-      res.status(502).json({ error: (err as Error).message });
-    }
-  });
-
-  // Only reached for password-protected accounts — verifyCode() above set
-  // pendingPasswordTrackId instead of completing the login directly.
-  api.post('/auth/password', async (req, res) => {
-    const password = req.body?.password;
-    if (!password) {
-      res.status(400).json({ error: 'password missing' });
-      return;
-    }
-    if (!pendingPasswordTrackId) {
-      res.status(400).json({ error: 'no pending password challenge — call /api/auth/verify first' });
-      return;
-    }
-    try {
-      await maxAuthCheckPassword(String(password));
-      res.json({ success: true });
-    } catch (err) {
-      logger.error('Failed to verify MAX password', err);
-      res.status(502).json({ error: (err as Error).message });
-    }
-  });
-
-  // Same MAX-side teardown /kill's bot command uses (disconnect + delete the
-  // encrypted session) — but scoped to just that, unlike /kill, which also
-  // wipes every Telegram topic. Lets the web panel offer "log out / change
-  // number" without touching chat history.
-  api.post('/auth/logout', async (_req, res) => {
-    await killMaxSession();
-    res.json({ success: true });
-  });
-
-  api.get('/chats', (_req, res) => {
-    const chats = cachedChats.map((chat) => ({
-      ...(chat as object),
-      displayName: resolveChatName(chat, myAccountId, contactProfiles),
-    }));
-    res.type('application/json').send(jsonStringify({ success: true, data: { chats } }));
-  });
-
-  api.get('/chat-mappings', async (_req, res) => {
-    res.json({ success: true, data: await chatMapStore.list() });
-  });
-
-  // The /api/debug/* one-shot probes that used to live here (test-poll, test-contact,
-  // test-group*, test-delete, chats-list, contact-info, chat-history) were removed
-  // 2026-08-14 after every probed opcode got wired into real bot commands — they were
-  // API-key-gated but still let a caller send messages and manage groups on the MAX
-  // account, which is needless surface on a production install. Recover from git
-  // history if a new opcode ever needs live probing again.
-
-  api.post('/chats/:id/messages', async (req, res) => {
-    if (!maxConnected) {
-      res.status(503).json({ error: 'MAX is disconnected' });
-      return;
-    }
-    const text = req.body?.text;
-    if (!text) {
-      res.status(400).json({ error: 'text missing' });
-      return;
-    }
-    try {
-      const { cid } = await max.sendMessage(req.params.id, String(text));
-      res.json({ success: true, cid });
-    } catch (err) {
-      res.status(502).json({ error: (err as Error).message });
-    }
-  });
-
-  app.use('/api', api);
-
-  // --- Frontend ---
-  if (process.env.NODE_ENV === 'production') {
-    const distPath = path.join(process.cwd(), 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (_req, res) => res.sendFile(path.join(distPath, 'index.html')));
-  } else {
-    // Dynamic import, NOT a static top-level one: vite is a devDependency, so it
-    // doesn't exist in the production image at all. A static import crashed the
-    // container on boot (ERR_MODULE_NOT_FOUND) the moment @tailwindcss/vite left
-    // "dependencies" — it had been pulling vite into the runtime image as its
-    // peer dependency this whole time, masking the problem. Hit live 2026-08-14.
-    const { createServer: createViteServer } = await import('vite');
-    const vite = await createViteServer({ server: { middlewareMode: true }, appType: 'spa' });
-    app.use(vite.middlewares);
-  }
-
-  let listener: net.Server = httpServer;
-  if (tlsMaterial) {
-    // Single-port polyglot: a TLS ClientHello always starts with byte 0x16, so
-    // anything else on the socket is a plain-HTTP client — an old bookmark or a
-    // pre-TLS /apikey link — and gets a 301 to the same URL over https instead
-    // of a cryptic protocol error.
-    const redirectServer = createServer((req, res) => {
-      res.writeHead(301, { Location: `https://${req.headers.host ?? `localhost:${config.port}`}${req.url ?? '/'}` });
-      res.end();
-    });
-    listener = net.createServer((socket) => {
-      socket.on('error', () => socket.destroy());
-      socket.once('data', (firstChunk) => {
-        socket.pause();
-        socket.unshift(firstChunk);
-        (firstChunk[0] === 0x16 ? httpServer : redirectServer).emit('connection', socket);
-        // NOT a synchronous resume: the TLS wrap set up by the 'connection'
-        // listener needs this tick, or the handshake never sees the ClientHello
-        // and hangs forever (caught by a local smoke test before shipping).
-        process.nextTick(() => socket.resume());
-      });
-    });
-  }
-  listener.listen(config.port, '0.0.0.0', () => {
-    logger.info(`Server listening on port ${config.port}${tlsMaterial ? ' (HTTPS, self-signed)' : ''}`);
-  });
-
-  // docker stop / systemd send SIGTERM (node runs as PID 1 — exec-form CMD, so it
-  // actually receives it). Stop polling Telegram and close the MAX socket cleanly
-  // instead of letting the runtime kill mid-write; the backfill cursor is persisted
-  // per message, so an in-flight backfill resumes where it left off either way.
+  // docker stop / systemd send SIGTERM (node runs as PID 1 — exec-form CMD, so it actually
+  // receives it). Stop polling Telegram and close the MAX socket cleanly instead of letting the
+  // runtime kill mid-write; the backfill cursor is persisted per message, so an in-flight
+  // backfill resumes where it left off either way.
   const shutdown = (signal: string): void => {
     logger.info(`Received ${signal}, shutting down`);
     try {
@@ -824,11 +456,9 @@ async function startServer(): Promise<void> {
       // bot may not have launched (bad token, mid-retry) — nothing to stop
     }
     max.disconnect();
-    if (listener !== httpServer) httpServer.close();
-    listener.close(() => process.exit(0));
-    // Failsafe: don't let a lingering keep-alive socket hold the process past
-    // docker's own stop timeout.
+    // Failsafe: don't let a lingering keep-alive socket hold the process past docker's stop timeout.
     setTimeout(() => process.exit(0), 5_000).unref();
+    process.exit(0);
   };
   process.once('SIGTERM', () => shutdown('SIGTERM'));
   process.once('SIGINT', () => shutdown('SIGINT'));
@@ -869,7 +499,6 @@ const BOT_COMMANDS = [
   { command: 'panel', description: '🎛 Пульт управления (меню с кнопками)' },
   { command: 'help', description: 'Полный список команд и ограничений' },
   { command: 'donate', description: 'Поддержать проект (рубли / TON)' },
-  { command: 'apikey', description: 'Показать ключ для веб-панели' },
   { command: 'login', description: 'Войти в MAX (номер + SMS, в личке бота)' },
   { command: 'version', description: 'Версия бота, обновление по кнопке' },
   { command: 'info', description: 'Карточка контакта/чата (просто в теме)' },
@@ -945,7 +574,6 @@ async function announceGroupReadyOnce(bot: Telegraf): Promise<void> {
 
 function retryTelegramLaunch(bot: Telegraf, attempt: number, reason: unknown): void {
   tgActive = false;
-  broadcastStatus();
   const idx = Math.min(attempt, TELEGRAM_RETRY_DELAYS_MS.length - 1);
   const delay = TELEGRAM_RETRY_DELAYS_MS[idx] as number;
   logger.error(`Telegram bot stopped, retrying in ${delay}ms:`, reason instanceof Error ? reason.message : reason);
@@ -970,7 +598,6 @@ async function launchTelegramBotWithRetry(bot: Telegraf, attempt = 0): Promise<v
 
   tgActive = true;
   logger.info('Telegram bot active');
-  broadcastStatus();
 
   // Best-effort: keeps the bot's Telegram profile description in sync with its
   // actual command surface and the two platform-level gaps a user could otherwise
@@ -990,28 +617,6 @@ async function launchTelegramBotWithRetry(bot: Telegraf, attempt = 0): Promise<v
   bot
     .launch({ allowedUpdates: ['message', 'edited_message', 'message_reaction', 'poll_answer', 'callback_query'] })
     .catch((err) => retryTelegramLaunch(bot, attempt, err));
-}
-
-/** Tries to reach api.telegram.org through the given proxy URL (empty = direct). Backs
- * the panel's "test" button before a proxy is saved. Never throws — returns a verdict. */
-async function testTelegramProxyReachable(proxyUrl: string): Promise<{ ok: boolean; error?: string }> {
-  let agent: ReturnType<typeof buildTelegramProxyAgent>;
-  try {
-    agent = buildTelegramProxyAgent(proxyUrl);
-  } catch (err) {
-    return { ok: false, error: (err as Error).message };
-  }
-  return new Promise((resolve) => {
-    const req = https.get('https://api.telegram.org/', { agent, timeout: 8000 }, (res) => {
-      res.resume();
-      resolve({ ok: true });
-    });
-    req.on('timeout', () => {
-      req.destroy();
-      resolve({ ok: false, error: 'таймаут подключения' });
-    });
-    req.on('error', (err) => resolve({ ok: false, error: err.message }));
-  });
 }
 
 function createBotSafely(token: string): Telegraf | null {

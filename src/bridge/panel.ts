@@ -19,8 +19,6 @@ export interface ControlPanelDeps {
   /** Reused slash-command bodies — the panel just triggers the same output. */
   leaves: {
     sendHelp: LeafSender;
-    sendLoginLink: LeafSender;
-    sendApiKey: LeafSender;
     sendVersion: LeafSender;
     sendBanList: LeafSender;
     sendUnbanList: LeafSender;
@@ -89,7 +87,7 @@ function rootView(phone: string): View {
     text: `🎛 Telemax — пульт\n${status} · версия ${version}`,
     markup: Markup.inlineKeyboard([
       [Markup.button.callback('👤 Найти контакт', 'tlmx_panel:contacts'), Markup.button.callback('🚫 Чаты', 'tlmx_panel:chats')],
-      [Markup.button.callback('🌐 Веб-панель', 'tlmx_panel:web'), Markup.button.callback('⚙️ Система', 'tlmx_panel:system')],
+      [Markup.button.callback('🔐 Вход в MAX', 'tlmx_panel:web'), Markup.button.callback('⚙️ Система', 'tlmx_panel:system')],
     ]).reply_markup,
   };
 }
@@ -112,15 +110,16 @@ function chatsView(): View {
   };
 }
 function webView(botUsername?: string): View {
-  // The MAX-login button is a deep link into the bot's DM (t.me/<bot>?start=login) — auth (SMS code,
-  // 2FA password) happens privately there, not in the group. Shown only once we know the username.
+  // Auth is a deep link into the bot's DM (t.me/<bot>?start=login) — SMS code and 2FA password
+  // are entered privately there, never in the group. Button shown only once we know the username.
   const rows = [
-    [Markup.button.callback('🔗 Ссылка для входа', 'tlmx_panel:link'), Markup.button.callback('🔑 API-ключ', 'tlmx_panel:apikey')],
     ...(botUsername ? [[Markup.button.url('🔐 Войти в MAX', `https://t.me/${botUsername}?start=login`)]] : []),
     [Markup.button.callback('◀️ Назад', 'tlmx_panel:root')],
   ];
   return {
-    text: '🌐 Веб-панель:',
+    text: botUsername
+      ? '🔐 Вход в MAX — в личке бота:\nнажмите кнопку (или напишите боту в личку /login). Код и пароль не попадут в группу.'
+      : '🔐 Вход в MAX: напишите боту в личку /login.',
     markup: Markup.inlineKeyboard(rows).reply_markup,
   };
 }
@@ -232,14 +231,6 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
   bot.action('tlmx_panel:help', async (ctx) => {
     await ctx.answerCbQuery();
     await leaves.sendHelp(chatIdOf(ctx));
-  });
-  bot.action('tlmx_panel:apikey', async (ctx) => {
-    await ctx.answerCbQuery();
-    await leaves.sendApiKey(chatIdOf(ctx));
-  });
-  bot.action('tlmx_panel:link', async (ctx) => {
-    await ctx.answerCbQuery();
-    await leaves.sendLoginLink(chatIdOf(ctx));
   });
   bot.action('tlmx_panel:update', async (ctx) => {
     await ctx.answerCbQuery();

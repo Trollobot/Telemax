@@ -16,7 +16,7 @@
 import { gunzipSync } from 'node:zlib';
 import { spawn } from 'node:child_process';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import puppeteer from 'puppeteer-core';
@@ -25,6 +25,15 @@ import { createLogger } from '../logger.js';
 const logger = createLogger('lottie');
 
 const CHROMIUM_PATH = process.env.CHROMIUM_PATH || '/usr/bin/chromium';
+
+/**
+ * Whether this image can render animated (.tgs) stickers to video. The "slim" build (STICKERS=slim,
+ * see Dockerfile) omits Chromium+ffmpeg to save ~1.4 GB; there, animated stickers relay as their
+ * static thumbnail instead. Presence of the Chromium binary IS the signal — no separate flag needed.
+ */
+export function canRenderAnimatedStickers(): boolean {
+  return existsSync(CHROMIUM_PATH);
+}
 // esbuild bundles this whole module into dist/server.mjs — import.meta.url at
 // runtime points at THAT file's location (/app/dist/server.mjs), not this
 // source file's, so the relative path has to be resolved from there.

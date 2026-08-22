@@ -1,112 +1,13 @@
 #!/usr/bin/env bash
-# Interactive first-time setup for Telemax. Generates the two secret keys
-# automatically, asks only for the two things nobody but you can provide
-# (the Telegram bot token and target group id), writes .env, and offers to
-# build + start the bridge right away.
+# Interactive first-time setup for Telemax (v0.4 — headless, no web panel).
+# Generates the session-encryption key automatically, asks only for the two things
+# nobody but you can provide (the Telegram bot token and target group), lets you pick
+# the image size (animated stickers on/off), writes .env, and builds + starts the
+# bridge. MAX authorization happens afterwards IN THE BOT: send /login to it in a DM.
 set -euo pipefail
 cd "$(dirname "$0")"
 
 bold() { printf '\033[1m%s\033[0m\n' "$1"; }
-
-# Waits until the container's HTTPS panel answers /health. MAX connects a moment
-# after the container starts, so /auth/* would 503 if we asked too early. Expects
-# API_URL set. Panel uses a self-signed cert generated on first start — hence -k.
-wait_for_server() {
-  echo "Жду готовности сервера..."
-  for attempt in 1 2 3 4 5 6 7 8 9 10; do
-    curl -sk --max-time 2 "$API_URL/health" >/dev/null 2>&1 && break
-    sleep 2
-  done
-}
-
-# Interactive MAX auth (phone -> SMS -> optional cloud password) against the running
-# container's /api/auth/*, the same endpoints the web panel uses. Runs both on a
-# fresh install and on the re-auth path below (an already-configured install where
-# auth was never finished). Expects API_URL, API_KEY, HOST, PORT set; sets AUTHED=1
-# on success.
-run_max_auth() {
-  echo
-  echo "════════════════════════════════════════════════════════════════"
-  bold "  ШАГ АВТОРИЗАЦИИ MAX — БЕЗ НЕГО МОСТ НЕ ЗАРАБОТАЕТ"
-  echo "════════════════════════════════════════════════════════════════"
-  echo "Введите номер MAX и код из SMS. Если пропустить (просто Enter) —"
-  echo "контейнер останется запущенным, но НЕ подключённым к аккаунту, пока"
-  echo "вы не авторизуетесь позже через веб-панель."
-  echo
-  AUTHED=""
-  read -rp "Номер телефона MAX (с кодом страны, напр. +79991234567), или Enter чтобы позже: " MAX_PHONE
-  if [ -n "$MAX_PHONE" ]; then
-    PHONE_OK=""
-    for attempt in 1 2 3; do
-      PHONE_RESP=$(curl -sk -X POST -H "x-api-key: $API_KEY" -H "Content-Type: application/json" \
-        -d "{\"phone\":\"$MAX_PHONE\"}" "$API_URL/auth/phone")
-      if echo "$PHONE_RESP" | grep -q '"success":true'; then
-        PHONE_OK=1
-        break
-      fi
-      sleep 2
-    done
-    if [ -n "$PHONE_OK" ]; then
-      echo "Код отправлен на $MAX_PHONE."
-      read -rp "Код из SMS: " MAX_CODE
-      VERIFY_RESP=$(curl -sk -X POST -H "x-api-key: $API_KEY" -H "Content-Type: application/json" \
-        -d "{\"code\":\"$MAX_CODE\"}" "$API_URL/auth/verify")
-      if echo "$VERIFY_RESP" | grep -q '"passwordRequired":true'; then
-        # Some MAX accounts have a password set as a second factor on top of SMS.
-        # A wrong password can be retried freely — the auth session behind it
-        # doesn't expire until a correct one goes through (confirmed live 2026-08-14).
-        HINT=$(echo "$VERIFY_RESP" | grep -o '"hint":"[^"]*"' | sed 's/"hint":"//;s/"$//')
-        echo "Этот MAX-аккаунт защищён паролем (второй фактор поверх SMS)."
-        [ -n "$HINT" ] && echo "Подсказка: $HINT"
-        PASSWORD_OK=""
-        while [ -z "$PASSWORD_OK" ]; do
-          read -rsp "Пароль: " MAX_PASSWORD
-          echo
-          PASSWORD_RESP=$(curl -sk -X POST -H "x-api-key: $API_KEY" -H "Content-Type: application/json" \
-            -d "{\"password\":\"$MAX_PASSWORD\"}" "$API_URL/auth/password")
-          if echo "$PASSWORD_RESP" | grep -q '"success":true'; then
-            PASSWORD_OK=1
-            AUTHED=1
-            bold "Готово — мост авторизован и подключён к MAX."
-          else
-            echo "❌ Неверный пароль, попробуйте ещё раз (или Ctrl+C — тогда через веб-панель: https://$HOST:$PORT)."
-          fi
-        done
-      elif echo "$VERIFY_RESP" | grep -q '"success":true'; then
-        AUTHED=1
-        bold "Готово — мост авторизован и подключён к MAX."
-      else
-        echo "❌ Не удалось подтвердить код: $VERIFY_RESP"
-        echo "Попробуйте ещё раз через веб-панель: https://$HOST:$PORT"
-      fi
-    else
-      echo "❌ Не удалось запросить SMS: $PHONE_RESP"
-      echo "Попробуйте через веб-панель: https://$HOST:$PORT"
-    fi
-  else
-    echo "Ок — авторизацию можно завершить позже через веб-панель (см. ниже)."
-  fi
-}
-
-# Big, unmissable closing summary — authed vs not, plus the panel URL and key.
-# Expects AUTHED, HOST, PORT, API_KEY.
-print_final_status() {
-  echo
-  echo "════════════════════════════════════════════════════════════════"
-  if [ -n "$AUTHED" ]; then
-    bold "  ✅ ГОТОВО. Мост авторизован, запущен и подключён к MAX."
-  else
-    bold "  ⚠️  МОСТ ЗАПУЩЕН, НО MAX ПОКА НЕ АВТОРИЗОВАН"
-    echo "  Без авторизации сообщения не будут пересылаться. Завершите её:"
-    echo "  откройте https://$HOST:$PORT, введите ключ ниже, затем номер и код из SMS."
-  fi
-  echo "════════════════════════════════════════════════════════════════"
-  echo "  Веб-панель:  https://$HOST:$PORT"
-  echo "  Ключ входа:  $API_KEY"
-  echo "  (сертификат самоподписанный — браузер предупредит один раз:"
-  echo "   «Дополнительно» → «Перейти на сайт». Ключ можно вернуть командой /apikey у бота.)"
-  echo "════════════════════════════════════════════════════════════════"
-}
 
 # Runs on every invocation, even on an already-configured install (the .env
 # check below exits before the rest of setup) — an update pulled in via the
@@ -149,60 +50,28 @@ else
   echo "Пропускаю установку вотчера обновлений — нужны root и systemd. Обновляться придётся вручную: ./update.sh"
 fi
 
+# Already configured — nothing to re-ask. If MAX isn't authorized yet, that's now
+# a one-liner in the bot (/login), so we don't need the old console-auth flow.
 if [ -f .env ]; then
-  # Already configured — but the MAX auth step might never have been finished
-  # (interrupted mid-flow, or only the bot/group part was done, or the account
-  # has a cloud password and the person bailed at that prompt). Re-running the
-  # installer used to just say "нечего делать" and exit, leaving the web panel as
-  # the only recovery path. Instead: check whether MAX is actually authorized and,
-  # if not, offer to finish it right here in the console.
-  set -a
-  # shellcheck disable=SC1091
-  . ./.env 2>/dev/null || true
-  set +a
-  PORT="${PORT:-3000}"
-  API_URL="https://localhost:$PORT/api"
-  PUBLIC_IP=$(curl -s --max-time 3 ifconfig.me || true)
-  HOST="${PUBLIC_IP:-<адрес-сервера>}"
-
   if ! command -v docker >/dev/null 2>&1; then
-    echo ".env уже существует, но Docker недоступен на этой машине —"
-    echo "запустите контейнер там, где есть Docker, и авторизуйтесь через веб-панель."
+    echo ".env уже существует, но Docker недоступен на этой машине — запустите контейнер там, где есть Docker."
     exit 0
   fi
-
   if [ -z "$(docker compose ps --status running --format '{{.Name}}' 2>/dev/null)" ]; then
     read -rp ".env есть, но контейнер не запущен. Запустить сейчас? [Y/n] " RUN_NOW
     if [ "${RUN_NOW:-Y}" = "n" ] || [ "${RUN_NOW:-Y}" = "N" ]; then
-      echo "Ок. Когда будете готовы: docker compose up -d, затем ./setup.sh или веб-панель."
+      echo "Ок. Когда будете готовы: docker compose up -d"
       exit 0
     fi
     GIT_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo unknown) docker compose up -d --build
   fi
-
-  wait_for_server
-  # /api/status returns the active phone once MAX is authorized; empty until then.
-  STATUS=$(curl -sk --max-time 3 -H "x-api-key: ${API_KEY:-}" "$API_URL/status" 2>/dev/null || true)
-  if echo "$STATUS" | grep -q '"phone":"[^"]'; then
-    echo "✅ Уже настроено и авторизовано в MAX. Ничего делать не нужно."
-    echo "   Веб-панель: https://$HOST:$PORT"
-    exit 0
-  fi
-
-  echo
-  bold "⚠️  .env есть, но MAX ещё не авторизован — шаг авторизации не завершён."
-  read -rp "Пройти авторизацию сейчас? [Y/n] " DO_AUTH
-  if [ "${DO_AUTH:-Y}" = "n" ] || [ "${DO_AUTH:-Y}" = "N" ]; then
-    echo "Ок — можно позже через веб-панель: https://$HOST:$PORT (ключ: /apikey у бота или grep API_KEY .env)."
-    exit 0
-  fi
-  run_max_auth
-  print_final_status
+  echo "✅ Уже настроено и запущено."
+  echo "   Если MAX ещё не авторизован — напишите боту в ЛИЧКУ: /login (или в группе: /panel → «🔐 Вход в MAX»)."
   exit 0
 fi
 
 if ! command -v openssl >/dev/null 2>&1; then
-  echo "Не найден openssl — он нужен, чтобы сгенерировать ключи. Установите его (обычно уже есть на Ubuntu/Debian: apt install openssl) и запустите скрипт снова."
+  echo "Не найден openssl — он нужен для генерации ключа шифрования сессии. Установите (apt install openssl) и запустите скрипт снова."
   exit 1
 fi
 
@@ -244,18 +113,6 @@ check_tcp() {
   return 1
 }
 
-# Starting from $1, returns the first port nothing is already listening on
-# locally. Used instead of hard-failing when 3000 is taken (e.g. a leftover
-# container from an earlier install attempt) — just use the next one free.
-find_free_port() {
-  local port=$1
-  while (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; do
-    exec 3>&- 3<&-
-    port=$((port + 1))
-  done
-  echo "$port"
-}
-
 # Ask about a Telegram proxy BEFORE the reachability check: on a host where Telegram
 # is reachable only through a proxy (e.g. a home server with no direct route to
 # api.telegram.org), a direct check would falsely fail and abort setup. MAX always
@@ -272,21 +129,23 @@ echo
 echo "Проверяю связь с серверами MAX и Telegram..."
 
 # MAX is fatal: it's always direct, so nothing the user could re-type fixes a blocked
-# MAX — a firewall/geo-block is an environment problem, not a typo.
-if check_tcp 155.212.204.150 443; then
-  echo "  MAX (155.212.204.150:443): OK"
+# MAX — a firewall/geo-block is an environment problem, not a typo. Checked by NAME so
+# an IPv6-only host resolves via DNS64/NAT64 (MAX itself is IPv4-only).
+if check_tcp api2.oneme.ru 443; then
+  echo "  MAX (api2.oneme.ru:443): OK"
 else
-  echo "  MAX (155.212.204.150:443): нет связи"
+  echo "  MAX (api2.oneme.ru:443): нет связи"
   echo
   echo "Без связи с сервером MAX мост работать не сможет — обычно это файрвол хостинга"
-  echo "или гео-блокировка. Проверьте сеть сервера и запустите setup.sh снова."
+  echo "или гео-блокировка. На IPv6-only хосте нужен NAT64/DNS64 у провайдера. Проверьте"
+  echo "сеть сервера и запустите setup.sh снова."
   exit 1
 fi
 
 # Telegram is NOT fatal: the usual cause is a mistyped proxy (or a host that needs a
 # proxy at all) — both fixable right here. So loop and let the user re-enter the proxy
 # and re-check instead of aborting, with an explicit "skip" escape so a genuinely
-# blocked host isn't a dead end (the proxy can still be set later in the panel).
+# blocked host isn't a dead end (the proxy can still be set later in .env).
 while true; do
   TG_PROXY_ARGS=()
   if [ -n "$TELEGRAM_PROXY" ]; then
@@ -305,11 +164,11 @@ while true; do
   fi
   echo "    • впишите прокси (socks5://… или http://…) и Enter — перепроверю через него;"
   echo "    • пустой Enter — перепроверить напрямую, без прокси;"
-  echo "    • skip — продолжить установку без проверки (прокси можно задать позже в панели)."
+  echo "    • skip — продолжить установку без проверки (прокси можно задать позже в .env)."
   read -rp "  > " TG_INPUT
   if [ "$TG_INPUT" = "skip" ]; then
     echo "  Пропускаю проверку Telegram. Мост поднимется, но без связи с Telegram пересылки"
-    echo "  не будет — задайте прокси в веб-панели (Configuration → Telegram-прокси)."
+    echo "  не будет — задайте TELEGRAM_PROXY в .env и пересоберите."
     break
   fi
   TELEGRAM_PROXY="$TG_INPUT"
@@ -403,37 +262,45 @@ if [ -f "$AVATAR" ]; then
   fi
 fi
 
-API_KEY=$(openssl rand -hex 24)
 MAX_SESSION_KEY=$(openssl rand -hex 32)
 
-PORT=$(find_free_port 3000)
-if [ "$PORT" != "3000" ]; then
-  echo "Порт 3000 занят — использую $PORT вместо него."
+# Animated stickers (.tgs) — the one real image-size knob. Rendering them to playable
+# video needs a headless Chromium + ffmpeg (~1.4 GB); opting out ("slim") relays them as
+# a static picture instead and keeps the image ~0.3 GB with a much faster build. 30-second
+# timeout so an unattended install isn't blocked — defaults to full.
+echo
+echo "Анимированные стикеры (.tgs):"
+echo "  • FULL (по умолчанию) — проигрываются как видео. Образ +~1.4 ГБ (Chromium+ffmpeg), сборка дольше."
+echo "  • SLIM — уходят статической картинкой. Образ ~0.3 ГБ, быстрая сборка."
+STICKERS=full
+if read -t 30 -rp "Впишите slim для лёгкого образа, или Enter (жду 30с) — оставить full: " STICKERS_CHOICE; then
+  case "${STICKERS_CHOICE:-}" in
+    slim | SLIM | s | S) STICKERS=slim ;;
+    *) STICKERS=full ;;
+  esac
+else
+  echo
+  echo "  (30с прошло — оставляю full)"
 fi
+echo "  → образ: $STICKERS"
 
-# .env carries every secret this install has (API key, session-encryption key,
-# bot token) — don't leave it readable to other local users.
+# .env carries the session-encryption key and bot token — don't leave it readable to
+# other local users. STICKERS is read by docker-compose.yml as a build arg.
 umask 077
 cat > .env <<EOF
 # сгенерировано setup.sh $(date -u +%Y-%m-%dT%H:%M:%SZ)
-API_KEY=$API_KEY
 MAX_SESSION_KEY=$MAX_SESSION_KEY
 TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN
 TARGET_TELEGRAM_GROUP=$TARGET_TELEGRAM_GROUP
-PORT=$PORT
 TELEGRAM_PROXY=$TELEGRAM_PROXY
+STICKERS=$STICKERS
 EOF
 
 echo
 bold "Готово: .env создан."
-echo "Ключ для входа в веб-панель (сохраните — если потеряете, его всегда можно"
-echo "запросить снова у бота командой /apikey прямо в вашей Telegram-группе):"
-bold "  $API_KEY"
-echo
 
 if ! command -v docker >/dev/null 2>&1; then
-  echo "Docker не найден на этой машине — установите Docker и Docker Compose, затем запустите:"
-  echo "  docker compose up -d --build"
+  echo "Docker не найден — установите Docker и Docker Compose, затем: docker compose up -d --build"
   exit 0
 fi
 
@@ -444,18 +311,18 @@ if [ "${RUN_NOW:-Y}" = "n" ] || [ "${RUN_NOW:-Y}" = "N" ]; then
 fi
 
 echo
-echo "Собираю образ — первая сборка дольше обычного (внутри headless-браузер для рендера стикеров), обычно несколько минут."
+if [ "$STICKERS" = "full" ]; then
+  echo "Собираю образ (full) — первая сборка дольше (внутри headless-браузер для стикеров), обычно несколько минут."
+else
+  echo "Собираю образ (slim) — быстрая сборка."
+fi
 GIT_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo unknown) docker compose up -d --build
 
-PUBLIC_IP=$(curl -s --max-time 3 ifconfig.me || true)
-HOST="${PUBLIC_IP:-<адрес-сервера>}"
-
 echo
-bold "Контейнер собран и запущен. Остался ОДИН обязательный шаг ниже."
-
-# Авторизация в MAX прямо здесь, без переключения в браузер — тот же /api/auth/*,
-# которым пользуется веб-панель, просто из консоли.
-API_URL="https://localhost:$PORT/api"
-wait_for_server
-run_max_auth
-print_final_status
+echo "════════════════════════════════════════════════════════════════"
+bold "  ✅ Мост собран и запущен. Остался ОДИН обязательный шаг: авторизация MAX."
+echo "  Откройте вашего бота в Telegram и напишите ему в ЛИЧКУ команду:"
+bold "      /login"
+echo "  Введёте номер MAX и код из SMS прямо в личке — в группу они не попадут."
+echo "  (Альтернатива: в группе /panel → «🔐 Вход в MAX».)"
+echo "════════════════════════════════════════════════════════════════"

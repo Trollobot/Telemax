@@ -64,6 +64,36 @@ fi
 # two up originally, which silently broke the whole watcher — confirmed live
 # 2026-08-14: a marker written straight to `data/` was never picked up
 # because update-watcher.sh was checking `.data/` instead).
+STEP="проверка подписи релиза"
+# Signed-release trust (v0.4): the transport (GitHub OR the self-hosted mirror) is untrusted — only
+# the maintainer's GPG signature on the release tag is. When release-signing-key.asc is pinned in the
+# repo, REQUIRE a valid signed tag at the pulled HEAD before building anything, so a compromised
+# GitHub/mirror can't auto-deploy code. Absent (pre-signing installs, mid-transition) → skip.
+PUBKEY_FILE="release-signing-key.asc"
+if [ -f "$PUBKEY_FILE" ]; then
+  if ! command -v gpg >/dev/null 2>&1; then
+    notify "❌ Обновление отклонено: не установлен gpg для проверки подписи релиза (apt-get install -y gnupg)."
+    exit 1
+  fi
+  VERIFY_HOME=$(mktemp -d)
+  GNUPGHOME="$VERIFY_HOME" gpg --quiet --import "$PUBKEY_FILE" >/dev/null 2>&1 || true
+  TAG_AT_HEAD=$(git tag --points-at HEAD 2>/dev/null | grep -E '^v[0-9]' | sort -V | tail -1 || true)
+  if [ -z "$TAG_AT_HEAD" ]; then
+    rm -rf "$VERIFY_HOME"
+    notify "❌ Обновление отклонено: на новой версии нет подписанного тега."
+    exit 1
+  fi
+  if ! GNUPGHOME="$VERIFY_HOME" git -c gpg.program=gpg verify-tag "$TAG_AT_HEAD" >/dev/null 2>&1; then
+    rm -rf "$VERIFY_HOME"
+    notify "❌ Обновление отклонено: подпись релиза ${TAG_AT_HEAD} не прошла проверку. Возможна компрометация источника — версия НЕ установлена."
+    exit 1
+  fi
+  rm -rf "$VERIFY_HOME"
+  echo "[update] release signature OK: ${TAG_AT_HEAD}"
+else
+  echo "[update] no release-signing-key.asc pinned — skipping signature check (bootstrap)."
+fi
+
 mkdir -p data
 git rev-parse HEAD > data/update-completed
 

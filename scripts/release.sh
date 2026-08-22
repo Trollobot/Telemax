@@ -30,8 +30,24 @@ echo ">> Releasing ${TAG}"
 
 # The tag must already exist (coordinate the tag first, then run this).
 if ! git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
-  echo "!! Tag ${TAG} not found. Create it first:  git tag ${TAG}  then re-run." >&2
+  echo "!! Tag ${TAG} not found. Create it first:  git tag -s ${TAG}  then re-run." >&2
   exit 1
+fi
+
+# Signed-release trust (v0.4): once the maintainer's public key is pinned in the repo
+# (release-signing-key.asc), refuse to publish a tag that isn't validly signed by it — so neither
+# GitHub nor the mirror can ever carry code that update.sh's verify-tag would (correctly) reject.
+# Create signed tags with:  git tag -s vX.Y.Z   (needs the private key + gpg on this machine).
+if [ -f release-signing-key.asc ]; then
+  VERIFY_HOME=$(mktemp -d)
+  GNUPGHOME="$VERIFY_HOME" gpg --quiet --import release-signing-key.asc >/dev/null 2>&1 || true
+  if ! GNUPGHOME="$VERIFY_HOME" git -c gpg.program=gpg verify-tag "${TAG}" >/dev/null 2>&1; then
+    rm -rf "$VERIFY_HOME"
+    echo "!! Tag ${TAG} is not validly signed by the pinned release key. Sign it: git tag -s -f ${TAG}" >&2
+    exit 1
+  fi
+  rm -rf "$VERIFY_HOME"
+  echo ">> release signature OK: ${TAG}"
 fi
 
 echo ">> [1/4] push to GitHub (origin)"

@@ -13,6 +13,5 @@
     "rootDir": ".",
     "types": ["node"]
   },
-  "include": ["src", "scripts", "tests"],
-  "exclude": ["src/App.tsx", "src/main.tsx", "src/api.ts"]
+  "include": ["src", "scripts", "tests"]
 }
