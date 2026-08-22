@@ -14,6 +14,7 @@ import { uploadTelegramAttachmentToMax } from './upload.js';
 import { reportBridgeError } from './errorReporter.js';
 import { wireControlPanel } from './panel.js';
 import { createBugReports, BUGREPORT_BOT_HANDLE, type BugReports } from './bugReports.js';
+import { createMaxAuthFlow, type MaxAuthCallbacks } from './maxAuthFlow.js';
 import { createTelemetry } from './telemetry.js';
 import { checkVersion, type VersionStatus } from './version.js';
 import { toTelegramReaction } from '../max/reactions.js';
@@ -737,6 +738,8 @@ export interface BridgeOptions {
   triggerFullResync: () => Promise<void>;
   /** Disconnects from MAX and deletes the encrypted session — used by /kill. Awaited (unlike triggerFullResync) since /kill's own confirmation message should only go out once this has actually finished. */
   killEverything: () => Promise<void>;
+  /** MAX auth steps for the in-Telegram /login flow (same functions the web panel's /api/auth/* use). */
+  auth: MaxAuthCallbacks;
 }
 
 /** Wires MAX push messages <-> Telegram forum topics in both directions (ТЗ.md §1.2). */
@@ -756,6 +759,7 @@ export function wireBridge({
   getPanelScheme,
   triggerFullResync,
   killEverything,
+  auth,
 }: BridgeOptions): WiredBridge {
   // Bug-report channel: private DMs from outsiders become bug reports. The inbox is only
   // ON where BUGREPORT_INBOX is set (the maintainer's prod bot); everywhere else the flag
@@ -763,6 +767,10 @@ export function wireBridge({
   // the middlewares so the first one can route private chats into it.
   const bugReportInboxEnabled = !!process.env.BUGREPORT_INBOX && !/^(0|false|off)$/i.test(process.env.BUGREPORT_INBOX);
   const bugReports: BugReports = createBugReports({ bot, targetGroupId, enabled: bugReportInboxEnabled });
+  // In-Telegram MAX (re)authorization — a private /login conversation (SMS code + optional 2FA
+  // password). Shares the exact auth steps the web panel uses; runs in DM so code/password stay
+  // private, and admin-gated so a stranger can't re-point the bridge at their own MAX account.
+  const maxAuth = createMaxAuthFlow({ targetGroupId, auth });
 
   // Every update Telegraf would otherwise route to a command/action/message
   // handler below passes through here first. /reboot and /kill only gate on
@@ -778,6 +786,9 @@ export function wireBridge({
       // A private DM from an outsider isn't an attack surface — it's a bug report (or a
       // redirect to where reports go). Only non-target GROUPS/channels get the hard reject.
       if (ctx.chat.type === 'private') {
+        // The /login auth flow gets first refusal on private updates (it admin-gates internally);
+        // anything it doesn't claim falls through to bug reports as before.
+        if (await maxAuth.handlePrivate(ctx)) return;
         await bugReports.handleIncomingPrivate(ctx);
         return;
       }
@@ -1536,10 +1547,11 @@ export function wireBridge({
 Обслуживание бота:
 /panel — 🎛 пульт управления: меню с кнопками (найти контакт, чаты, веб-панель, пауза MAX, обновление). Он же закреплён в General.
 /apikey — показать ключ для входа в веб-панель (если потерял/не сохранил при установке)
-Первая авторизация MAX — прямо в консоли при установке (setup.sh спросит номер и код из SMS). Всё, что потом (повторная авторизация после /kill, смена номера) — через веб-панель по ссылке из /apikey.
+/login — войти в MAX прямо через бота: номер + код из SMS (и пароль, если включён 2FA) в личке бота. Удобно для повторной авторизации после сбоя.
+Первая авторизация MAX — в личке бота через /login (номер + код из SMS), либо в консоли при установке. Повторная авторизация (после сбоя, /kill, смена номера) — тоже через /login или веб-панель.
 /version — проверить версию, обновить по кнопке (раз в сутки бот сам напомнит, если вышло обновление)
 /reboot — удалить ВСЕ темы в этой Telegram-группе и пересинхронизировать всё с нуля из MAX (требует подтверждения, MAX не затрагивается)
-/kill — то же самое + разлогинить MAX-сессию (нужна новая SMS-авторизация через веб-панель). Необратимо, требует подтверждения.
+/kill — то же самое + разлогинить MAX-сессию (нужна новая SMS-авторизация — /login или веб-панель). Необратимо, требует подтверждения.
 
 🔒 Команды выполняются только у администраторов группы. Обычные участники могут читать и писать (участвовать в обсуждении), но не командовать ботом.
 
@@ -1593,6 +1605,20 @@ export function wireBridge({
       parse_mode: 'HTML',
       link_preview_options: { is_disabled: true },
     });
+  });
+
+  // In-Telegram MAX login. In a DM the private-chat auth flow already handles /login; this group
+  // handler just hands over the deep link into that DM, so the SMS code and 2FA password never
+  // touch the group chat.
+  bot.command('login', async (ctx) => {
+    const username = ctx.botInfo?.username;
+    const kb = username
+      ? Markup.inlineKeyboard([[Markup.button.url('🔐 Войти в MAX', `https://t.me/${username}?start=login`)]])
+      : undefined;
+    await ctx.reply(
+      '🔐 Вход в MAX — в личке бота: нажмите кнопку ниже или напишите мне в личку /login. Так код из SMS и пароль не попадут в группу.',
+      kb,
+    );
   });
 
   bot.command('version', async (ctx) => {
@@ -2125,7 +2151,7 @@ export function wireBridge({
     if (confirm !== 'УНИЧТОЖИТЬ') {
       await bot.telegram.sendMessage(
         targetGroupId,
-        '☢️ Это разлогинит MAX-сессию (после потребуется новая SMS-авторизация через веб-панель) и удалит ВСЕ темы, историю и связки в этой Telegram-группе. Необратимо. Подтверди: /kill УНИЧТОЖИТЬ',
+        '☢️ Это разлогинит MAX-сессию (после потребуется новая SMS-авторизация — /login или веб-панель) и удалит ВСЕ темы, историю и связки в этой Telegram-группе. Необратимо. Подтверди: /kill УНИЧТОЖИТЬ',
       );
       return;
     }
@@ -2144,7 +2170,7 @@ export function wireBridge({
       await killEverything();
       await bot.telegram.sendMessage(
         targetGroupId,
-        '✅ Готово. MAX-сессия удалена, все данные стёрты. Чтобы продолжить — авторизуйся заново через веб-панель.',
+        '✅ Готово. MAX-сессия удалена, все данные стёрты. Чтобы продолжить — авторизуйся заново: /login (в личке бота) или веб-панель.',
       );
     } catch (err) {
       logger.error('Kill failed', err);

@@ -111,13 +111,17 @@ function chatsView(): View {
     ]).reply_markup,
   };
 }
-function webView(): View {
+function webView(botUsername?: string): View {
+  // The MAX-login button is a deep link into the bot's DM (t.me/<bot>?start=login) — auth (SMS code,
+  // 2FA password) happens privately there, not in the group. Shown only once we know the username.
+  const rows = [
+    [Markup.button.callback('🔗 Ссылка для входа', 'tlmx_panel:link'), Markup.button.callback('🔑 API-ключ', 'tlmx_panel:apikey')],
+    ...(botUsername ? [[Markup.button.url('🔐 Войти в MAX', `https://t.me/${botUsername}?start=login`)]] : []),
+    [Markup.button.callback('◀️ Назад', 'tlmx_panel:root')],
+  ];
   return {
     text: '🌐 Веб-панель:',
-    markup: Markup.inlineKeyboard([
-      [Markup.button.callback('🔗 Ссылка для входа', 'tlmx_panel:link'), Markup.button.callback('🔑 API-ключ', 'tlmx_panel:apikey')],
-      [Markup.button.callback('◀️ Назад', 'tlmx_panel:root')],
-    ]).reply_markup,
+    markup: Markup.inlineKeyboard(rows).reply_markup,
   };
 }
 function systemView(): View {
@@ -209,7 +213,7 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
   });
   bot.action('tlmx_panel:web', async (ctx) => {
     await ctx.answerCbQuery();
-    await edit(ctx, webView());
+    await edit(ctx, webView(ctx.botInfo?.username));
   });
   bot.action('tlmx_panel:system', async (ctx) => {
     await ctx.answerCbQuery();

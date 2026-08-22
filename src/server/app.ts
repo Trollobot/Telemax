@@ -66,6 +66,10 @@ let tgActive = false;
 let maxConnected = false;
 let activePhone = '';
 let pendingPhone = '';
+// The phone we last authenticated with. Unlike currentSession/activePhone (wiped on a session
+// rejection), this SURVIVES so the Telegram /login flow can offer "re-auth with +7•••1587?" after a
+// reconnect failure — two taps instead of retyping the number. Cleared only by /kill or change-number.
+let lastKnownPhone = '';
 let pendingAuthToken: string | null = null;
 /** Set when verifyCode() comes back password_required — cleared only on a successful login, since the trackId survives a wrong password and can be retried (confirmed live 2026-08-14). */
 let pendingPasswordTrackId: string | null = null;
@@ -142,9 +146,44 @@ async function completeMaxLogin(loginToken: string): Promise<void> {
   await sessionStore.save(session);
   currentSession = session;
   activePhone = session.phone;
+  lastKnownPhone = session.phone;
   notifyMaxSessionRestored();
   broadcastStatus();
   refreshBotDescription();
+}
+
+// --- Shared MAX auth steps: used by BOTH the web panel (/api/auth/*) and the Telegram /login flow ---
+
+async function maxAuthRequestSms(rawPhone: string): Promise<void> {
+  const phone = rawPhone.replace(/[^\d+]/g, '');
+  if (!phone) throw new Error('Пустой номер телефона');
+  // No active session (first login / re-auth after loss / change-number): bring up a FRESH socket
+  // first — a socket left over from a rejected session refuses START_AUTH (hit live 2026-08-18).
+  if (!currentSession) await freshConnectForAuth();
+  else if (!maxConnected) throw new Error('MAX is disconnected');
+  pendingAuthToken = await max.requestSms(phone);
+  pendingPhone = phone;
+}
+
+async function maxAuthVerifyCode(code: string): Promise<{ ok: true } | { passwordRequired: true; hint: string | null }> {
+  if (!pendingAuthToken) throw new Error('no pending auth — request an SMS first');
+  const verified = await max.verifyCode(pendingAuthToken, code);
+  if (verified.status === 'password_required') {
+    pendingPasswordTrackId = verified.challenge.trackId;
+    return { passwordRequired: true, hint: verified.challenge.hint ?? null };
+  }
+  pendingAuthToken = null;
+  await completeMaxLogin(verified.loginToken);
+  return { ok: true };
+}
+
+async function maxAuthCheckPassword(password: string): Promise<void> {
+  if (!pendingPasswordTrackId) throw new Error('no pending password challenge');
+  // NOT cleared on a throw: the trackId survives a wrong password on MAX's side, so the user can
+  // retry the password without a fresh SMS (confirmed live 2026-08-14). Only success clears it.
+  const loginToken = await max.checkPassword(pendingPasswordTrackId, password);
+  pendingPasswordTrackId = null;
+  await completeMaxLogin(loginToken);
 }
 
 /**
@@ -192,6 +231,7 @@ async function killMaxSession(): Promise<void> {
   currentSession = null;
   activePhone = '';
   pendingPhone = '';
+  lastKnownPhone = '';
   pendingAuthToken = null;
   cachedChats = [];
   myAccountId = null;
@@ -316,6 +356,25 @@ let resumeInFlight = false;
 const MAX_RESUME_RETRIES = 3;
 const RESUME_RETRY_DELAY_MS = 5_000;
 
+/** Inline keyboard: a deep link into the bot's DM that kicks off the /login flow. undefined until the bot knows its own @username (Telegraf sets botInfo during launch). */
+function maxLoginKeyboard(): { reply_markup: { inline_keyboard: { text: string; url: string }[][] } } | undefined {
+  const username = bot?.botInfo?.username;
+  if (!username) return undefined;
+  return { reply_markup: { inline_keyboard: [[{ text: '🔐 Войти в MAX', url: `https://t.me/${username}?start=login` }]] } };
+}
+
+/** Tells the group the MAX session was rejected and offers the in-bot re-auth flow (button + /login). Fires once per loss — guarded by maxSessionLostReported, reset by notifyMaxSessionRestored. */
+function notifyReauthNeeded(): void {
+  if (maxSessionLostReported) return;
+  maxSessionLostReported = true;
+  const text =
+    '❌ MAX-сессия отклонена — нужна повторная авторизация (номер + код из SMS). ' +
+    'Нажмите «🔐 Войти в MAX» и авторизуйтесь в личке бота (или напишите боту в личку /login). Пока переписка не пересылается.';
+  bot?.telegram
+    .sendMessage(config.targetTelegramGroup, text, maxLoginKeyboard())
+    .catch((err) => logger.error('Failed to send re-auth notice', err));
+}
+
 /** After a reported session loss, tells the group it's back — on resume or re-auth. */
 function notifyMaxSessionRestored(): void {
   if (!maxSessionLostReported) return;
@@ -350,6 +409,7 @@ async function loginWithSession(session: MaxSession): Promise<void> {
     const { sessionToken, payload } = await max.login(session.sessionToken);
     applyLoginPayload(payload);
     activePhone = session.phone;
+    lastKnownPhone = session.phone;
     // MAX rotates the session token on every LOGIN and eventually invalidates the previous
     // one. The fresh-auth path (completeMaxLogin) already persists the new token; a resumed
     // login must do the same — otherwise every reconnect keeps presenting the ORIGINAL token
@@ -378,13 +438,10 @@ async function loginWithSession(session: MaxSession): Promise<void> {
       logger.warn('Saved session was rejected after retries, clearing it:', msg);
       currentSession = null;
       activePhone = '';
+      // lastKnownPhone deliberately kept — the re-auth flow offers a one-tap "войти с +7•••…?".
       await sessionStore.clear();
-      // The bridge is functionally dead until someone re-authenticates. Tell the group (throttled).
-      reportBridgeError(
-        'max-session-lost',
-        '❌ MAX-сессия отклонена — нужна повторная авторизация (номер + код из SMS) через веб-панель (ссылка: команда /apikey). Пока переписка не пересылается.',
-      );
-      maxSessionLostReported = true;
+      // The bridge is functionally dead until someone re-authenticates. Prompt the in-bot flow.
+      notifyReauthNeeded();
     }
   } finally {
     resumeInFlight = false;
@@ -395,6 +452,7 @@ async function loginWithSession(session: MaxSession): Promise<void> {
 
 async function startServer(): Promise<void> {
   currentSession = await sessionStore.load();
+  if (currentSession) lastKnownPhone = currentSession.phone;
 
   // --- MAX client wiring ---
   // A brief MAX drop during a reconnect is normal and shouldn't ping the group — only
@@ -486,6 +544,12 @@ async function startServer(): Promise<void> {
         getPanelScheme: () => panelScheme,
         triggerFullResync: () => refreshChatsAndNames().then(() => syncChatsIfPossible()),
         killEverything: killMaxSession,
+        auth: {
+          getLastKnownPhone: () => lastKnownPhone,
+          requestSms: maxAuthRequestSms,
+          verifyCode: maxAuthVerifyCode,
+          checkPassword: maxAuthCheckPassword,
+        },
       }));
       launchTelegramBotWithRetry(bot);
       // Route throttled operator error notices (MAX down, delivery failures, internal
@@ -603,24 +667,13 @@ async function startServer(): Promise<void> {
       res.status(400).json({ error: 'phone missing' });
       return;
     }
-    const phone = String(rawPhone).replace(/[^\d+]/g, '');
     try {
-      // No active session (first login, re-auth after a session loss, or change-number
-      // after logout): reconnect a FRESH socket first. A socket left over from a rejected
-      // session refuses START_AUTH ("Недопустимое состояние сессии") and used to need a
-      // manual container restart (hit live 2026-08-18). With an active session, leave it.
-      if (!currentSession) {
-        await freshConnectForAuth();
-      } else if (!maxConnected) {
-        res.status(503).json({ error: 'MAX is disconnected' });
-        return;
-      }
-      pendingAuthToken = await max.requestSms(phone);
-      pendingPhone = phone;
+      await maxAuthRequestSms(String(rawPhone));
       res.json({ success: true });
     } catch (err) {
-      logger.error(`Failed to request SMS for ${phone}`, err);
-      res.status(502).json({ error: (err as Error).message });
+      const msg = (err as Error).message;
+      logger.error('Failed to request SMS', err);
+      res.status(msg === 'MAX is disconnected' ? 503 : 502).json({ error: msg });
     }
   });
 
@@ -635,14 +688,11 @@ async function startServer(): Promise<void> {
       return;
     }
     try {
-      const verified = await max.verifyCode(pendingAuthToken, String(code));
-      if (verified.status === 'password_required') {
-        pendingPasswordTrackId = verified.challenge.trackId;
-        res.json({ success: true, passwordRequired: true, hint: verified.challenge.hint ?? null });
+      const result = await maxAuthVerifyCode(String(code));
+      if ('passwordRequired' in result) {
+        res.json({ success: true, passwordRequired: true, hint: result.hint });
         return;
       }
-      pendingAuthToken = null;
-      await completeMaxLogin(verified.loginToken);
       res.json({ success: true });
     } catch (err) {
       logger.error('Failed to verify SMS code', err);
@@ -663,14 +713,9 @@ async function startServer(): Promise<void> {
       return;
     }
     try {
-      const loginToken = await max.checkPassword(pendingPasswordTrackId, String(password));
-      pendingPasswordTrackId = null;
-      await completeMaxLogin(loginToken);
+      await maxAuthCheckPassword(String(password));
       res.json({ success: true });
     } catch (err) {
-      // Deliberately NOT clearing pendingPasswordTrackId here — it survives a
-      // wrong password on MAX's side, so the user can just retry the password
-      // without needing a fresh SMS code (confirmed live 2026-08-14).
       logger.error('Failed to verify MAX password', err);
       res.status(502).json({ error: (err as Error).message });
     }
@@ -825,6 +870,7 @@ const BOT_COMMANDS = [
   { command: 'help', description: 'Полный список команд и ограничений' },
   { command: 'donate', description: 'Поддержать проект (рубли / TON)' },
   { command: 'apikey', description: 'Показать ключ для веб-панели' },
+  { command: 'login', description: 'Войти в MAX (номер + SMS, в личке бота)' },
   { command: 'version', description: 'Версия бота, обновление по кнопке' },
   { command: 'info', description: 'Карточка контакта/чата (просто в теме)' },
   { command: 'poll', description: 'Актуальный счёт опроса (ответом на сообщение)' },
@@ -888,7 +934,8 @@ async function announceGroupReadyOnce(bot: Telegraf): Promise<void> {
   try {
     await bot.telegram.sendMessage(
       groupId,
-      '✅ Telemax подключён к этой группе.\n\nЕсли ещё не завершили вход в MAX — сделайте это в веб-панели (ключ входа: команда /apikey). Полный список команд — /help.',
+      '✅ Telemax подключён к этой группе.\n\nЕсли ещё не вошли в MAX — нажмите «🔐 Войти в MAX» и авторизуйтесь в личке бота (номер + код из SMS), или напишите боту в личку /login. Полный список команд — /help.',
+      maxLoginKeyboard(),
     );
     await writeFile(WELCOME_SENT_MARKER, new Date().toISOString(), 'utf8').catch(() => {});
   } catch (err) {
