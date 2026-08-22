@@ -146,6 +146,9 @@ export class MaxClient extends EventEmitter {
 
   connect(): void {
     this.closedByUser = false;
+    // Cancel any pending auto-reconnect so a manual connect() (proactive session refresh,
+    // resume retry) can't leave a stale timer that fires a second, overlapping connect later.
+    this.clearReconnectTimer();
     this.teardownSocket();
     this.buffer = Buffer.alloc(0);
     this.seq = 1;
@@ -435,10 +438,24 @@ export class MaxClient extends EventEmitter {
       throw new Error('chatsCount must be <= 50 — the server returns an internal error above that (see ТЗ.md §2)');
     }
     const { dir, payload } = await this.request(OPCODES.LOGIN, { token, interactive: true, chatsCount });
-    const sessionToken = findLongToken(payload);
-    if (dir === DIR.ERR || !sessionToken) {
-      throw new Error(describeAuthError(payload, 'LOGIN did not return a session token — token may have expired'));
+    if (dir === DIR.ERR) {
+      // Genuine rejection. Append a safe shape hint (frame direction + top-level field NAMES, never
+      // values) so a resume failure is self-diagnosing in the logs.
+      const shape =
+        payload && typeof payload === 'object' && !Array.isArray(payload)
+          ? `keys=[${Object.keys(payload as object).join(',')}]`
+          : `type=${typeof payload}`;
+      throw new Error(
+        `${describeAuthError(payload, 'LOGIN was rejected — the session token is no longer valid')} (dir=0x${dir.toString(16)}, ${shape})`,
+      );
     }
+    // A successful LOGIN only SOMETIMES rotates the session token (returns a fresh 663-char string);
+    // when it doesn't, the presented token is still valid and the OK response just carries the account
+    // snapshot with no new token. That is success — fall back to the token we authenticated with.
+    // Treating a token-less OK response as expiry was bricking still-valid sessions and forcing a
+    // needless SMS re-auth (confirmed live: dir=0x1 OK, keys=[profile,chats,messages,contacts,
+    // presence,config,time,updates], no token). Only a dir=ERR frame is a real rejection.
+    const sessionToken = findLongToken(payload) ?? token;
     return { sessionToken, payload };
   }
 

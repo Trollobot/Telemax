@@ -307,6 +307,15 @@ async function loadOrCreatePanelCert(): Promise<{ key: Buffer; cert: Buffer } | 
 // fires after an actual loss — and only once.
 let maxSessionLostReported = false;
 
+// A resume LOGIN can fail transiently (a blip mid-handshake, a momentary server hiccup),
+// so we don't nuke the saved session on the first miss — we reconnect a fresh socket and let
+// 'ready' retry, only demanding a fresh SMS after several genuine failures in a row. resumeInFlight
+// collapses overlapping resumes (two 'ready' events racing) into one.
+let resumeFailures = 0;
+let resumeInFlight = false;
+const MAX_RESUME_RETRIES = 3;
+const RESUME_RETRY_DELAY_MS = 5_000;
+
 /** After a reported session loss, tells the group it's back — on resume or re-auth. */
 function notifyMaxSessionRestored(): void {
   if (!maxSessionLostReported) return;
@@ -335,6 +344,8 @@ function freshConnectForAuth(timeoutMs = 15000): Promise<void> {
 }
 
 async function loginWithSession(session: MaxSession): Promise<void> {
+  if (resumeInFlight) return; // two 'ready' events (e.g. a racy reconnect) must not double-LOGIN
+  resumeInFlight = true;
   try {
     const { sessionToken, payload } = await max.login(session.sessionToken);
     applyLoginPayload(payload);
@@ -342,29 +353,41 @@ async function loginWithSession(session: MaxSession): Promise<void> {
     // MAX rotates the session token on every LOGIN and eventually invalidates the previous
     // one. The fresh-auth path (completeMaxLogin) already persists the new token; a resumed
     // login must do the same — otherwise every reconnect keeps presenting the ORIGINAL token
-    // and, once its grace window lapses, MAX rejects it, surfacing as a spurious "re-auth
-    // required" every few hours on instances whose socket cycles regularly (a stable box
-    // rarely reconnects, so it never bit the maintainer).
+    // and, once its lifetime lapses, MAX rejects it. The "rotated"/"unchanged" tag confirms
+    // whether re-LOGIN actually hands back a NEW token (it must, for the proactive refresh
+    // below to keep the session alive on a rock-stable connection).
     const refreshed: MaxSession = { ...session, sessionToken, savedAt: new Date().toISOString() };
     await sessionStore.save(refreshed);
     currentSession = refreshed;
-    logger.info(`Resumed session for ${session.phone}`);
+    resumeFailures = 0;
+    logger.info(`Resumed session for ${session.phone} (token ${sessionToken === session.sessionToken ? 'unchanged' : 'rotated'})`);
     notifyMaxSessionRestored();
     await refreshChatsAndNames();
     void syncChatsIfPossible();
   } catch (err) {
-    logger.warn('Saved session was rejected, clearing it:', (err as Error).message);
-    currentSession = null;
-    activePhone = '';
-    await sessionStore.clear();
-    // The socket is still up (no `disconnected` event fired), so the max-down alarm
-    // never triggers for a session rejection — but the bridge is functionally dead
-    // until someone re-authenticates. Tell the group explicitly (throttled).
-    reportBridgeError(
-      'max-session-lost',
-      '❌ MAX-сессия отклонена — нужна повторная авторизация (номер + код из SMS) через веб-панель (ссылка: команда /apikey). Пока переписка не пересылается.',
-    );
-    maxSessionLostReported = true;
+    const msg = (err as Error).message;
+    resumeFailures += 1;
+    if (resumeFailures < MAX_RESUME_RETRIES) {
+      // The socket stays up after a rejected LOGIN (no 'disconnected' fires). Reconnect a fresh
+      // socket and let 'ready' retry rather than nuking a possibly-still-valid session on one
+      // transient miss — a single failure used to brick the bridge until a manual SMS re-auth.
+      logger.warn(`Resume login failed (attempt ${resumeFailures}/${MAX_RESUME_RETRIES}), reconnecting to retry: ${msg}`);
+      setTimeout(() => max.connect(), RESUME_RETRY_DELAY_MS);
+    } else {
+      resumeFailures = 0;
+      logger.warn('Saved session was rejected after retries, clearing it:', msg);
+      currentSession = null;
+      activePhone = '';
+      await sessionStore.clear();
+      // The bridge is functionally dead until someone re-authenticates. Tell the group (throttled).
+      reportBridgeError(
+        'max-session-lost',
+        '❌ MAX-сессия отклонена — нужна повторная авторизация (номер + код из SMS) через веб-панель (ссылка: команда /apikey). Пока переписка не пересылается.',
+      );
+      maxSessionLostReported = true;
+    }
+  } finally {
+    resumeInFlight = false;
   }
   broadcastStatus();
   refreshBotDescription();

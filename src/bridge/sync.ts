@@ -3,6 +3,7 @@ import { writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { Markup, type Telegraf } from 'telegraf';
 import type { ChatAction, TelegramEmoji } from 'telegraf/types';
+import { Agent, fetch as undiciFetch } from 'undici';
 import type { MaxClient, MaxMessageEvent, MaxHistoryMessage } from '../max/client.js';
 import { OPCODES, formatOpcode } from '../max/opcodes.js';
 import { resolveContactDisplayName, resolveChatName, type ContactProfile } from '../max/names.js';
@@ -666,14 +667,26 @@ async function pinInfoCard(bot: Telegraf, targetGroupId: string, messageId: numb
   }
 }
 
+// ifconfig.me is dual-stack; Node's built-in fetch (undici) doesn't reliably honor the process
+// ipv4-first DNS order, so it can answer over IPv6 and echo back the server's IPv6 address. That IPv6
+// then lands in the /apikey panel link — unbracketed (a broken URL) and pointing at a family the panel
+// doesn't even serve (it listens on 0.0.0.0, IPv4 only). Pin this one probe to IPv4 so the login link
+// is always a reachable IPv4 URL. Reported live: a dual-stack user's panel button handed out IPv6.
+const ipv4OnlyDispatcher = new Agent({ connect: { family: 4 } });
+
 /** Same lookup setup.sh does once at install time, run live for /apikey's link — best-effort, `null` just falls back to the bare key. */
 async function detectPublicIp(): Promise<string | null> {
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 5000);
-    const res = await fetch('https://ifconfig.me/ip', { signal: controller.signal }).finally(() => clearTimeout(timeout));
+    const res = await undiciFetch('https://ifconfig.me/ip', {
+      signal: controller.signal,
+      dispatcher: ipv4OnlyDispatcher,
+    }).finally(() => clearTimeout(timeout));
     if (!res.ok) return null;
-    return (await res.text()).trim();
+    const ip = (await res.text()).trim();
+    // Safety net: should be IPv4 given the dispatcher above, but never emit a bare IPv6 into a URL.
+    return ip.includes(':') ? `[${ip}]` : ip;
   } catch (err) {
     logger.error('Failed to detect public IP for /apikey link', err);
     return null;
