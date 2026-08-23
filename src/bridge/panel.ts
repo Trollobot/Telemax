@@ -359,7 +359,18 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
   bot.action(/^tlmx_panel:startchat:(.+)$/, async (ctx) => {
     const uid = ctx.match?.[1];
     if (!uid) return;
-    const name = shownContacts.get(uid)?.name ?? `MAX ${uid}`;
+    // Name usually comes from a prior search card (shownContacts). For a button sourced from a group
+    // ROSTER (no prior search), fall back to a fresh CONTACT_INFO lookup so the topic gets a real name.
+    let name = shownContacts.get(uid)?.name;
+    if (!name) {
+      try {
+        const contacts = await max.getContactInfo([Number(uid)]);
+        if (contacts[0]) name = contactName(contacts[0]);
+      } catch (err) {
+        logger.error(`Failed to resolve contact ${uid} for startchat`, err);
+      }
+      name = name ?? `MAX ${uid}`;
+    }
     await ctx.answerCbQuery('Открываю чат…');
     const res = await startDialog(uid, name).catch((err) => ({
       ok: false,

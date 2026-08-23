@@ -691,7 +691,13 @@ async function sendContactInfoCard(
       for (const p of roster) lines.push(`• ${p.isSelf ? '🧑 Вы' : `👤 ${p.name}`} — MAX ID ${p.id}`);
       if (participantCount != null && participantCount > roster.length) lines.push(`…и ещё ${participantCount - roster.length}`);
     }
-    const sent = await bot.telegram.sendMessage(targetGroupId, lines.join('\n'), { message_thread_id: topicId });
+    // If there's anyone besides us, offer a one-tap "open a DM with a participant" — expands into a
+    // button per person (handled by tlmx_roster:open in wireBridge), each reusing the panel's startchat.
+    const hasOthers = !!roster?.some((p) => !p.isSelf);
+    const markup = hasOthers
+      ? Markup.inlineKeyboard([[Markup.button.callback('💬 Открыть личку', 'tlmx_roster:open')]]).reply_markup
+      : undefined;
+    const sent = await bot.telegram.sendMessage(targetGroupId, lines.join('\n'), { message_thread_id: topicId, reply_markup: markup });
     return sent.message_id;
   }
 
@@ -1848,6 +1854,41 @@ export function wireBridge({
     const count = chat?.participants ? Object.keys(chat.participants).length : undefined;
     const roster = await buildRoster(chat?.participants, chat?.type, max, getMyAccountId(), getContactProfiles());
     await sendContactInfoCard(bot, targetGroupId, topicId, chat?.title || mapping.title || 'Чат', chat?.type, count, otherId, profile, roster);
+  });
+
+  // "💬 Открыть личку" on a group's roster card → expands into a button per participant. Each reuses
+  // the panel's tlmx_panel:startchat:<uid> (which opens/reuses the 1:1 via startDialog). Participants
+  // are derived from the chat of the topic the card lives in — nothing is encoded in the button.
+  bot.action('tlmx_roster:open', async (ctx) => {
+    const topicId = (ctx.callbackQuery.message as { message_thread_id?: number } | undefined)?.message_thread_id;
+    const mapping = topicId != null ? await chatMapStore.getByTopicId(topicId) : undefined;
+    const chat = mapping
+      ? (getChats().find((c) => c && typeof c === 'object' && String((c as { id?: unknown }).id) === mapping.maxChatId) as
+          | { participants?: Record<string, unknown> }
+          | undefined)
+      : undefined;
+    const myId = getMyAccountId();
+    const others = chat?.participants
+      ? Object.keys(chat.participants)
+          .map(Number)
+          .filter((id) => !Number.isNaN(id) && id !== myId)
+          .slice(0, 50)
+      : [];
+    if (others.length === 0) {
+      await ctx.answerCbQuery('Не вижу участников — обновите /info').catch(() => {});
+      return;
+    }
+    const rows = others.map((id) => [Markup.button.callback(`✍️ ${resolveContactDisplayName(id, getContactProfiles().get(id))}`, `tlmx_panel:startchat:${id}`)]);
+    rows.push([Markup.button.callback('◀️ Свернуть', 'tlmx_roster:hide')]);
+    await ctx.answerCbQuery().catch(() => {});
+    await ctx.editMessageReplyMarkup(Markup.inlineKeyboard(rows).reply_markup).catch((err) => logger.error('Failed to expand roster DM list', err));
+  });
+
+  bot.action('tlmx_roster:hide', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    await ctx
+      .editMessageReplyMarkup(Markup.inlineKeyboard([[Markup.button.callback('💬 Открыть личку', 'tlmx_roster:open')]]).reply_markup)
+      .catch((err) => logger.error('Failed to collapse roster DM list', err));
   });
 
   /** Formats a poll's current tally — MAX sends no push for votes, so callers always pull it live via CHAT_HISTORY first. */
