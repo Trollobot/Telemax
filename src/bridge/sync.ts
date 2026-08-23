@@ -314,6 +314,16 @@ class RecentCids {
 }
 
 /** Returns the first sent Telegram message_id — one MAX message can carry several attaches, but we only need one anchor to link for edit/react. */
+/**
+ * Whether sendAttachments will actually render this attach. Mirrors its silent skip (below) of
+ * CONTROL/service events that aren't new/join/leave/title (e.g. 'system', pin). Used so a message
+ * whose ONLY content is such an event doesn't post a bare author prefix ("👤 Имя:" with nothing) —
+ * reported live 2026-08-23 for a group service event attributed to a member.
+ */
+function isRenderableAttach(att: MaxAttachment): boolean {
+  return !(att._type === 'CONTROL' && !['new', 'join', 'leave', 'title'].includes(String((att as { event?: unknown }).event)));
+}
+
 async function sendAttachments(
   bot: Telegraf,
   groupId: string,
@@ -586,7 +596,7 @@ async function backfillHistoryToTelegram(
     const forwarded = await resolveForwardContent(max, chats, msg.link);
     let text = forwarded ? forwarded.text : msg.text;
     const attaches = forwarded ? forwarded.attaches : Array.isArray(msg.attaches) ? (msg.attaches as MaxAttachment[]) : [];
-    if (!text && attaches.length === 0) {
+    if (!text && !attaches.some((a) => isRenderableAttach(a as MaxAttachment))) {
       await chatMapStore.advanceHistoryCursor(maxChatId, msg.time);
       continue;
     }
@@ -847,7 +857,7 @@ export function wireBridge({
 
   // Regular messages/reactions/votes are participation — anyone in the group can do
   // them (adding people to the group for a shared discussion is a legitimate use).
-  // But every BOT COMMAND (/kill, /reboot, /apikey, group management, …) is
+  // But every BOT COMMAND (/kill, /reboot, /login, group management, …) is
   // admin-only: a plain member must not be able to wipe the session, leak the web
   // panel key, or manage MAX groups just by being in the chat. Commands and inline
   // button presses go through here; everything else falls straight through.
@@ -1437,7 +1447,18 @@ export function wireBridge({
       return;
     }
 
-    if (!text && attaches.length === 0) return;
+    // Nothing to show — no text AND every attach is a non-rendered CONTROL/service event. Skip
+    // entirely (as before 0.4.3), otherwise the author prefix below posts a bare "👤 Имя:". Log the
+    // attach types (never the content) so a recurrence is self-diagnosing.
+    if (!text && !attaches.some((a) => isRenderableAttach(a as MaxAttachment))) {
+      if (attaches.length > 0) {
+        const kinds = attaches
+          .map((a) => `${(a as MaxAttachment)._type}${(a as { event?: unknown }).event ? `/${String((a as { event?: unknown }).event)}` : ''}`)
+          .join(',');
+        logger.info(`Skipped a non-renderable MAX message in chat ${String(chatId)} (attach: ${kinds})`);
+      }
+      return;
+    }
 
     const pollAttach = attaches.find((a) => (a as MaxAttachment)._type === 'POLL') as MaxAttachment | undefined;
     if (pollAttach) {
@@ -1570,44 +1591,34 @@ export function wireBridge({
 
 Сообщения, файлы, голосовые, стикеры и опросы синхронизируются в обе стороны автоматически — команды нужны только для управления. Обычная пересылка сообщений (drag-forward) в тему тоже работает сама — прилетит в привязанный MAX-чат с пометкой «↩️ Переслано от/из...». Звонки — только текстовые уведомления (входящий звонит / завершённый / пропущенный), без передачи аудио — для этого нужен WebRTC, вне рамок Bot API-моста.
 
-/info — карточка контакта или чата (просто в теме, ответ на сообщение не нужен)
+/info — карточка контакта или чата (просто в теме)
 
-Ответом на сообщение:
-/poll — актуальный счёт опроса (голоса из MAX сами в виджет Telegram не попадают)
+Ответом на опрос:
+/poll — актуальный счёт (голоса из MAX сами в виджет Telegram не попадают)
 
-Удаление сообщений (в обе стороны):
-• /delete ответом на сообщение — удалить сразу с обеих сторон (/delete me — только у себя)
-• 👎 на своё сообщение — быстро удалить его с обеих сторон
-• Свайп-удаление своего сообщения в Telegram тоже подхватывается само (обычно за секунды) и удаляется в MAX
-• Удаление на стороне MAX прилетает в Telegram сразу
+Удаление:
+Работает как в Telegram: удаление в MAX прилетает в Telegram сразу; удаление в Telegram зеркалится в MAX (с небольшой задержкой). Ещё способы: 👎 на своё сообщение или /delete в ответ на него.
 
-Управление группой (без ответа):
-/newgroup <название> — создать группу в MAX
-/invite <MAX ID> — пригласить участника
-/kick <MAX ID> — удалить участника
-/rename <название> — переименовать (MAX иногда молча игнорирует переименование — известный баг платформы)
-/setdesc <описание> — изменить описание
+Управление группой:
 /leavegroup — выйти из группы (требует подтверждения)
 /deletegroup — удалить группу (требует подтверждения)
 
-Контакты:
-/ban — заглушить чат: выбери из списка кнопкой, сообщения от него перестанут приходить, тема удалится
+Чаты:
+/ban — заглушить чат (диалог или группу): выбери из списка кнопкой, сообщения перестанут приходить, тема удалится
 /unban — вернуть заглушённый чат (тема появится при следующем сообщении от него)
 
 Обслуживание бота:
-/panel — 🎛 пульт управления: меню с кнопками (найти контакт, чаты, веб-панель, пауза MAX, обновление). Он же закреплён в General.
-/apikey — показать ключ для входа в веб-панель (если потерял/не сохранил при установке)
-/login — войти в MAX прямо через бота: номер + код из SMS (и пароль, если включён 2FA) в личке бота. Удобно для повторной авторизации после сбоя.
-Первая авторизация MAX — в личке бота через /login (номер + код из SMS), либо в консоли при установке. Повторная авторизация (после сбоя, /kill, смена номера) — тоже через /login или веб-панель.
+/panel — 🎛 пульт управления: меню с кнопками (найти контакт, чаты, вход в MAX, пауза MAX, обновление). Он же закреплён в General.
+/login — войти в MAX через бота: номер + код из SMS (и пароль, если включён 2FA) — в личке бота. И первая авторизация, и повторная (после сбоя, /kill, смена номера) — через него.
 /version — проверить версию, обновить по кнопке (раз в сутки бот сам напомнит, если вышло обновление)
 /reboot — удалить ВСЕ темы в этой Telegram-группе и пересинхронизировать всё с нуля из MAX (требует подтверждения, MAX не затрагивается)
-/kill — то же самое + разлогинить MAX-сессию (нужна новая SMS-авторизация — /login или веб-панель). Необратимо, требует подтверждения.
+/kill — то же самое + разлогинить MAX-сессию (после нужна новая авторизация через /login). Необратимо, требует подтверждения.
 
 🔒 Команды выполняются только у администраторов группы. Обычные участники могут читать и писать (участвовать в обсуждении), но не командовать ботом.
 
-⚠️ Ограничения платформы:
-• Свайп-удаление подхватывается только для СВОИХ сообщений и тех, что отправлены после последнего запуска моста — если не удалилось, добей командой /delete.
-• Голоса за опрос из MAX не отражаются в виджете Telegram сами — актуальный счёт смотри через /poll.
+⚠️ Ограничения:
+• Удаление, сделанное в Telegram, мост ловит периодической проверкой (не мгновенно). Надёжнее — 👎 на своё сообщение или /delete в ответ. Но всё это работает только для недавних сообщений: связки теряются при перезапуске моста — такое удали в приложении MAX.
+• Голоса за опрос из MAX не отражаются в виджете Telegram — актуальный счёт через /poll в ответ на опрос.
 
 🐞 Нашли баг или есть вопрос? Пишите: https://t.me/${BUGREPORT_BOT_HANDLE}
 
@@ -1633,7 +1644,6 @@ export function wireBridge({
     });
   });
 
-  /** Recovers the web-panel API_KEY without needing SSH/file access to the server — safe now that the target-group middleware above actually gates who can ask. Bundles it into a ready-to-open link (App.tsx reads ?key= and logs straight in) when the server's public IP can be detected, falling back to the bare key otherwise. */
   // In-Telegram MAX login. In a DM the private-chat auth flow already handles /login; this group
   // handler just hands over the deep link into that DM, so the SMS code and 2FA password never
   // touch the group chat.
@@ -1734,7 +1744,7 @@ export function wireBridge({
   });
 
   // --- Control panel (src/bridge/panel.ts): a pinned inline-button menu in the group's
-  // General topic. The reused leaves (help/version/apikey/link/ban/unban) delegate to
+  // General topic. The reused leaves (help/version/ban/unban) delegate to
   // the same logic the slash commands use; startDialog creates a MAX dialog + its topic.
   const startDialog = async (
     recipientUserId: string,
@@ -2172,7 +2182,7 @@ export function wireBridge({
     if (confirm !== 'УНИЧТОЖИТЬ') {
       await bot.telegram.sendMessage(
         targetGroupId,
-        '☢️ Это разлогинит MAX-сессию (после потребуется новая SMS-авторизация — /login или веб-панель) и удалит ВСЕ темы, историю и связки в этой Telegram-группе. Необратимо. Подтверди: /kill УНИЧТОЖИТЬ',
+        '☢️ Это разлогинит MAX-сессию (после потребуется новая авторизация через /login в личке бота) и удалит ВСЕ темы, историю и связки в этой Telegram-группе. Необратимо. Подтверди: /kill УНИЧТОЖИТЬ',
       );
       return;
     }
@@ -2191,7 +2201,7 @@ export function wireBridge({
       await killEverything();
       await bot.telegram.sendMessage(
         targetGroupId,
-        '✅ Готово. MAX-сессия удалена, все данные стёрты. Чтобы продолжить — авторизуйся заново: /login (в личке бота) или веб-панель.',
+        '✅ Готово. MAX-сессия удалена, все данные стёрты. Чтобы продолжить — авторизуйся заново: /login (в личке бота).',
       );
     } catch (err) {
       logger.error('Kill failed', err);

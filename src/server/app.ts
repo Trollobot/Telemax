@@ -484,7 +484,7 @@ function buildBotDescription(): string {
 Ограничения:
 • Голоса за опрос из MAX сами не появляются в Telegram — счёт через /poll ответом на опрос.
 
-Команды: /help /donate /apikey /version /info /poll /delete /newgroup /invite /kick /leavegroup /deletegroup /ban /unban /reboot /kill`;
+Команды: /help /donate /login /version /info /poll /delete /newgroup /invite /kick /leavegroup /deletegroup /ban /unban /reboot /kill`;
 }
 
 /** Best-effort refresh once the phone number becomes known (or changes) — the initial setMyDescription at Telegram launch may well have fired before MAX auth finished. */

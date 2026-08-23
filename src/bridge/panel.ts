@@ -7,7 +7,7 @@ import { createLogger } from '../logger.js';
 
 const logger = createLogger('panel');
 
-/** Sends one of the reused command outputs (help, apikey, version, ban/unban list) to a chat. */
+/** Sends one of the reused command outputs (help, version, ban/unban list) to a chat. */
 type LeafSender = (chatId: number) => Promise<void>;
 
 export interface ControlPanelDeps {
