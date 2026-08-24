@@ -28,6 +28,10 @@ export interface ControlPanelDeps {
     recipientUserId: string,
     name: string,
   ) => Promise<{ ok: boolean; error?: string; topicName: string; chatLink?: string; existed?: boolean }>;
+  /** Resolves a display name for a MAX user id from the WARM contact-profile cache only (undefined on a
+   * miss). Lets the group-roster "Открыть личку" name a participant without a blocking CONTACT_INFO
+   * round-trip — the same instant-name behaviour the search path gets from its own card cache. */
+  resolveContactName?: (uid: string) => string | undefined;
 }
 
 // The panel message id is remembered in ./data so the same pinned message is edited
@@ -148,7 +152,7 @@ function pauseView(): View {
 }
 
 export function wireControlPanel(deps: ControlPanelDeps): void {
-  const { bot, targetGroupId, max, getActivePhone, triggerFullResync, leaves, startDialog } = deps;
+  const { bot, targetGroupId, max, getActivePhone, triggerFullResync, leaves, startDialog, resolveContactName } = deps;
 
   const edit = (ctx: Context, view: View) => ctx.editMessageText(view.text, { reply_markup: view.markup }).catch(() => {});
   const chatIdOf = (ctx: Context): number => ctx.chat?.id ?? Number(targetGroupId);
@@ -359,10 +363,16 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
   bot.action(/^tlmx_panel:startchat:(.+)$/, async (ctx) => {
     const uid = ctx.match?.[1];
     if (!uid) return;
-    // Name usually comes from a prior search card (shownContacts). For a button sourced from a group
-    // ROSTER (no prior search), fall back to a fresh CONTACT_INFO lookup so the topic gets a real name.
-    let name = shownContacts.get(uid)?.name;
+    // Name from a WARM cache first (search card → shownContacts; group roster → the contact-profile
+    // cache buildRoster already filled), so we normally skip MAX entirely — exactly what the search
+    // path does. CRITICAL: answer the callback BEFORE any MAX round-trip. A CONTACT_INFO lookup can
+    // take up to its 20s timeout, well past Telegram's ~15s callback expiry — so awaiting it first
+    // killed the handler before startDialog ran, and the group-roster "Открыть личку" did "вообще
+    // ничего" for a stranger (reported live 2026-08-24). Search never hit this: its name was cached.
+    let name = shownContacts.get(uid)?.name ?? resolveContactName?.(uid);
+    await ctx.answerCbQuery('Открываю чат…').catch(() => {});
     if (!name) {
+      // Cache miss (rare for a roster button) — now safe to hit MAX; the callback is already answered.
       try {
         const contacts = await max.getContactInfo([Number(uid)]);
         if (contacts[0]) name = contactName(contacts[0]);
@@ -371,7 +381,6 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
       }
       name = name ?? `MAX ${uid}`;
     }
-    await ctx.answerCbQuery('Открываю чат…');
     const res = await startDialog(uid, name).catch((err) => ({
       ok: false,
       error: (err as Error).message,

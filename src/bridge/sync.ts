@@ -1846,6 +1846,15 @@ export function wireBridge({
     getActivePhone,
     triggerFullResync,
     startDialog,
+    // Warm-cache name lookup for the group-roster "Открыть личку" button — buildRoster already
+    // fetched every participant's profile, so this resolves instantly with no MAX round-trip
+    // (undefined on a genuine miss, which lets the panel fall back to a CONTACT_INFO lookup).
+    resolveContactName: (uid) => {
+      const id = Number(uid);
+      if (Number.isNaN(id)) return undefined;
+      const profile = getContactProfiles().get(id);
+      return profile ? resolveContactDisplayName(id, profile) : undefined;
+    },
     leaves: {
       sendHelp: (chatId) => bot.telegram.sendMessage(chatId, buildHelpText()).then(() => {}),
       sendVersion: async (chatId) => {
@@ -2341,7 +2350,22 @@ export function wireBridge({
           );
           return;
         }
-        const opened = await max.sendToNewDialog(mapping.pendingUserId, text, [], replyLink);
+        // Opening the dialog can be rejected by MAX (privacy, an invalid/unreachable user id, a
+        // session hiccup). The generic catch below only logs — so a failure here used to leave the
+        // sender staring at a silent topic ("написал — тишина"). Surface the reason IN the topic and
+        // keep the pending sentinel intact so the next message just retries.
+        let opened;
+        try {
+          opened = await max.sendToNewDialog(mapping.pendingUserId, text, [], replyLink);
+        } catch (err) {
+          logger.error(`Failed to open new MAX 1:1 dialog with user ${mapping.pendingUserId}`, err);
+          await bot.telegram
+            .sendMessage(targetGroupId, `❌ Не удалось открыть личку в MAX: ${(err as Error).message}. Сообщение не отправлено — попробуйте ещё раз.`, {
+              message_thread_id: topicId,
+            })
+            .catch((e) => logger.error('Failed to report pending-dialog open failure to Telegram', e));
+          return;
+        }
         await chatMapStore.remove(mapping.maxChatId); // drop the "pending:<userId>" sentinel entry
         await chatMapStore.upsert({
           maxChatId: opened.chatId,
@@ -2464,6 +2488,11 @@ export function wireBridge({
       messageLinks.add({ maxChatId: mapping.maxChatId, maxMessageId: messageId, telegramMessageId: ctx.message.message_id, outgoing: true });
     } catch (err) {
       logger.error('Telegram -> MAX forward failed', err);
+      // Don't fail silently — a swallowed send is indistinguishable from success to the sender.
+      // Report the reason into the same topic (best-effort; never throw out of the handler).
+      await bot.telegram
+        .sendMessage(targetGroupId, `⚠️ Не удалось отправить в MAX: ${(err as Error).message}`, { message_thread_id: topicId })
+        .catch((e) => logger.error('Failed to report TG->MAX forward failure to Telegram', e));
     }
   });
 
