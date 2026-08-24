@@ -1447,15 +1447,35 @@ export function wireBridge({
       return;
     }
 
-    // Nothing to show — no text AND every attach is a non-rendered CONTROL/service event. Skip
-    // entirely (as before 0.4.3), otherwise the author prefix below posts a bare "👤 Имя:". Log the
+    // Nothing to RENDER — no text AND every attach is a non-rendered CONTROL/service event.
+    // Don't fall through to the author prefix below (it would post a bare "👤 Имя:" — the 0.4.6
+    // fix). BUT a service event can be the FIRST live signal of a chat we were just added to,
+    // and creating its topic is the ONLY way a group appears live: CHAT_UPDATE never creates a
+    // topic (handleMaxChatUpdate returns early when there's no mapping), so without this the
+    // group stays invisible until a reconnect's full resync runs. Before 0.4.6 the relay path
+    // created the topic as a side effect of this same push; 0.4.6's early return killed that
+    // (regression: "добавили в группу, а она не появляется" — reported live 2026-08-24). So if
+    // the chat has no topic yet, create it (empty — nothing posted inside, no bare prefix); an
+    // EXISTING chat (the common service-event case, e.g. Дарья's pin) still just skips. Log the
     // attach types (never the content) so a recurrence is self-diagnosing.
     if (!text && !attaches.some((a) => isRenderableAttach(a as MaxAttachment))) {
+      const existingMapping = await chatMapStore.getByMaxChatId(chatId);
+      if (!existingMapping) {
+        await deliverToTopic(chatId, async (topicId, created) => {
+          if (created) {
+            await sendAutoInfoCard(chatId, message.sender, topicId).catch((err) =>
+              logger.error('Failed to send auto contact-info card for service-only new chat', err),
+            );
+          }
+        }).catch((err) => logger.error('Failed to ensure topic for service-only MAX event', err));
+      }
       if (attaches.length > 0) {
         const kinds = attaches
           .map((a) => `${(a as MaxAttachment)._type}${(a as { event?: unknown }).event ? `/${String((a as { event?: unknown }).event)}` : ''}`)
           .join(',');
-        logger.info(`Skipped a non-renderable MAX message in chat ${String(chatId)} (attach: ${kinds})`);
+        logger.info(
+          `Skipped a non-renderable MAX message in chat ${String(chatId)} (attach: ${kinds})${existingMapping ? '' : ' — created its topic (new chat)'}`,
+        );
       }
       return;
     }
