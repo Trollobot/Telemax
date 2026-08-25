@@ -102,8 +102,18 @@ const server = createServer(async (req, res) => {
   }
 
   if (req.method === 'GET' && url.pathname === '/stats') {
+    // /stats is HTTPS-only: it must arrive via the Caddy TLS front (which stamps
+    // X-Forwarded-Proto), never over the plain-HTTP port that stays open for legacy
+    // /ping clients — so the key can't be accidentally sent in the clear. The header
+    // is spoofable, but that only lets an attacker who ALREADY sends the key over
+    // HTTP defeat their own transport security, not ours; the guard exists to stop
+    // the owner from doing it by habit.
+    if (req.headers['x-forwarded-proto'] !== 'https') {
+      res.writeHead(403).end('stats is https-only — use https://zergont-gate.duckdns.org/stats');
+      return;
+    }
     // Prefer the x-stats-key header (doesn't land in access logs / proxies the way a
-    // query string does); the ?key= form still works for quick curl checks.
+    // query string does); the ?key= form still works for quick curl/browser checks.
     const presented = req.headers['x-stats-key'] ?? url.searchParams.get('key');
     if (!STATS_KEY || presented !== STATS_KEY) {
       res.writeHead(403).end('forbidden');
