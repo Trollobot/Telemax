@@ -1,19 +1,25 @@
 #!/usr/bin/env bash
-# Interactive first-time setup for Telemax (v0.4 — headless, no web panel).
-# Generates the session-encryption key automatically, asks only for the two things
-# nobody but you can provide (the Telegram bot token and target group), lets you pick
-# the image size (animated stickers on/off), writes .env, and builds + starts the
-# bridge. MAX authorization happens afterwards IN THE BOT: send /login to it in a DM.
+# Interactive setup for Telemax (v0.4 — headless, no web panel).
+#
+# First run: generates the session-encryption key automatically, asks only for the
+# things nobody but you can provide (the Telegram bot token and target group), lets
+# you pick the image size (animated stickers on/off), writes .env and builds + starts
+# the bridge. MAX authorization happens afterwards IN THE BOT: send /login to it in a DM.
+#
+# Re-run on a configured install (.env exists): opens a settings menu instead —
+# show/change the Telegram proxy (with a live connectivity test BEFORE saving),
+# change the bot token / target group, switch the sticker image mode, re-check
+# connectivity, rebuild. This is the sanctioned way to change settings after the
+# web panel was removed in v0.4 — everything lives in .env, this menu edits it.
 set -euo pipefail
 cd "$(dirname "$0")"
 
 bold() { printf '\033[1m%s\033[0m\n' "$1"; }
 
-# Runs on every invocation, even on an already-configured install (the .env
-# check below exits before the rest of setup) — an update pulled in via the
-# watcher itself needs the watcher already installed to have gotten here, and
-# re-running enable is harmless, so this is the one place that's safe to do
-# unconditionally.
+# Runs on every invocation, even on an already-configured install — an update
+# pulled in via the watcher itself needs the watcher already installed to have
+# gotten here, and re-running enable is harmless, so this is the one place
+# that's safe to do unconditionally.
 if [ "$(id -u)" = "0" ] && command -v systemctl >/dev/null 2>&1; then
   REPO_DIR="$(pwd)"
   # systemd services run with a stripped environment (notably a different or
@@ -50,25 +56,340 @@ else
   echo "Пропускаю установку вотчера обновлений — нужны root и systemd. Обновляться придётся вручную: ./update.sh"
 fi
 
-# Already configured — nothing to re-ask. If MAX isn't authorized yet, that's now
-# a one-liner in the bot (/login), so we don't need the old console-auth flow.
-if [ -f .env ]; then
-  if ! command -v docker >/dev/null 2>&1; then
-    echo ".env уже существует, но Docker недоступен на этой машине — запустите контейнер там, где есть Docker."
-    exit 0
-  fi
-  if [ -z "$(docker compose ps --status running --format '{{.Name}}' 2>/dev/null)" ]; then
-    read -rp ".env есть, но контейнер не запущен. Запустить сейчас? [Y/n] " RUN_NOW
-    if [ "${RUN_NOW:-Y}" = "n" ] || [ "${RUN_NOW:-Y}" = "N" ]; then
-      echo "Ок. Когда будете готовы: docker compose up -d"
-      exit 0
+# ---------------------------------------------------------------------------
+# Shared helpers — used by BOTH the first-run flow and the settings menu below.
+# ---------------------------------------------------------------------------
+
+# First 6 + last 4 chars of the bot token — enough to recognize it, useless to steal.
+mask_token() {
+  local t="$1"
+  if [ "${#t}" -le 12 ]; then printf '***'; else printf '%s…%s' "${t:0:6}" "${t: -4}"; fi
+}
+
+# Proxy URL with any user:pass@ stripped — safe to print (mirrors src/telegram/proxy.ts).
+redact_proxy() {
+  printf '%s' "$1" | sed -E 's#//[^@/]+@#//#'
+}
+
+# Fails fast on a server whose network can't reach one of the two services this
+# bridge depends on (firewall, geo-blocking, restrictive hosting policy). Retries a
+# few times first: a single attempt right after boot can spuriously fail on a
+# transient blip (DNS not warmed up yet, a flaky first packet) even though the
+# server is perfectly reachable a couple seconds later — confirmed live.
+check_tcp() {
+  for attempt in 1 2 3; do
+    if timeout 5 bash -c "cat < /dev/null > /dev/tcp/$1/$2" 2>/dev/null; then
+      return 0
     fi
-    GIT_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo unknown) docker compose up -d --build
+    [ "$attempt" -lt 3 ] && sleep 2
+  done
+  return 1
+}
+
+# curl args for the current $TELEGRAM_PROXY (empty proxy -> direct).
+build_tg_proxy_args() {
+  TG_PROXY_ARGS=()
+  [ -n "${TELEGRAM_PROXY:-}" ] && TG_PROXY_ARGS=(--proxy "$TELEGRAM_PROXY")
+}
+
+# One Telegram reachability check through the CURRENT $TELEGRAM_PROXY. Prints the
+# verdict; returns 0/1. MAX is checked separately (always direct, by hostname so an
+# IPv6-only host resolves via DNS64/NAT64 — MAX itself is IPv4-only).
+check_telegram_once() {
+  if [ -n "${TELEGRAM_PROXY:-}" ]; then
+    if curl -sS --proxy "$TELEGRAM_PROXY" --max-time 8 -o /dev/null https://api.telegram.org 2>/dev/null; then
+      echo "  Telegram (через прокси $(redact_proxy "$TELEGRAM_PROXY")): OK"
+      return 0
+    fi
+    echo "  Telegram через прокси недоступен — возможно, неверный адрес/логин/пароль прокси."
+    return 1
   fi
-  echo "✅ Уже настроено и запущено."
-  echo "   Если MAX ещё не авторизован — напишите боту в ЛИЧКУ: /login (или в группе: /panel → «🔐 Вход в MAX»)."
-  exit 0
+  if check_tcp api.telegram.org 443; then
+    echo "  Telegram (api.telegram.org:443): OK"
+    return 0
+  fi
+  echo "  Telegram напрямую недоступен (частая причина на хостингах в РФ — блокировка; помогает прокси)."
+  return 1
+}
+
+# Interactive loop: keeps re-asking for a proxy until Telegram is reachable through
+# the current setting (or the user types skip). Works off/into $TELEGRAM_PROXY —
+# the caller decides what to do with the verified value. Telegram is NOT fatal here:
+# the usual cause is a mistyped proxy — fixable right in the loop, with an explicit
+# "skip" escape so a genuinely blocked host isn't a dead end.
+verify_telegram_proxy_loop() {
+  while true; do
+    check_telegram_once && return 0
+    echo "    • впишите прокси (socks5://… или http://…) и Enter — перепроверю через него;"
+    echo "    • пустой Enter — перепроверить напрямую, без прокси;"
+    echo "    • skip — продолжить без проверки (значение сохранится как есть)."
+    read -rp "  > " TG_INPUT
+    if [ "$TG_INPUT" = "skip" ]; then
+      echo "  Пропускаю проверку Telegram. Без связи с Telegram пересылки не будет —"
+      echo "  прокси можно поменять позже, снова запустив ./setup.sh."
+      return 0
+    fi
+    TELEGRAM_PROXY="$TG_INPUT"
+  done
+}
+
+# Detects the target Telegram group via getUpdates (needs $TELEGRAM_BOT_TOKEN and jq;
+# honors $TELEGRAM_PROXY). Sets $TARGET_TELEGRAM_GROUP. Loops until found/picked.
+detect_group() {
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "❌ Не найден jq — без него не могу определить группу. Установите: apt-get install -y jq — и запустите setup.sh заново."
+    exit 1
+  fi
+  build_tg_proxy_args
+  TARGET_TELEGRAM_GROUP=""
+  while [ -z "$TARGET_TELEGRAM_GROUP" ]; do
+    echo "Ищу группу..."
+    TG_GROUPS=""
+    for attempt in 1 2 3 4 5 6; do
+      UPDATES=$(curl -s "${TG_PROXY_ARGS[@]}" "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?limit=100" || true)
+      # Собираем группы, которые бот «видел» — из сообщений И из события my_chat_member
+      # (бота добавили/сделали админом). Второе приходит на обязательном шаге «сделать
+      # админом», не зависит от того, отправит ли пользователь сообщение и попадёт ли в окно.
+      TG_GROUPS=$(echo "$UPDATES" | jq -r '
+        [ .result[]
+          | ( (.message // .channel_post // .my_chat_member // empty) | .chat )
+          | select(.type == "supergroup" or .type == "group")
+          | {id, title: (.title // "без названия")} ]
+        | unique_by(.id) | .[] | "\(.id)\t\(.title)"' 2>/dev/null || true)
+      [ -n "$TG_GROUPS" ] && break
+      echo "  Пока не вижу бота в группе, жду 3с ($attempt/6)..."
+      sleep 3
+    done
+
+    if [ -z "$TG_GROUPS" ]; then
+      echo
+      echo "Пока не вижу группу. Чаще всего помогает одно:"
+      echo "   ✍️  НАПИШИТЕ В ГРУППУ ЛЮБОЕ СООБЩЕНИЕ — и я её сразу замечу."
+      echo "   (бот «видит» группу по свежему сообщению; если его добавили давно, событие о добавлении"
+      echo "    могло не попасть в окно обновлений — сообщение это чинит.)"
+      echo "Заодно проверьте, что бот ДОБАВЛЕН в нужную группу и он АДМИНИСТРАТОР с правом"
+      echo "«Управление темами» (Manage Topics)."
+      read -rp "Сделайте это и нажмите Enter, чтобы попробовать снова... "
+      continue
+    fi
+
+    mapfile -t GROUP_LINES <<< "$TG_GROUPS"
+    if [ "${#GROUP_LINES[@]}" -eq 1 ]; then
+      TARGET_TELEGRAM_GROUP="${GROUP_LINES[0]%%$'\t'*}"
+      echo "Нашёл группу: «${GROUP_LINES[0]#*$'\t'}» ($TARGET_TELEGRAM_GROUP)"
+    else
+      echo
+      echo "Бот состоит в нескольких группах — выберите целевую:"
+      for i in "${!GROUP_LINES[@]}"; do
+        printf "  %d) %s  (%s)\n" "$((i + 1))" "${GROUP_LINES[$i]#*$'\t'}" "${GROUP_LINES[$i]%%$'\t'*}"
+      done
+      while [ -z "$TARGET_TELEGRAM_GROUP" ]; do
+        read -rp "Номер: " choice
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#GROUP_LINES[@]}" ]; then
+          TARGET_TELEGRAM_GROUP="${GROUP_LINES[$((choice - 1))]%%$'\t'*}"
+          echo "Выбрана: «${GROUP_LINES[$((choice - 1))]#*$'\t'}» ($TARGET_TELEGRAM_GROUP)"
+        else
+          echo "  Нет такого номера, попробуйте ещё раз."
+        fi
+      done
+    fi
+  done
+}
+
+# Rewrites (or appends) NAME=value in .env, preserving every other line as-is.
+# awk instead of sed so proxy URLs with #, @, / etc. can't break the substitution.
+set_env_var() {
+  local name="$1" value="$2"
+  if grep -q "^${name}=" .env 2>/dev/null; then
+    awk -v n="$name" -v v="$value" 'index($0, n"=") == 1 { print n"=" v; next } { print }' .env > .env.tmp
+    mv .env.tmp .env
+  else
+    echo "${name}=${value}" >> .env
+  fi
+  chmod 600 .env
+}
+
+compose_up() {
+  # The container runs as the unprivileged node user (uid 1000) — the mounted ./data
+  # volume must be writable by it (root-owned dirs from older installs aren't).
+  mkdir -p data
+  [ "$(id -u)" = "0" ] && chown -R 1000:1000 data 2>/dev/null || true
+  GIT_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo unknown) docker compose up -d "$@"
+}
+
+# Recreate the container so an .env change actually takes effect (docker only reads
+# env_file at container creation; a plain restart keeps the old values).
+apply_env_change() {
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "Docker недоступен — изменения сохранены в .env, примените их там, где запущен контейнер."
+    return 0
+  fi
+  read -rp "Пересоздать контейнер, чтобы применить изменения? [Y/n] " APPLY_NOW
+  if [ "${APPLY_NOW:-Y}" = "n" ] || [ "${APPLY_NOW:-Y}" = "N" ]; then
+    echo "Ок. Применится при следующем: docker compose up -d --force-recreate"
+    return 0
+  fi
+  compose_up --force-recreate
+  echo "✅ Применено."
+}
+
+# ---------------------------------------------------------------------------
+# Settings menu — .env already exists, so this is a configured install.
+# ---------------------------------------------------------------------------
+if [ -f .env ]; then
+  # Old installs (pre-0.3) left .env world-readable — tighten on every run.
+  chmod 600 .env
+
+  show_status() {
+    # Re-read on every call so the menu always shows what's actually in .env.
+    set -a
+    # shellcheck disable=SC1091
+    source .env
+    set +a
+    local container="не запущен"
+    if command -v docker >/dev/null 2>&1 && [ -n "$(docker compose ps --status running --format '{{.Name}}' 2>/dev/null)" ]; then
+      container="работает"
+    fi
+    echo
+    bold "=== Telemax — текущие настройки ==="
+    echo "  Контейнер:        $container"
+    echo "  Токен бота:       $(mask_token "${TELEGRAM_BOT_TOKEN:-}")"
+    echo "  Группа Telegram:  ${TARGET_TELEGRAM_GROUP:-не задана}"
+    if [ -n "${TELEGRAM_PROXY:-}" ]; then
+      echo "  Прокси Telegram:  $(redact_proxy "$TELEGRAM_PROXY")"
+    else
+      echo "  Прокси Telegram:  нет (напрямую)"
+    fi
+    echo "  Стикеры (образ):  ${STICKERS:-full}"
+    echo "  MAX-авторизация:  через бота — /login в личку (статус виден в /panel)"
+  }
+
+  change_proxy() {
+    echo
+    if [ -n "${TELEGRAM_PROXY:-}" ]; then
+      echo "Текущий прокси: $(redact_proxy "$TELEGRAM_PROXY")"
+    else
+      echo "Сейчас прокси не задан — Telegram идёт напрямую."
+    fi
+    echo "Форматы: socks5://[логин:пароль@]хост:порт или http://[логин:пароль@]хост:порт."
+    echo "Введите новый адрес; «-» — убрать прокси (напрямую); пустой Enter — оставить как есть."
+    read -rp "Прокси: " NEW_PROXY
+    case "$NEW_PROXY" in
+      '') echo "Оставляю как есть."; return 0 ;;
+      -) TELEGRAM_PROXY="" ;;
+      *) TELEGRAM_PROXY="$NEW_PROXY" ;;
+    esac
+    echo "Проверяю связь с Telegram через новую настройку..."
+    verify_telegram_proxy_loop
+    set_env_var TELEGRAM_PROXY "$TELEGRAM_PROXY"
+    echo "Сохранено в .env: TELEGRAM_PROXY=$( [ -n "$TELEGRAM_PROXY" ] && redact_proxy "$TELEGRAM_PROXY" || echo '(напрямую)' )"
+    apply_env_change
+  }
+
+  change_bot() {
+    echo
+    echo "Текущий токен: $(mask_token "${TELEGRAM_BOT_TOKEN:-}")"
+    read -rp "Новый токен бота (пустой Enter — оставить текущий): " NEW_TOKEN
+    local token_changed=0
+    if [ -n "$NEW_TOKEN" ]; then
+      TELEGRAM_BOT_TOKEN="$NEW_TOKEN"
+      token_changed=1
+    fi
+    echo "Текущая группа: ${TARGET_TELEGRAM_GROUP:-не задана}"
+    local redetect="n"
+    if [ "$token_changed" = "1" ]; then
+      # A new bot almost certainly means the group binding needs re-checking too.
+      read -rp "Определить группу заново? [Y/n] " R
+      [ "${R:-Y}" != "n" ] && [ "${R:-Y}" != "N" ] && redetect="y"
+    else
+      read -rp "Определить группу заново? [y/N] " R
+      { [ "${R:-N}" = "y" ] || [ "${R:-N}" = "Y" ]; } && redetect="y"
+    fi
+    if [ "$redetect" = "y" ]; then
+      echo "Добавьте бота в нужную группу администратором (право «Управление темами») и напишите в неё любое сообщение."
+      read -rp "Готово? Enter... "
+      detect_group
+    fi
+    [ "$token_changed" = "1" ] && set_env_var TELEGRAM_BOT_TOKEN "$TELEGRAM_BOT_TOKEN"
+    set_env_var TARGET_TELEGRAM_GROUP "$TARGET_TELEGRAM_GROUP"
+    echo "Сохранено."
+    apply_env_change
+  }
+
+  change_stickers() {
+    echo
+    local current="${STICKERS:-full}"
+    echo "Сейчас: $current."
+    echo "  • full — анимированные стикеры проигрываются как видео (образ +~1.4 ГБ, сборка дольше)."
+    echo "  • slim — уходят статической картинкой (образ ~0.3 ГБ, быстрая сборка)."
+    local target="slim"
+    [ "$current" = "slim" ] && target="full"
+    read -rp "Переключить на $target и пересобрать образ? [y/N] " SW
+    if [ "${SW:-N}" != "y" ] && [ "${SW:-N}" != "Y" ]; then
+      echo "Оставляю $current."
+      return 0
+    fi
+    set_env_var STICKERS "$target"
+    if command -v docker >/dev/null 2>&1; then
+      echo "Пересобираю образ ($target)..."
+      compose_up --build
+      echo "✅ Готово."
+    else
+      echo "Docker недоступен — сохранено в .env, пересоберите там, где запущен контейнер."
+    fi
+  }
+
+  check_connectivity() {
+    echo
+    echo "Проверяю связь..."
+    if check_tcp api2.oneme.ru 443; then
+      echo "  MAX (api2.oneme.ru:443): OK"
+    else
+      echo "  MAX (api2.oneme.ru:443): нет связи — мост работать не сможет (файрвол/гео-блокировка;"
+      echo "  на IPv6-only хосте нужен NAT64/DNS64 у провайдера)."
+    fi
+    check_telegram_once || true
+  }
+
+  # Make current .env values available to the menu handlers.
+  show_status
+  while true; do
+    echo
+    bold "Что сделать?"
+    echo "  1) Показать текущие настройки"
+    echo "  2) Изменить прокси Telegram (с проверкой связи до записи)"
+    echo "  3) Сменить токен бота / группу"
+    echo "  4) Переключить режим стикеров (full/slim, с пересборкой)"
+    echo "  5) Проверить связь с MAX и Telegram"
+    echo "  6) Пересобрать и перезапустить контейнер"
+    echo "  0) Выход"
+    read -rp "Пункт: " MENU_CHOICE
+    case "$MENU_CHOICE" in
+      1) show_status ;;
+      2) change_proxy ;;
+      3) change_bot ;;
+      4) change_stickers ;;
+      5) check_connectivity ;;
+      6)
+        if command -v docker >/dev/null 2>&1; then
+          compose_up --build
+          echo "✅ Пересобрано и запущено."
+        else
+          echo "Docker недоступен на этой машине."
+        fi
+        ;;
+      0 | '')
+        echo "Если MAX ещё не авторизован — напишите боту в ЛИЧКУ: /login (или в группе: /panel → «🔐 Вход в MAX»)."
+        exit 0
+        ;;
+      *) echo "Нет такого пункта." ;;
+    esac
+  done
 fi
+
+# ---------------------------------------------------------------------------
+# First-time setup — no .env yet.
+# ---------------------------------------------------------------------------
 
 if ! command -v openssl >/dev/null 2>&1; then
   echo "Не найден openssl — он нужен для генерации ключа шифрования сессии. Установите (apt install openssl) и запустите скрипт снова."
@@ -96,22 +417,6 @@ if command -v docker >/dev/null 2>&1; then
     echo
   fi
 fi
-
-# Fails fast on a server whose network can't reach one of the two services this
-# bridge depends on (firewall, geo-blocking, restrictive hosting policy) —
-# better to say so now than after the user has typed in a bot token. Retries a
-# few times first: a single attempt right after boot can spuriously fail on a
-# transient blip (DNS not warmed up yet, a flaky first packet) even though the
-# server is perfectly reachable a couple seconds later — confirmed live.
-check_tcp() {
-  for attempt in 1 2 3; do
-    if timeout 5 bash -c "cat < /dev/null > /dev/tcp/$1/$2" 2>/dev/null; then
-      return 0
-    fi
-    [ "$attempt" -lt 3 ] && sleep 2
-  done
-  return 1
-}
 
 # Ask about a Telegram proxy BEFORE the reachability check: on a host where Telegram
 # is reachable only through a proxy (e.g. a home server with no direct route to
@@ -143,36 +448,9 @@ else
 fi
 
 # Telegram is NOT fatal: the usual cause is a mistyped proxy (or a host that needs a
-# proxy at all) — both fixable right here. So loop and let the user re-enter the proxy
-# and re-check instead of aborting, with an explicit "skip" escape so a genuinely
-# blocked host isn't a dead end (the proxy can still be set later in .env).
-while true; do
-  TG_PROXY_ARGS=()
-  if [ -n "$TELEGRAM_PROXY" ]; then
-    TG_PROXY_ARGS=(--proxy "$TELEGRAM_PROXY")
-    if curl -sS "${TG_PROXY_ARGS[@]}" --max-time 8 -o /dev/null https://api.telegram.org 2>/dev/null; then
-      echo "  Telegram (через прокси): OK"
-      break
-    fi
-    echo "  Telegram через прокси недоступен — возможно, неверный адрес/логин/пароль прокси."
-  else
-    if check_tcp api.telegram.org 443; then
-      echo "  Telegram (api.telegram.org:443): OK"
-      break
-    fi
-    echo "  Telegram напрямую недоступен (частая причина на хостингах в РФ — блокировка; помогает прокси)."
-  fi
-  echo "    • впишите прокси (socks5://… или http://…) и Enter — перепроверю через него;"
-  echo "    • пустой Enter — перепроверить напрямую, без прокси;"
-  echo "    • skip — продолжить установку без проверки (прокси можно задать позже в .env)."
-  read -rp "  > " TG_INPUT
-  if [ "$TG_INPUT" = "skip" ]; then
-    echo "  Пропускаю проверку Telegram. Мост поднимется, но без связи с Telegram пересылки"
-    echo "  не будет — задайте TELEGRAM_PROXY в .env и пересоберите."
-    break
-  fi
-  TELEGRAM_PROXY="$TG_INPUT"
-done
+# proxy at all) — both fixable right in the loop (see verify_telegram_proxy_loop).
+verify_telegram_proxy_loop
+
 echo
 echo "Понадобится токен бота — создайте его через @BotFather (https://t.me/BotFather), команда /newbot."
 echo
@@ -192,69 +470,13 @@ echo "  3. id группы определю сам. Если несколько 
 echo "     Не подхватится сразу — просто ✍️ напишите в группу любое сообщение, и я её замечу."
 echo
 
-TARGET_TELEGRAM_GROUP=""
-if ! command -v jq >/dev/null 2>&1; then
-  echo "❌ Не найден jq — без него не могу определить группу. Установите: apt-get install -y jq — и запустите setup.sh заново."
-  exit 1
-fi
-
 read -rp "Сделали? Нажмите Enter, когда бот добавлен в группу администратором... "
-while [ -z "$TARGET_TELEGRAM_GROUP" ]; do
-  echo "Ищу группу..."
-  TG_GROUPS=""
-  for attempt in 1 2 3 4 5 6; do
-    UPDATES=$(curl -s "${TG_PROXY_ARGS[@]}" "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?limit=100" || true)
-    # Собираем группы, которые бот «видел» — из сообщений И из события my_chat_member
-    # (бота добавили/сделали админом). Второе приходит на обязательном шаге «сделать
-    # админом», не зависит от того, отправит ли пользователь сообщение и попадёт ли в окно.
-    TG_GROUPS=$(echo "$UPDATES" | jq -r '
-      [ .result[]
-        | ( (.message // .channel_post // .my_chat_member // empty) | .chat )
-        | select(.type == "supergroup" or .type == "group")
-        | {id, title: (.title // "без названия")} ]
-      | unique_by(.id) | .[] | "\(.id)\t\(.title)"' 2>/dev/null || true)
-    [ -n "$TG_GROUPS" ] && break
-    echo "  Пока не вижу бота в группе, жду 3с ($attempt/6)..."
-    sleep 3
-  done
-
-  if [ -z "$TG_GROUPS" ]; then
-    echo
-    echo "Пока не вижу группу. Чаще всего помогает одно:"
-    echo "   ✍️  НАПИШИТЕ В ГРУППУ ЛЮБОЕ СООБЩЕНИЕ — и я её сразу замечу."
-    echo "   (бот «видит» группу по свежему сообщению; если его добавили давно, событие о добавлении"
-    echo "    могло не попасть в окно обновлений — сообщение это чинит.)"
-    echo "Заодно проверьте, что бот ДОБАВЛЕН в нужную группу и он АДМИНИСТРАТОР с правом"
-    echo "«Управление темами» (Manage Topics)."
-    read -rp "Сделайте это и нажмите Enter, чтобы попробовать снова... "
-    continue
-  fi
-
-  mapfile -t GROUP_LINES <<< "$TG_GROUPS"
-  if [ "${#GROUP_LINES[@]}" -eq 1 ]; then
-    TARGET_TELEGRAM_GROUP="${GROUP_LINES[0]%%$'\t'*}"
-    echo "Нашёл группу: «${GROUP_LINES[0]#*$'\t'}» ($TARGET_TELEGRAM_GROUP)"
-  else
-    echo
-    echo "Бот состоит в нескольких группах — выберите целевую:"
-    for i in "${!GROUP_LINES[@]}"; do
-      printf "  %d) %s  (%s)\n" "$((i + 1))" "${GROUP_LINES[$i]#*$'\t'}" "${GROUP_LINES[$i]%%$'\t'*}"
-    done
-    while [ -z "$TARGET_TELEGRAM_GROUP" ]; do
-      read -rp "Номер: " choice
-      if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#GROUP_LINES[@]}" ]; then
-        TARGET_TELEGRAM_GROUP="${GROUP_LINES[$((choice - 1))]%%$'\t'*}"
-        echo "Выбрана: «${GROUP_LINES[$((choice - 1))]#*$'\t'}» ($TARGET_TELEGRAM_GROUP)"
-      else
-        echo "  Нет такого номера, попробуйте ещё раз."
-      fi
-    done
-  fi
-done
+detect_group
 
 # Best-effort — needs the bot to already be a group admin with "Change Group
 # Info" rights, which setup already asked for above. setChatPhoto needs an
 # actual file upload (multipart), not a URL, unlike sendPhoto.
+build_tg_proxy_args
 AVATAR="$(dirname "$0")/assets/group-avatar.png"
 if [ -f "$AVATAR" ]; then
   if curl -s "${TG_PROXY_ARGS[@]}" -F "chat_id=$TARGET_TELEGRAM_GROUP" -F "photo=@$AVATAR" \
@@ -319,7 +541,7 @@ if [ "$STICKERS" = "full" ]; then
 else
   echo "Собираю образ (slim) — быстрая сборка."
 fi
-GIT_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo unknown) docker compose up -d --build
+compose_up --build
 
 echo
 echo "════════════════════════════════════════════════════════════════"
@@ -329,3 +551,5 @@ bold "      /login"
 echo "  Введёте номер MAX и код из SMS прямо в личке — в группу они не попадут."
 echo "  (Альтернатива: в группе /panel → «🔐 Вход в MAX».)"
 echo "════════════════════════════════════════════════════════════════"
+echo
+echo "Изменить настройки позже (прокси, токен, группа, стикеры) — просто запустите ./setup.sh ещё раз."
