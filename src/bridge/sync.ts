@@ -18,7 +18,7 @@ import { createMaxAuthFlow, type MaxAuthCallbacks } from './maxAuthFlow.js';
 import { createTelemetry } from './telemetry.js';
 import { checkVersion, type VersionStatus } from './version.js';
 import { toTelegramReaction } from '../max/reactions.js';
-import { createLogger, jsonStringify } from '../logger.js';
+import { createLogger, jsonStringify, redactSecrets } from '../logger.js';
 
 const logger = createLogger('bridge');
 
@@ -107,15 +107,18 @@ export function classifyProbeResult(errText: string): 'alive' | 'gone' | 'unknow
   return 'unknown';
 }
 
-/** Telegram's flood-control 429 carries how long to wait — honor it instead of failing the send. */
+/** Telegram's flood-control 429 carries how long to wait — honor it instead of failing the send.
+ * Capped: an endless 429 (the bot got flagged/limited for real) must eventually surface as an
+ * error instead of holding a backfill loop hostage forever. */
+const FLOOD_RETRY_MAX_ATTEMPTS = 5;
 async function withFloodRetry<T>(fn: () => Promise<T>): Promise<T> {
-  for (;;) {
+  for (let attempt = 1; ; attempt++) {
     try {
       return await fn();
     } catch (err) {
       const retryAfter = (err as { response?: { parameters?: { retry_after?: number } } })?.response?.parameters?.retry_after;
-      if (!retryAfter) throw err;
-      logger.info(`Telegram flood control: waiting ${retryAfter}s`);
+      if (!retryAfter || attempt >= FLOOD_RETRY_MAX_ATTEMPTS) throw err;
+      logger.info(`Telegram flood control: waiting ${retryAfter}s (attempt ${attempt}/${FLOOD_RETRY_MAX_ATTEMPTS})`);
       await sleep((retryAfter + 1) * 1000);
     }
   }
@@ -914,13 +917,23 @@ export function wireBridge({
   // same mechanism as text edits, confirmed live 2026-08-10. Telegram's native poll widget has
   // no API for injecting an externally-cast vote, so this dedup gate (by poll `version`) guards
   // a follow-up text message reporting the new tally instead of trying to edit the poll itself.
+  // Bounded (FIFO) like every other long-lived map here — the process runs for months.
   const lastRelayedPollVersion = new Map<string, number>();
+  const POLL_VERSION_CAP = 500;
+  function rememberPollVersion(key: string, version: number): void {
+    if (!lastRelayedPollVersion.has(key) && lastRelayedPollVersion.size >= POLL_VERSION_CAP) {
+      const oldest = lastRelayedPollVersion.keys().next().value;
+      if (oldest !== undefined) lastRelayedPollVersion.delete(oldest);
+    }
+    lastRelayedPollVersion.set(key, version);
+  }
 
   // MAX sends no live push for reaction removal (see handleMaxChatUpdate below),
   // so this is the only way to notice it — poll each message we know has an
   // active relayed reaction and clear it in Telegram once MAX reports it gone.
   const REACTION_POLL_INTERVAL_MS = 60_000;
-  setInterval(() => void pollReactionRemovals(), REACTION_POLL_INTERVAL_MS);
+  // unref: maintenance timers must not keep the process alive during shutdown.
+  setInterval(() => void pollReactionRemovals(), REACTION_POLL_INTERVAL_MS).unref();
 
   async function pollReactionRemovals(): Promise<void> {
     for (const [key, relayed] of lastRelayedReaction) {
@@ -961,7 +974,7 @@ export function wireBridge({
   const PROBE_TICK_MS = 15_000;
   const PROBE_MAX_PER_TICK = 12; // comfortably under Telegram's ~30 req/s global cap
   const probeLastAt = new Map<string, number>();
-  setInterval(() => void runProbeTick(), PROBE_TICK_MS);
+  setInterval(() => void runProbeTick(), PROBE_TICK_MS).unref();
 
   async function probeMessageState(link: MessageLink): Promise<'alive' | 'gone' | 'unknown'> {
     const relayed = lastRelayedReaction.get(`${String(link.maxChatId)}:${String(link.maxMessageId)}`);
@@ -979,14 +992,21 @@ export function wireBridge({
   async function runProbeTick(): Promise<void> {
     const now = Date.now();
     const due: MessageLink[] = [];
+    const liveKeys = new Set<string>();
     for (const link of messageLinks.outgoingLinks()) {
       const key = `${String(link.maxChatId)}:${String(link.maxMessageId)}`;
+      liveKeys.add(key);
       const interval = probeIntervalMs(now - (link.createdAt ?? now));
       if (interval == null) {
         probeLastAt.delete(key); // cooled off — stop probing (the link itself lives on for /delete & edit)
         continue;
       }
       if (now - (probeLastAt.get(key) ?? 0) >= interval) due.push(link);
+    }
+    // Entries whose link was evicted from the bounded MessageLinkStore (or removed by a
+    // delete) would otherwise sit in probeLastAt forever — prune them each tick.
+    for (const key of probeLastAt.keys()) {
+      if (!liveKeys.has(key)) probeLastAt.delete(key);
     }
     for (const link of due.slice(0, PROBE_MAX_PER_TICK)) {
       const key = `${String(link.maxChatId)}:${String(link.maxMessageId)}`;
@@ -1015,11 +1035,11 @@ export function wireBridge({
   // Anonymous install counter (opt out with TELEMETRY=off). Pinged once shortly after boot so
   // a fresh install registers without waiting up to a day, then on every version-check tick.
   const telemetry = createTelemetry();
-  setTimeout(() => void telemetry.ping(), 60_000);
+  setTimeout(() => void telemetry.ping(), 60_000).unref();
 
   function scheduleVersionCheck(): void {
     const delay = VERSION_CHECK_MIN_MS + Math.random() * (VERSION_CHECK_MAX_MS - VERSION_CHECK_MIN_MS);
-    setTimeout(() => void runScheduledVersionCheck().finally(scheduleVersionCheck), delay);
+    setTimeout(() => void runScheduledVersionCheck().finally(scheduleVersionCheck), delay).unref();
   }
 
   async function runScheduledVersionCheck(): Promise<void> {
@@ -1049,7 +1069,8 @@ export function wireBridge({
       // Tested live 2026-08-08: never fired for a real reaction from another
       // user. Logged in case it turns out to be conditional (e.g. group chats,
       // a different client version) — CHAT_UPDATE below is what's actually wired up.
-      logger.info(`${formatOpcode(event.opcode)} payload:`, jsonStringify(event.payload));
+      // redactSecrets: an unknown payload shape may carry anything — never log it raw.
+      logger.info(`${formatOpcode(event.opcode)} payload:`, jsonStringify(redactSecrets(event.payload)));
     }
   });
 
@@ -1127,7 +1148,8 @@ export function wireBridge({
   async function handleMaxMessageDelete(payload: unknown): Promise<void> {
     const p = payload as { chatId?: unknown; messageIds?: unknown[] } | null;
     if (p?.chatId == null || !Array.isArray(p.messageIds)) {
-      logger.info('NOTIF_MSG_DELETE payload (unrecognized shape):', jsonStringify(payload));
+      // redactSecrets: an unrecognized shape may carry anything — never log it raw.
+      logger.info('NOTIF_MSG_DELETE payload (unrecognized shape):', jsonStringify(redactSecrets(payload)));
       return;
     }
     for (const messageId of p.messageIds) {
@@ -1438,7 +1460,7 @@ export function wireBridge({
         const key = `${String(chatId)}:${String(message.id)}`;
         const version = typeof updatedPoll.version === 'number' ? updatedPoll.version : undefined;
         if (version == null || lastRelayedPollVersion.get(key) !== version) {
-          if (version != null) lastRelayedPollVersion.set(key, version);
+          if (version != null) rememberPollVersion(key, version);
           await relayPollUpdate(chatId, existingLink.telegramMessageId, updatedPoll).catch((err) =>
             logger.error('Failed to relay poll update to Telegram', err),
           );
@@ -1523,7 +1545,7 @@ export function wireBridge({
           // that tally is otherwise invisible on the Telegram side. Report it right away.
           if ((pollAttach.state?.result?.some((r) => (r.voteCount ?? 0) > 0)) && message.id != null) {
             const key = `${String(chatId)}:${String(message.id)}`;
-            if (typeof pollAttach.version === 'number') lastRelayedPollVersion.set(key, pollAttach.version);
+            if (typeof pollAttach.version === 'number') rememberPollVersion(key, pollAttach.version);
             await relayPollUpdate(chatId, sentPoll.message_id, pollAttach).catch((err) =>
               logger.error('Failed to relay initial poll tally to Telegram', err),
             );

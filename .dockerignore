@@ -1,6 +1,9 @@
 node_modules
 dist
 .data
+# host-side runtime state (mounted at /app/.data) — session, chat map, logs; must
+# never end up in the build context / image layers
+data
 .env
 .env.*
 !.env.example

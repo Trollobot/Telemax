@@ -251,7 +251,12 @@ export class MaxClient extends EventEmitter {
         header = readFrameHeader(this.buffer);
       } catch (err) {
         this.emit('error', err as Error);
+        // teardownSocket removes the socket's listeners, so no 'close' event will
+        // fire to schedule a reconnect — without doing it here explicitly, a single
+        // corrupt/desynced frame left the client permanently offline (silently: the
+        // process kept running, just never reconnected).
         this.teardownSocket();
+        if (!this.closedByUser && this.opts.reconnect) this.scheduleReconnect();
         return;
       }
 
@@ -322,10 +327,9 @@ export class MaxClient extends EventEmitter {
    * Resolves with the first response frame matching `opcode`. The server doesn't
    * reliably echo `seq`, so opcode matching is the only correlation available —
    * which is only unambiguous while at most ONE request per opcode is in flight.
-   * request() below enforces that; don't call this directly for request/response
-   * pairs.
+   * request() below enforces that, hence private.
    */
-  waitForOpcode(opcode: number, timeoutMs = 20_000): Promise<MaxMessageEvent> {
+  private waitForOpcode(opcode: number, timeoutMs = 20_000): Promise<MaxMessageEvent> {
     return new Promise((resolve, reject) => {
       const cleanup = () => {
         clearTimeout(timer);
@@ -352,6 +356,16 @@ export class MaxClient extends EventEmitter {
 
   // Tail of the in-flight request chain per opcode — see request() below.
   private readonly requestChains = new Map<number, Promise<unknown>>();
+
+  // `cid` doubles as the echo-suppression key (RecentCids in bridge/sync.ts), so two
+  // sends within the same millisecond must not share one — Date.now() alone collides.
+  private lastCid = 0;
+
+  private nextCid(): number {
+    const cid = Math.max(Date.now(), this.lastCid + 1);
+    this.lastCid = cid;
+    return cid;
+  }
 
   /**
    * Sends `payload` and resolves with the first response frame carrying `opcode`,
@@ -477,7 +491,7 @@ export class MaxClient extends EventEmitter {
     attaches: unknown[] = [],
     replyTo?: { messageId: unknown; chatId: unknown },
   ): Promise<{ cid: number; messageId: unknown; attaches: unknown[] }> {
-    const cid = Date.now();
+    const cid = this.nextCid();
     // Outgoing reply link shape is {type, messageId, chatId} — note this differs from
     // the INCOMING reply link ({type, message, chatId}); MAX uses two shapes (confirmed
     // 2026-08-16). messageId is the quoted MAX message's id (BigInt from the link store).
@@ -507,7 +521,7 @@ export class MaxClient extends EventEmitter {
     attaches: unknown[] = [],
     replyTo?: { messageId: unknown; chatId: unknown },
   ): Promise<{ cid: number; messageId: unknown; chatId: unknown; attaches: unknown[] }> {
-    const cid = Date.now();
+    const cid = this.nextCid();
     const link = replyTo ? { type: 'REPLY', messageId: replyTo.messageId, chatId: toChatId(replyTo.chatId) } : null;
     const { dir, payload } = await this.request(OPCODES.MSG_SEND, {
       userId: Number(userId),
@@ -626,20 +640,6 @@ export class MaxClient extends EventEmitter {
   }
 
   /**
-   * Searches the account's LOCAL address book by name/nickname (CONTACT_SEARCH, 0x0025;
-   * field is `count`, not limit). Response: `{result: [{contact, presence?, …}], total}`
-   * — the contact is nested under `.contact`. NOTE: this only sees the local address
-   * book, so an empty book returns total:0 even for an existing user — for a global
-   * name search use publicSearch(). Shapes from the user (2026-08-16).
-   */
-  async searchContactByName(query: string, count = 10): Promise<MaxContactInfo[]> {
-    const { dir, payload } = await this.request(OPCODES.CONTACT_SEARCH, { query, count });
-    if (dir === DIR.ERR) throw new Error(describeAuthError(payload, 'CONTACT_SEARCH failed'));
-    const p = payload as { result?: Array<{ contact?: MaxContactInfo }> } | null;
-    return (p?.result ?? []).map((r) => r.contact).filter((c): c is MaxContactInfo => c != null);
-  }
-
-  /**
    * Global directory search by name/nickname (PUBLIC_SEARCH, 0x003C) — unlike
    * CONTACT_SEARCH (local address book only), this hits the whole MAX catalog, so it's
    * what "find contact by name" should use. Request/response shape UNCONFIRMED — assumed
@@ -706,7 +706,7 @@ export class MaxClient extends EventEmitter {
   async createGroup(title: string, userIds: number[] = [], chatType: 'CHAT' | 'CHANNEL' = 'CHAT'): Promise<{ chatId: unknown; owner: unknown }> {
     const { dir, payload } = await this.request(OPCODES.MSG_SEND, {
       message: {
-        cid: BigInt(Date.now()),
+        cid: BigInt(this.nextCid()),
         attaches: [{ _type: 'CONTROL', event: 'new', chatType, title, userIds }],
       },
       notify: true,

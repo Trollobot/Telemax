@@ -10,7 +10,7 @@ const GITHUB_API_TIMEOUT_MS = 8000;
  * account gets flagged, or GitHub is filtered on the install's network). Overridable via env so
  * the mirror can move without a code change. Serves `/latest.json` (version manifest) and
  * `/Telemax.git` (a read-only git mirror that update.sh falls back to). */
-const MIRROR_BASE_URL = (process.env.MIRROR_BASE_URL || 'http://zergont-gate.duckdns.org:3200').replace(/\/+$/, '');
+const MIRROR_BASE_URL = (process.env.MIRROR_BASE_URL || 'https://zergont-gate.duckdns.org').replace(/\/+$/, '');
 
 export interface LatestVersionInfo {
   /** Git tag on GitHub, e.g. "v0.3.2". */
@@ -43,17 +43,6 @@ export function getAppVersion(): string {
     cachedVersion = 'unknown';
   }
   return cachedVersion;
-}
-
-/** The commit this container was built from — still baked via GIT_COMMIT when setup.sh passes
- * it; kept for diagnostics only, no longer used for the update check. `null` for builds without it. */
-export function getCurrentCommit(): string | null {
-  const commit = process.env.GIT_COMMIT;
-  return commit && commit !== 'unknown' ? commit : null;
-}
-
-export function shortSha(sha: string): string {
-  return sha.slice(0, 7);
 }
 
 /** Parses "v0.3.1" / "0.3.1" into [0,3,1]; null if it isn't a plain X.Y.Z (pre-release suffixes ignored). */

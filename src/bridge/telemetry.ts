@@ -11,7 +11,7 @@ const logger = createLogger('telemetry');
 // can be counted. NO phone numbers, NO IPs stored, NO personal data — just a random id and a
 // version string. On by default; opt out with TELEMETRY=off (documented in the README, not in
 // the bot's /help). The endpoint is a DDNS hostname, not a hardcoded IP, so it can move.
-const TELEMETRY_URL = 'http://zergont-gate.duckdns.org:3100/ping';
+const TELEMETRY_URL = 'https://zergont-gate.duckdns.org/ping';
 const INSTALL_ID_FILE = path.join(process.cwd(), '.data', 'install-id');
 const PING_TIMEOUT_MS = 8000;
 

@@ -24,7 +24,7 @@ MIRROR_WEB_PATH="${MIRROR_WEB_PATH:-/opt/telemax-mirror/web}"
 MIRROR_GIT_URL="ssh://${MIRROR_SSH}${MIRROR_REPO_PATH}"
 # Public HTTP base of the mirror — used to read back the current latest.json so the per-version
 # changelog map accumulates across releases (see scripts/build-latest-json.mjs).
-MIRROR_HTTP_URL="${MIRROR_HTTP_URL:-http://zergont-gate.duckdns.org:3200}"
+MIRROR_HTTP_URL="${MIRROR_HTTP_URL:-https://zergont-gate.duckdns.org}"
 
 echo ">> Releasing ${TAG}"
 

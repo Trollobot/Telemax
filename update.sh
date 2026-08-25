@@ -44,7 +44,7 @@ STEP="git pull"
 # Self-hosted read-only mirror to fall back to when GitHub is unreachable (account flagged, or
 # GitHub filtered on this network). Overridable via env so the mirror can move without a code
 # change. Must serve the same `main` + tags as origin — the release script pushes to both.
-MIRROR_GIT_URL="${MIRROR_GIT_URL:-http://zergont-gate.duckdns.org:3200/Telemax.git}"
+MIRROR_GIT_URL="${MIRROR_GIT_URL:-https://zergont-gate.duckdns.org/Telemax.git}"
 echo "[update] $(date -u +%Y-%m-%dT%H:%M:%SZ) pulling latest main from origin (GitHub)..."
 if git pull --ff-only; then
   echo "[update] pulled from origin (GitHub)"
@@ -99,6 +99,9 @@ GIT_COMMIT=$(git rev-parse HEAD) docker compose build
 
 STEP="перезапуск контейнера"
 echo "[update] restarting..."
+# The container runs as the unprivileged node user (uid 1000) — ./data must be
+# writable by it; older installs created it root-owned, fix on every update.
+chown -R 1000:1000 data 2>/dev/null || true
 docker compose up -d
 
 STEP="проверка после запуска"

@@ -24,7 +24,9 @@ async function fetchTelegramFile(bot: Telegraf, fileId: string): Promise<Buffer>
   const link = await bot.telegram.getFileLink(fileId);
   const agent = getTelegramProxyAgent();
   if (!agent) {
-    const res = await fetch(link.toString());
+    // Bounded like the proxied branch below (its https.get carries timeout: 30_000) —
+    // a hung CDN response must not stall the relay handler forever.
+    const res = await fetch(link.toString(), { signal: AbortSignal.timeout(120_000) });
     if (!res.ok) throw new Error(`Failed to download Telegram file: ${res.status}`);
     return Buffer.from(await res.arrayBuffer());
   }

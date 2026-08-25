@@ -43,6 +43,13 @@ export function createBugReports(deps: BugReportsDeps): BugReports {
 
   function rateLimited(chatId: number): boolean {
     const now = Date.now();
+    // Opportunistic cleanup so the map can't grow one entry per stranger forever:
+    // drop reporters whose window has fully expired before admitting a new one.
+    if (recent.size >= 1000 && !recent.has(chatId)) {
+      for (const [id, times] of recent) {
+        if (times.every((t) => now - t >= RATE_WINDOW_MS)) recent.delete(id);
+      }
+    }
     const arr = (recent.get(chatId) ?? []).filter((t) => now - t < RATE_WINDOW_MS);
     arr.push(now);
     recent.set(chatId, arr);

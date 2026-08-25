@@ -64,6 +64,17 @@ const pendingSearch = new Map<number, { mode: SearchMode; requesterId: number }>
 // membership without re-fetching. Keyed by userId (string).
 const shownContacts = new Map<string, { name: string; onMax: boolean }>();
 
+// Both maps live for the whole process and only ever grew (an abandoned search prompt,
+// every contact ever shown) — bound them FIFO so months of uptime can't leak memory.
+const PANEL_MAP_CAP = 200;
+function boundedSet<K, V>(map: Map<K, V>, key: K, value: V): void {
+  if (!map.has(key) && map.size >= PANEL_MAP_CAP) {
+    const oldest = map.keys().next().value;
+    if (oldest !== undefined) map.delete(oldest);
+  }
+  map.set(key, value);
+}
+
 function contactName(c: MaxContactInfo): string {
   const names = c.names ?? [];
   const primary = names.find((n) => n.type === 'ONEME') ?? names[0];
@@ -194,7 +205,8 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
     await postAndPin().catch((err) => logger.error('Failed to post control panel', err));
   }
   // Fire-and-forget on wire-up; a small delay lets the bot finish coming up first.
-  setTimeout(() => void restoreOrPost(), 4000);
+  // unref (as with every maintenance timer): must not hold the process open during shutdown.
+  setTimeout(() => void restoreOrPost(), 4000).unref();
 
   bot.command('panel', async (ctx) => {
     await postAndPin().catch((err) => logger.error('Failed to post control panel (/panel)', err));
@@ -275,6 +287,7 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
         pauseTimer = null;
         max.connect();
       }, secs * 1000);
+      pauseTimer.unref();
     }
     await ctx.answerCbQuery('MAX на паузе');
     await edit(ctx, systemView());
@@ -286,7 +299,7 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
     const sent = await bot.telegram.sendMessage(chatIdOf(ctx), `🔎 Отправьте ${label} в ответ на это сообщение:`, {
       reply_markup: { force_reply: true, input_field_placeholder: mode === 'phone' ? '+79991234567' : 'Имя' },
     });
-    pendingSearch.set(sent.message_id, { mode, requesterId: ctx.from?.id ?? 0 });
+    boundedSet(pendingSearch, sent.message_id, { mode, requesterId: ctx.from?.id ?? 0 });
   }
   bot.action('tlmx_panel:find:phone', async (ctx) => {
     await ctx.answerCbQuery();
@@ -301,7 +314,7 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
     const uid = String(c.id);
     const name = contactName(c);
     const onMax = isOnMax(c);
-    shownContacts.set(uid, { name, onMax });
+    boundedSet(shownContacts, uid, { name, onMax });
     const phone = c.phone != null ? ` · ${String(c.phone)}` : '';
     const country = c.country ? ` · ${c.country}` : '';
     const text = `👤 ${name}\nID ${uid}${phone}${country}${onMax ? '' : '\n⚠️ Контакт не в MAX — начать чат нельзя.'}`;
@@ -331,7 +344,7 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
         await sendCard(chatId, list[0]!);
         return;
       }
-      for (const c of list) shownContacts.set(String(c.id), { name: contactName(c), onMax: isOnMax(c) });
+      for (const c of list) boundedSet(shownContacts, String(c.id), { name: contactName(c), onMax: isOnMax(c) });
       const buttons = list
         .slice(0, 8)
         .map((c) => Markup.button.callback(`${contactName(c)}${isOnMax(c) ? '' : ' (не в MAX)'}`, `tlmx_panel:pick:${String(c.id)}`));

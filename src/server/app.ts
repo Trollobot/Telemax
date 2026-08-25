@@ -402,10 +402,10 @@ async function startServer(): Promise<void> {
 
   max.connect();
 
-  // Resolve the Telegram proxy (env var or panel-set override in ./data) before the
-  // bot is built — Telegraf binds its agent at construction time, so this has to run
+  // Build the Telegram proxy agent (TELEGRAM_PROXY from .env) before the bot is
+  // built — Telegraf binds its agent at construction time, so this has to run
   // first. No-op when no proxy is configured.
-  await initTelegramProxy();
+  initTelegramProxy();
 
   // --- Telegram bot (optional — bridge stays dormant without credentials) ---
   if (config.telegramEnabled) {
@@ -456,9 +456,11 @@ async function startServer(): Promise<void> {
       // bot may not have launched (bad token, mid-retry) — nothing to stop
     }
     max.disconnect();
-    // Failsafe: don't let a lingering keep-alive socket hold the process past docker's stop timeout.
+    // Let in-flight work (a mid-write store persist, the polling loop's teardown)
+    // drain naturally; the timer is the failsafe so a lingering keep-alive socket
+    // or maintenance interval can't hold the process past docker's stop timeout.
+    // (An immediate exit(0) here used to make the "graceful" part a no-op.)
     setTimeout(() => process.exit(0), 5_000).unref();
-    process.exit(0);
   };
   process.once('SIGTERM', () => shutdown('SIGTERM'));
   process.once('SIGINT', () => shutdown('SIGINT'));

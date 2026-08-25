@@ -96,11 +96,15 @@ export interface DownloadContext {
   fallbackMessageId?: unknown;
 }
 
+// Generous — covers a large video on a slow CDN — but finite: a hung download must
+// not stall the relay handler forever (nothing else here bounds it).
+const DOWNLOAD_TIMEOUT_MS = 120_000;
+
 // Every URL that reaches this helper is a MAX-owned host (photo/sticker/file/video
 // CDN) — hence maxFetch, which trusts the Russian state chain those certs use.
 async function downloadUrl(url: string): Promise<Buffer | null> {
   try {
-    const res = await maxFetch(url);
+    const res = await maxFetch(url, { signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
     if (!res.ok) {
       logger.error(`downloadUrl got non-OK response ${res.status} ${res.statusText} for ${url}`);
       return null;

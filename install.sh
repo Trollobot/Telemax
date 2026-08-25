@@ -12,8 +12,13 @@ set -euo pipefail
 REPO_URL="https://github.com/Trollobot/Telemax.git"
 # Read-only fallback mirror for when GitHub is unreachable (account flagged, or GitHub filtered on
 # this network). Overridable via env so the mirror can move without editing this script.
-MIRROR_GIT_URL="${MIRROR_GIT_URL:-http://zergont-gate.duckdns.org:3200/Telemax.git}"
+MIRROR_GIT_URL="${MIRROR_GIT_URL:-https://zergont-gate.duckdns.org/Telemax.git}"
 INSTALL_DIR="/opt/telemax"
+# The maintainer's release-signing key, pinned HERE as well as in the repo's allowed_signers:
+# update.sh trusts whatever allowed_signers the checkout carries, so a tampered clone (a
+# compromised transport swapping in an attacker's key) would otherwise bootstrap a poisoned
+# trust chain. As long as THIS script arrived over HTTPS, the check below catches that swap.
+EXPECTED_SIGNER='release@telemax namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILE1HMFVabDZUp6fRrnnt2lMgTY57ghrMP1pp+dE5MIe'
 
 bold() { printf '\033[1m%s\033[0m\n' "$1"; }
 
@@ -102,6 +107,15 @@ else
 fi </dev/null  # same stdin guard as the apt calls — keep git off the curl|bash pipe
 
 cd "$INSTALL_DIR"
+
+# Bootstrap-trust check (see EXPECTED_SIGNER above): the cloned repo must carry exactly the
+# pinned release key. Missing file counts as failure — every release since v0.4.1 ships it.
+if ! grep -qxF "$EXPECTED_SIGNER" allowed_signers 2>/dev/null; then
+  echo "❌ Ключ подписи релизов в скачанном репозитории не совпадает с ожидаемым."
+  echo "   Возможна компрометация источника (GitHub/зеркала) — установка остановлена."
+  exit 1
+fi
+
 echo
 bold "Окружение готово, переходим к настройке."
 echo

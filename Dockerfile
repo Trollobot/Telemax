@@ -36,5 +36,11 @@ COPY certs ./certs
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 COPY --from=build /app/dist ./dist
+COPY entrypoint.sh ./
+# Privilege drop lives in entrypoint.sh, not a static `USER node`: the entrypoint
+# must start as root once per boot to chown the mounted ./data (root-owned on every
+# pre-0.4.9 install) before handing off to the unprivileged node user — see the
+# script for the full rationale. sh -form so the script needs no exec bit (Windows
+# checkouts drop it); exec-chain keeps node as PID 1 for SIGTERM.
 # Headless bridge (v0.4): no inbound web server — MAX is an outbound socket, Telegram is long-polled.
-CMD ["node", "dist/server.mjs"]
+CMD ["/bin/sh", "/app/entrypoint.sh"]
