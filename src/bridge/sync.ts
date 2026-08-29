@@ -1449,8 +1449,22 @@ export function wireBridge({
     }
     if (existingLink) {
       if (text != null) {
+        // Telegram never shows its own "edited" tag on bot-edited messages (deliberate
+        // Bot API behavior — bots edit constantly for live UIs), so mark the edit in the
+        // text itself. Group messages get the marker fused with the author prefix
+        // ("✏️ 👤 Имя:"), which the plain-relay path adds much further down and this
+        // early-return branch used to LOSE entirely — an edited group message silently
+        // dropped its author line. 1:1 gets an explicit "✏️ изменено: ". No stacking on
+        // repeated edits: MAX sends the full fresh text each time, we rebuild from it.
+        const editedChat = getChats().find((c) => c && typeof c === 'object' && String((c as { id?: unknown }).id) === String(chatId));
+        const editAuthorPrefix = await resolveAuthorPrefix(editedChat, message.sender, getMyAccountId(), max, getContactProfiles());
+        // Receipt time ≈ edit time (edit pushes arrive live); MAX's own payload carries no
+        // confirmed edit-timestamp field. Timezone mirrors the client's default (Europe/Moscow),
+        // overridable via TZ — the container itself runs on UTC, which would look wrong.
+        const editedAt = new Intl.DateTimeFormat('ru-RU', { hour: '2-digit', minute: '2-digit', timeZone: process.env.TZ || 'Europe/Moscow' }).format(new Date());
+        const marked = editAuthorPrefix ? `✏️ (${editedAt}) ${editAuthorPrefix}${text}` : `✏️ изменено в ${editedAt}:\n${text}`;
         try {
-          await bot.telegram.editMessageText(targetGroupId, existingLink.telegramMessageId, undefined, text);
+          await bot.telegram.editMessageText(targetGroupId, existingLink.telegramMessageId, undefined, marked);
         } catch (err) {
           logger.error('Failed to relay MAX edit to Telegram', err);
         }
