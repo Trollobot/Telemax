@@ -56,12 +56,26 @@ echo ">> [2/4] push to mirror (${MIRROR_GIT_URL})"
 git push "${MIRROR_GIT_URL}" "+refs/heads/main:refs/heads/main" "+refs/tags/*:refs/tags/*"
 
 echo ">> [3/4] build latest.json (cumulative per-version changelog)"
-PREV_TAG=$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || echo "")
-RANGE="${TAG}"
-[ -n "${PREV_TAG}" ] && RANGE="${PREV_TAG}..${TAG}"
-# This version's notes: commit subjects since the previous tag, minus the release-bump commit itself.
-NEW_NOTES_JSON=$(git log --format='%s' "${RANGE}" | grep -viE '^Релиз |^Release ' \
-  | node -e "const l=require('fs').readFileSync(0,'utf8').split('\n').filter(Boolean); process.stdout.write(JSON.stringify(l))")
+# This version's notes come from CHANGELOG.md's `## ${VERSION}` section — NOT from commit
+# subjects: commits are technical, users see only what's deliberately written in the file.
+# No section (or an empty one) = refuse to release, so notes can't be forgotten.
+NEW_NOTES_JSON=$(node -e "
+const fs = require('fs');
+const version = '${VERSION}';
+const map = {};
+let cur = null;
+for (const line of fs.readFileSync('CHANGELOG.md', 'utf8').split('\n')) {
+  const h = /^##\s+v?(\d+\.\d+\.\d+)\b/.exec(line);
+  if (h) { cur = h[1]; map[cur] ??= []; continue; }
+  if (cur && line.startsWith('- ')) { const n = line.slice(2).trim(); if (n) map[cur].push(n); }
+}
+const notes = map[version];
+if (!notes || notes.length === 0) process.exit(1);
+process.stdout.write(JSON.stringify(notes));
+") || {
+  echo "!! В CHANGELOG.md нет раздела '## ${VERSION}' с пунктами — заполните его и повторите релиз." >&2
+  exit 1
+}
 # Accumulate into the map already published on the mirror so multi-version jumps keep every release.
 EXISTING_JSON=$(curl -fsS "${MIRROR_HTTP_URL}/latest.json" 2>/dev/null || echo '{}')
 LATEST_JSON=$(node scripts/build-latest-json.mjs "${VERSION}" "${TAG}" "${NEW_NOTES_JSON}" "${EXISTING_JSON}")

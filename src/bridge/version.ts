@@ -84,29 +84,48 @@ async function fetchLatestTag(): Promise<LatestVersionInfo | null> {
   }
 }
 
-/** First-line messages of the commits between two refs (newest-first) via the compare API — the
- * "what's new". Best-effort: [] on any failure (e.g. the running version has no matching tag). */
-async function fetchChangelog(base: string, head: string): Promise<string[]> {
+/**
+ * Parses CHANGELOG.md (the file, not git history — commits are technical and never
+ * shown to users) into a version -> notes map. Sections start with `## X.Y.Z` (an
+ * optional `v` prefix and anything after the version — a dash, a date — is ignored);
+ * notes are the section's `- ` bullet lines. Exported for tests.
+ */
+export function parseChangelogMd(text: string): Record<string, string[]> {
+  const map: Record<string, string[]> = {};
+  let current: string | null = null;
+  for (const line of text.split('\n')) {
+    const header = /^##\s+v?(\d+\.\d+\.\d+)\b/.exec(line);
+    if (header) {
+      current = header[1] as string;
+      map[current] ??= [];
+      continue;
+    }
+    if (current && line.startsWith('- ')) {
+      const note = line.slice(2).trim();
+      if (note) map[current]!.push(note);
+    }
+  }
+  return map;
+}
+
+/** CHANGELOG.md as published at `tag` on GitHub — the user-facing "what's new" source
+ * (replaces the old compare-API commit-subject list, which leaked technical commits).
+ * Best-effort: {} on any failure (older tags predate the file). */
+async function fetchChangelogFromGitHub(tag: string): Promise<Record<string, string[]>> {
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), GITHUB_API_TIMEOUT_MS);
-    const res = await fetch(`https://api.github.com/repos/${REPO}/compare/${base}...${head}`, {
-      headers: { Accept: 'application/vnd.github+json' },
+    const res = await fetch(`https://raw.githubusercontent.com/${REPO}/${tag}/CHANGELOG.md`, {
       signal: controller.signal,
     }).finally(() => clearTimeout(timeout));
     if (!res.ok) {
-      logger.error(`GitHub compare API returned ${res.status} ${res.statusText}`);
-      return [];
+      logger.error(`GitHub raw CHANGELOG.md returned ${res.status} ${res.statusText}`);
+      return {};
     }
-    const payload = (await res.json()) as { commits?: Array<{ commit?: { message?: string } }> };
-    // compare returns oldest-first; reverse so the newest change reads first.
-    return (payload.commits ?? [])
-      .map((c) => (c.commit?.message ?? '').split('\n')[0] ?? '')
-      .filter(Boolean)
-      .reverse();
+    return parseChangelogMd(await res.text());
   } catch (err) {
-    logger.error('Failed to fetch changelog from GitHub', err);
-    return [];
+    logger.error('Failed to fetch CHANGELOG.md from GitHub', err);
+    return {};
   }
 }
 
@@ -148,10 +167,11 @@ async function fetchLatestFromMirror(): Promise<
   }
 }
 
-/** Flattens the mirror's per-version changelog map into a single newest-first list of every release
+/** Flattens a per-version changelog map into a single newest-first list of every release
  * strictly newer than `current` — so a multi-version jump shows all skipped versions' notes, not
- * just the latest. Falls back to `fallback` (the newest release's notes) when the map is empty. */
-function assembleMirrorChangelog(
+ * just the latest. Shared by the GitHub (CHANGELOG.md) and mirror (latest.json) paths. Falls back
+ * to `fallback` (the newest release's notes) when the map has nothing newer. Exported for tests. */
+export function assembleChangelog(
   changelogs: Record<string, string[]>,
   current: string,
   fallback: string[],
@@ -174,12 +194,12 @@ export async function checkVersion(): Promise<VersionStatus> {
   const current = getAppVersion();
   const currentSemver = parseSemver(current);
 
-  // Primary source: GitHub tags (+ compare API for the changelog).
+  // Primary source: GitHub tags (+ CHANGELOG.md at the latest tag for the notes).
   const ghLatest = await fetchLatestTag();
   if (ghLatest) {
     const latestSemver = parseSemver(ghLatest.version);
     const updateAvailable = latestSemver != null && currentSemver != null && cmpSemver(latestSemver, currentSemver) > 0;
-    const changelog = updateAvailable ? await fetchChangelog(`v${current}`, ghLatest.tag) : [];
+    const changelog = updateAvailable ? assembleChangelog(await fetchChangelogFromGitHub(ghLatest.tag), current, []) : [];
     return { current, latest: ghLatest, updateAvailable, changelog };
   }
 
@@ -194,8 +214,8 @@ export async function checkVersion(): Promise<VersionStatus> {
       latest: { tag: mirror.tag, version: mirror.version },
       updateAvailable,
       // Cumulative: every version between `current` and latest, so a multi-version jump isn't
-      // reduced to just the newest release's notes (as the GitHub compare API would show).
-      changelog: updateAvailable ? assembleMirrorChangelog(mirror.changelogs, current, mirror.changelog) : [],
+      // reduced to just the newest release's notes.
+      changelog: updateAvailable ? assembleChangelog(mirror.changelogs, current, mirror.changelog) : [],
     };
   }
 
