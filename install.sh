@@ -54,12 +54,12 @@ apt_get() {
 bold "=== Telemax — установка на чистый сервер ==="
 echo
 
-echo "[1/5] Обновляю систему (может занять несколько минут)..."
+echo "[1/6] Обновляю систему (может занять несколько минут)..."
 apt-get update -y </dev/null
 apt_get upgrade -y
 
 echo
-echo "[2/5] Проверяю git и jq..."
+echo "[2/6] Проверяю git и jq..."
 # jq: used by setup.sh to auto-detect the Telegram group id (no need to hunt for it
 # manually — see setup.sh). (update.sh's release-signature check uses ssh-keygen, which
 # ships with openssh and is already present on any host you can SSH into — no extra pkg.)
@@ -70,7 +70,7 @@ for pkg in git jq; do
 done
 
 echo
-echo "[3/5] Проверяю Docker..."
+echo "[3/6] Проверяю Docker..."
 if ! command -v docker >/dev/null 2>&1; then
   # get.docker.com's own script calls apt-get install internally and can hit
   # the exact same recurring trigger issue — don't trust its exit code alone,
@@ -86,7 +86,50 @@ fi
 systemctl enable --now docker >/dev/null 2>&1 || true
 
 echo
-echo "[4/5] Скачиваю проект в $INSTALL_DIR..."
+echo "[4/6] Защита сервера от подбора пароля по SSH (Fail2ban)..."
+# The bridge opens no inbound ports (MAX = outbound TCP, Telegram = long-polling), so the only
+# door on this host is SSH — and every public server gets hammered with password guesses within
+# hours of going online. Fail2ban's stock `sshd` jail bans a source after 5 failures in 10 min
+# (for 10 min). Offered, not forced: default YES, 30s timeout so an unattended run isn't
+# blocked. Read from /dev/tty — under `curl | bash` stdin is the script itself. The `if` keeps a
+# timed-out read from tripping `set -e`.
+if command -v fail2ban-client >/dev/null 2>&1; then
+  echo "Fail2ban уже установлен — пропускаю."
+else
+  F2B_CHOICE=""
+  if read -t 30 -rp "Поставить Fail2ban? [Y/n] (жду 30с, по умолчанию — да): " F2B_CHOICE </dev/tty; then :; else echo; fi
+  case "${F2B_CHOICE:-}" in
+    n | N | no | NO | нет | Нет) echo "Пропускаю Fail2ban." ;;
+    *)
+      apt_get install -y fail2ban
+      # Two known pitfalls handled up front:
+      #  - minimal Ubuntu 22.04/24.04 images ship no /var/log/auth.log (no rsyslog), and fail2ban's
+      #    default `auto` backend then fails to start the sshd jail at all -> read the journal;
+      #  - the installer can lock THEMSELVES out by mistyping their SSH password -> whitelist the
+      #    IP of this very SSH session (SSH_CONNECTION is exported by sshd; empty when not over SSH).
+      # Only written on a fresh install (the command -v check above skips an existing setup), so a
+      # user's own jail.local is never clobbered.
+      F2B_SELF_IP="${SSH_CONNECTION:-}"
+      F2B_SELF_IP="${F2B_SELF_IP%% *}"
+      cat > /etc/fail2ban/jail.local <<EOF
+[DEFAULT]
+backend = systemd
+ignoreip = 127.0.0.1/8 ::1 ${F2B_SELF_IP}
+
+[sshd]
+enabled = true
+EOF
+      systemctl enable --now fail2ban >/dev/null 2>&1 </dev/null || true
+      if systemctl is-active --quiet fail2ban; then
+        echo "Fail2ban включён: jail sshd активен${F2B_SELF_IP:+, ваш IP ${F2B_SELF_IP} в белом списке}."
+      else
+        echo "⚠️  Fail2ban установлен, но служба не запустилась — проверьте: systemctl status fail2ban"
+      fi
+      ;;
+  esac
+fi
+echo
+echo "[5/6] Скачиваю проект в $INSTALL_DIR..."
 if [ -d "$INSTALL_DIR/.git" ]; then
   echo "Уже склонировано — обновляю до последней версии..."
   # GIT_TERMINAL_PROMPT=0 so a flagged/unreachable GitHub fails fast instead of hanging on a
