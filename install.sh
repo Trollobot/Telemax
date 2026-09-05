@@ -93,22 +93,56 @@ echo "[4/6] Защита сервера от подбора пароля по SS
 # (for 10 min). Offered, not forced: default YES, 30s timeout so an unattended run isn't
 # blocked. Read from /dev/tty — under `curl | bash` stdin is the script itself. The `if` keeps a
 # timed-out read from tripping `set -e`.
+#
+# The jail reads the journal (`backend = systemd`) — chosen because minimal Ubuntu 22.04/24.04
+# images ship no /var/log/auth.log, where fail2ban's default backend can't start the sshd jail at
+# all. That backend needs the python3-systemd bindings, which Ubuntu/Debian do NOT pull in as a
+# fail2ban dependency. 0.5.0 shipped without them: the service came up, the jail silently died
+# ("No module named 'systemd'") and the script still reported success — caught live on the test
+# box 2026-09-05. Hence: install both, and verify the JAIL (not the service) before claiming
+# protection.
+f2b_jail_up() {
+  # The server needs a moment after start; a status query before "Server ready" fails spuriously.
+  local i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    if fail2ban-client status sshd >/dev/null 2>&1; then return 0; fi
+    sleep 1
+  done
+  return 1
+}
+f2b_report() {
+  if f2b_jail_up; then
+    echo "Fail2ban включён: jail sshd работает${F2B_SELF_IP:+, ваш IP ${F2B_SELF_IP} в белом списке}."
+  else
+    echo "⚠️  Fail2ban запущен, но jail sshd не поднялся — защиты SSH НЕТ. Причина из лога:"
+    grep -E "ERROR" /var/log/fail2ban.log 2>/dev/null | tail -3 | sed 's/^/    /' || true
+    echo "    Проверьте: fail2ban-client status sshd"
+  fi
+}
 if command -v fail2ban-client >/dev/null 2>&1; then
-  echo "Fail2ban уже установлен — пропускаю."
+  # Already installed. One targeted self-heal: a config on the systemd backend (ours from 0.5.0,
+  # or the user's own) with the bindings missing = a jail that never started. Add the module and
+  # restart; everything else about an existing setup is left alone.
+  if grep -qs '^backend *= *systemd' /etc/fail2ban/jail.local 2>/dev/null \
+     && ! python3 -c 'import systemd.journal' >/dev/null 2>&1; then
+    echo "Fail2ban уже стоит, но без python3-systemd его jail sshd не работает — доставляю модуль..."
+    apt_get install -y python3-systemd
+    systemctl restart fail2ban >/dev/null 2>&1 </dev/null || true
+    F2B_SELF_IP=""; f2b_report
+  else
+    echo "Fail2ban уже установлен — пропускаю."
+  fi
 else
   F2B_CHOICE=""
   if read -t 30 -rp "Поставить Fail2ban? [Y/n] (жду 30с, по умолчанию — да): " F2B_CHOICE </dev/tty; then :; else echo; fi
   case "${F2B_CHOICE:-}" in
     n | N | no | NO | нет | Нет) echo "Пропускаю Fail2ban." ;;
     *)
-      apt_get install -y fail2ban
-      # Two known pitfalls handled up front:
-      #  - minimal Ubuntu 22.04/24.04 images ship no /var/log/auth.log (no rsyslog), and fail2ban's
-      #    default `auto` backend then fails to start the sshd jail at all -> read the journal;
-      #  - the installer can lock THEMSELVES out by mistyping their SSH password -> whitelist the
-      #    IP of this very SSH session (SSH_CONNECTION is exported by sshd; empty when not over SSH).
-      # Only written on a fresh install (the command -v check above skips an existing setup), so a
-      # user's own jail.local is never clobbered.
+      apt_get install -y fail2ban python3-systemd
+      # Whitelist the IP of this very SSH session so the installer can't lock THEMSELVES out by
+      # mistyping their password (SSH_CONNECTION is exported by sshd; empty when not over SSH).
+      # Only written on a fresh install (the command -v branch above never clobbers a user's own
+      # jail.local).
       F2B_SELF_IP="${SSH_CONNECTION:-}"
       F2B_SELF_IP="${F2B_SELF_IP%% *}"
       cat > /etc/fail2ban/jail.local <<EOF
@@ -120,11 +154,7 @@ ignoreip = 127.0.0.1/8 ::1 ${F2B_SELF_IP}
 enabled = true
 EOF
       systemctl enable --now fail2ban >/dev/null 2>&1 </dev/null || true
-      if systemctl is-active --quiet fail2ban; then
-        echo "Fail2ban включён: jail sshd активен${F2B_SELF_IP:+, ваш IP ${F2B_SELF_IP} в белом списке}."
-      else
-        echo "⚠️  Fail2ban установлен, но служба не запустилась — проверьте: systemctl status fail2ban"
-      fi
+      f2b_report
       ;;
   esac
 fi
