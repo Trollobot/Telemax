@@ -595,18 +595,29 @@ async function backfillHistoryToTelegram(
   // May change mid-run if the topic turns out to be deleted (recreated on the fly).
   let currentTopicId = topicId;
   let recreatedOnce = false;
+  const backfillProfiles = new Map<number, ContactProfile>(); // per-run name cache for member events
   for (const msg of messages) {
     const forwarded = await resolveForwardContent(max, chats, msg.link);
     let text = forwarded ? forwarded.text : msg.text;
-    const attaches = forwarded ? forwarded.attaches : Array.isArray(msg.attaches) ? (msg.attaches as MaxAttachment[]) : [];
+    let attaches = forwarded ? forwarded.attaches : Array.isArray(msg.attaches) ? (msg.attaches as MaxAttachment[]) : [];
     if (!text && !attaches.some((a) => isRenderableAttach(a as MaxAttachment))) {
       await chatMapStore.advanceHistoryCursor(maxChatId, msg.time);
       continue;
     }
-    // Group chats: prefix the author so the topic isn't an anonymous stream (1:1 needs none).
-    const chat = chats.find((c) => c && typeof c === 'object' && String((c as { id?: unknown }).id) === String(maxChatId));
-    const authorPrefix = await resolveAuthorPrefix(chat, (msg as { sender?: unknown }).sender, myAccountId, max);
-    if (authorPrefix) text = text ? `${authorPrefix}${text}` : authorPrefix;
+    // Same join/leave rendering as the live path (see renderMemberEvent), so synced history also
+    // says who left / was added — with their MAX ID and a DM button.
+    let memberMarkup: InlineMarkup | undefined;
+    const memberEvent = await renderMemberEvent(attaches as MaxAttachment[], text, (msg as { sender?: unknown }).sender, myAccountId, max, backfillProfiles);
+    if (memberEvent) {
+      text = memberEvent.text;
+      attaches = [];
+      memberMarkup = memberEvent.markup;
+    } else {
+      // Group chats: prefix the author so the topic isn't an anonymous stream (1:1 needs none).
+      const chat = chats.find((c) => c && typeof c === 'object' && String((c as { id?: unknown }).id) === String(maxChatId));
+      const authorPrefix = await resolveAuthorPrefix(chat, (msg as { sender?: unknown }).sender, myAccountId, max);
+      if (authorPrefix) text = text ? `${authorPrefix}${text}` : authorPrefix;
+    }
     // One retry: if the topic was deleted, recreate it (once per run) and re-send
     // this same message. Without this, catch-up after a restart silently drops every
     // message for a chat whose topic was removed (the cursor advances regardless).
@@ -615,7 +626,7 @@ async function backfillHistoryToTelegram(
         let textMessageId: number | undefined;
         let attachMessageId: number | undefined;
         if (text) {
-          const sent = await withFloodRetry(() => bot.telegram.sendMessage(groupId, text, { message_thread_id: currentTopicId }));
+          const sent = await withFloodRetry(() => bot.telegram.sendMessage(groupId, text, { message_thread_id: currentTopicId, ...(memberMarkup ? { reply_markup: memberMarkup } : {}) }));
           textMessageId = sent.message_id;
           await sleep(HISTORY_SEND_DELAY_MS);
         }
@@ -682,6 +693,67 @@ async function buildRoster(
     name: resolveContactDisplayName(id, profiles.get(id)),
     isSelf: myAccountId != null && id === myAccountId,
   }));
+}
+
+type InlineMarkup = ReturnType<typeof Markup.inlineKeyboard>['reply_markup'];
+
+/**
+ * A group "member event" (CONTROL join/leave) rendered as ONE actionable message: who left / who was
+ * added, their MAX ID in the text, and a «✍️ Имя» button per person that opens a 1:1 through the
+ * panel's tlmx_panel:startchat:<id> — the same proven path as the roster buttons. Motivation
+ * (reported live 2026-09-07): once someone leaves a group they vanish from the roster, and the old
+ * rendering — a bare "👤 Имя:" author line + a separate "➖ Участник вышел" label — left no way to
+ * reach them from Telegram. Returns undefined when the message isn't such an event (or a join
+ * carries no userIds — then the old prefix + label rendering applies; no regression).
+ */
+async function renderMemberEvent(
+  attaches: MaxAttachment[],
+  text: string | undefined,
+  senderId: unknown,
+  myAccountId: number | null,
+  max: MaxClient,
+  profiles: Map<number, ContactProfile>,
+): Promise<{ text: string; markup: InlineMarkup | undefined } | undefined> {
+  if (text) return undefined;
+  const renderable = attaches.filter((a) => isRenderableAttach(a));
+  const ev = renderable.length === 1 && renderable[0]!._type === 'CONTROL' ? renderable[0]! : undefined;
+  if (!ev || (ev.event !== 'join' && ev.event !== 'leave')) return undefined;
+  const actor = Number(senderId);
+  const isSelf = (id: number) => myAccountId != null && id === myAccountId;
+  let people: number[];
+  if (ev.event === 'leave') {
+    if (Number.isNaN(actor)) return undefined;
+    people = [actor];
+  } else {
+    people = (Array.isArray(ev.userIds) ? ev.userIds : []).map(Number).filter((id) => !Number.isNaN(id));
+    if (people.length === 0) return undefined;
+  }
+  // Names from the warm cache; batch-fetch the rest (same pattern as buildRoster).
+  const uncached = [...new Set([...people, ...(Number.isNaN(actor) ? [] : [actor])])].filter((id) => !profiles.has(id) && !isSelf(id));
+  if (uncached.length > 0) {
+    try {
+      for (const c of await max.getContactInfo(uncached)) {
+        const cid = Number((c as { id?: unknown }).id);
+        if (!Number.isNaN(cid)) profiles.set(cid, c);
+      }
+    } catch (err) {
+      logger.error('Failed to fetch profiles for a member event', err);
+    }
+  }
+  const nameOf = (id: number) => (isSelf(id) ? 'вы' : resolveContactDisplayName(id, profiles.get(id)));
+  let line: string;
+  if (ev.event === 'leave') {
+    line = isSelf(actor) ? '➖ Вы вышли из группы' : `➖ Участник вышел: ${nameOf(actor)} · MAX ID ${actor}`;
+  } else {
+    const list = people.map((id) => (isSelf(id) ? 'вы' : `${nameOf(id)} (MAX ID ${id})`)).join(', ');
+    line = `${people.length === 1 ? '➕ Участник добавлен' : '➕ Участники добавлены'}: ${list}`;
+    if (!Number.isNaN(actor) && !people.includes(actor)) line += ` — добавил: ${nameOf(actor)}`;
+  }
+  const buttons = people
+    .filter((id) => !isSelf(id))
+    .slice(0, 10)
+    .map((id) => [Markup.button.callback(`✍️ ${nameOf(id)}`, `tlmx_panel:startchat:${id}`)]);
+  return { text: line, markup: buttons.length > 0 ? Markup.inlineKeyboard(buttons).reply_markup : undefined };
 }
 
 /** Builds and sends the contact/chat card — shared by the /info command and the auto-send on first contact with a new chat. Returns the sent message's id so auto-send callers can pin it. */
@@ -1507,7 +1579,7 @@ export function wireBridge({
       }
       if (attaches.length > 0) {
         const kinds = attaches
-          .map((a) => `${(a as MaxAttachment)._type}${(a as { event?: unknown }).event ? `/${String((a as { event?: unknown }).event)}` : ''}`)
+          .map((a) => `${(a as MaxAttachment)._type}${(a as { event?: unknown }).event ? `/${String((a as { event?: unknown }).event)}` : ''}${Array.isArray((a as MaxAttachment).userIds) ? '+userIds' : ''}`)
           .join(',');
         logger.info(
           `Skipped a non-renderable MAX message in chat ${String(chatId)} (attach: ${kinds})${existingMapping ? '' : ' — created its topic (new chat)'}`,
@@ -1571,11 +1643,21 @@ export function wireBridge({
       return;
     }
 
-    // Group chats: prefix the author so the topic isn't an anonymous stream (1:1 needs none). For an
-    // attachment-only group message the prefix becomes the text, so the file still shows who sent it.
-    const senderChat = getChats().find((c) => c && typeof c === 'object' && String((c as { id?: unknown }).id) === String(chatId));
-    const authorPrefix = await resolveAuthorPrefix(senderChat, message.sender, getMyAccountId(), max, getContactProfiles());
-    if (authorPrefix) text = text ? `${authorPrefix}${text}` : authorPrefix;
+    // A join/leave event becomes ONE actionable message (who + MAX ID + a «✍️» button to DM them) and
+    // consumes the attach, so the bare "➖ Участник вышел" label isn't posted as a second bubble.
+    let memberMarkup: InlineMarkup | undefined;
+    const memberEvent = await renderMemberEvent(attaches as MaxAttachment[], text, message.sender, getMyAccountId(), max, getContactProfiles());
+    if (memberEvent) {
+      text = memberEvent.text;
+      attaches = [];
+      memberMarkup = memberEvent.markup;
+    } else {
+      // Group chats: prefix the author so the topic isn't an anonymous stream (1:1 needs none). For an
+      // attachment-only group message the prefix becomes the text, so the file still shows who sent it.
+      const senderChat = getChats().find((c) => c && typeof c === 'object' && String((c as { id?: unknown }).id) === String(chatId));
+      const authorPrefix = await resolveAuthorPrefix(senderChat, message.sender, getMyAccountId(), max, getContactProfiles());
+      if (authorPrefix) text = text ? `${authorPrefix}${text}` : authorPrefix;
+    }
 
     try {
       await deliverToTopic(chatId, async (topicId, created) => {
@@ -1589,6 +1671,7 @@ export function wireBridge({
             await bot.telegram.sendMessage(targetGroupId, text, {
               message_thread_id: topicId,
               ...(replyParameters ? { reply_parameters: replyParameters } : {}),
+              ...(memberMarkup ? { reply_markup: memberMarkup } : {}),
             })
           ).message_id;
         if (attaches.length > 0) {

@@ -58,7 +58,7 @@ function isPaused(): boolean {
 }
 
 // --- Contact-search force-reply correlation ------------------------------------------
-type SearchMode = 'phone' | 'nick';
+type SearchMode = 'phone' | 'nick' | 'id';
 const pendingSearch = new Map<number, { mode: SearchMode; requesterId: number }>();
 // Contacts shown with a "Начать чат" button, so the tap knows the display name / MAX
 // membership without re-fetching. Keyed by userId (string).
@@ -111,6 +111,7 @@ function contactsView(): View {
     text: '👤 Найти контакт в MAX:',
     markup: Markup.inlineKeyboard([
       [Markup.button.callback('🔢 По номеру', 'tlmx_panel:find:phone'), Markup.button.callback('@ По нику', 'tlmx_panel:find:nick')],
+      [Markup.button.callback('🆔 По ID', 'tlmx_panel:find:id')],
       [Markup.button.callback('◀️ Назад', 'tlmx_panel:root')],
     ]).reply_markup,
   };
@@ -295,9 +296,9 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
 
   // --- Contact search -----------------------------------------------------------------
   async function promptSearch(ctx: Context, mode: SearchMode): Promise<void> {
-    const label = mode === 'phone' ? 'номер телефона (с + или без)' : 'имя или ник';
+    const label = mode === 'phone' ? 'номер телефона (с + или без)' : mode === 'id' ? 'MAX ID (число — например, из карточки группы или из сообщения о выходе участника)' : 'имя или ник';
     const sent = await bot.telegram.sendMessage(chatIdOf(ctx), `🔎 Отправьте ${label} в ответ на это сообщение:`, {
-      reply_markup: { force_reply: true, input_field_placeholder: mode === 'phone' ? '+79991234567' : 'Имя' },
+      reply_markup: { force_reply: true, input_field_placeholder: mode === 'phone' ? '+79991234567' : mode === 'id' ? '123456789' : 'Имя' },
     });
     boundedSet(pendingSearch, sent.message_id, { mode, requesterId: ctx.from?.id ?? 0 });
   }
@@ -308,6 +309,10 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
   bot.action('tlmx_panel:find:nick', async (ctx) => {
     await ctx.answerCbQuery();
     await promptSearch(ctx, 'nick');
+  });
+  bot.action('tlmx_panel:find:id', async (ctx) => {
+    await ctx.answerCbQuery();
+    await promptSearch(ctx, 'id');
   });
 
   async function sendCard(chatId: number, c: MaxContactInfo): Promise<void> {
@@ -330,6 +335,21 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
         const contact = await max.searchContactByPhone(query);
         if (!contact) {
           await bot.telegram.sendMessage(chatId, '❌ Контакт по этому номеру не найден в MAX.');
+          return;
+        }
+        await sendCard(chatId, contact);
+        return;
+      }
+      if (mode === 'id') {
+        // Any MAX ID the bridge prints (roster card, member events) can be pasted here to open a chat.
+        const id = Number(query.replace(/\D/g, ''));
+        if (!Number.isInteger(id) || id <= 0) {
+          await bot.telegram.sendMessage(chatId, '❌ MAX ID — это число, например 123456789.');
+          return;
+        }
+        const [contact] = await max.getContactInfo([id]);
+        if (!contact) {
+          await bot.telegram.sendMessage(chatId, '❌ Контакт с таким MAX ID не найден.');
           return;
         }
         await sendCard(chatId, contact);
