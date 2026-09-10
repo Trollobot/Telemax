@@ -28,6 +28,20 @@ if [ "$(id -u)" -ne 0 ]; then
 fi
 
 export DEBIAN_FRONTEND=noninteractive
+# dpkg's conffile prompt ("cloud.cfg modified — Y/I/N/O/D/Z?") is NOT covered by DEBIAN_FRONTEND:
+# that only silences debconf. With our stdin guard (</dev/null below) such a prompt hits EOF, the
+# package is left half-configured, dpkg is broken for every later apt call — and get.docker.com,
+# which runs its OWN apt-get, then fails too (hit live 2026-09-10 on a fresh Ubuntu 24.04 VPS whose
+# provider had edited /etc/cloud/cloud.cfg). Fix: for the duration of this install, tell dpkg
+# GLOBALLY to keep the existing config on a conflict (confold) and take the package default where
+# there is none (confdef) — via apt.conf.d, so it also reaches apt-get calls we don't make
+# ourselves (Docker's installer). Removed on exit, so the server's normal apt behaviour is untouched.
+export UCF_FORCE_CONFOLD=1
+APT_NI_SNIPPET=/etc/apt/apt.conf.d/99telemax-install
+printf 'Dpkg::Options { "--force-confdef"; "--force-confold"; };\n' > "$APT_NI_SNIPPET"
+trap 'rm -f "$APT_NI_SNIPPET"' EXIT
+# Same two flags for direct dpkg calls (unquoted on purpose — it must split into two arguments).
+DPKG_NI="--force-confdef --force-confold"
 
 # Best-effort apt wrapper. Some VPS images ship with an unrelated package
 # already broken (seen live — initramfs-tools' dhcpcd hook failing on a
@@ -47,7 +61,9 @@ export DEBIAN_FRONTEND=noninteractive
 apt_get() {
   if ! apt-get "$@" </dev/null; then
     echo "⚠️  apt-get $* завершился с предупреждением (см. вывод выше) — похоже, дело в стороннем пакете, не связанном с Telemax. Продолжаю; если хотите разобраться отдельно, обычно помогает: dpkg --configure -a"
-    dpkg --configure -a >/dev/null 2>&1 </dev/null || true
+    # With the force flags, a pending configure that was waiting on a conffile prompt actually
+    # completes here instead of dying on the same question (which is what used to happen).
+    dpkg --configure -a $DPKG_NI >/dev/null 2>&1 </dev/null || true
   fi
 }
 
@@ -55,7 +71,7 @@ bold "=== Telemax — установка на чистый сервер ==="
 echo
 
 echo "[1/6] Обновляю систему (может занять несколько минут)..."
-apt-get update -y </dev/null
+apt_get update -y
 apt_get upgrade -y
 
 echo
@@ -75,6 +91,8 @@ if ! command -v docker >/dev/null 2>&1; then
   # get.docker.com's own script calls apt-get install internally and can hit
   # the exact same recurring trigger issue — don't trust its exit code alone,
   # check whether docker actually landed afterward.
+  # Never hand Docker's installer a half-configured dpkg — its own apt-get would fail on it.
+  dpkg --configure -a $DPKG_NI >/dev/null 2>&1 </dev/null || true
   curl -fsSL https://get.docker.com | sh || true
   if ! command -v docker >/dev/null 2>&1; then
     echo "❌ Docker всё ещё не установлен после попытки. Разберитесь с ошибкой apt выше (обычно: dpkg --configure -a), затем запустите install.sh заново."
@@ -195,4 +213,6 @@ echo
 
 # curl | bash consumes stdin for the script itself — reconnect to the real
 # terminal so setup.sh's prompts (bot token, group id) actually work.
+# `exec` replaces this shell, so the EXIT trap above will NOT fire — remove the snippet here.
+rm -f "$APT_NI_SNIPPET"
 exec ./setup.sh < /dev/tty
