@@ -17,6 +17,7 @@ import { createBugReports, BUGREPORT_BOT_HANDLE, type BugReports } from './bugRe
 import { createMaxAuthFlow, type MaxAuthCallbacks } from './maxAuthFlow.js';
 import { createTelemetry } from './telemetry.js';
 import { checkVersion, type VersionStatus } from './version.js';
+import { buildStatusText, collectHostStats } from './status.js';
 import { toTelegramReaction } from '../max/reactions.js';
 import { createLogger, jsonStringify, redactSecrets } from '../logger.js';
 
@@ -863,6 +864,8 @@ export interface BridgeOptions {
   getMyAccountId: () => number | null;
   getContactProfiles: () => Map<number, ContactProfile>;
   getActivePhone: () => string;
+  /** Live MAX-leg state for the panel's «📊 Статус» (connected flag + when the last LOGIN succeeded). */
+  getMaxState: () => { connected: boolean; lastLoginAt: number | null };
   /** Refetches MAX's chat list and re-runs the full backfill sync — used by /reboot after wiping local state. Fire-and-forget on the caller's side (server/app.ts already guards against overlapping runs). */
   triggerFullResync: () => Promise<void>;
   /** Disconnects from MAX and deletes the encrypted session — used by /kill. Awaited (unlike triggerFullResync) since /kill's own confirmation message should only go out once this has actually finished. */
@@ -885,6 +888,7 @@ export function wireBridge({
   getMyAccountId,
   getContactProfiles,
   getActivePhone,
+  getMaxState,
   triggerFullResync,
   killEverything,
   auth,
@@ -958,6 +962,9 @@ export function wireBridge({
     }
   });
 
+  // When a message last crossed in each direction — for the panel's «📊 Статус» ("is it alive?").
+  let lastInAt: number | null = null;
+  let lastOutAt: number | null = null;
   const outgoingCids = new RecentCids();
   const messageLinks = new MessageLinkStore();
   const pollLinks = new PollLinkStore();
@@ -974,6 +981,7 @@ export function wireBridge({
    */
   function rememberOutgoingSend(chatId: unknown, cid: number): void {
     outgoingCids.remember(cid);
+    lastOutAt = Date.now();
     chatMapStore.advanceHistoryCursor(chatId, Date.now()).catch((err) => logger.error('Failed to advance history cursor after outgoing send', err));
   }
 
@@ -1694,6 +1702,7 @@ export function wireBridge({
         if (telegramMessageId != null) {
           const extraTelegramMessageIds = textMessageId != null && attachMessageId != null && attachMessageId !== telegramMessageId ? [attachMessageId] : undefined;
           messageLinks.add({ maxChatId: chatId, maxMessageId: message.id, telegramMessageId, extraTelegramMessageIds });
+          lastInAt = Date.now();
           // Advance the backfill cursor for this live incoming message. Without it, a MAX
           // reconnect's catch-up re-reads the message (it sits past the stale cursor) and
           // relays it to Telegram a SECOND time — the mirror image of the rememberOutgoingSend
@@ -1973,6 +1982,27 @@ export function wireBridge({
       if (Number.isNaN(id)) return undefined;
       const profile = getContactProfiles().get(id);
       return profile ? resolveContactDisplayName(id, profile) : undefined;
+    },
+    // «📊 Статус» — everything the bridge can see from inside its container (see status.ts).
+    getStatus: async (pausedLabel) => {
+      const mappings = await chatMapStore.list();
+      let update: { updateAvailable: boolean; latest: string | null } | null = null;
+      try {
+        const v = await checkVersion();
+        update = { updateAvailable: v.updateAvailable, latest: (v.latest as { version?: string } | null)?.version ?? null };
+      } catch {
+        update = null; // offline / rate-limited — rendered as "не удалось проверить"
+      }
+      const st = getMaxState();
+      return buildStatusText({
+        uptimeSec: process.uptime(),
+        max: { connected: st.connected, phone: getActivePhone(), lastLoginAt: st.lastLoginAt, paused: pausedLabel },
+        chats: { active: mappings.filter((m) => !m.banned).length, banned: mappings.filter((m) => m.banned).length },
+        lastInAt,
+        lastOutAt,
+        ...collectHostStats(`${process.cwd()}/.data`),
+        update,
+      });
     },
     leaves: {
       sendHelp: (chatId) => bot.telegram.sendMessage(chatId, buildHelpText()).then(() => {}),

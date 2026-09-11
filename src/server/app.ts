@@ -47,6 +47,7 @@ let bot: Telegraf | null = null;
 let messageLinks: MessageLinkStore | null = null;
 let tgActive = false;
 let maxConnected = false;
+let lastLoginAt: number | null = null; // set on every successful LOGIN (fresh or resumed) — shown in the panel's status
 let activePhone = '';
 let pendingPhone = '';
 // The phone we last authenticated with. Unlike currentSession/activePhone (wiped on a session
@@ -316,6 +317,7 @@ async function loginWithSession(session: MaxSession): Promise<void> {
     await sessionStore.save(refreshed);
     currentSession = refreshed;
     resumeFailures = 0;
+    lastLoginAt = Date.now();
     logger.info(`Resumed session for ${session.phone} (token ${sessionToken === session.sessionToken ? 'unchanged' : 'rotated'})`);
     notifyMaxSessionRestored();
     await refreshChatsAndNames();
@@ -420,6 +422,7 @@ async function startServer(): Promise<void> {
         getMyAccountId: () => myAccountId,
         getContactProfiles: () => contactProfiles,
         getActivePhone: () => activePhone,
+        getMaxState: () => ({ connected: maxConnected, lastLoginAt }),
         triggerFullResync: () => refreshChatsAndNames().then(() => syncChatsIfPossible()),
         killEverything: killMaxSession,
         auth: {

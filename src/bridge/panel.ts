@@ -32,6 +32,8 @@ export interface ControlPanelDeps {
    * miss). Lets the group-roster "Открыть личку" name a participant without a blocking CONTACT_INFO
    * round-trip — the same instant-name behaviour the search path gets from its own card cache. */
   resolveContactName?: (uid: string) => string | undefined;
+  /** Builds the «📊 Статус» text; `pausedLabel` is the panel-owned pause state (null when not paused). */
+  getStatus?: (pausedLabel: string | null) => Promise<string>;
 }
 
 // The panel message id is remembered in ./data so the same pinned message is edited
@@ -146,6 +148,7 @@ function systemView(): View {
   return {
     text: '⚙️ Система:',
     markup: Markup.inlineKeyboard([
+      [Markup.button.callback('📊 Статус', 'tlmx_panel:status')],
       [pauseBtn, Markup.button.callback('⬆️ Обновление', 'tlmx_panel:update')],
       [Markup.button.callback('🔄 Пересинхронизация', 'tlmx_panel:resync'), Markup.button.callback('📋 Команды', 'tlmx_panel:help')],
       [Markup.button.callback('◀️ Назад', 'tlmx_panel:root')],
@@ -164,7 +167,7 @@ function pauseView(): View {
 }
 
 export function wireControlPanel(deps: ControlPanelDeps): void {
-  const { bot, targetGroupId, max, getActivePhone, triggerFullResync, leaves, startDialog, resolveContactName } = deps;
+  const { bot, targetGroupId, max, getActivePhone, triggerFullResync, leaves, startDialog, resolveContactName, getStatus } = deps;
 
   const edit = (ctx: Context, view: View) => ctx.editMessageText(view.text, { reply_markup: view.markup }).catch(() => {});
   const chatIdOf = (ctx: Context): number => ctx.chat?.id ?? Number(targetGroupId);
@@ -265,6 +268,29 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
     await ctx.answerCbQuery('Пересинхронизация запущена');
     await ctx.reply('🔄 Пересинхронизация запущена…').catch(() => {});
     void triggerFullResync().catch((err) => logger.error('panel resync failed', err));
+  });
+
+  // «📊 Статус»: server/bridge health in one card (see status.ts for what is and isn't visible).
+  bot.action('tlmx_panel:status', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    if (!getStatus) return;
+    const pausedLabel = isPaused()
+      ? pauseUntil === Number.POSITIVE_INFINITY
+        ? 'до ручного возобновления'
+        : `~${Math.max(0, Math.round(((pauseUntil ?? Date.now()) - Date.now()) / 60000))} мин`
+      : null;
+    let text: string;
+    try {
+      text = await getStatus(pausedLabel);
+    } catch (err) {
+      logger.error('panel status failed', err);
+      text = '❌ Не удалось собрать статус — смотри логи контейнера.';
+    }
+    await ctx
+      .editMessageText(text, {
+        reply_markup: Markup.inlineKeyboard([[Markup.button.callback('🔄 Обновить', 'tlmx_panel:status'), Markup.button.callback('◀️ Назад', 'tlmx_panel:system')]]).reply_markup,
+      })
+      .catch(() => {});
   });
 
   // --- Pause / resume -----------------------------------------------------------------
@@ -428,6 +454,28 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
     } else {
       await ctx.editMessageText(`❌ Не удалось создать чат: ${res.error ?? 'ошибка'}`).catch(() => {});
     }
+  });
+
+  // A Telegram contact card shared into the group's General topic (no thread) = "find this person in
+  // MAX". The bot cannot read anyone's Telegram contact list (Bot API grants no such access — by
+  // design), but a card the admin shares carries the phone, and THAT is matchable: it reuses the
+  // phone search → same result card → «Начать чат». Inside a chat topic (thread id present) a contact
+  // still relays to MAX as content, untouched. Admin-only, like every other panel action.
+  bot.on('message', async (ctx, next) => {
+    const m = ctx.message as { contact?: { phone_number?: string; first_name?: string; last_name?: string }; message_thread_id?: number };
+    const phone = m.contact?.phone_number;
+    if (!phone || m.message_thread_id != null) return next();
+    const userId = ctx.from?.id;
+    if (userId == null) return;
+    try {
+      const member = await ctx.telegram.getChatMember(targetGroupId, userId);
+      if (member.status !== 'creator' && member.status !== 'administrator') return; // not an admin — ignore
+    } catch {
+      return;
+    }
+    const who = [m.contact?.first_name, m.contact?.last_name].filter(Boolean).join(' ').trim();
+    await ctx.reply(`📇 Контакт из Telegram${who ? ` «${who}»` : ''} — ищу в MAX по номеру…`).catch(() => {});
+    await runSearch(chatIdOf(ctx), 'phone', phone);
   });
 
   // Force-reply answers to a search prompt. Registered here (early in wireBridge) so it
