@@ -1751,7 +1751,7 @@ export function wireBridge({
 /login — войти в MAX через бота: номер + код из SMS (и пароль, если включён 2FA) — в личке бота. И первая авторизация, и повторная (после сбоя, /kill, смена номера) — через него.
 /version — проверить версию, обновить по кнопке (раз в сутки бот сам напомнит, если вышло обновление)
 /reboot — удалить ВСЕ темы в этой Telegram-группе и пересинхронизировать всё с нуля из MAX (требует подтверждения, MAX не затрагивается)
-/kill — то же самое + разлогинить MAX-сессию (после нужна новая авторизация через /login). Необратимо, требует подтверждения.
+/kill — то же самое + отключить мост от MAX и стереть сохранённую сессию (после нужна новая авторизация через /login). Саму сессию в MAX завершите в приложении: Настройки → Устройства. Необратимо, требует подтверждения.
 
 🔒 Команды выполняются только у администраторов группы. Обычные участники могут читать и писать (участвовать в обсуждении), но не командовать ботом.
 
@@ -2325,12 +2325,15 @@ export function wireBridge({
    * valid on MAX's servers until it naturally expires, we just stop holding it.
    * The process keeps running so the web UI stays reachable to re-authenticate.
    */
+  // NOTE: MAX exposes no logout/revoke opcode (checked 2026-09-11), so this can only drop OUR copy of
+  // the session and disconnect — the session stays valid on MAX's side until it expires. The texts
+  // below say so and point at the app's device list; don't promise a server-side logout.
   bot.command('kill', async (ctx) => {
     const confirm = (ctx as unknown as { payload?: string }).payload?.trim().toUpperCase();
     if (confirm !== 'УНИЧТОЖИТЬ') {
       await bot.telegram.sendMessage(
         targetGroupId,
-        '☢️ Это разлогинит MAX-сессию (после потребуется новая авторизация через /login в личке бота) и удалит ВСЕ темы, историю и связки в этой Telegram-группе. Необратимо. Подтверди: /kill УНИЧТОЖИТЬ',
+        '☢️ Это отключит мост от MAX и сотрёт сохранённую ЗДЕСЬ сессию (после потребуется новая авторизация через /login в личке бота), а также ВСЕ темы, историю и связки в этой Telegram-группе. ⚠️ Саму сессию на стороне MAX мост завершить не может — после /kill завершите её в приложении MAX: Настройки → Устройства. Необратимо. Подтверди: /kill УНИЧТОЖИТЬ',
       );
       return;
     }
@@ -2349,7 +2352,7 @@ export function wireBridge({
       await killEverything();
       await bot.telegram.sendMessage(
         targetGroupId,
-        '✅ Готово. MAX-сессия удалена, все данные стёрты. Чтобы продолжить — авторизуйся заново: /login (в личке бота).',
+        '✅ Готово. Мост отключён от MAX, сохранённая здесь сессия и все данные стёрты. ⚠️ Не забудьте завершить сессию и в приложении MAX (Настройки → Устройства) — мост сделать это не может. Чтобы продолжить — авторизуйся заново: /login (в личке бота).',
       );
     } catch (err) {
       logger.error('Kill failed', err);
