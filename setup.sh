@@ -112,6 +112,63 @@ check_telegram_once() {
   return 1
 }
 
+# Bot API call through the current $TELEGRAM_PROXY; prints the JSON body (empty on network failure).
+tg_api() {
+  build_tg_proxy_args
+  curl -s "${TG_PROXY_ARGS[@]}" --max-time 15 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/$1" || true
+}
+
+# Token: format first (catches paste errors), then getMe — proves it's a real, live token AND shows
+# which bot it belongs to (a token from the wrong bot passes every format check). Before this, a bad
+# token only surfaced later as a puzzling "group not found".
+verify_bot_token() {
+  if ! [[ "$TELEGRAM_BOT_TOKEN" =~ ^[0-9]{6,12}:[A-Za-z0-9_-]{30,50}$ ]]; then
+    echo "  ❌ Не похоже на токен бота (формат 123456789:AAAA…). Скопируйте его целиком из @BotFather."
+    return 1
+  fi
+  command -v jq >/dev/null 2>&1 || { echo "  (jq не найден — проверяю только формат токена)"; return 0; }
+  local me user desc
+  me=$(tg_api getMe)
+  user=$(echo "$me" | jq -r 'select(.ok == true) | .result.username // empty' 2>/dev/null)
+  if [ -z "$user" ]; then
+    desc=$(echo "$me" | jq -r '.description // empty' 2>/dev/null)
+    echo "  ❌ Telegram не принял токен${desc:+ ($desc)}. Проверьте его в @BotFather (/mybots → API Token)."
+    return 1
+  fi
+  echo "  ✅ Токен принят: это бот @${user}"
+  return 0
+}
+
+# Group: must be reachable, a supergroup with Topics enabled, and the bot an admin holding
+# "Manage Topics" — each missing piece is named explicitly (people used to hit a bare
+# "can't create topics" much later, after the container was already up).
+verify_group() {
+  command -v jq >/dev/null 2>&1 || return 0
+  local chat title type forum bot_id member status can ok=0
+  chat=$(tg_api "getChat?chat_id=$1")
+  if [ "$(echo "$chat" | jq -r '.ok' 2>/dev/null)" != "true" ]; then
+    echo "  ❌ Группа $1 недоступна боту: $(echo "$chat" | jq -r '.description // "нет ответа"' 2>/dev/null). Бот добавлен в неё?"
+    return 1
+  fi
+  title=$(echo "$chat" | jq -r '.result.title // "без названия"')
+  type=$(echo "$chat" | jq -r '.result.type')
+  forum=$(echo "$chat" | jq -r '.result.is_forum // false')
+  echo "  Группа: «$title» ($1)"
+  if [ "$type" != "supergroup" ]; then echo "  ❌ Это не супергруппа ($type) — включите Темы: настройки группы → Темы (группа станет супергруппой)."; ok=1; fi
+  if [ "$forum" != "true" ]; then echo "  ❌ В группе выключены Темы — включите: настройки группы → Темы."; ok=1; fi
+  bot_id="${TELEGRAM_BOT_TOKEN%%:*}"
+  member=$(tg_api "getChatMember?chat_id=$1&user_id=$bot_id")
+  status=$(echo "$member" | jq -r '.result.status // "unknown"')
+  can=$(echo "$member" | jq -r '.result.can_manage_topics // false')
+  if [ "$status" != "administrator" ] && [ "$status" != "creator" ]; then
+    echo "  ❌ Бот не администратор группы (статус: $status) — сделайте его администратором."; ok=1
+  elif [ "$can" != "true" ]; then
+    echo "  ❌ У бота нет права «Управление темами» (Manage Topics) — включите его в правах администратора."; ok=1
+  fi
+  [ "$ok" -eq 0 ] && echo "  ✅ Темы включены, бот — администратор с «Управлением темами»."
+  return $ok
+}
+
 # Interactive loop: keeps re-asking for a proxy until Telegram is reachable through
 # the current setting (or the user types skip). Works off/into $TELEGRAM_PROXY —
 # the caller decides what to do with the verified value. Telegram is NOT fatal here:
@@ -169,7 +226,11 @@ detect_group() {
       echo "    могло не попасть в окно обновлений — сообщение это чинит.)"
       echo "Заодно проверьте, что бот ДОБАВЛЕН в нужную группу и он АДМИНИСТРАТОР с правом"
       echo "«Управление темами» (Manage Topics)."
-      read -rp "Сделайте это и нажмите Enter, чтобы попробовать снова... "
+      read -rp "Сделайте это и нажмите Enter — или введите id группы вручную (вида -100…): " MANUAL_GROUP
+      if [[ "${MANUAL_GROUP:-}" =~ ^-?[0-9]{5,}$ ]]; then
+        TARGET_TELEGRAM_GROUP="$MANUAL_GROUP"
+        verify_group "$TARGET_TELEGRAM_GROUP" || { TARGET_TELEGRAM_GROUP=""; read -rp "Исправьте и нажмите Enter, чтобы проверить снова... "; }
+      fi
       continue
     fi
 
@@ -177,6 +238,7 @@ detect_group() {
     if [ "${#GROUP_LINES[@]}" -eq 1 ]; then
       TARGET_TELEGRAM_GROUP="${GROUP_LINES[0]%%$'\t'*}"
       echo "Нашёл группу: «${GROUP_LINES[0]#*$'\t'}» ($TARGET_TELEGRAM_GROUP)"
+      verify_group "$TARGET_TELEGRAM_GROUP" || { TARGET_TELEGRAM_GROUP=""; read -rp "Исправьте права/темы и нажмите Enter, чтобы проверить снова... "; }
     else
       echo
       echo "Бот состоит в нескольких группах — выберите целевую:"
@@ -188,6 +250,7 @@ detect_group() {
         if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#GROUP_LINES[@]}" ]; then
           TARGET_TELEGRAM_GROUP="${GROUP_LINES[$((choice - 1))]%%$'\t'*}"
           echo "Выбрана: «${GROUP_LINES[$((choice - 1))]#*$'\t'}» ($TARGET_TELEGRAM_GROUP)"
+          verify_group "$TARGET_TELEGRAM_GROUP" || { TARGET_TELEGRAM_GROUP=""; echo "  Исправьте и выберите группу снова."; }
         else
           echo "  Нет такого номера, попробуйте ещё раз."
         fi
@@ -456,8 +519,8 @@ echo "Понадобится токен бота — создайте его ч�
 echo
 
 read -rp "Токен бота (TELEGRAM_BOT_TOKEN): " TELEGRAM_BOT_TOKEN
-while [ -z "$TELEGRAM_BOT_TOKEN" ]; do
-  read -rp "Токен не может быть пустым, введите ещё раз: " TELEGRAM_BOT_TOKEN
+until [ -n "$TELEGRAM_BOT_TOKEN" ] && verify_bot_token; do
+  read -rp "Токен бота (TELEGRAM_BOT_TOKEN): " TELEGRAM_BOT_TOKEN
 done
 
 echo
