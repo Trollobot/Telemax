@@ -43,6 +43,11 @@ trap 'rm -f "$APT_NI_SNIPPET"' EXIT
 # Same two flags for direct dpkg calls (unquoted on purpose — it must split into two arguments).
 DPKG_NI="--force-confdef --force-confold"
 
+# Everything below is also written to a log file — attach it to a bug report if something fails.
+INSTALL_LOG=/var/log/telemax-install.log
+exec > >(tee -a "$INSTALL_LOG") 2>&1
+echo "(лог установки: $INSTALL_LOG)"
+
 # Best-effort apt wrapper. Some VPS images ship with an unrelated package
 # already broken (seen live — initramfs-tools' dhcpcd hook failing on a
 # missing .so with nothing to do with Telemax) whose dpkg trigger re-fires
@@ -59,7 +64,15 @@ DPKG_NI="--force-confdef --force-confold"
 # that step (hit live on a fresh Ubuntu 24.04 box). Giving apt its own empty stdin keeps the pipe
 # — and the rest of this script — intact for bash.
 apt_get() {
-  if ! apt-get "$@" </dev/null; then
+  # A fresh VPS often still runs unattended-upgrades for minutes after boot, holding the apt/dpkg
+  # locks — "Could not get lock" used to fail the very first step. Wait for it (bounded), and let
+  # apt itself wait on the dpkg lock too.
+  local waited=0
+  while pgrep -x apt-get >/dev/null 2>&1 || pgrep -x dpkg >/dev/null 2>&1 || pgrep -f unattended-upgrade >/dev/null 2>&1; do
+    [ "$waited" -eq 0 ] && echo "  ⏳ Жду, пока система закончит фоновое обновление (unattended-upgrades)..."
+    sleep 5; waited=$((waited + 5)); [ "$waited" -ge 600 ] && break
+  done
+  if ! apt-get -o DPkg::Lock::Timeout=300 "$@" </dev/null; then
     echo "⚠️  apt-get $* завершился с предупреждением (см. вывод выше) — похоже, дело в стороннем пакете, не связанном с Telemax. Продолжаю; если хотите разобраться отдельно, обычно помогает: dpkg --configure -a"
     # With the force flags, a pending configure that was waiting on a conffile prompt actually
     # completes here instead of dying on the same question (which is what used to happen).
@@ -67,9 +80,56 @@ apt_get() {
   fi
 }
 
+# Preflight: name the reasons an install would fail BEFORE spending minutes on apt/Docker. Hard
+# stops only for what can't work at all (arch, disk); everything else is a warning with the fix.
+preflight() {
+  local fail=0 free_mb mem_mb hp net_ts skew
+  . /etc/os-release 2>/dev/null || true
+  case "${ID:-}" in
+    ubuntu | debian) echo "  ОС: ${PRETTY_NAME:-?} — OK" ;;
+    *) echo "  ⚠️  ОС ${PRETTY_NAME:-неизвестна}: скрипт рассчитан на Ubuntu/Debian (apt). Продолжаю, но без гарантий." ;;
+  esac
+  case "$(uname -m)" in
+    x86_64 | aarch64) echo "  Архитектура: $(uname -m) — OK" ;;
+    *) echo "  ❌ Архитектура $(uname -m) не поддерживается (нужна x86_64 или arm64)."; fail=1 ;;
+  esac
+  free_mb=$(df -Pm / | awk 'NR==2{print $4}')
+  if [ "${free_mb:-0}" -lt 3072 ]; then
+    echo "  ❌ Свободно ${free_mb} МБ на / — нужно минимум 3 ГБ (образ ~1.7 ГБ + сборка)."; fail=1
+  else
+    echo "  Диск: свободно ${free_mb} МБ — OK"
+  fi
+  mem_mb=$(awk '/MemTotal/{printf "%d", $2/1024}' /proc/meminfo)
+  if [ "${mem_mb:-0}" -lt 900 ]; then
+    echo "  ⚠️  RAM ${mem_mb} МБ — сборка образа с Chromium может не пройти; при установке выберите slim (лёгкий образ)."
+  else
+    echo "  RAM: ${mem_mb} МБ — OK"
+  fi
+  for hp in api.telegram.org:443 api2.oneme.ru:443 zergont-gate.duckdns.org:443; do
+    if timeout 5 bash -c "cat </dev/null >/dev/tcp/${hp%%:*}/${hp##*:}" 2>/dev/null; then
+      echo "  Сеть: ${hp%%:*} — OK"
+    else
+      echo "  ⚠️  Сеть: ${hp%%:*} недоступен (для Telegram может помочь прокси — setup.sh спросит; MAX и зеркало нужны напрямую)."
+    fi
+  done
+  net_ts=$(curl -fsSI --max-time 8 https://api.telegram.org 2>/dev/null | tr -d '\r' | awk -F': ' 'tolower($1)=="date"{print $2}')
+  if [ -n "$net_ts" ]; then
+    skew=$(( $(date +%s) - $(date -d "$net_ts" +%s 2>/dev/null || date +%s) )); skew=${skew#-}
+    if [ "$skew" -gt 300 ]; then
+      echo "  ⚠️  Часы сервера расходятся с реальным временем на ${skew}с — TLS/Telegram могут отказывать. Обычно лечит: timedatectl set-ntp true"
+    else
+      echo "  Время: OK"
+    fi
+  fi
+  [ "$fail" -eq 0 ]
+}
+
 bold "=== Telemax — установка на чистый сервер ==="
 echo
 
+echo "[0/6] Проверяю сервер..."
+preflight || { echo "❌ Сервер не подходит для установки — см. причины выше."; exit 1; }
+echo
 echo "[1/6] Обновляю систему (может занять несколько минут)..."
 apt_get update -y
 apt_get upgrade -y
@@ -95,7 +155,19 @@ if ! command -v docker >/dev/null 2>&1; then
   dpkg --configure -a $DPKG_NI >/dev/null 2>&1 </dev/null || true
   curl -fsSL https://get.docker.com | sh || true
   if ! command -v docker >/dev/null 2>&1; then
-    echo "❌ Docker всё ещё не установлен после попытки. Разберитесь с ошибкой apt выше (обычно: dpkg --configure -a), затем запустите install.sh заново."
+    # get.docker.com unreachable/blocked or its repo setup failed — fall back to the distro packages
+    # (docker.io + the compose v2 plugin): older, but plenty for this bridge.
+    echo "Установщик Docker не сработал — пробую пакеты дистрибутива (docker.io)..."
+    apt_get install -y docker.io
+    apt_get install -y docker-compose-v2
+    docker compose version >/dev/null 2>&1 || apt_get install -y docker-compose-plugin
+  fi
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "❌ Docker всё ещё не установлен после двух попыток. Смотрите ошибки выше и лог $INSTALL_LOG, затем запустите install.sh заново."
+    exit 1
+  fi
+  if ! docker compose version >/dev/null 2>&1; then
+    echo "❌ Docker есть, но нет Docker Compose v2 (команда 'docker compose'). Установите плагин: apt-get install docker-compose-v2 (или docker-compose-plugin) — и запустите install.sh заново."
     exit 1
   fi
 else
