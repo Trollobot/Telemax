@@ -198,12 +198,33 @@ detect_group() {
     exit 1
   fi
   build_tg_proxy_args
+  # A webhook left on this bot (tried elsewhere once) makes getUpdates refuse outright. Dropping it is
+  # harmless when there is none — this bridge only ever long-polls.
+  tg_api deleteWebhook >/dev/null 2>&1 || true
   TARGET_TELEGRAM_GROUP=""
   while [ -z "$TARGET_TELEGRAM_GROUP" ]; do
     echo "Ищу группу..."
     TG_GROUPS=""
     for attempt in 1 2 3 4 5 6; do
-      UPDATES=$(curl -s "${TG_PROXY_ARGS[@]}" "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?limit=100" || true)
+      # timeout=3 (a short long-poll) does two things: a message written right now arrives at once,
+      # and a COMPETING bot instance reveals itself — Telegram serves the newest getUpdates and
+      # terminates the older one with 409; a competitor re-polls immediately, so OUR pending call is
+      # the one that gets 409. A timeout=0 call returns before that race and never sees it (and the
+      # competitor quietly consumes every update, so we'd see an empty result forever).
+      UPDATES=$(curl -s --max-time 15 "${TG_PROXY_ARGS[@]}" "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?limit=100&timeout=3" || true)
+      # An API error used to be swallowed here and looked exactly like "no group yet" — an endless
+      # "не вижу группу" no matter what the user did (reported live 2026-09-11). Name it instead:
+      # 409 = ANOTHER instance of this bot is long-polling somewhere (old server/container with the
+      # same token) — the one cause "write in the group" can never fix; 401 = the token.
+      TG_ERR=$(echo "$UPDATES" | jq -r 'select(.ok != true) | "\(.error_code // "?"): \(.description // "нет ответа")"' 2>/dev/null || true)
+      if [ -n "$TG_ERR" ]; then
+        echo "  ❌ Telegram: $TG_ERR"
+        case "$TG_ERR" in
+          409*) echo "     У этого бота уже запущен ДРУГОЙ экземпляр (старый сервер или контейнер с тем же токеном) — остановите его, иначе группу не найти." ;;
+          401*) echo "     Токен не принят — проверьте его в @BotFather (/mybots → API Token)." ;;
+        esac
+        break
+      fi
       # Собираем группы, которые бот «видел» — из сообщений И из события my_chat_member
       # (бота добавили/сделали админом). Второе приходит на обязательном шаге «сделать
       # админом», не зависит от того, отправит ли пользователь сообщение и попадёт ли в окно.
@@ -225,7 +246,8 @@ detect_group() {
       echo "   (бот «видит» группу по свежему сообщению; если его добавили давно, событие о добавлении"
       echo "    могло не попасть в окно обновлений — сообщение это чинит.)"
       echo "Заодно проверьте, что бот ДОБАВЛЕН в нужную группу и он АДМИНИСТРАТОР с правом"
-      echo "«Управление темами» (Manage Topics)."
+      echo "«Управление темами» (Manage Topics) — без прав администратора бот ваших сообщений НЕ ВИДИТ,"
+      echo "и «напишите в группу» не поможет."
       read -rp "Сделайте это и нажмите Enter — или введите id группы вручную (вида -100…): " MANUAL_GROUP
       if [[ "${MANUAL_GROUP:-}" =~ ^-?[0-9]{5,}$ ]]; then
         TARGET_TELEGRAM_GROUP="$MANUAL_GROUP"
