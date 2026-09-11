@@ -89,7 +89,14 @@ check_tcp() {
 # curl args for the current $TELEGRAM_PROXY (empty proxy -> direct).
 build_tg_proxy_args() {
   TG_PROXY_ARGS=()
-  [ -n "${TELEGRAM_PROXY:-}" ] && TG_PROXY_ARGS=(--proxy "$TELEGRAM_PROXY")
+  # NOT `[ -n ... ] && TG_PROXY_ARGS=(...)`: with no proxy that list evaluates to 1, and as the
+  # function's last statement it became the function's exit status — under `set -e` every first-time
+  # setup WITHOUT a proxy silently died right after the "Сделали? Enter" prompt (the client's "Enter
+  # нажимаю и ничего", shipped since 0.4.9; caught 2026-09-11 by an end-to-end fresh-install run).
+  if [ -n "${TELEGRAM_PROXY:-}" ]; then
+    TG_PROXY_ARGS=(--proxy "$TELEGRAM_PROXY")
+  fi
+  return 0
 }
 
 # One Telegram reachability check through the CURRENT $TELEGRAM_PROXY. Prints the
