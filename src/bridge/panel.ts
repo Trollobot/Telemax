@@ -97,8 +97,11 @@ function rootView(phone: string): View {
       pauseUntil === Number.POSITIVE_INFINITY
         ? '⏸ MAX на паузе (до ручного возобновления)'
         : `⏸ MAX на паузе (~${Math.max(0, Math.round((pauseUntil! - Date.now()) / 60000))} мин)`;
+  } else if (!phone) {
+    // No session yet (fresh install, or after /kill): must not look green — the user read it as "ok".
+    status = '🔴 MAX: не авторизован — /login';
   } else {
-    status = `🟢 MAX: ${phone || 'не авторизован'}`;
+    status = `🟢 MAX: ${phone}`;
   }
   return {
     text: `🎛 Telemax — пульт\n${status} · версия ${version}`,
@@ -265,6 +268,14 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
     await leaves.sendUnbanList(chatIdOf(ctx));
   });
   bot.action('tlmx_panel:resync', async (ctx) => {
+    // Without a MAX session CHATS_LIST is rejected ("Недопустимое состояние сессии") and the only
+    // trace was a stack in the log while the user read "запущена" (hit live 2026-09-11 right after a
+    // fresh install). Say it plainly instead; after /login the sync starts by itself anyway.
+    if (!getActivePhone()) {
+      await ctx.answerCbQuery('MAX не авторизован — сначала /login').catch(() => {});
+      await ctx.reply('⛔ MAX не авторизован — сначала войдите: /login в личке бота. После входа синхронизация запустится сама.').catch(() => {});
+      return;
+    }
     await ctx.answerCbQuery('Пересинхронизация запущена');
     await ctx.reply('🔄 Пересинхронизация запущена…').catch(() => {});
     void triggerFullResync().catch((err) => logger.error('panel resync failed', err));

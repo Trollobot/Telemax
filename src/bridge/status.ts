@@ -59,11 +59,15 @@ export function maskPhone(p: string): string {
 
 export function formatStatus(i: StatusInput): string {
   const now = i.now ?? Date.now();
+  // "Authorized" means a session exists (a phone is known): on a fresh install the socket is connected
+  // yet unauthenticated, and that must not read as green.
   const maxLine = i.max.paused
     ? `MAX: ⏸ на паузе (${i.max.paused})`
-    : i.max.connected
-      ? `MAX: 🟢 подключён · ${maskPhone(i.max.phone)} · вход ${formatAgo(i.max.lastLoginAt, now)}`
-      : `MAX: 🔴 не подключён${i.max.phone ? ` · ${maskPhone(i.max.phone)}` : ' · не авторизован (/login)'}`;
+    : !i.max.phone
+      ? 'MAX: 🔴 не авторизован — /login'
+      : i.max.connected
+        ? `MAX: 🟢 подключён · ${maskPhone(i.max.phone)} · вход ${formatAgo(i.max.lastLoginAt, now)}`
+        : `MAX: 🔴 не подключён · ${maskPhone(i.max.phone)}`;
   const lines = [
     '📊 Telemax — состояние',
     `Версия ${i.version} · аптайм ${formatDuration(i.uptimeSec)}`,

@@ -86,7 +86,13 @@ async function refreshChatsAndNames(): Promise<void> {
     const allChats = await max.getAllChats();
     if (allChats.length > 0) cachedChats = allChats;
   } catch (err) {
-    logger.error('Failed to fetch full chat list via CHATS_LIST, using LOGIN snapshot:', err);
+    if (/Недопустимое состояние сессии/.test((err as Error).message ?? '')) {
+      // MAX's wording for "this connection has no authenticated session" — expected before the first
+      // /login on a fresh install (e.g. someone pressed «Пересинхронизация» early); no stack needed.
+      logger.warn('CHATS_LIST rejected: no MAX session on this connection (not logged in yet) — using the LOGIN snapshot');
+    } else {
+      logger.error('Failed to fetch full chat list via CHATS_LIST, using LOGIN snapshot:', err);
+    }
   }
 
   const participantIds = new Set<number>();

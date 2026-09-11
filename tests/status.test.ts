@@ -62,7 +62,10 @@ describe('status formatting', () => {
     expect(formatStatus(input({ update: { updateAvailable: true, latest: '0.6.1' } }))).toContain('⬆️ доступна 0.6.1 — /version');
     expect(formatStatus(input({ update: null }))).toContain('не удалось проверить');
     expect(formatStatus(input({ max: { connected: false, phone: '', lastLoginAt: null, paused: '~40 мин' } }))).toContain('MAX: ⏸ на паузе (~40 мин)');
-    expect(formatStatus(input({ max: { connected: false, phone: '', lastLoginAt: null, paused: null } }))).toContain('MAX: 🔴 не подключён · не авторизован (/login)');
+    expect(formatStatus(input({ max: { connected: false, phone: '', lastLoginAt: null, paused: null } }))).toContain('MAX: 🔴 не авторизован — /login');
+    // a connected but unauthenticated socket (fresh install) must NOT be green
+    expect(formatStatus(input({ max: { connected: true, phone: '', lastLoginAt: null, paused: null } }))).toContain('MAX: 🔴 не авторизован — /login');
+    expect(formatStatus(input({ max: { connected: false, phone: '+79959809587', lastLoginAt: null, paused: null } }))).toContain('MAX: 🔴 не подключён · +7995***9587');
     expect(formatStatus(input({ disk: null }))).not.toContain('Диск');
   });
 });
