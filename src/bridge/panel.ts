@@ -3,6 +3,7 @@ import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { Markup, type Telegraf, type Context } from 'telegraf';
 import type { MaxClient, MaxContactInfo } from '../max/client.js';
 import { getAppVersion } from './version.js';
+import { maskPhone } from './status.js';
 import { createLogger } from '../logger.js';
 
 const logger = createLogger('panel');
@@ -95,13 +96,17 @@ function rootView(phone: string): View {
   if (isPaused()) {
     status =
       pauseUntil === Number.POSITIVE_INFINITY
-        ? '⏸ MAX на паузе (до ручного возобновления)'
+        // Pause lives in memory only: any container restart — including an auto-update — resumes MAX.
+        // Calling it «навсегда» was a promise the code never kept.
+        ? '⏸ MAX на паузе (до возобновления или перезапуска моста)'
         : `⏸ MAX на паузе (~${Math.max(0, Math.round((pauseUntil! - Date.now()) / 60000))} мин)`;
   } else if (!phone) {
     // No session yet (fresh install, or after /kill): must not look green — the user read it as "ok".
     status = '🔴 MAX: не авторизован — /login';
   } else {
-    status = `🟢 MAX: ${phone}`;
+    // The panel card is pinned in a group every member can read, and status.ts already decided the
+    // full number shouldn't be on display — same rule here.
+    status = `🟢 MAX: ${maskPhone(phone)}`;
   }
   return {
     text: `🎛 Telemax — пульт\n${status} · версия ${version}`,
@@ -160,10 +165,10 @@ function systemView(): View {
 }
 function pauseView(): View {
   return {
-    text: '⏸ На сколько поставить MAX на паузу? Приём/отправка остановятся, авто-возобновление по таймеру.',
+    text: '⏸ На сколько поставить MAX на паузу? Приём/отправка остановятся, авто-возобновление по таймеру.\nПауза живёт в памяти: перезапуск моста (в том числе автообновление) снимет её в любом случае.',
     markup: Markup.inlineKeyboard([
       [Markup.button.callback('10 минут', 'tlmx_panel:pause:600'), Markup.button.callback('1 час', 'tlmx_panel:pause:3600')],
-      [Markup.button.callback('1 сутки', 'tlmx_panel:pause:86400'), Markup.button.callback('Навсегда', 'tlmx_panel:pause:0')],
+      [Markup.button.callback('1 сутки', 'tlmx_panel:pause:86400'), Markup.button.callback('До перезапуска', 'tlmx_panel:pause:0')],
       [Markup.button.callback('◀️ Назад', 'tlmx_panel:system')],
     ]).reply_markup,
   };
@@ -287,7 +292,7 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
     if (!getStatus) return;
     const pausedLabel = isPaused()
       ? pauseUntil === Number.POSITIVE_INFINITY
-        ? 'до ручного возобновления'
+        ? 'до возобновления или перезапуска моста'
         : `~${Math.max(0, Math.round(((pauseUntil ?? Date.now()) - Date.now()) / 60000))} мин`
       : null;
     let text: string;
