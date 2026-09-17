@@ -12,8 +12,6 @@ ENV NODE_ENV=production
 # it through from $GIT_COMMIT) — the runtime image has no .git of its own
 # (excluded via .dockerignore), so this is the only way /version can know what
 # commit is actually running vs what's latest on GitHub.
-ARG GIT_COMMIT=unknown
-ENV GIT_COMMIT=$GIT_COMMIT
 # Animated-sticker rendering (.tgs/Lottie → short WebM via headless Chromium + ffmpeg, so it can go
 # through the ordinary VIDEO_UPLOAD pipeline and autoplay in the feed like MAX's own animated stickers)
 # is OPTIONAL — chromium + ffmpeg together weigh ~1.4 GB. Build with --build-arg STICKERS=slim to skip
@@ -37,6 +35,16 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 COPY --from=build /app/dist ./dist
 COPY entrypoint.sh ./
+# Baked in from the host's git checkout at build time (docker-compose.yml passes it through from
+# $GIT_COMMIT) — the runtime image has no .git of its own (excluded via .dockerignore), so this is
+# the only way /version can know what commit is actually running vs what's latest upstream.
+# DELIBERATELY LAST: its value changes on every single commit, and a layer's cache key covers every
+# layer below it. Sitting above the apt step, it invalidated the ~1.4 GB chromium+ffmpeg install on
+# EVERY update for EVERY user — a ~4-minute rebuild and a fresh 1.69 GB image each time (which is
+# why an `image prune` had to follow), and two bridges on one host could not share the layer either.
+# Measured after the move (2026-09-17): a rebuild at a different commit takes 1.6s and adds 0 bytes.
+ARG GIT_COMMIT=unknown
+ENV GIT_COMMIT=$GIT_COMMIT
 # Privilege drop lives in entrypoint.sh, not a static `USER node`: the entrypoint
 # must start as root once per boot to chown the mounted ./data (root-owned on every
 # pre-0.4.9 install) before handing off to the unprivileged node user — see the

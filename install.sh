@@ -13,7 +13,9 @@ REPO_URL="https://github.com/Trollobot/Telemax.git"
 # Read-only fallback mirror for when GitHub is unreachable (account flagged, or GitHub filtered on
 # this network). Overridable via env so the mirror can move without editing this script.
 MIRROR_GIT_URL="${MIRROR_GIT_URL:-https://zergont-gate.duckdns.org/Telemax.git}"
-INSTALL_DIR="/opt/telemax"
+# Overridable so a SECOND, independent bridge can live on the same host (different bot, different
+# group, different MAX account):  curl -fsSL <...>/install.sh | INSTALL_DIR=/opt/telemax-2 bash
+INSTALL_DIR="${INSTALL_DIR:-/opt/telemax}"
 # The maintainer's release-signing key, pinned HERE as well as in the repo's allowed_signers:
 # update.sh trusts whatever allowed_signers the checkout carries, so a tampered clone (a
 # compromised transport swapping in an attacker's key) would otherwise bootstrap a poisoned
@@ -44,7 +46,9 @@ trap 'rm -f "$APT_NI_SNIPPET"' EXIT
 DPKG_NI="--force-confdef --force-confold"
 
 # Everything below is also written to a log file — attach it to a bug report if something fails.
-INSTALL_LOG=/var/log/telemax-install.log
+# Per-directory, so a second install doesn't interleave its output into the first one's log.
+INSTALL_SLUG=$(basename "$INSTALL_DIR" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]//g')
+INSTALL_LOG="/var/log/telemax-install-${INSTALL_SLUG:-telemax}.log"
 exec > >(tee -a "$INSTALL_LOG") 2>&1
 echo "(лог установки: $INSTALL_LOG)"
 
@@ -125,6 +129,14 @@ preflight() {
 }
 
 bold "=== Telemax — установка на чистый сервер ==="
+echo "Каталог установки: $INSTALL_DIR"
+if [ -f "$INSTALL_DIR/.env" ]; then
+  echo
+  echo "ℹ️  В $INSTALL_DIR уже есть НАСТРОЕННАЯ установка — обновлю её и открою меню настроек."
+  echo "    Нужен ВТОРОЙ независимый мост на этом сервере? Укажите другой каталог:"
+  echo "      curl -fsSL https://zergont-gate.duckdns.org/install.sh | INSTALL_DIR=/opt/telemax-2 bash"
+  echo "    (у него должен быть свой бот, своя группа и свой номер MAX)"
+fi
 echo
 
 echo "[0/6] Проверяю сервер..."
