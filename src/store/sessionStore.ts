@@ -1,6 +1,9 @@
 import { randomBytes, createCipheriv, createDecipheriv } from 'node:crypto';
-import { mkdir, readFile, writeFile, unlink } from 'node:fs/promises';
+import { mkdir, readFile, rename, writeFile, unlink } from 'node:fs/promises';
 import path from 'node:path';
+import { createLogger } from '../logger.js';
+
+const logger = createLogger('session');
 
 export interface MaxSession {
   sessionToken: string;
@@ -35,6 +38,9 @@ interface EncryptedFile {
 
 /** Encrypted, disk-persisted store for the MAX session token (ТЗ.md §1.4, §3.2). */
 export class SessionStore {
+  /** Set when load() had to park an unreadable session file — startup uses it to say so in Telegram. */
+  corruptedOnLoad = false;
+
   constructor(private readonly filePath: string = path.join(process.cwd(), '.data', 'max.session.json')) {}
 
   async save(session: MaxSession): Promise<void> {
@@ -52,7 +58,13 @@ export class SessionStore {
     };
 
     await mkdir(path.dirname(this.filePath), { recursive: true });
-    await writeFile(this.filePath, JSON.stringify(encoded), 'utf8');
+    // write-then-rename, same as ChatMapStore: save() runs on every reconnect (MAX rotates the token),
+    // so a crash or a power cut mid-write is a real possibility — and a truncated file used to make
+    // load() throw on every boot, which with `restart: unless-stopped` is an endless restart loop
+    // curable only by deleting the file over SSH.
+    const tmpPath = `${this.filePath}.tmp`;
+    await writeFile(tmpPath, JSON.stringify(encoded), 'utf8');
+    await rename(tmpPath, this.filePath);
   }
 
   async load(): Promise<MaxSession | null> {
@@ -64,12 +76,29 @@ export class SessionStore {
       throw err;
     }
 
+    // DELIBERATELY outside the try below: a missing or malformed MAX_SESSION_KEY is an operator
+    // configuration error, and it must stay loud. Swallowing it here would park a perfectly good
+    // session file as "corrupt" the moment someone starts the bridge without its key.
     const key = loadKey();
-    const { iv, authTag, ciphertext } = JSON.parse(raw) as EncryptedFile;
-    const decipher = createDecipheriv(ALGO, key, Buffer.from(iv, 'base64'));
-    decipher.setAuthTag(Buffer.from(authTag, 'base64'));
-    const plaintext = Buffer.concat([decipher.update(Buffer.from(ciphertext, 'base64')), decipher.final()]);
-    return JSON.parse(plaintext.toString('utf8')) as MaxSession;
+    try {
+      const { iv, authTag, ciphertext } = JSON.parse(raw) as EncryptedFile;
+      const decipher = createDecipheriv(ALGO, key, Buffer.from(iv, 'base64'));
+      decipher.setAuthTag(Buffer.from(authTag, 'base64'));
+      const plaintext = Buffer.concat([decipher.update(Buffer.from(ciphertext, 'base64')), decipher.final()]);
+      return JSON.parse(plaintext.toString('utf8')) as MaxSession;
+    } catch (err) {
+      // Truncated file, or one encrypted with a DIFFERENT MAX_SESSION_KEY — the classic way in is
+      // restoring ./data onto a fresh install without carrying .env across, which README used to
+      // present as a complete backup. This threw straight out of startServer and killed the process
+      // on every boot: an endless restart loop with not one word in Telegram. Park the file instead
+      // (renamed, never deleted — it's still decryptable if the right key turns up) and come up
+      // unauthenticated; the operator just needs /login.
+      this.corruptedOnLoad = true;
+      const parked = `${this.filePath}.broken`;
+      await rename(this.filePath, parked).catch(() => {});
+      logger.error(`Не удалось прочитать сохранённую MAX-сессию — файл перемещён в ${path.basename(parked)}. Нужна повторная авторизация: /login`, err);
+      return null;
+    }
   }
 
   async clear(): Promise<void> {
