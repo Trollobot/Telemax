@@ -16,18 +16,37 @@ cd "$(dirname "$0")"
 
 bold() { printf '\033[1m%s\033[0m\n' "$1"; }
 
-# Runs on every invocation, even on an already-configured install — an update
-# pulled in via the watcher itself needs the watcher already installed to have
-# gotten here, and re-running enable is harmless, so this is the one place
-# that's safe to do unconditionally.
-if [ "$(id -u)" = "0" ] && command -v systemctl >/dev/null 2>&1; then
+# The watcher unit is global and its NAME is fixed, but its WorkingDirectory points at exactly one
+# install. Rewriting it unconditionally — which this did on every single run, including a routine
+# trip into the settings menu — silently handed the timer to whichever install ran setup.sh last,
+# left the other one without auto-updates, and still printed "установлен и включён". Take it over
+# only when it's free, points at a directory that no longer holds an install, or the operator agrees.
+# `-d /run/systemd/system` is the real test for "systemd is running": the binary exists inside LXC
+# containers and WSL too, where it exits 1 — and with no `|| true` that killed setup.sh outright,
+# before .env, before the build, without printing a thing.
+if [ "$(id -u)" = "0" ] && command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
   REPO_DIR="$(pwd)"
+  WATCHER_UNIT=/etc/systemd/system/telemax-updater.service
+  WATCHER_OWNER=$(sed -n 's/^WorkingDirectory=//p' "$WATCHER_UNIT" 2>/dev/null | head -1)
+  WATCHER_TAKE=yes
+  if [ -n "${WATCHER_OWNER:-}" ] && [ "$WATCHER_OWNER" != "$REPO_DIR" ] && [ -f "$WATCHER_OWNER/docker-compose.yml" ]; then
+    echo "⚠️  Автообновление сейчас обслуживает другую установку: $WATCHER_OWNER"
+    echo "    Если перенацелить его сюда, ТА установка перестанет обновляться автоматически."
+    RETARGET=""
+    read -rp "Перенацелить автообновление на $REPO_DIR? [y/N] " RETARGET </dev/tty 2>/dev/null || RETARGET=""
+    case "${RETARGET:-N}" in y | Y | yes | YES | да) WATCHER_TAKE=yes ;; *) WATCHER_TAKE=no ;; esac
+  fi
+fi
+if [ "${WATCHER_TAKE:-no}" = "yes" ] && [ "$(id -u)" = "0" ] && command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
   # systemd services run with a stripped environment (notably a different or
   # unset $HOME), so git's "dubious ownership" check can reject the repo even
   # when a normal interactive `git config --global` already covers it for an
   # SSH session as the same user — hit live 2026-08-14, silently broke every
   # update the watcher tried to run. --system doesn't depend on $HOME at all.
-  git config --system --add safe.directory "$REPO_DIR" 2>/dev/null || true
+  # --get-all first: plain --add appended a duplicate on EVERY setup.sh run (8 identical entries on
+  # the test box), slowly filling the system gitconfig with noise.
+  git config --system --get-all safe.directory 2>/dev/null | grep -qxF "$REPO_DIR" \
+    || git config --system --add safe.directory "$REPO_DIR" 2>/dev/null || true
   cat > /etc/systemd/system/telemax-updater.service <<EOF
 [Unit]
 Description=Telemax update watcher (one-shot)
@@ -49,21 +68,72 @@ Unit=telemax-updater.service
 [Install]
 WantedBy=timers.target
 EOF
-  systemctl daemon-reload
-  systemctl enable --now telemax-updater.timer >/dev/null 2>&1
-  echo "Вотчер обновлений (telemax-updater, systemd-таймер) установлен и включён в автозапуск — см. README."
+  systemctl daemon-reload || true
+  systemctl enable --now telemax-updater.timer >/dev/null 2>&1 || true
+  # Report what actually happened, not what we attempted.
+  if systemctl is-enabled telemax-updater.timer >/dev/null 2>&1; then
+    echo "Вотчер обновлений (telemax-updater) включён и обслуживает: $REPO_DIR"
+  else
+    echo "⚠️  Вотчер обновлений включить не удалось — обновляйтесь вручную: ./update.sh"
+  fi
+elif [ "${WATCHER_TAKE:-yes}" = "no" ]; then
+  echo "Автообновление оставлено за ${WATCHER_OWNER}. Эта установка обновляется вручную: ./update.sh"
 else
-  echo "Пропускаю установку вотчера обновлений — нужны root и systemd. Обновляться придётся вручную: ./update.sh"
+  echo "Пропускаю установку вотчера обновлений — нужны root и работающий systemd. Обновляться придётся вручную: ./update.sh"
 fi
 
 # ---------------------------------------------------------------------------
 # Shared helpers — used by BOTH the first-run flow and the settings menu below.
 # ---------------------------------------------------------------------------
 
+# Docker Compose derives the project name — and with it the container, image and network names —
+# from the directory basename: lowercased, with every character outside [a-z0-9_-] dropped (verified
+# 2026-09-17: Telemax -> telemax, telemax.2 -> telemax2, telemax-2 -> telemax-2). Reproducing that
+# rule exactly is what makes writing COMPOSE_PROJECT_NAME into .env a NO-OP for every existing
+# install: the name stays byte-identical, it just stops silently depending on the directory's name.
+compose_name_from_dir() {
+  local n
+  n=$(basename "$(pwd)" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]//g')
+  [ -n "$n" ] || n=telemax
+  printf '%s' "$n"
+}
+
+# A name already used by a DIFFERENT install on this host means the two would share one container,
+# image and network (two bridges in same-named directories, e.g. /opt/telemax and /root/telemax —
+# the most natural choice for a second one). Step aside with a suffix instead.
+unique_compose_name() {
+  local base n i dir
+  base=$(compose_name_from_dir); n="$base"; i=2
+  command -v docker >/dev/null 2>&1 || { printf '%s' "$n"; return 0; }
+  while [ "$i" -le 20 ]; do
+    dir=$(docker ps -a --filter "label=com.docker.compose.project=$n" --format '{{.Label "com.docker.compose.project.working_dir"}}' 2>/dev/null | head -1)
+    if [ -z "$dir" ] || [ "$dir" = "$(pwd)" ]; then break; fi
+    n="${base}-${i}"; i=$((i + 1))
+  done
+  printf '%s' "$n"
+}
+
 # First 6 + last 4 chars of the bot token — enough to recognize it, useless to steal.
 mask_token() {
   local t="$1"
   if [ "${#t}" -le 12 ]; then printf '***'; else printf '%s…%s' "${t:0:6}" "${t: -4}"; fi
+}
+
+# Docker Compose's env_file parser is NOT a shell. Simple single quotes it understands (verified
+# 2026-09-17: `$`, a space, `&` and `#` all survive), but the shell idiom for an embedded apostrophe
+# ('\'') makes it reject the WHOLE file — "unexpected character ' in variable name" — and the
+# container then starts with no environment at all. No quoting form carries an apostrophe past both
+# bash and Compose, so refuse it at the door instead of writing a file that breaks everything.
+# Proxy URLs carry it percent-encoded natively, which is the normal way to write such a password.
+has_apostrophe() {
+  case "$1" in
+    *"'"*)
+      echo "  ❌ Апостроф ( ' ) в строке прокси не поддерживается — Docker не сможет прочитать настройки."
+      echo "     Закодируйте его в пароле как %27, например:  socks5://user:pa%27ss@host:1080"
+      return 0
+      ;;
+  esac
+  return 1
 }
 
 # Proxy URL with any user:pass@ stripped — safe to print (mirrors src/telegram/proxy.ts).
@@ -188,6 +258,7 @@ verify_telegram_proxy_loop() {
     echo "    • пустой Enter — перепроверить напрямую, без прокси;"
     echo "    • skip — продолжить без проверки (значение сохранится как есть)."
     read -rp "  > " TG_INPUT
+    if has_apostrophe "$TG_INPUT"; then continue; fi
     if [ "$TG_INPUT" = "skip" ]; then
       echo "  Пропускаю проверку Telegram. Без связи с Telegram пересылки не будет —"
       echo "  прокси можно поменять позже, снова запустив ./setup.sh."
@@ -290,13 +361,24 @@ detect_group() {
 
 # Rewrites (or appends) NAME=value in .env, preserving every other line as-is.
 # awk instead of sed so proxy URLs with #, @, / etc. can't break the substitution.
+# Values go into .env SINGLE-QUOTED (with any ' escaped as '\''). Two independent reasons, both hit
+# live: (1) bash `source .env` treats `$`, a space or a backtick in a bare value as code — under
+# `set -u` that aborted setup.sh and update.sh outright, silently and permanently; (2) Docker Compose
+# INTERPOLATES `$...` inside env_file, so a proxy password containing `$` reached the container
+# MANGLED (verified 2026-09-17: `pa$w0rd` arrived as `pa`) and Telegram just never connected, with
+# nothing anywhere saying why. Compose strips the surrounding single quotes and leaves `$` alone.
+env_quote() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
 set_env_var() {
   local name="$1" value="$2"
+  value=$(env_quote "$value")
   if grep -q "^${name}=" .env 2>/dev/null; then
     awk -v n="$name" -v v="$value" 'index($0, n"=") == 1 { print n"=" v; next } { print }' .env > .env.tmp
     mv .env.tmp .env
   else
-    echo "${name}=${value}" >> .env
+    printf '%s=%s\n' "$name" "$value" >> .env
   fi
   chmod 600 .env
 }
@@ -366,6 +448,7 @@ if [ -f .env ]; then
     echo "Форматы: socks5://[логин:пароль@]хост:порт или http://[логин:пароль@]хост:порт."
     echo "Введите новый адрес; «-» — убрать прокси (напрямую); пустой Enter — оставить как есть."
     read -rp "Прокси: " NEW_PROXY
+    if has_apostrophe "$NEW_PROXY"; then echo "  Настройка не изменена."; return 0; fi
     case "$NEW_PROXY" in
       '') echo "Оставляю как есть."; return 0 ;;
       -) TELEGRAM_PROXY="" ;;
@@ -496,7 +579,11 @@ echo
 # Telegram with its own bot token — races the getUpdates call below and
 # silently breaks group auto-detection. Confirmed live 2026-08-14.
 if command -v docker >/dev/null 2>&1; then
-  RUNNING=$(docker compose ps --status running --format '{{.Name}}' 2>/dev/null || true)
+  # Scoped to THIS directory by label, not by compose's project scope: without an explicit project
+  # name Compose derives it from the directory basename, so a second bridge installed into a
+  # same-named directory saw the FIRST one's live container here and offered — with Enter as the
+  # default answer — to tear down a working bridge belonging to someone else's MAX account.
+  RUNNING=$(docker ps --filter "label=com.docker.compose.project.working_dir=$(pwd)" --format '{{.Names}}' 2>/dev/null | head -1 || true)
   if [ -n "$RUNNING" ]; then
     echo "⚠️  Уже запущен контейнер предыдущей установки: $RUNNING"
     echo "Пока он работает, его бот перехватывает Telegram-обновления — автоопределение"
@@ -521,6 +608,9 @@ echo "сервер, где прямой доступ к api.telegram.org зак�
 echo "этом идёт напрямую. Форматы: socks5://[логин:пароль@]хост:порт или"
 echo "http://[логин:пароль@]хост:порт. Ошибётесь — проверка ниже даст поправить."
 read -rp "Прокси для Telegram (Enter — без прокси): " TELEGRAM_PROXY
+while has_apostrophe "$TELEGRAM_PROXY"; do
+  read -rp "Прокси для Telegram (Enter — без прокси): " TELEGRAM_PROXY
+done
 
 echo
 echo "Проверяю связь с серверами MAX и Telegram..."
@@ -603,14 +693,25 @@ echo "  → образ: $STICKERS"
 
 # .env carries the session-encryption key and bot token — don't leave it readable to
 # other local users. STICKERS is read by docker-compose.yml as a build arg.
+# Belt and braces: a value that can't be represented must never reach .env, because Compose then
+# refuses the entire file and the bridge comes up with no configuration whatsoever.
+for _v in "$MAX_SESSION_KEY" "$TELEGRAM_BOT_TOKEN" "$TARGET_TELEGRAM_GROUP" "$TELEGRAM_PROXY" "$STICKERS"; do
+  case "$_v" in
+    *"'"*)
+      echo "❌ Значение с апострофом нельзя записать в .env (Docker не прочитает файл). Уберите апостроф и повторите."
+      exit 1
+      ;;
+  esac
+done
 umask 077
 cat > .env <<EOF
 # сгенерировано setup.sh $(date -u +%Y-%m-%dT%H:%M:%SZ)
-MAX_SESSION_KEY=$MAX_SESSION_KEY
-TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN
-TARGET_TELEGRAM_GROUP=$TARGET_TELEGRAM_GROUP
-TELEGRAM_PROXY=$TELEGRAM_PROXY
-STICKERS=$STICKERS
+COMPOSE_PROJECT_NAME=$(env_quote "$(unique_compose_name)")
+MAX_SESSION_KEY=$(env_quote "$MAX_SESSION_KEY")
+TELEGRAM_BOT_TOKEN=$(env_quote "$TELEGRAM_BOT_TOKEN")
+TARGET_TELEGRAM_GROUP=$(env_quote "$TARGET_TELEGRAM_GROUP")
+TELEGRAM_PROXY=$(env_quote "$TELEGRAM_PROXY")
+STICKERS=$(env_quote "$STICKERS")
 EOF
 
 echo
