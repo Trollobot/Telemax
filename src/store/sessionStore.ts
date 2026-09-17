@@ -41,6 +41,12 @@ export class SessionStore {
   /** Set when load() had to park an unreadable session file — startup uses it to say so in Telegram. */
   corruptedOnLoad = false;
 
+  // save() runs on every reconnect (MAX rotates the token) and the auth flow can fire one at the same
+  // moment. Two overlapping writes each write-then-rename the SAME tmp path, and the second rename
+  // hits ENOENT because the first already moved it — the exact race that corrupted chat-map.json in
+  // production, which is why ChatMapStore grew this queue. Same medicine here.
+  private writeQueue: Promise<void> = Promise.resolve();
+
   constructor(private readonly filePath: string = path.join(process.cwd(), '.data', 'max.session.json')) {}
 
   async save(session: MaxSession): Promise<void> {
@@ -62,9 +68,14 @@ export class SessionStore {
     // so a crash or a power cut mid-write is a real possibility — and a truncated file used to make
     // load() throw on every boot, which with `restart: unless-stopped` is an endless restart loop
     // curable only by deleting the file over SSH.
-    const tmpPath = `${this.filePath}.tmp`;
-    await writeFile(tmpPath, JSON.stringify(encoded), 'utf8');
-    await rename(tmpPath, this.filePath);
+    const run = this.writeQueue.then(async () => {
+      const tmpPath = `${this.filePath}.tmp`;
+      await writeFile(tmpPath, JSON.stringify(encoded), 'utf8');
+      await rename(tmpPath, this.filePath);
+    });
+    // Keep the queue moving even if this write failed, so one bad write can't wedge every later one.
+    this.writeQueue = run.catch(() => undefined);
+    return run;
   }
 
   async load(): Promise<MaxSession | null> {

@@ -130,13 +130,25 @@ try_source() {
   # Tags must arrive BEFORE the check — otherwise a perfectly signed release looks unsigned. A
   # failure here isn't fatal on its own: the verification below is what decides.
   git fetch "$url" "+refs/tags/*:refs/tags/*" >/dev/null 2>&1 || echo "[update] ${label}: теги не скачались"
-  tag=$(git tag --points-at "$CANDIDATE" 2>/dev/null | grep -E '^v[0-9]' | sort -V | tail -1 || true)
+  # Пробуем КАЖДЫЙ тег на коммите, а не только старший по версии: одна лишняя метка рядом с
+  # настоящим релизом (например оставленная вручную) выигрывала сортировку, не проходила проверку
+  # подписи — и обновления вставали навсегда, хотя валидный подписанный тег был тут же.
+  local t seen=0
+  tag=""
+  for t in $(git tag --points-at "$CANDIDATE" 2>/dev/null | grep -E '^v[0-9]' | sort -rV); do
+    seen=1
+    if git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile="$ALLOWED_SIGNERS" verify-tag "$t" >/dev/null 2>&1; then
+      tag="$t"
+      break
+    fi
+    echo "[update] ${label}: подпись тега ${t} НЕ прошла проверку — пробую следующий"
+  done
   if [ -z "$tag" ]; then
-    echo "[update] ${label}: на входящей версии нет тега релиза"
-    return 1
-  fi
-  if ! git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile="$ALLOWED_SIGNERS" verify-tag "$tag" >/dev/null 2>&1; then
-    echo "[update] ${label}: подпись тега ${tag} НЕ прошла проверку"
+    if [ "$seen" = "1" ]; then
+      echo "[update] ${label}: ни один тег на входящей версии не подписан корректно"
+    else
+      echo "[update] ${label}: на входящей версии нет тега релиза"
+    fi
     return 1
   fi
   # A reachable but STALE source must not beat a fresh one. `git merge --ff-only <ancestor>` prints
