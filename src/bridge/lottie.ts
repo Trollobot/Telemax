@@ -93,6 +93,12 @@ export async function renderTgsToWebm(tgsBuffer: Buffer): Promise<Buffer> {
   const frameStep = nativeFr / targetFr;
   const outputFrameCount = Math.max(1, Math.min(300, Math.round((op - ip) / frameStep)));
 
+  // A .tgs is just a JSON file an arbitrary sender put in a chat, and it lands INSIDE a <script>
+  // block. JSON.stringify escapes quotes but NOT '<', so a string value containing "</script>" ends
+  // the block and everything after it becomes markup — arbitrary JS in a Chromium that sits next to
+  // the bot token and the MAX session. Escaping '<' as \\u003c is the standard fix: still valid JSON
+  // to the parser, impossible to break out of.
+  const serializeForScript = (data: unknown): string => JSON.stringify(data).replace(/</g, '\\u003c');
   const html = `<!doctype html><html><body style="margin:0;background:transparent;overflow:hidden">
 <div id="a" style="width:${width}px;height:${height}px"></div>
 <script>${getLottieScript()}</script>
@@ -102,7 +108,7 @@ export async function renderTgsToWebm(tgsBuffer: Buffer): Promise<Buffer> {
     renderer: 'canvas',
     loop: false,
     autoplay: false,
-    animationData: ${JSON.stringify(lottieJson)},
+    animationData: ${serializeForScript(lottieJson)},
   });
   window.__ready = new Promise((resolve) => {
     if (window.__anim.isLoaded) resolve(true);

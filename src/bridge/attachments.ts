@@ -99,6 +99,10 @@ export interface DownloadContext {
 // Generous — covers a large video on a slow CDN — but finite: a hung download must
 // not stall the relay handler forever (nothing else here bounds it).
 const DOWNLOAD_TIMEOUT_MS = 120_000;
+// A response was buffered whole with no ceiling, so ONE oversized incoming file could exhaust the
+// container's memory and take the bridge down (and it would keep happening on every retry). Telegram
+// itself refuses to send anything above 50 MB, so nothing under this cap is ever lost in practice.
+const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
 
 // Every URL that reaches this helper is a MAX-owned host (photo/sticker/file/video
 // CDN) — hence maxFetch, which trusts the Russian state chain those certs use.
@@ -109,7 +113,18 @@ async function downloadUrl(url: string): Promise<Buffer | null> {
       logger.error(`downloadUrl got non-OK response ${res.status} ${res.statusText} for ${url}`);
       return null;
     }
-    return Buffer.from(await res.arrayBuffer());
+    const declared = Number(res.headers.get('content-length') ?? '');
+    if (Number.isFinite(declared) && declared > MAX_DOWNLOAD_BYTES) {
+      logger.error(`downloadUrl refused ${declared} bytes (limit ${MAX_DOWNLOAD_BYTES}) for ${url}`);
+      return null;
+    }
+    const buf = Buffer.from(await res.arrayBuffer());
+    // Header can lie or be absent — check what actually arrived too.
+    if (buf.byteLength > MAX_DOWNLOAD_BYTES) {
+      logger.error(`downloadUrl got ${buf.byteLength} bytes, over the ${MAX_DOWNLOAD_BYTES} limit, for ${url}`);
+      return null;
+    }
+    return buf;
   } catch (err) {
     logger.error(`downloadUrl threw for ${url}`, err);
     return null;
