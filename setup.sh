@@ -244,20 +244,24 @@ tg_api() {
 # which bot it belongs to (a token from the wrong bot passes every format check). Before this, a bad
 # token only surfaced later as a puzzling "group not found".
 verify_bot_token() {
+  echo "  Проверяю токен:"
   if ! [[ "$TELEGRAM_BOT_TOKEN" =~ ^[0-9]{6,12}:[A-Za-z0-9_-]{30,50}$ ]]; then
-    echo "  ❌ Не похоже на токен бота (формат 123456789:AAAA…). Скопируйте его целиком из @BotFather."
+    echo "     ❌ Не похоже на токен бота — ожидается вид 123456789:AAAA…"
+    echo "        → скопируйте его ЦЕЛИКОМ из @BotFather, без пробелов и переносов"
     return 1
   fi
-  command -v jq >/dev/null 2>&1 || { echo "  (jq не найден — проверяю только формат токена)"; return 0; }
+  echo "     ✅ Формат токена верный"
+  command -v jq >/dev/null 2>&1 || { echo "     ⚠️ jq не найден — дальше проверить не могу, продолжаю"; return 0; }
   local me user desc
   me=$(tg_api getMe)
   user=$(echo "$me" | jq -r 'select(.ok == true) | .result.username // empty' 2>/dev/null)
   if [ -z "$user" ]; then
     desc=$(echo "$me" | jq -r '.description // empty' 2>/dev/null)
-    echo "  ❌ Telegram не принял токен${desc:+ ($desc)}. Проверьте его в @BotFather (/mybots → API Token)."
+    echo "     ❌ Telegram не принял токен${desc:+: $desc}"
+    echo "        → возьмите актуальный в @BotFather: /mybots → ваш бот → API Token"
     return 1
   fi
-  echo "  ✅ Токен принят: это бот @${user}"
+  echo "     ✅ Telegram принял токен: это бот @${user}"
   return 0
 }
 
@@ -269,25 +273,55 @@ verify_group() {
   local chat title type forum bot_id member status can ok=0
   chat=$(tg_api "getChat?chat_id=$1")
   if [ "$(echo "$chat" | jq -r '.ok' 2>/dev/null)" != "true" ]; then
-    echo "  ❌ Группа $1 недоступна боту: $(echo "$chat" | jq -r '.description // "нет ответа"' 2>/dev/null). Бот добавлен в неё?"
+    echo "  Группа $1:"
+    echo "     ❌ Бот её не видит: $(echo "$chat" | jq -r '.description // "нет ответа"' 2>/dev/null)"
+    echo "        → проверьте, что бот ДОБАВЛЕН именно в эту группу и id указан верно"
     return 1
   fi
   title=$(echo "$chat" | jq -r '.result.title // "без названия"')
   type=$(echo "$chat" | jq -r '.result.type')
   forum=$(echo "$chat" | jq -r '.result.is_forum // false')
+  # Печатаем КАЖДЫЙ пункт, а не только провалившийся: иначе видно лишь первую проблему и неясно,
+  # что уже в порядке, а что ещё не проверялось. Каждый ❌ — со строкой «что нажать».
   echo "  Группа: «$title» ($1)"
-  if [ "$type" != "supergroup" ]; then echo "  ❌ Это не супергруппа ($type) — включите Темы: настройки группы → Темы (группа станет супергруппой)."; ok=1; fi
-  if [ "$forum" != "true" ]; then echo "  ❌ В группе выключены Темы — включите: настройки группы → Темы."; ok=1; fi
+  if [ "$type" = "supergroup" ]; then
+    echo "     ✅ Тип: супергруппа"
+  else
+    echo "     ❌ Тип: $type — нужна супергруппа"
+    echo "        → настройки группы → Темы → включить (группа сама станет супергруппой)"
+    ok=1
+  fi
+  if [ "$forum" = "true" ]; then
+    echo "     ✅ Темы включены"
+  else
+    echo "     ❌ Темы ВЫКЛЮЧЕНЫ — без них мост не сможет завести тему под каждый чат MAX"
+    echo "        → настройки группы → Темы → включить"
+    ok=1
+  fi
   bot_id="${TELEGRAM_BOT_TOKEN%%:*}"
   member=$(tg_api "getChatMember?chat_id=$1&user_id=$bot_id")
   status=$(echo "$member" | jq -r '.result.status // "unknown"')
   can=$(echo "$member" | jq -r '.result.can_manage_topics // false')
-  if [ "$status" != "administrator" ] && [ "$status" != "creator" ]; then
-    echo "  ❌ Бот не администратор группы (статус: $status) — сделайте его администратором."; ok=1
-  elif [ "$can" != "true" ]; then
-    echo "  ❌ У бота нет права «Управление темами» (Manage Topics) — включите его в правах администратора."; ok=1
+  if [ "$status" = "administrator" ] || [ "$status" = "creator" ]; then
+    echo "     ✅ Бот — администратор группы"
+  else
+    echo "     ❌ Бот НЕ администратор (статус: $status)"
+    echo "        → настройки группы → Администраторы → добавить бота"
+    ok=1
   fi
-  [ "$ok" -eq 0 ] && echo "  ✅ Темы включены, бот — администратор с «Управлением темами»."
+  if [ "$can" = "true" ]; then
+    echo "     ✅ Право «Управление темами» выдано"
+  else
+    echo "     ❌ Право «Управление темами» — ВЫКЛЮЧЕНО"
+    echo "        → Администраторы → ваш бот → включить «Управление темами»"
+    echo "          (в базовый набор прав администратора оно НЕ входит — на этом спотыкаются чаще всего)"
+    ok=1
+  fi
+  if [ "$ok" -eq 0 ]; then
+    echo "     Всё готово."
+  else
+    echo "     Исправьте отмеченное ❌ — проверю снова."
+  fi
   return $ok
 }
 
