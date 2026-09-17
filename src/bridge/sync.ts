@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { writeFile } from 'node:fs/promises';
+import { rm, stat, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { Markup, type Telegraf } from 'telegraf';
 import type { ChatAction, TelegramEmoji } from 'telegraf/types';
@@ -1720,6 +1720,30 @@ export function wireBridge({
     }
   }
 
+  /**
+   * Is the chat behind this topic a 1:1, and what do we call the other side? The MAX group commands
+   * below never asked: in a DIALOG topic /rename, /setdesc, /invite, /kick and /leavegroup are
+   * meaningless (the user just got an opaque MAX error), and /deletegroup ВСЕМ — whose confirmation
+   * talks about «группу» and «участников» — actually wipes the conversation for the person on the
+   * other end. Falls back to "not a dialog" when the chat isn't in the cache yet: that only ever
+   * loosens a guard on a genuine group, never tightens one into deleting someone's history.
+   */
+  function describeTopicChat(maxChatId: string): { isDialog: boolean; name: string } {
+    const { chat, otherId, profile } = resolveDialogContact(maxChatId);
+    const participants = chat?.participants ? Object.keys(chat.participants).length : undefined;
+    const isDialog = chat?.type === 'DIALOG' || (chat?.type == null && participants === 2) || participants === 2;
+    const name = isDialog && otherId != null ? resolveContactDisplayName(otherId, profile) : chat?.title || 'этот чат';
+    return { isDialog, name };
+  }
+
+  /** Refuses a group-only command in a 1:1 topic, explaining why instead of letting MAX answer with a shrug. */
+  async function refuseInDialog(maxChatId: string, topicId: number, command: string): Promise<boolean> {
+    const { isDialog, name } = describeTopicChat(maxChatId);
+    if (!isDialog) return false;
+    await bot.telegram.sendMessage(targetGroupId, `⛔ ${command} — команда для групп. Это личный чат с «${name}».`, { message_thread_id: topicId });
+    return true;
+  }
+
   /** Resolves the "other participant" + their profile for a DIALOG chat, looking them up in cachedChats/contactProfiles. */
   function resolveDialogContact(maxChatId: string): { chat: { type?: string; title?: string; participants?: Record<string, unknown> } | undefined; otherId: number | undefined; profile: ContactProfile | undefined } {
     const chat = getChats().find((c) => c && typeof c === 'object' && String((c as { id?: unknown }).id) === maxChatId) as
@@ -1812,13 +1836,40 @@ export function wireBridge({
     await bot.telegram.sendMessage(ctx.chat.id, text, { message_thread_id: ctx.message.message_thread_id, reply_markup: replyMarkup });
   });
 
+  /**
+   * An update marker only means "an update is really in flight" while it's FRESH. update.sh clears
+   * update-in-progress in an EXIT trap, but a SIGKILL, an OOM or a reboot mid-build skips the trap;
+   * and update-requested is only ever consumed by the host watcher — which doesn't exist at all on an
+   * install set up without root, or belongs to a different bridge on a multi-instance host. In both
+   * cases the leftover file latched the «Обновить» button permanently: every later press answered
+   * "Обновление уже запущено — дождись сообщения о завершении", and no message was ever coming.
+   * Nothing in the codebase deleted either marker, so the only cure was `rm` over SSH. A marker older
+   * than the window below is treated as abandoned and removed, so the next press works.
+   */
+  const UPDATE_MARKER_STALE_MS = 30 * 60_000;
+  async function markerActive(file: string): Promise<boolean> {
+    if (!existsSync(file)) return false;
+    try {
+      const { mtimeMs } = await stat(file);
+      if (Date.now() - mtimeMs < UPDATE_MARKER_STALE_MS) return true;
+      await rm(file, { force: true });
+      logger.info(`Забытый маркер обновления ${file} (старше ${UPDATE_MARKER_STALE_MS / 60_000} мин) — игнорирую и удаляю`);
+      return false;
+    } catch (err) {
+      logger.error(`Не удалось проверить маркер обновления ${file}`, err);
+      return false; // fail OPEN: better a second update attempt than a button wedged forever
+    }
+  }
+
   bot.action('tlmx_update', async (ctx) => {
     // Guard against re-triggering while one is already in flight: a fresh /version
     // still shows a live "Обновить" button even mid-update (the container hasn't been
     // rebuilt yet, so it still looks out-of-date). update-requested = queued but not
     // yet picked up by the host watcher; update-in-progress = update.sh is running.
     // flock in update-watcher.sh is the hard backstop; this is the friendly heads-up.
-    if (existsSync(UPDATE_REQUESTED_MARKER) || existsSync(UPDATE_IN_PROGRESS_MARKER)) {
+    // Age-checked, not just existence-checked: see markerActive — a stale marker used to make
+    // this button answer "уже запущено" forever, with the message it promises never arriving.
+    if ((await markerActive(UPDATE_REQUESTED_MARKER)) || (await markerActive(UPDATE_IN_PROGRESS_MARKER))) {
       await ctx.answerCbQuery('Обновление уже идёт');
       await ctx.editMessageText('⏳ Обновление уже запущено — дождись сообщения о завершении.').catch(() => {});
       return;
@@ -1989,7 +2040,11 @@ export function wireBridge({
       let update: { updateAvailable: boolean; latest: string | null } | null = null;
       try {
         const v = await checkVersion();
-        update = { updateAvailable: v.updateAvailable, latest: (v.latest as { version?: string } | null)?.version ?? null };
+        // checkVersion() never throws — every fetcher catches internally and a FAILED check comes back
+        // as `latest: null`. Passing that through rendered the reassuring "Обновление: актуальная
+        // версия" while nothing had actually been checked (and made the catch below dead code).
+        const latest = (v.latest as { version?: string } | null)?.version ?? null;
+        update = v.latest ? { updateAvailable: v.updateAvailable, latest } : null;
       } catch {
         update = null; // offline / rate-limited — rendered as "не удалось проверить"
       }
@@ -2177,9 +2232,13 @@ export function wireBridge({
     if (!topicId) return;
     const mapping = await chatMapStore.getByTopicId(topicId);
     if (!mapping) return;
-    const userId = Number((ctx as unknown as { payload?: string }).payload?.trim());
-    if (Number.isNaN(userId)) {
-      await bot.telegram.sendMessage(targetGroupId, 'Использование: /invite <MAX ID>', { message_thread_id: topicId });
+    if (await refuseInDialog(mapping.maxChatId, topicId, '/invite')) return;
+    // `Number('')` is 0, not NaN — a bare "/invite " (trailing space) sailed past an isNaN check and
+    // sent MAX `userIds: [0]`. Require a real positive id.
+    const raw = (ctx as unknown as { payload?: string }).payload?.trim() ?? '';
+    const userId = Number(raw);
+    if (!/^\d+$/.test(raw) || !Number.isSafeInteger(userId) || userId <= 0) {
+      await bot.telegram.sendMessage(targetGroupId, 'Использование: /invite <MAX ID> — например, /invite 123456789. ID участника есть в карточке группы.', { message_thread_id: topicId });
       return;
     }
     try {
@@ -2196,8 +2255,10 @@ export function wireBridge({
     if (!topicId) return;
     const mapping = await chatMapStore.getByTopicId(topicId);
     if (!mapping) return;
-    const userId = Number((ctx as unknown as { payload?: string }).payload?.trim());
-    if (Number.isNaN(userId)) {
+    if (await refuseInDialog(mapping.maxChatId, topicId, '/kick')) return;
+    const rawKick = (ctx as unknown as { payload?: string }).payload?.trim() ?? '';
+    const userId = Number(rawKick);
+    if (!/^\d+$/.test(rawKick) || !Number.isSafeInteger(userId) || userId <= 0) {
       await bot.telegram.sendMessage(targetGroupId, 'Использование: /kick <MAX ID>', { message_thread_id: topicId });
       return;
     }
@@ -2215,6 +2276,7 @@ export function wireBridge({
     if (!topicId) return;
     const mapping = await chatMapStore.getByTopicId(topicId);
     if (!mapping) return;
+    if (await refuseInDialog(mapping.maxChatId, topicId, '/rename')) return;
     const title = (ctx as unknown as { payload?: string }).payload?.trim();
     if (!title) {
       await bot.telegram.sendMessage(targetGroupId, 'Использование: /rename <новое название>', { message_thread_id: topicId });
@@ -2239,6 +2301,7 @@ export function wireBridge({
     if (!topicId) return;
     const mapping = await chatMapStore.getByTopicId(topicId);
     if (!mapping) return;
+    if (await refuseInDialog(mapping.maxChatId, topicId, '/setdesc')) return;
     const description = (ctx as unknown as { payload?: string }).payload?.trim();
     if (!description) {
       await bot.telegram.sendMessage(targetGroupId, 'Использование: /setdesc <описание>', { message_thread_id: topicId });
@@ -2259,6 +2322,7 @@ export function wireBridge({
     if (!topicId) return;
     const mapping = await chatMapStore.getByTopicId(topicId);
     if (!mapping) return;
+    if (await refuseInDialog(mapping.maxChatId, topicId, '/leavegroup')) return;
     const confirm = (ctx as unknown as { payload?: string }).payload?.trim().toUpperCase();
     if (confirm !== 'ПОДТВЕРДИТЬ') {
       await bot.telegram.sendMessage(targetGroupId, '⚠️ Это выход из группы на стороне MAX. Для подтверждения: /leavegroup ПОДТВЕРДИТЬ', {
@@ -2281,11 +2345,18 @@ export function wireBridge({
     if (!topicId) return;
     const mapping = await chatMapStore.getByTopicId(topicId);
     if (!mapping) return;
+    // The command is NAMED for groups, but nothing stopped it running in a 1:1 topic — where
+    // «удалить для всех участников» quietly means "wipe this conversation for the person I'm
+    // talking to". Deleting a dialog for both sides is a legitimate messenger feature (MAX has it),
+    // so it stays available — but the confirmation must name the human it will hit.
+    const target = describeTopicChat(mapping.maxChatId);
     const args = (ctx as unknown as { payload?: string }).payload?.trim().toUpperCase().split(/\s+/) ?? [];
     if (args[0] !== 'УДАЛИТЬ') {
       await bot.telegram.sendMessage(
         targetGroupId,
-        '⚠️ Это удаление группы на стороне MAX. /deletegroup УДАЛИТЬ — удалить только у себя. /deletegroup УДАЛИТЬ ВСЕМ — удалить для всех участников (необратимо для них тоже).',
+        target.isDialog
+          ? `⚠️ Это личная переписка с «${target.name}», а не группа.\n/deletegroup УДАЛИТЬ — удалить её только у себя.\n/deletegroup УДАЛИТЬ ВСЕМ — удалить её И У «${target.name}» ТОЖЕ. Необратимо для него.`
+          : `⚠️ Это удаление группы «${target.name}» на стороне MAX. /deletegroup УДАЛИТЬ — удалить только у себя. /deletegroup УДАЛИТЬ ВСЕМ — удалить для всех участников (необратимо для них тоже).`,
         { message_thread_id: topicId },
       );
       return;
@@ -2294,8 +2365,10 @@ export function wireBridge({
     const chat = getChats().find((c) => c && typeof c === 'object' && String((c as { id?: unknown }).id) === mapping.maxChatId) as
       | { lastEventTime?: unknown }
       | undefined;
+    // `Number(null)` is 0, not NaN — a chat missing from the cache slipped through the isNaN check
+    // and sent MAX lastEventTime: 0.
     const lastEventTime = Number(chat?.lastEventTime);
-    if (Number.isNaN(lastEventTime)) {
+    if (!Number.isSafeInteger(lastEventTime) || lastEventTime <= 0) {
       await bot.telegram.sendMessage(targetGroupId, 'Не нашёл lastEventTime этого чата — попробуй чуть позже (после следующей синхронизации).', {
         message_thread_id: topicId,
       });
@@ -2303,7 +2376,13 @@ export function wireBridge({
     }
     try {
       await max.deleteChat(mapping.maxChatId, lastEventTime, forAll);
-      await bot.telegram.sendMessage(targetGroupId, `✅ Группа удалена ${forAll ? 'для всех' : 'у меня'}.`, { message_thread_id: topicId });
+      await bot.telegram.sendMessage(
+        targetGroupId,
+        target.isDialog
+          ? `✅ Переписка с «${target.name}» удалена ${forAll ? 'у обоих' : 'у меня'}.`
+          : `✅ Группа удалена ${forAll ? 'для всех' : 'у меня'}.`,
+        { message_thread_id: topicId },
+      );
     } catch (err) {
       logger.error('Failed to delete chat', err);
       await bot.telegram.sendMessage(targetGroupId, 'Не удалось удалить группу.', { message_thread_id: topicId });
