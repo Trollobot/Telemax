@@ -9,6 +9,13 @@ cd "$(dirname "$0")"
 
 # `data/`, NOT `.data/` — that's the container-internal path (docker-compose.yml
 # mounts host `./data` there); this script runs on the host itself.
+# Heartbeat FIRST, before the early exit: it is how the bridge knows an auto-updater actually serves
+# THIS directory. Without it the «Обновить» button cheerfully wrote a marker nobody would ever read
+# (an install set up without root, or — before the dispatcher — a second bridge on the same host) and
+# the promised completion message never came.
+mkdir -p data
+date -u +%Y-%m-%dT%H:%M:%SZ > data/watcher-heartbeat 2>/dev/null || true
+
 MARKER="data/update-requested"
 [ -f "$MARKER" ] || exit 0
 

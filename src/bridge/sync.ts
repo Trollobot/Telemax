@@ -830,6 +830,8 @@ async function pinInfoCard(bot: Telegraf, targetGroupId: string, messageId: numb
 const UPDATE_REQUESTED_MARKER = path.join(process.cwd(), '.data', 'update-requested');
 /** Written by update.sh while it runs (data/ is the same mount as .data/) — lets the /version button refuse a second request mid-update. */
 const UPDATE_IN_PROGRESS_MARKER = path.join(process.cwd(), '.data', 'update-in-progress');
+/** Touched every minute by the host's update dispatcher for the directory it serves (update-watcher.sh). */
+const WATCHER_HEARTBEAT_MARKER = path.join(process.cwd(), '.data', 'watcher-heartbeat');
 
 /** Shared by /version and the daily scheduled check — same text/buttons either way. */
 function formatVersionMessage(status: VersionStatus): { text: string; replyMarkup?: ReturnType<typeof Markup.inlineKeyboard>['reply_markup'] } {
@@ -1852,6 +1854,16 @@ export function wireBridge({
    * than the window below is treated as abandoned and removed, so the next press works.
    */
   const UPDATE_MARKER_STALE_MS = 30 * 60_000;
+  /** The dispatcher ticks once a minute; anything older than this means nothing is watching us. */
+  const WATCHER_STALE_MS = 5 * 60_000;
+  async function watcherAlive(): Promise<boolean> {
+    try {
+      const { mtimeMs } = await stat(WATCHER_HEARTBEAT_MARKER);
+      return Date.now() - mtimeMs < WATCHER_STALE_MS;
+    } catch {
+      return false; // never ticked here
+    }
+  }
   async function markerActive(file: string): Promise<boolean> {
     if (!existsSync(file)) return false;
     try {
@@ -1877,6 +1889,17 @@ export function wireBridge({
     if ((await markerActive(UPDATE_REQUESTED_MARKER)) || (await markerActive(UPDATE_IN_PROGRESS_MARKER))) {
       await ctx.answerCbQuery('Обновление уже идёт');
       await ctx.editMessageText('⏳ Обновление уже запущено — дождись сообщения о завершении.').catch(() => {});
+      return;
+    }
+    // Is anything on the host actually going to pick this up? The marker is consumed only by the
+    // update dispatcher, which doesn't exist when setup.sh ran without root — and before 0.6.4 a
+    // second bridge on the same host had no updater either. Writing a marker nobody reads produced a
+    // cheerful «⏳ Обновление запрошено» and then nothing, forever.
+    if (!(await watcherAlive())) {
+      await ctx.answerCbQuery('Автообновление не настроено');
+      await ctx
+        .editMessageText('⚠️ Автообновление на этом мосту не настроено — запрос некому выполнить.\nОбновите на сервере:  cd <каталог моста> && ./update.sh\n(автообновление ставится запуском ./setup.sh от root)')
+        .catch(() => {});
       return;
     }
     await ctx.answerCbQuery('Обновление запрошено');

@@ -16,56 +16,92 @@ cd "$(dirname "$0")"
 
 bold() { printf '\033[1m%s\033[0m\n' "$1"; }
 
-# The watcher unit is global and its NAME is fixed, but its WorkingDirectory points at exactly one
-# install. Rewriting it unconditionally — which this did on every single run, including a routine
-# trip into the settings menu — silently handed the timer to whichever install ran setup.sh last,
-# left the other one without auto-updates, and still printed "установлен и включён". Take it over
-# only when it's free, points at a directory that no longer holds an install, or the operator agrees.
+# AUTO-UPDATE FOR EVERY BRIDGE ON THIS HOST (0.6.4).
+# The timer used to run one install's update-watcher.sh directly (ExecStart=$REPO_DIR/...), so the
+# unit — global, fixed name — belonged to whichever install ran setup.sh last. A second bridge
+# silently took auto-updates away from the first, and a routine trip into the settings menu did it
+# too. Now the timer runs a DISPATCHER that walks a registry of install directories: nothing to
+# steal, and adding a bridge is one line in a file.
+#
+# Migration matters here: an existing host has the old unit pointing at install #1. We read that
+# WorkingDirectory and register it too, so converting to the dispatcher never orphans whoever the
+# timer used to serve.
+#
 # `-d /run/systemd/system` is the real test for "systemd is running": the binary exists inside LXC
 # containers and WSL too, where it exits 1 — and with no `|| true` that killed setup.sh outright,
 # before .env, before the build, without printing a thing.
+TELEMAX_REGISTRY=/etc/telemax/instances
+TELEMAX_DISPATCHER=/usr/local/sbin/telemax-updater
 if [ "$(id -u)" = "0" ] && command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
   REPO_DIR="$(pwd)"
   WATCHER_UNIT=/etc/systemd/system/telemax-updater.service
-  # `sed` по отсутствующему файлу возвращает 2, `pipefail` поднимает это из конвейера, а присваивание
-  # из подстановки команды под `set -e` убивает скрипт — на ЧИСТОЙ установке юнита ещё нет, то есть
-  # setup.sh умирал бы здесь молча, до .env и до сборки. Тот же класс, что убил 0.6.2; читаем файл,
-  # только убедившись, что он есть.
-  WATCHER_OWNER=""
+
+  # Whoever the old unit served must not lose auto-updates when we switch to the dispatcher.
+  # `sed` on a missing file exits 2, `pipefail` lifts that out of the pipe and the assignment kills
+  # the script under `set -e` — on a CLEAN install the unit doesn't exist yet, so read it only when
+  # it's there (this exact shape silently killed setup.sh once already).
+  LEGACY_DIR=""
   if [ -f "$WATCHER_UNIT" ]; then
-    WATCHER_OWNER=$(sed -n 's/^WorkingDirectory=//p' "$WATCHER_UNIT" | head -1) || WATCHER_OWNER=""
+    LEGACY_DIR=$(sed -n 's/^WorkingDirectory=//p' "$WATCHER_UNIT" | head -1) || LEGACY_DIR=""
   fi
-  WATCHER_TAKE=yes
-  if [ -n "${WATCHER_OWNER:-}" ] && [ "$WATCHER_OWNER" != "$REPO_DIR" ] && [ -f "$WATCHER_OWNER/docker-compose.yml" ]; then
-    echo "⚠️  Автообновление сейчас обслуживает другую установку: $WATCHER_OWNER"
-    echo "    Если перенацелить его сюда, ТА установка перестанет обновляться автоматически."
-    RETARGET=""
-    read -rp "Перенацелить автообновление на $REPO_DIR? [y/N] " RETARGET </dev/tty 2>/dev/null || RETARGET=""
-    case "${RETARGET:-N}" in y | Y | yes | YES | да) WATCHER_TAKE=yes ;; *) WATCHER_TAKE=no ;; esac
+
+  mkdir -p "$(dirname "$TELEMAX_REGISTRY")"
+  touch "$TELEMAX_REGISTRY"
+  # Register a directory once, and only if it really holds a bridge.
+  register_instance() {
+    local d="$1"
+    [ -n "$d" ] || return 0
+    [ -f "$d/update-watcher.sh" ] || return 0
+    grep -qxF "$d" "$TELEMAX_REGISTRY" 2>/dev/null || printf '%s\n' "$d" >> "$TELEMAX_REGISTRY"
+    # The dispatcher runs each install's git commands as root from a stripped systemd environment,
+    # where git's "dubious ownership" check would otherwise reject the repo.
+    git config --system --get-all safe.directory 2>/dev/null | grep -qxF "$d" \
+      || git config --system --add safe.directory "$d" 2>/dev/null || true
+    return 0
+  }
+  register_instance "$REPO_DIR"
+  [ "$LEGACY_DIR" != "$REPO_DIR" ] && register_instance "$LEGACY_DIR"
+  # Drop entries whose directory is gone, so a removed bridge stops being walked.
+  if [ -s "$TELEMAX_REGISTRY" ]; then
+    while IFS= read -r _d; do
+      [ -n "$_d" ] && [ -f "$_d/update-watcher.sh" ] && printf '%s\n' "$_d"
+    done < "$TELEMAX_REGISTRY" | sort -u > "$TELEMAX_REGISTRY.tmp" || true
+    mv "$TELEMAX_REGISTRY.tmp" "$TELEMAX_REGISTRY"
   fi
-fi
-if [ "${WATCHER_TAKE:-no}" = "yes" ] && [ "$(id -u)" = "0" ] && command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
-  # systemd services run with a stripped environment (notably a different or
-  # unset $HOME), so git's "dubious ownership" check can reject the repo even
-  # when a normal interactive `git config --global` already covers it for an
-  # SSH session as the same user — hit live 2026-08-14, silently broke every
-  # update the watcher tried to run. --system doesn't depend on $HOME at all.
-  # --get-all first: plain --add appended a duplicate on EVERY setup.sh run (8 identical entries on
-  # the test box), slowly filling the system gitconfig with noise.
-  git config --system --get-all safe.directory 2>/dev/null | grep -qxF "$REPO_DIR" \
-    || git config --system --add safe.directory "$REPO_DIR" 2>/dev/null || true
-  cat > /etc/systemd/system/telemax-updater.service <<EOF
+
+  mkdir -p "$(dirname "$TELEMAX_DISPATCHER")"
+  cat > "$TELEMAX_DISPATCHER" <<'DISPATCHER'
+#!/usr/bin/env bash
+# Telemax update dispatcher — ONE systemd timer serves EVERY bridge on this host.
+# Written by setup.sh; the list of installs lives in /etc/telemax/instances (one absolute path per
+# line). Each install's own update-watcher.sh does the real work (marker check + flock + update.sh),
+# so this only decides WHO gets a turn. Deliberately forgiving: one broken install must not stop the
+# others from updating.
+set -uo pipefail
+REG=/etc/telemax/instances
+[ -f "$REG" ] || exit 0
+while IFS= read -r dir; do
+  [ -n "$dir" ] || continue
+  case "$dir" in \#*) continue ;; esac
+  [ -f "$dir/update-watcher.sh" ] || continue
+  # `bash <script>`, not `./script`: git checkouts made on Windows lose the exec bit.
+  ( cd "$dir" && bash ./update-watcher.sh ) || true
+done < "$REG"
+exit 0
+DISPATCHER
+  chmod 755 "$TELEMAX_DISPATCHER"
+
+  cat > "$WATCHER_UNIT" <<EOF
 [Unit]
-Description=Telemax update watcher (one-shot)
+Description=Telemax update dispatcher (one-shot, serves every installed bridge)
 
 [Service]
 Type=oneshot
-WorkingDirectory=$REPO_DIR
-ExecStart=$REPO_DIR/update-watcher.sh
+ExecStart=$TELEMAX_DISPATCHER
 EOF
   cat > /etc/systemd/system/telemax-updater.timer <<'EOF'
 [Unit]
-Description=Run the Telemax update watcher every minute
+Description=Run the Telemax update dispatcher every minute
 
 [Timer]
 OnBootSec=30s
@@ -77,14 +113,16 @@ WantedBy=timers.target
 EOF
   systemctl daemon-reload || true
   systemctl enable --now telemax-updater.timer >/dev/null 2>&1 || true
+  # Seed the heartbeat so the bot doesn't claim "автообновление не настроено" during the first
+  # minute, before the timer has had a chance to tick.
+  mkdir -p "$REPO_DIR/data" && date -u +%Y-%m-%dT%H:%M:%SZ > "$REPO_DIR/data/watcher-heartbeat" || true
   # Report what actually happened, not what we attempted.
   if systemctl is-enabled telemax-updater.timer >/dev/null 2>&1; then
-    echo "Вотчер обновлений (telemax-updater) включён и обслуживает: $REPO_DIR"
+    echo "Автообновление (telemax-updater) включено и обслуживает мосты:"
+    sed 's/^/    • /' "$TELEMAX_REGISTRY" 2>/dev/null || true
   else
-    echo "⚠️  Вотчер обновлений включить не удалось — обновляйтесь вручную: ./update.sh"
+    echo "⚠️  Автообновление включить не удалось — обновляйтесь вручную: ./update.sh"
   fi
-elif [ "${WATCHER_TAKE:-yes}" = "no" ]; then
-  echo "Автообновление оставлено за ${WATCHER_OWNER}. Эта установка обновляется вручную: ./update.sh"
 else
   echo "Пропускаю установку вотчера обновлений — нужны root и работающий systemd. Обновляться придётся вручную: ./update.sh"
 fi
