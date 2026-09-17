@@ -1731,7 +1731,12 @@ export function wireBridge({
   function describeTopicChat(maxChatId: string): { isDialog: boolean; name: string } {
     const { chat, otherId, profile } = resolveDialogContact(maxChatId);
     const participants = chat?.participants ? Object.keys(chat.participants).length : undefined;
-    const isDialog = chat?.type === 'DIALOG' || (chat?.type == null && participants === 2) || participants === 2;
+    // A real MAX GROUP can legitimately have two members; treating every 2-participant chat as a 1:1
+    // made /invite, /kick, /rename, /setdesc and /leavegroup refuse in it forever, and made
+    // /deletegroup call it «личная переписка». Trust the declared type; fall back to the participant
+    // count only when the chat isn't in the cache yet (conservative: an unknown 2-person chat is
+    // treated as a dialog, which only ever adds a warning, never removes one).
+    const isDialog = chat?.type === 'DIALOG' || (chat?.type == null && participants === 2);
     const name = isDialog && otherId != null ? resolveContactDisplayName(otherId, profile) : chat?.title || 'этот чат';
     return { isDialog, name };
   }

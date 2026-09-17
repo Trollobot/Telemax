@@ -27,7 +27,14 @@ bold() { printf '\033[1m%s\033[0m\n' "$1"; }
 if [ "$(id -u)" = "0" ] && command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
   REPO_DIR="$(pwd)"
   WATCHER_UNIT=/etc/systemd/system/telemax-updater.service
-  WATCHER_OWNER=$(sed -n 's/^WorkingDirectory=//p' "$WATCHER_UNIT" 2>/dev/null | head -1)
+  # `sed` по отсутствующему файлу возвращает 2, `pipefail` поднимает это из конвейера, а присваивание
+  # из подстановки команды под `set -e` убивает скрипт — на ЧИСТОЙ установке юнита ещё нет, то есть
+  # setup.sh умирал бы здесь молча, до .env и до сборки. Тот же класс, что убил 0.6.2; читаем файл,
+  # только убедившись, что он есть.
+  WATCHER_OWNER=""
+  if [ -f "$WATCHER_UNIT" ]; then
+    WATCHER_OWNER=$(sed -n 's/^WorkingDirectory=//p' "$WATCHER_UNIT" | head -1) || WATCHER_OWNER=""
+  fi
   WATCHER_TAKE=yes
   if [ -n "${WATCHER_OWNER:-}" ] && [ "$WATCHER_OWNER" != "$REPO_DIR" ] && [ -f "$WATCHER_OWNER/docker-compose.yml" ]; then
     echo "⚠️  Автообновление сейчас обслуживает другую установку: $WATCHER_OWNER"
@@ -414,12 +421,27 @@ if [ -f .env ]; then
   # Old installs (pre-0.3) left .env world-readable — tighten on every run.
   chmod 600 .env
 
+  # Same parser update.sh uses: `source .env` executes the file as shell, so a legacy unquoted value
+  # containing `$`, a space or a backtick aborted the settings menu under `set -u` — on exactly the
+  # installs that need the menu to FIX that value. Reads both the new quoted form and the old bare one.
+  env_read() {
+    local line
+    line=$(grep -m1 "^$1=" .env 2>/dev/null) || return 0
+    line=${line#*=}
+    case "$line" in
+      "'"*"'") line=${line#\'}; line=${line%\'} ;;
+      '"'*'"') line=${line#\"}; line=${line%\"} ;;
+    esac
+    printf '%s' "$line"
+  }
+
   show_status() {
     # Re-read on every call so the menu always shows what's actually in .env.
-    set -a
-    # shellcheck disable=SC1091
-    source .env
-    set +a
+    TELEGRAM_BOT_TOKEN=$(env_read TELEGRAM_BOT_TOKEN)
+    TARGET_TELEGRAM_GROUP=$(env_read TARGET_TELEGRAM_GROUP)
+    TELEGRAM_PROXY=$(env_read TELEGRAM_PROXY)
+    STICKERS=$(env_read STICKERS)
+    MAX_SESSION_KEY=$(env_read MAX_SESSION_KEY)
     local container="не запущен"
     if command -v docker >/dev/null 2>&1 && [ -n "$(docker compose ps --status running --format '{{.Name}}' 2>/dev/null)" ]; then
       container="работает"

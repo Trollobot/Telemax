@@ -617,6 +617,11 @@ async function launchTelegramBotWithRetry(bot: Telegraf, attempt = 0): Promise<v
   bot.telegram.setMyDescription(buildBotDescription()).catch((err) => logger.error('Failed to set bot description', err));
   bot.telegram.setMyCommands(BOT_COMMANDS).catch((err) => logger.error('Failed to set bot commands', err));
   void reportIfJustUpdated(bot);
+  // SessionStore parked an unreadable session file (corrupt, or encrypted with a different
+  // MAX_SESSION_KEY — the usual cause is restoring ./data without carrying .env across). The bridge
+  // is up but unauthenticated, so say so in the group with the same re-auth prompt a rejected
+  // session gets; otherwise it just sits there silently doing nothing.
+  if (sessionStore.corruptedOnLoad) notifyReauthNeeded();
   void announceGroupReadyOnce(bot);
 
   // message_reaction and poll_answer are opt-in — Telegram omits them from the default update set unless

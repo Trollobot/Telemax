@@ -84,7 +84,9 @@ on_error() {
   # writing it (build ok, restart failed) it must not survive, or the bot cheerfully announces a
   # version that never started.
   rm -f data/update-completed
-  notify "❌ Обновление не удалось на шаге «${STEP}» — мост продолжает работать на прежней версии. Подробности: cat $(pwd)/data/update.log"
+  # Reached only on steps that do their own rollback-free exit (fetch/verify happen before the tree
+  # moves), so don't promise anything about the running bridge beyond what we know.
+  notify "❌ Обновление не удалось на шаге «${STEP}». Подробности на сервере: cat $(pwd)/data/update.log"
 }
 trap on_error ERR
 
@@ -137,6 +139,15 @@ try_source() {
     echo "[update] ${label}: подпись тега ${tag} НЕ прошла проверку"
     return 1
   fi
+  # A reachable but STALE source must not beat a fresh one. `git merge --ff-only <ancestor>` prints
+  # "Already up to date" and exits 0, so an origin frozen at an older release would silently produce a
+  # "successful update" to a version OLDER than the one installed, and the mirror holding the real
+  # release would never be tried. (Not hypothetical here: GitHub is frozen while the mirror carries
+  # the current releases.) Require the candidate to contain what we already have.
+  if ! git merge-base --is-ancestor "$PREV_HEAD" "$CANDIDATE" 2>/dev/null; then
+    echo "[update] ${label}: там версия старее установленной или история разошлась — не подходит"
+    return 1
+  fi
   SIGNED_TAG="$tag"
   echo "[update] ${label}: подпись релиза OK (ssh): ${tag}"
   return 0
@@ -155,10 +166,31 @@ if ! try_source origin "GitHub"; then
   fi
 fi
 
+# What commit is ACTUALLY running? The bridge bakes GIT_COMMIT into its image, so this is the only
+# honest answer — the git tree alone isn't one.
+deployed_commit() {
+  local cid out
+  cid=$(docker compose ps -q 2>/dev/null | head -1) || cid=""
+  [ -n "$cid" ] || return 0
+  out=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$cid" 2>/dev/null) || out=""
+  printf '%s' "$out" | sed -n 's/^GIT_COMMIT=//p' | head -1 || true
+  return 0
+}
+
+# Comparing the git tree alone would be a trap: an interrupt anywhere between the merge and a
+# successful restart (kill -9, OOM, reboot, a failed `up -d`) leaves the tree on the NEW commit while
+# the container still runs the OLD image — or nothing runs at all. Every later run would then say
+# "уже на последней версии" and do nothing, and re-running update.sh by hand — the documented way out
+# — would be a guaranteed no-op. Only skip the work when the running container really is this commit.
 if [ "$CANDIDATE" = "$PREV_HEAD" ]; then
-  echo "[update] уже на последней версии (${SIGNED_TAG}) — обновлять нечего."
-  notify "ℹ️ Обновление не требуется: уже установлена последняя версия (${SIGNED_TAG})."
-  exit 0
+  DEPLOYED=$(deployed_commit)
+  if [ -n "$DEPLOYED" ] && [ "$DEPLOYED" = "$PREV_HEAD" ]; then
+    echo "[update] уже на последней версии (${SIGNED_TAG}) — обновлять нечего."
+    notify "ℹ️ Обновление не требуется: уже установлена последняя версия (${SIGNED_TAG})."
+    exit 0
+  fi
+  echo "[update] исходники уже на ${SIGNED_TAG}, но запущено не это — пересобираю и перезапускаю."
+  notify "🔧 Исходники уже на последней версии, но работает не она — пересобираю."
 fi
 
 # Only now is the working tree allowed to move.
@@ -171,9 +203,21 @@ echo "[update] обновлено до ${SIGNED_TAG} ($(git rev-parse --short HE
 
 # Anything that fails from here on has already moved the tree — put it back, so "мост продолжает
 # работать на прежней версии" stays true and the next attempt starts from a known state.
+# Restoring the SOURCES alone left the broken new container running (compose restarts it forever with
+# `unless-stopped`) or nothing running at all — the bridge down, no bot left to press «Обновить» with,
+# and the watcher only ever reacts to a marker the bot writes. That is a dead end no later release can
+# reach. Bring the previous version back UP too; rebuilding it is cheap now that GIT_COMMIT is the
+# last Dockerfile layer (measured: 1.6s).
 rollback() {
   git merge --abort >/dev/null 2>&1 || true
   git reset --hard "$PREV_HEAD" >/dev/null 2>&1 || true
+  rm -f data/update-completed
+  if GIT_COMMIT=$(git rev-parse HEAD) docker compose up -d --build >/dev/null 2>&1; then
+    echo "[update] откат выполнен: вернул прежнюю версию и поднял контейнер"
+  else
+    echo "[update] ОТКАТ НЕ УДАЛСЯ — мост может быть остановлен"
+    notify "⚠️ Откат на прежнюю версию не удался — мост может быть остановлен. Нужен ручной запуск на сервере: cd $(pwd) && docker compose up -d --build"
+  fi
 }
 
 # Pin the compose project name explicitly (0.6.4). It used to be re-derived from the directory
@@ -215,7 +259,15 @@ echo "[update] restarting..."
 # The container runs as the unprivileged node user (uid 1000) — ./data must be
 # writable by it; older installs created it root-owned, fix on every update.
 chown -R 1000:1000 data 2>/dev/null || true
-docker compose up -d
+# The one post-merge step that had no rollback: `up -d` recreates the container, so a failure here
+# (port taken, bad mount, no disk, a broken compose file in the new release) left the bridge fully
+# down while the ERR trap cheerfully reported "мост продолжает работать на прежней версии".
+if ! docker compose up -d; then
+  rm -f data/update-completed
+  rollback
+  notify "❌ Не удалось запустить контейнер новой версии — вернул прежнюю. Проверьте: docker compose logs"
+  exit 1
+fi
 
 # "Поднялся" used to mean `sleep 5` + "is something running?", which a container in a crash-restart
 # loop passes just as happily as a healthy one (compose restarts it with `unless-stopped`). Watch it
