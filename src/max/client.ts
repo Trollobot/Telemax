@@ -101,6 +101,15 @@ function toChatId(chatId: unknown): bigint {
   return typeof chatId === 'bigint' ? chatId : BigInt(chatId as string | number);
 }
 
+/**
+ * User/contact ids share chatId's overflow trap: bot accounts (@id…_bot) have ids above 2^32
+ * (seen live: 4725009270), which a plain number degrades to float64 and the server rejects
+ * with "Ошибка валидации". Repack every outgoing user id the same way.
+ */
+function toUserId(id: unknown): bigint {
+  return typeof id === 'bigint' ? id : BigInt(id as string | number);
+}
+
 interface ResolvedOptions {
   host: string;
   port: number;
@@ -524,7 +533,7 @@ export class MaxClient extends EventEmitter {
     const cid = this.nextCid();
     const link = replyTo ? { type: 'REPLY', messageId: replyTo.messageId, chatId: toChatId(replyTo.chatId) } : null;
     const { dir, payload } = await this.request(OPCODES.MSG_SEND, {
-      userId: Number(userId),
+      userId: toUserId(userId),
       message: { text, cid: BigInt(cid), elements: [], attaches, link },
       notify: true,
     });
@@ -609,7 +618,7 @@ export class MaxClient extends EventEmitter {
    * this tries the plausible ones rather than assuming `contacts`.
    */
   async getContactInfo(contactIds: unknown[]): Promise<MaxContactInfo[]> {
-    const { dir, payload } = await this.request(OPCODES.CONTACT_INFO, { contactIds });
+    const { dir, payload } = await this.request(OPCODES.CONTACT_INFO, { contactIds: contactIds.map(toUserId) });
     if (dir === DIR.ERR) throw new Error(describeAuthError(payload, 'CONTACT_INFO failed'));
     const p = payload as { contacts?: MaxContactInfo[]; profiles?: MaxContactInfo[] } | null;
     if (p && Array.isArray(p.contacts)) return p.contacts;
@@ -707,7 +716,7 @@ export class MaxClient extends EventEmitter {
     const { dir, payload } = await this.request(OPCODES.MSG_SEND, {
       message: {
         cid: BigInt(this.nextCid()),
-        attaches: [{ _type: 'CONTROL', event: 'new', chatType, title, userIds }],
+        attaches: [{ _type: 'CONTROL', event: 'new', chatType, title, userIds: userIds.map(toUserId) }],
       },
       notify: true,
     });
@@ -719,7 +728,7 @@ export class MaxClient extends EventEmitter {
 
   /** `operation: 'add' | 'remove'`. */
   async updateChatMembers(chatId: unknown, userIds: number[], operation: 'add' | 'remove', showHistory = true): Promise<void> {
-    const { dir, payload } = await this.request(OPCODES.CHAT_MEMBERS, { chatId: toChatId(chatId), userIds, showHistory, operation });
+    const { dir, payload } = await this.request(OPCODES.CHAT_MEMBERS, { chatId: toChatId(chatId), userIds: userIds.map(toUserId), showHistory, operation });
     if (dir === DIR.ERR) throw new Error(describeAuthError(payload, 'CHAT_MEMBERS failed'));
   }
 
