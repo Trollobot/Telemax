@@ -15,7 +15,9 @@ REPO_URL="https://github.com/Trollobot/Telemax.git"
 MIRROR_GIT_URL="${MIRROR_GIT_URL:-https://zergont-gate.duckdns.org/Telemax.git}"
 # Overridable so a SECOND, independent bridge can live on the same host (different bot, different
 # group, different MAX account):  curl -fsSL <...>/install.sh | INSTALL_DIR=/opt/telemax-2 bash
-INSTALL_DIR="${INSTALL_DIR:-/opt/telemax}"
+# An EXPLICIT dir means the caller already decided what to do — the existing-bridges menu below
+# stays out of the way (keeps the documented one-liner and any automation non-interactive).
+if [ -n "${INSTALL_DIR:-}" ]; then INSTALL_DIR_EXPLICIT=1; else INSTALL_DIR_EXPLICIT=0; INSTALL_DIR=/opt/telemax; fi
 # The maintainer's release-signing key, pinned HERE as well as in the repo's allowed_signers:
 # update.sh trusts whatever allowed_signers the checkout carries, so a tampered clone (a
 # compromised transport swapping in an attacker's key) would otherwise bootstrap a poisoned
@@ -44,13 +46,6 @@ printf 'Dpkg::Options { "--force-confdef"; "--force-confold"; };\n' > "$APT_NI_S
 trap 'rm -f "$APT_NI_SNIPPET"' EXIT
 # Same two flags for direct dpkg calls (unquoted on purpose — it must split into two arguments).
 DPKG_NI="--force-confdef --force-confold"
-
-# Everything below is also written to a log file — attach it to a bug report if something fails.
-# Per-directory, so a second install doesn't interleave its output into the first one's log.
-INSTALL_SLUG=$(basename "$INSTALL_DIR" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]//g')
-INSTALL_LOG="/var/log/telemax-install-${INSTALL_SLUG:-telemax}.log"
-exec > >(tee -a "$INSTALL_LOG") 2>&1
-echo "(лог установки: $INSTALL_LOG)"
 
 # Best-effort apt wrapper. Some VPS images ship with an unrelated package
 # already broken (seen live — initramfs-tools' dhcpcd hook failing on a
@@ -128,9 +123,171 @@ preflight() {
   [ "$fail" -eq 0 ]
 }
 
-bold "=== Telemax — установка на чистый сервер ==="
+bold "=== Telemax — установка ==="
+
+# ---------------------------------------------------------------------------
+# Existing bridges: find every configured install on this host and, when the
+# run is interactive and the caller didn't pin INSTALL_DIR, offer a menu —
+# update/reconfigure one, add another, or remove one/all. Sources: the 0.6.4
+# auto-update registry, Docker compose labels (catches installs that predate
+# the registry or fell out of it) and the default /opt/telemax* location.
+# A "bridge" = a directory holding a Telemax checkout (docker-compose.yml +
+# update-watcher.sh). One without .env — an interrupted install — is listed as
+# «не настроен», so the menu can finish or remove it instead of losing it.
+# ---------------------------------------------------------------------------
+discover_installs() {
+  {
+    cat /etc/telemax/instances 2>/dev/null || true
+    docker ps -a --format '{{.Label "com.docker.compose.project.working_dir"}}' 2>/dev/null || true
+    ls -d /opt/telemax* 2>/dev/null || true
+  } | sort -u | while IFS= read -r d; do
+    if [ -n "$d" ] && [ -f "$d/docker-compose.yml" ] && [ -f "$d/update-watcher.sh" ]; then printf '%s\n' "$d"; fi
+  done
+}
+install_version() { sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' "$1/package.json" 2>/dev/null | head -1; }
+install_status() {
+  if [ ! -f "$1/.env" ]; then printf '⚙️ не настроен'; return 0; fi
+  # Container names live under the compose project name — setup.sh writes it into .env
+  # since 0.6.4; older installs derive it from the directory basename (same rule).
+  local name
+  name=$(sed -n 's/^COMPOSE_PROJECT_NAME=//p' "$1/.env" 2>/dev/null | head -1 | tr -d "\"'")
+  [ -n "$name" ] || name=$(basename "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]//g')
+  if [ -n "$(docker ps -q --filter "label=com.docker.compose.project=$name" 2>/dev/null)" ]; then
+    printf '🟢 работает'
+  elif [ -n "$(docker ps -aq --filter "label=com.docker.compose.project=$name" 2>/dev/null)" ]; then
+    printf '🔴 остановлен'
+  else
+    printf '⚪ контейнера нет'
+  fi
+}
+# Saves the only irreplaceable parts (.env = tokens/keys, data/ = MAX session + chat map)
+# before anything destructive. Prints the archive path, or nothing if there was nothing to save.
+backup_install() {
+  local dir="$1" slug out items=()
+  slug=$(basename "$dir" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]//g')
+  out="/root/telemax-backup-${slug:-telemax}-$(date +%Y%m%d-%H%M%S).tar.gz"
+  [ -f "$dir/.env" ] && items+=(.env)
+  [ -d "$dir/data" ] && items+=(data)
+  if [ "${#items[@]}" -gt 0 ] && tar -czf "$out" -C "$dir" "${items[@]}" 2>/dev/null; then
+    printf '%s' "$out"
+  fi
+}
+delete_install() {
+  local dir="$1" bak
+  echo "Удаляю мост в $dir..."
+  bak=$(backup_install "$dir")
+  if [ -n "$bak" ]; then echo "  На всякий случай настройки и данные сохранены: $bak"; fi
+  if command -v docker >/dev/null 2>&1 && [ -f "$dir/docker-compose.yml" ]; then
+    (cd "$dir" && docker compose down -v --rmi local --remove-orphans) </dev/null || true
+  fi
+  rm -rf "$dir"
+  if [ -f /etc/telemax/instances ]; then
+    grep -vxF "$dir" /etc/telemax/instances > /etc/telemax/instances.tmp 2>/dev/null || true
+    mv /etc/telemax/instances.tmp /etc/telemax/instances
+  fi
+  git config --system --fixed-value --unset-all safe.directory "$dir" 2>/dev/null || true
+  echo "  Мост $dir удалён."
+}
+# The auto-update timer, dispatcher and registry are host-shared — remove them only when the
+# LAST bridge is gone. Docker and Fail2ban stay: they belong to the server, not to Telemax.
+maybe_remove_updater() {
+  if [ -z "$(discover_installs)" ]; then
+    systemctl disable --now telemax-updater.timer >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/telemax-updater.timer /etc/systemd/system/telemax-updater.service /usr/local/sbin/telemax-updater
+    rm -f /etc/telemax/instances
+    rmdir /etc/telemax 2>/dev/null || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    echo "Это был последний мост — общий таймер автообновления тоже убран (Docker и Fail2ban не тронуты: они серверные)."
+  fi
+}
+# Prints the chosen directory from EXISTING, or nothing on a bad answer. With a single
+# install there is nothing to ask.
+pick_install() {
+  local n="${#EXISTING[@]}" c=""
+  if [ "$n" -eq 1 ]; then printf '%s' "${EXISTING[0]}"; return 0; fi
+  read -rp "$1 [1-$n]: " c </dev/tty || true
+  case "$c" in '' | *[!0-9]*) return 0 ;; esac
+  if [ "$c" -ge 1 ] && [ "$c" -le "$n" ]; then printf '%s' "${EXISTING[$((c - 1))]}"; fi
+}
+
+CLEAN_REINSTALL=0
+if [ "$INSTALL_DIR_EXPLICIT" -eq 0 ] && bash -c ': </dev/tty' 2>/dev/null; then
+  mapfile -t EXISTING < <(discover_installs)
+  if [ "${#EXISTING[@]}" -gt 0 ]; then
+    echo "На этом сервере уже есть мост(ы) Telemax:"
+    _i=1
+    for _d in "${EXISTING[@]}"; do
+      printf '  %d) %s — v%s, %s\n' "$_i" "$_d" "$(install_version "$_d")" "$(install_status "$_d")"
+      _i=$((_i + 1))
+    done
+    echo
+    echo "Что сделать?"
+    echo "  1) Обновить или перенастроить существующий мост"
+    echo "  2) Установить ещё один, НОВЫЙ мост (ему нужны свой бот, своя группа и свой номер MAX)"
+    echo "  3) Удалить мост"
+    echo "  0) Ничего, выйти"
+    MENU_CHOICE=""
+    read -rp "Выбор [1]: " MENU_CHOICE </dev/tty || true
+    case "${MENU_CHOICE:-1}" in
+      2)
+        _i=2
+        while [ -e "/opt/telemax-$_i" ]; do _i=$((_i + 1)); done
+        NEW_DIR=""
+        read -rp "Каталог для нового моста [/opt/telemax-$_i]: " NEW_DIR </dev/tty || true
+        INSTALL_DIR="${NEW_DIR:-/opt/telemax-$_i}"
+        ;;
+      3)
+        TARGET=""
+        if [ "${#EXISTING[@]}" -gt 1 ]; then
+          echo "Какой удалить? (0 — ВСЕ мосты)"
+          DEL_CHOICE=""
+          read -rp "Номер [ничего не удалять]: " DEL_CHOICE </dev/tty || true
+          if [ "$DEL_CHOICE" = "0" ]; then TARGET="ALL"; else
+            case "$DEL_CHOICE" in *[!0-9]* | '') TARGET="" ;; *)
+              if [ "$DEL_CHOICE" -ge 1 ] && [ "$DEL_CHOICE" -le "${#EXISTING[@]}" ]; then TARGET="${EXISTING[$((DEL_CHOICE - 1))]}"; fi ;;
+            esac
+          fi
+        else
+          TARGET="${EXISTING[0]}"
+        fi
+        if [ -z "$TARGET" ]; then echo "Не понял выбор — ничего не удаляю."; exit 0; fi
+        if [ "$TARGET" = "ALL" ]; then
+          echo "⚠️  Будут удалены ВСЕ мосты: контейнеры, образы и каталоги со всеми данными."
+        else
+          echo "⚠️  Будет удалён мост $TARGET: контейнер, образ и каталог со всеми данными."
+        fi
+        CONFIRM=""
+        read -rp "Точно? Введите «да»: " CONFIRM </dev/tty || true
+        case "$CONFIRM" in да | Да | ДА) : ;; *) echo "Отменено — ничего не удалял."; exit 0 ;; esac
+        if [ "$TARGET" = "ALL" ]; then
+          for _d in "${EXISTING[@]}"; do delete_install "$_d"; done
+        else
+          delete_install "$TARGET"
+        fi
+        maybe_remove_updater
+        echo "Готово."
+        exit 0
+        ;;
+      0)
+        echo "Выход — ничего не менял."
+        exit 0
+        ;;
+      *)
+        TARGET=$(pick_install "Какой мост обновить/перенастроить?")
+        if [ -z "$TARGET" ]; then echo "Не понял выбор — выхожу, ничего не менял."; exit 0; fi
+        INSTALL_DIR="$TARGET"
+        echo "  1) Обновить (настройки сохраняются, откроется меню настроек)"
+        echo "  2) Переустановить НАЧИСТО (настройки и данные сбросить; перед этим сохраню их в бэкап)"
+        SUB_CHOICE=""
+        read -rp "Выбор [1]: " SUB_CHOICE </dev/tty || true
+        if [ "${SUB_CHOICE:-1}" = "2" ]; then CLEAN_REINSTALL=1; fi
+        ;;
+    esac
+  fi
+fi
+
 echo "Каталог установки: $INSTALL_DIR"
-if [ -f "$INSTALL_DIR/.env" ]; then
+if [ -f "$INSTALL_DIR/.env" ] && [ "$CLEAN_REINSTALL" -eq 0 ]; then
   echo
   echo "ℹ️  В $INSTALL_DIR уже есть НАСТРОЕННАЯ установка — обновлю её и открою меню настроек."
   echo "    Нужен ВТОРОЙ независимый мост на этом сервере? Укажите другой каталог:"
@@ -138,6 +295,14 @@ if [ -f "$INSTALL_DIR/.env" ]; then
   echo "    (у него должен быть свой бот, своя группа и свой номер MAX)"
 fi
 echo
+
+# Everything below is also written to a log file — attach it to a bug report if something fails.
+# Per-directory, so a second install doesn't interleave its output into the first one's log.
+# After the menu on purpose: the log belongs to the directory the user actually chose.
+INSTALL_SLUG=$(basename "$INSTALL_DIR" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]//g')
+INSTALL_LOG="/var/log/telemax-install-${INSTALL_SLUG:-telemax}.log"
+exec > >(tee -a "$INSTALL_LOG") 2>&1
+echo "(лог установки: $INSTALL_LOG)"
 
 echo "[0/6] Проверяю сервер..."
 preflight || { echo "❌ Сервер не подходит для установки — см. причины выше."; exit 1; }
@@ -289,6 +454,19 @@ if ! grep -qxF "$EXPECTED_SIGNER" allowed_signers 2>/dev/null; then
   echo "❌ Ключ подписи релизов в скачанном репозитории не совпадает с ожидаемым."
   echo "   Возможна компрометация источника (GitHub/зеркала) — установка остановлена."
   exit 1
+fi
+
+# Clean reinstall (menu choice): wipe the configuration and the bridge state so setup.sh
+# runs its first-time flow. The backup happens HERE, right before the wipe — not at menu
+# time — so it captures the very last state. The git checkout stays (already updated above).
+if [ "$CLEAN_REINSTALL" -eq 1 ]; then
+  echo
+  echo "Переустановка начисто: сбрасываю настройки и данные..."
+  BAK=$(backup_install "$INSTALL_DIR")
+  if [ -n "$BAK" ]; then echo "  Старые настройки и данные сохранены: $BAK"; fi
+  docker compose down -v --remove-orphans </dev/null 2>/dev/null || true
+  rm -f .env
+  rm -rf data
 fi
 
 echo
