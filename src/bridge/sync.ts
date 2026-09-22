@@ -1294,6 +1294,29 @@ export function wireBridge({
    * to the push's `message.sender` and fetches that one contact's CONTACT_INFO
    * fresh, caching it for later /info calls and future auto-cards.
    */
+  /**
+   * Renames a topic stuck on a fallback title («MAX chat <id>») the moment the contact's
+   * profile becomes known — the auto-card's CONTACT_INFO fetch is exactly that moment.
+   * Closes the race where a fresh dialog's CHAT_UPDATE arrives BEFORE the profile is
+   * cached: the retro-rename in handleMaxChatUpdate then resolves a fallback name and
+   * correctly skips, and no later trigger fires if the contact doesn't write again
+   * (seen live on prod 2026-09-22: topic stayed «MAX chat 484245649» while the pinned
+   * card already showed the person's name).
+   */
+  async function renameFallbackTopic(chatId: unknown, contactId: number, profile: ContactProfile | undefined): Promise<void> {
+    const name = resolveContactDisplayName(contactId, profile);
+    if (/^MAX ID /.test(name)) return; // profile fetch failed — still nothing real to rename to
+    const mapping = await chatMapStore.getByMaxChatId(chatId);
+    if (!mapping || (mapping.title && !/^(CHAT|DIALOG|Chat|MAX chat|MAX ID) /i.test(mapping.title))) return;
+    try {
+      await bot.telegram.editForumTopic(targetGroupId, mapping.telegramTopicId, { name: name.slice(0, 128) });
+      await chatMapStore.upsert({ ...mapping, title: name });
+      logger.info(`Renamed topic ${mapping.telegramTopicId} for MAX chat ${String(chatId)} -> "${name}" (profile learned via auto-card)`);
+    } catch (err) {
+      logger.error('Failed to rename topic after contact profile fetch', err);
+    }
+  }
+
   async function sendAutoInfoCard(chatId: unknown, senderId: unknown, topicId: number): Promise<void> {
     const { chat, otherId, profile } = resolveDialogContact(String(chatId));
     if (chat) {
@@ -1314,6 +1337,7 @@ export function wireBridge({
             logger.error(`Failed to fetch CONTACT_INFO for dialog contact ${otherId}`, err);
           }
         }
+        await renameFallbackTopic(chatId, otherId, dialogProfile);
         const messageId = await sendContactInfoCard(bot, targetGroupId, topicId, chat.title || `MAX chat ${String(chatId)}`, 'DIALOG', count, otherId, dialogProfile);
         await pinInfoCard(bot, targetGroupId, messageId);
         return;
@@ -1335,6 +1359,7 @@ export function wireBridge({
         logger.error(`Failed to fetch CONTACT_INFO for new contact ${id}`, err);
       }
     }
+    await renameFallbackTopic(chatId, id, senderProfile);
     const messageId = await sendContactInfoCard(bot, targetGroupId, topicId, `MAX ID ${id}`, 'DIALOG', undefined, id, senderProfile);
     await pinInfoCard(bot, targetGroupId, messageId);
   }
