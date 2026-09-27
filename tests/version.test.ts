@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseChangelogMd, assembleChangelog } from '../src/bridge/version.js';
+import { parseChangelogMd, assembleChangelog, isNewerVersion } from '../src/bridge/version.js';
 
 const SAMPLE = `# Changelog
 
@@ -62,5 +62,20 @@ describe('assembleChangelog', () => {
     const out = assembleChangelog(map, 'dev', []);
     expect(out[0]).toBe('v0.4.10');
     expect(out).toContain('новое в 8');
+  });
+});
+
+describe('isNewerVersion (the one updateAvailable rule for GitHub and the mirror)', () => {
+  it('is true only for a strictly newer X.Y.Z, with or without the v prefix', () => {
+    expect(isNewerVersion('1.0.2', '1.0.1')).toBe(true);
+    expect(isNewerVersion('v1.1.0', '1.0.9')).toBe(true);
+    expect(isNewerVersion('1.0.10', '1.0.9')).toBe(true); // numeric, not string, compare
+    expect(isNewerVersion('1.0.1', '1.0.1')).toBe(false);
+    expect(isNewerVersion('1.0.0', '1.0.1')).toBe(false);
+  });
+
+  it('never reports an update when either side is not a version', () => {
+    expect(isNewerVersion('9.9.9', 'unknown')).toBe(false);
+    expect(isNewerVersion('garbage', '1.0.0')).toBe(false);
   });
 });

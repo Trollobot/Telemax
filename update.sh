@@ -79,13 +79,29 @@ notify() {
 }
 
 STEP="старт"
+# Set to 1 once the working tree has moved (right after the merge) and back to 0 once the new
+# version has passed the liveness check. While it is 1, ANY unexpected failure must roll back —
+# not only the build / up -d / liveness steps that handle their own: an error in between (writing
+# data/update-completed or COMPOSE_PROJECT_NAME on a full disk, `docker compose ps` under pipefail)
+# used to leave the tree on the new commit with the old container still running, and nothing
+# retried until the next «Обновить».
+ROLLBACK_ON_ERROR=0
 on_error() {
   # update-completed is what the NEW container reports as "✅ Обновлено" on boot. If we die after
   # writing it (build ok, restart failed) it must not survive, or the bot cheerfully announces a
   # version that never started.
   rm -f data/update-completed
-  # Reached only on steps that do their own rollback-free exit (fetch/verify happen before the tree
-  # moves), so don't promise anything about the running bridge beyond what we know.
+  if [ "$ROLLBACK_ON_ERROR" = "1" ]; then
+    ROLLBACK_ON_ERROR=0
+    # A failed rollback has already sent its own «откат не удался» warning — nothing may follow it
+    # claiming the old version is back (review 2026-09-26, shell-r1#2).
+    if rollback; then
+      notify "❌ Обновление не удалось на шаге «${STEP}» — вернул прежнюю версию. Подробности на сервере: cat $(pwd)/data/update.log"
+    fi
+    return 0
+  fi
+  # Before the merge (fetch/verify) the tree hasn't moved, so there is nothing to roll back — and
+  # don't promise anything about the running bridge beyond what we know.
   notify "❌ Обновление не удалось на шаге «${STEP}». Подробности на сервере: cat $(pwd)/data/update.log"
 }
 trap on_error ERR
@@ -112,6 +128,14 @@ fi
 if ! command -v ssh-keygen >/dev/null 2>&1; then
   STEP="проверка подписи релиза"
   notify "❌ Обновление отклонено: нет ssh-keygen для проверки подписи (apt-get install -y openssh-client)."
+  exit 1
+fi
+# git reads SSH signatures only since 2.34 (Debian 11, Ubuntu 20.04 ship older): every tag failed
+# verification and the refusal below blamed the source (review 2026-09-27, shell-r3.1#5).
+GIT_V=$(git --version | awk '{print $3}')
+if ! printf '2.34\n%s\n' "$GIT_V" | sort -C -V; then
+  STEP="проверка подписи релиза"
+  notify "❌ Обновление невозможно: git ${GIT_V} не умеет проверять подписи релизов (нужен 2.34+). Установите git новее (на Debian 11 — из bullseye-backports) или обновите ОС до Ubuntu 22.04+ / Debian 12+. Рабочая версия НЕ тронута."
   exit 1
 fi
 
@@ -203,10 +227,20 @@ if [ "$CANDIDATE" = "$PREV_HEAD" ]; then
   fi
   echo "[update] исходники уже на ${SIGNED_TAG}, но запущено не это — пересобираю и перезапускаю."
   notify "🔧 Исходники уже на последней версии, но работает не она — пересобираю."
+  # PREV_HEAD is the NEW commit here: a rollback to it rebuilt the very version that had just failed
+  # and reported «вернул прежнюю». Roll back to what actually runs (review 2026-09-27, shell-r3.1#0).
+  if [ -n "$DEPLOYED" ] && git cat-file -e "${DEPLOYED}^{commit}" 2>/dev/null; then PREV_HEAD="$DEPLOYED"; fi
 fi
 
 # Only now is the working tree allowed to move.
 STEP="применение обновления"
+# Refused up front: a merge that touches none of the edited files succeeds (and on the rebuild path
+# it is a no-op), and a failed build/start then wiped the edits with rollback's reset --hard
+# (review 2026-09-27, shell-r3.3#1). fileMode off: a lost exec bit is no edit.
+if ! git -c core.fileMode=false diff --quiet HEAD --; then
+  notify "❌ Обновление отклонено: в исходниках есть локальные правки (git status покажет, какие). Рабочая версия НЕ тронута."
+  exit 1
+fi
 if ! git merge --ff-only "$CANDIDATE" >/dev/null 2>&1; then
   notify "❌ Обновление отклонено: локальные изменения мешают обновиться (нужен fast-forward). Рабочая версия НЕ тронута."
   exit 1
@@ -220,17 +254,34 @@ echo "[update] обновлено до ${SIGNED_TAG} ($(git rev-parse --short HE
 # and the watcher only ever reacts to a marker the bot writes. That is a dead end no later release can
 # reach. Bring the previous version back UP too; rebuilding it is cheap now that GIT_COMMIT is the
 # last Dockerfile layer (measured: 1.6s).
+# Returns non-zero when the previous version could not be brought back up (it has then already sent
+# the «откат не удался» warning) — callers send their «вернул прежнюю версию» only on success, and
+# always call it as an `if` condition, so a failed rollback doesn't re-enter the ERR trap.
 rollback() {
+  if [ "$PREV_HEAD" = "$CANDIDATE" ]; then
+    echo "[update] откатываться не на что: прежняя версия неизвестна"
+    notify "⚠️ Откатиться не на что: неизвестно, какая версия работала до обновления, — мост может быть остановлен. Проверьте на сервере: cd $(pwd) && docker compose logs"
+    return 1
+  fi
   git merge --abort >/dev/null 2>&1 || true
   git reset --hard "$PREV_HEAD" >/dev/null 2>&1 || true
   rm -f data/update-completed
-  if GIT_COMMIT=$(git rev-parse HEAD) docker compose up -d --build >/dev/null 2>&1; then
+  local rc=0
+  GIT_COMMIT=$(git rev-parse HEAD) docker compose up -d --build >/dev/null 2>&1 || rc=$?
+  # A running commit off the release line (deployed by hand from another branch) is rebuilt, but the
+  # tree goes back to the release it was on: left on that commit, every later update was refused as a
+  # diverged history (review 2026-09-27, shell-r3.2#1). The next run then retries the rebuild.
+  git merge-base --is-ancestor "$PREV_HEAD" "$CANDIDATE" 2>/dev/null || git reset --hard "$CANDIDATE" >/dev/null 2>&1 || true
+  if [ "$rc" -eq 0 ]; then
     echo "[update] откат выполнен: вернул прежнюю версию и поднял контейнер"
-  else
-    echo "[update] ОТКАТ НЕ УДАЛСЯ — мост может быть остановлен"
-    notify "⚠️ Откат на прежнюю версию не удался — мост может быть остановлен. Нужен ручной запуск на сервере: cd $(pwd) && docker compose up -d --build"
+    return 0
   fi
+  echo "[update] ОТКАТ НЕ УДАЛСЯ — мост может быть остановлен"
+  notify "⚠️ Откат на прежнюю версию не удался — мост может быть остановлен. Нужен ручной запуск на сервере: cd $(pwd) && docker compose up -d --build"
+  return 1
 }
+# From here until the liveness check passes, the ERR trap rolls back too (see on_error).
+ROLLBACK_ON_ERROR=1
 
 # Pin the compose project name explicitly (0.6.4). It used to be re-derived from the directory
 # basename on every single command, so renaming the directory orphaned the running container, and
@@ -252,8 +303,10 @@ fi
 STEP="сборка образа"
 echo "[update] building (GIT_COMMIT=$(git rev-parse --short HEAD))..."
 if ! GIT_COMMIT=$(git rev-parse HEAD) docker compose build; then
-  rollback
-  notify "❌ Обновление не удалось на шаге «${STEP}» — вернул прежнюю версию, мост продолжает работать. Подробности: cat $(pwd)/data/update.log"
+  ROLLBACK_ON_ERROR=0
+  if rollback; then
+    notify "❌ Обновление не удалось на шаге «${STEP}» — вернул прежнюю версию, мост продолжает работать. Подробности: cat $(pwd)/data/update.log"
+  fi
   exit 1
 fi
 
@@ -275,9 +328,11 @@ chown -R 1000:1000 data 2>/dev/null || true
 # (port taken, bad mount, no disk, a broken compose file in the new release) left the bridge fully
 # down while the ERR trap cheerfully reported "мост продолжает работать на прежней версии".
 if ! docker compose up -d; then
+  ROLLBACK_ON_ERROR=0
   rm -f data/update-completed
-  rollback
-  notify "❌ Не удалось запустить контейнер новой версии — вернул прежнюю. Проверьте: docker compose logs"
+  if rollback; then
+    notify "❌ Не удалось запустить контейнер новой версии — вернул прежнюю. Проверьте: docker compose logs"
+  fi
   exit 1
 fi
 
@@ -299,11 +354,15 @@ alive() {
   return 0
 }
 if ! alive; then
+  ROLLBACK_ON_ERROR=0
   rm -f data/update-completed
-  rollback
-  notify "❌ Контейнер не поднялся (или перезапускается по кругу) после обновления — вернул прежнюю версию исходников. Проверьте: docker compose logs"
+  if rollback; then
+    notify "❌ Контейнер не поднялся (или перезапускается по кругу) после обновления — вернул прежнюю версию исходников. Проверьте: docker compose logs"
+  fi
   exit 1
 fi
+# The new version is up and verified — nothing after this point may roll it back.
+ROLLBACK_ON_ERROR=0
 
 # Every rebuild retags `latest` onto the new image, leaving the previous one
 # (the biggest chunk of disk churn per update — this image is ~2GB, mostly

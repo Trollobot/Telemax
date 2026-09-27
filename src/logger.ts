@@ -41,7 +41,7 @@ const SECRET_KEYS = new Set([
   'code',
   'apiKey',
   // CHECK_PASSWORD's request payload — without these the MAX account password
-  // went to the web-panel packet log in plain text.
+  // went to the packet log in plain text.
   'password',
   'trackId',
   // PII, not a credential — but the packet log has no reason to show raw phone numbers.
@@ -55,7 +55,7 @@ const SECRET_KEYS = new Set([
 // human-readable content; mask them all regardless of key.
 const LONG_STRING_THRESHOLD = 512;
 
-/** Recursively redacts known secret-bearing keys (and any suspiciously long string) before logging or sending to the UI. */
+/** Recursively redacts known secret-bearing keys (and any suspiciously long string) before logging. */
 export function redactSecrets(value: unknown, seen = new Set<unknown>()): unknown {
   if (typeof value === 'string') return value.length >= LONG_STRING_THRESHOLD ? maskString(value) : value;
   if (value === null || typeof value !== 'object') return value;

@@ -7,10 +7,37 @@
  * accounts/builds — the reference doc itself falls back to scanning the raw
  * response for the msgpack str16 marker rather than trusting a field number.
  * We do the equivalent after unpacking: walk the decoded object and return
- * whichever string is exactly 663 characters long.
+ * the first string that is exactly 663 characters long AND looks like a token.
+ *
+ * Length alone is not enough (review 2026-09-26, M5): a LOGIN OK response carries
+ * the whole account snapshot (chats with their last messages, messages, contacts,
+ * config), and any 663-char string in there — a channel post, a description — was
+ * taken for a rotated session token, saved, and bricked the session on the next
+ * resume. So the walk skips those snapshot branches, and a candidate must use the
+ * bearer-token alphabet only.
  */
 
 const SESSION_TOKEN_LENGTH = 663;
+
+/**
+ * RFC 6750 b64token alphabet: base64 and base64url letters, digits, `-._~+/`, trailing `=`
+ * padding. The live token's exact alphabet was never captured (tokens are only ever logged
+ * masked); anything that is a bearer token fits this, while text (spaces, Cyrillic,
+ * punctuation) and URLs (`:`, `?`, `&`, `%`) do not.
+ */
+const TOKEN_ALPHABET = /^[A-Za-z0-9\-._~+/]+=*$/;
+
+/**
+ * Account-snapshot branches of a LOGIN response (keys seen live: profile, chats, messages,
+ * contacts, presence, config, time, updates — see MaxClient.login). User content lives
+ * here, never the token, so the walk does not descend into them.
+ */
+const SNAPSHOT_KEYS = new Set(['profile', 'chats', 'messages', 'contacts', 'presence', 'config', 'updates']);
+
+/** True for a string of exactly `length` characters from the token alphabet. */
+export function looksLikeToken(value: string, length = SESSION_TOKEN_LENGTH): boolean {
+  return value.length === length && TOKEN_ALPHABET.test(value);
+}
 
 export function findAuthToken(payload: unknown): string | undefined {
   if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
@@ -22,16 +49,17 @@ export function findAuthToken(payload: unknown): string | undefined {
 
 export function findLongToken(value: unknown, length = SESSION_TOKEN_LENGTH, seen = new Set<unknown>()): string | undefined {
   if (typeof value === 'string') {
-    return value.length === length ? value : undefined;
+    return looksLikeToken(value, length) ? value : undefined;
   }
   if (!value || typeof value !== 'object') return undefined;
   if (seen.has(value)) return undefined; // guard against cyclic structures
   seen.add(value);
 
-  const children: Iterable<unknown> =
-    value instanceof Map ? value.values() : Array.isArray(value) ? value : Object.values(value as object);
+  const entries: Iterable<[unknown, unknown]> =
+    value instanceof Map ? value.entries() : Array.isArray(value) ? value.entries() : Object.entries(value as object);
 
-  for (const child of children) {
+  for (const [key, child] of entries) {
+    if (typeof key === 'string' && SNAPSHOT_KEYS.has(key)) continue;
     const found = findLongToken(child, length, seen);
     if (found) return found;
   }

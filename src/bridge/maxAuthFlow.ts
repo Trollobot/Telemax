@@ -1,9 +1,11 @@
 import { Markup, type Context } from 'telegraf';
 import { createLogger } from '../logger.js';
+import { maskPhone } from './status.js';
+import { isTransientMaxError } from './transient.js';
 
 const logger = createLogger('maxauth');
 
-/** The MAX auth steps this flow drives — same functions the web panel's /api/auth/* routes call. */
+/** The MAX auth steps this flow drives — implemented in server/app.ts (maxAuth*), the only place a MAX login happens. */
 export interface MaxAuthCallbacks {
   /** Last phone we authenticated with ('' if none) — lets the flow offer a one-tap re-auth. */
   getLastKnownPhone: () => string;
@@ -13,6 +15,19 @@ export interface MaxAuthCallbacks {
   verifyCode: (code: string) => Promise<{ ok: true } | { passwordRequired: true; hint: string | null }>;
   /** CHECK_PASSWORD: completes a 2FA login. */
   checkPassword: (password: string) => Promise<void>;
+}
+
+/**
+ * requestSms refusing because of the connection state (MAX paused, no connection), not the number:
+ * the flow shows the message alone and ends, instead of «Проверьте номер…» and waiting for a number
+ * that would only hit the same refusal (review 2026-09-26, client-r2#2). Likewise a code or password
+ * already spent on a LOGIN that then failed (review 2026-09-27, client-r3.1#2).
+ */
+export class MaxAuthUnavailableError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'MaxAuthUnavailableError';
+  }
 }
 
 export interface MaxAuthFlow {
@@ -34,13 +49,6 @@ interface Flow {
 // A half-finished auth conversation shouldn't linger forever (a stray later message would otherwise
 // be swallowed as auth input instead of becoming a bug report). Ten minutes is plenty for an SMS.
 const FLOW_TTL_MS = 10 * 60_000;
-
-/** +79959809587 -> +7•••••9587 (leading digit + last 4, rest masked) for display in chat. */
-function maskPhone(phone: string): string {
-  const digits = phone.replace(/\D/g, '');
-  if (digits.length < 5) return phone;
-  return `+${digits.slice(0, 1)}${'•'.repeat(Math.max(3, digits.length - 5))}${digits.slice(-4)}`;
-}
 
 export function createMaxAuthFlow(opts: { targetGroupId: string; auth: MaxAuthCallbacks }): MaxAuthFlow {
   const { targetGroupId, auth } = opts;
@@ -94,8 +102,26 @@ export function createMaxAuthFlow(opts: { targetGroupId: string; auth: MaxAuthCa
       setFlow(chatId, 'code');
       await ctx.reply('📲 Код отправлен по SMS. Пришлите его сюда одним сообщением.');
     } catch (err) {
+      if (await replyKnownError(ctx, chatId, err)) return;
       await ctx.reply(`❌ ${(err as Error).message}\nПроверьте номер и пришлите ещё раз, или /cancel.`);
     }
+  }
+
+  /**
+   * A MaxAuthUnavailableError is shown alone and ends the flow: resending would only hit it again.
+   * A timeout or dropped socket says nothing about the number, code or password: a plain retry hint
+   * instead of the raw English client error, and the flow stays open (review 2026-09-27, client-r3.3#0).
+   */
+  async function replyKnownError(ctx: Context, chatId: number, err: unknown): Promise<boolean> {
+    if (err instanceof MaxAuthUnavailableError) {
+      flows.delete(chatId);
+      await ctx.reply(`❌ ${err.message}`);
+      return true;
+    }
+    if (!isTransientMaxError(err)) return false;
+    logger.warn('MAX auth step failed on the connection', err);
+    await ctx.reply('❌ MAX не ответил — пришлите ещё раз или /cancel.');
+    return true;
   }
 
   async function announceAuthed(ctx: Context): Promise<void> {
@@ -183,6 +209,7 @@ export function createMaxAuthFlow(opts: { targetGroupId: string; auth: MaxAuthCa
             await announceAuthed(ctx);
           }
         } catch (err) {
+          if (await replyKnownError(ctx, chatId, err)) return true;
           await ctx.reply(`❌ ${(err as Error).message}\nПришлите код ещё раз или /cancel.`);
         }
         return true;
@@ -196,6 +223,7 @@ export function createMaxAuthFlow(opts: { targetGroupId: string; auth: MaxAuthCa
           await ctx.reply('🔐 Пароль принят.');
           await announceAuthed(ctx);
         } catch (err) {
+          if (await replyKnownError(ctx, chatId, err)) return true;
           await ctx.reply(`❌ Пароль не подошёл: ${(err as Error).message}\nПришлите пароль ещё раз или /cancel.`);
         }
         return true;

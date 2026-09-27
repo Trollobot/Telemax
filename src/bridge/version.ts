@@ -56,16 +56,23 @@ function cmpSemver(a: [number, number, number], b: [number, number, number]): nu
   return a[0] - b[0] || a[1] - b[1] || a[2] - b[2];
 }
 
+/** Whether `latest` is strictly newer than `current` — false when either isn't a plain X.Y.Z, so an
+ * unknown build never reports a false-positive update. Exported for tests. */
+export function isNewerVersion(latest: string, current: string): boolean {
+  const l = parseSemver(latest);
+  const c = parseSemver(current);
+  return l != null && c != null && cmpSemver(l, c) > 0;
+}
+
 /** Highest semver tag published on GitHub. Uses /tags (a plain `git push --tags` is enough — no
  * GitHub "Release" object required) and sorts by semver ourselves, since /tags isn't ordered. */
 async function fetchLatestTag(): Promise<LatestVersionInfo | null> {
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), GITHUB_API_TIMEOUT_MS);
+    // AbortSignal.timeout bounds the whole exchange, body included, with no timer to clear (A10).
     const res = await fetch(`https://api.github.com/repos/${REPO}/tags?per_page=100`, {
       headers: { Accept: 'application/vnd.github+json' },
-      signal: controller.signal,
-    }).finally(() => clearTimeout(timeout));
+      signal: AbortSignal.timeout(GITHUB_API_TIMEOUT_MS),
+    });
     if (!res.ok) {
       logger.error(`GitHub tags API returned ${res.status} ${res.statusText}`);
       return null;
@@ -113,11 +120,7 @@ export function parseChangelogMd(text: string): Record<string, string[]> {
  * Best-effort: {} on any failure (older tags predate the file). */
 async function fetchChangelogFromGitHub(tag: string): Promise<Record<string, string[]>> {
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), GITHUB_API_TIMEOUT_MS);
-    const res = await fetch(`https://raw.githubusercontent.com/${REPO}/${tag}/CHANGELOG.md`, {
-      signal: controller.signal,
-    }).finally(() => clearTimeout(timeout));
+    const res = await fetch(`https://raw.githubusercontent.com/${REPO}/${tag}/CHANGELOG.md`, { signal: AbortSignal.timeout(GITHUB_API_TIMEOUT_MS) });
     if (!res.ok) {
       logger.error(`GitHub raw CHANGELOG.md returned ${res.status} ${res.statusText}`);
       return {};
@@ -138,11 +141,7 @@ async function fetchLatestFromMirror(): Promise<
   (LatestVersionInfo & { changelog: string[]; changelogs: Record<string, string[]> }) | null
 > {
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), GITHUB_API_TIMEOUT_MS);
-    const res = await fetch(`${MIRROR_BASE_URL}/latest.json`, { signal: controller.signal }).finally(() =>
-      clearTimeout(timeout),
-    );
+    const res = await fetch(`${MIRROR_BASE_URL}/latest.json`, { signal: AbortSignal.timeout(GITHUB_API_TIMEOUT_MS) });
     if (!res.ok) {
       logger.error(`Mirror /latest.json returned ${res.status} ${res.statusText}`);
       return null;
@@ -189,34 +188,28 @@ export function assembleChangelog(
 /** Compares the running release (package.json version) against the highest tag on GitHub, falling
  * back to the self-hosted mirror when GitHub is unreachable. Release/tag-based, so it works for
  * every build — including images built without GIT_COMMIT. `updateAvailable` is only true when the
- * latest known version is strictly newer, never a false positive. */
+ * latest known version is strictly newer, never a false positive. The changelog is cumulative:
+ * every version between `current` and latest, so a multi-version jump isn't reduced to just the
+ * newest release's notes. */
 export async function checkVersion(): Promise<VersionStatus> {
   const current = getAppVersion();
-  const currentSemver = parseSemver(current);
 
-  // Primary source: GitHub tags (+ CHANGELOG.md at the latest tag for the notes).
+  // Primary source: GitHub tags (+ CHANGELOG.md at the latest tag for the notes, fetched only
+  // when there is an update to describe).
   const ghLatest = await fetchLatestTag();
   if (ghLatest) {
-    const latestSemver = parseSemver(ghLatest.version);
-    const updateAvailable = latestSemver != null && currentSemver != null && cmpSemver(latestSemver, currentSemver) > 0;
+    const updateAvailable = isNewerVersion(ghLatest.version, current);
     const changelog = updateAvailable ? assembleChangelog(await fetchChangelogFromGitHub(ghLatest.tag), current, []) : [];
     return { current, latest: ghLatest, updateAvailable, changelog };
   }
 
-  // Fallback: self-hosted mirror (GitHub blocked/down/flagged).
+  // Fallback: self-hosted mirror (GitHub blocked/down/flagged) — it already carries the notes.
   const mirror = await fetchLatestFromMirror();
   if (mirror) {
     logger.info(`GitHub unreachable — using mirror for version check (latest ${mirror.tag})`);
-    const latestSemver = parseSemver(mirror.version);
-    const updateAvailable = latestSemver != null && currentSemver != null && cmpSemver(latestSemver, currentSemver) > 0;
-    return {
-      current,
-      latest: { tag: mirror.tag, version: mirror.version },
-      updateAvailable,
-      // Cumulative: every version between `current` and latest, so a multi-version jump isn't
-      // reduced to just the newest release's notes.
-      changelog: updateAvailable ? assembleChangelog(mirror.changelogs, current, mirror.changelog) : [],
-    };
+    const updateAvailable = isNewerVersion(mirror.version, current);
+    const changelog = updateAvailable ? assembleChangelog(mirror.changelogs, current, mirror.changelog) : [];
+    return { current, latest: { tag: mirror.tag, version: mirror.version }, updateAvailable, changelog };
   }
 
   return { current, latest: null, updateAvailable: false, changelog: [] };

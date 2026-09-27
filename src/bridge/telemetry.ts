@@ -2,6 +2,7 @@ import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { getAppVersion } from './version.js';
+import { parseEnvBool } from '../env.js';
 import { createLogger } from '../logger.js';
 
 const logger = createLogger('telemetry');
@@ -15,8 +16,10 @@ const TELEMETRY_URL = 'https://zergont-gate.duckdns.org/ping';
 const INSTALL_ID_FILE = path.join(process.cwd(), '.data', 'install-id');
 const PING_TIMEOUT_MS = 8000;
 
-function isDisabled(): boolean {
-  return /^(off|0|false|no)$/i.test(process.env.TELEMETRY ?? '') || /^(1|true|yes|on)$/i.test(process.env.NO_TELEMETRY ?? '');
+/** Opted out: TELEMETRY set to off/0/false/no, or NO_TELEMETRY to 1/true/yes/on (parseEnvBool). Anything
+ * else — unset, or a value outside both sets — leaves the default: on. Exported for tests. */
+export function isTelemetryDisabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return parseEnvBool(env.TELEMETRY) === false || parseEnvBool(env.NO_TELEMETRY) === true;
 }
 
 let cachedId: string | null = null;
@@ -44,18 +47,16 @@ export interface Telemetry {
 
 export function createTelemetry(): Telemetry {
   async function ping(): Promise<void> {
-    if (isDisabled()) return;
+    if (isTelemetryDisabled()) return;
     try {
       const installId = await getInstallId();
       const version = getAppVersion();
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), PING_TIMEOUT_MS);
       await fetch(TELEMETRY_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ installId, version, ts: Date.now() }),
-        signal: controller.signal,
-      }).finally(() => clearTimeout(timeout));
+        signal: AbortSignal.timeout(PING_TIMEOUT_MS),
+      });
     } catch (err) {
       // Best-effort by design — telemetry must never affect the bridge. INFO, not ERROR.
       logger.info(`telemetry ping skipped: ${(err as Error).message}`);

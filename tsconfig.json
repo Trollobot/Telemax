@@ -8,9 +8,6 @@
     "noUncheckedIndexedAccess": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
-    "resolveJsonModule": true,
-    "outDir": "dist",
-    "rootDir": ".",
     "types": ["node"]
   },
   "include": ["src", "scripts", "tests"]

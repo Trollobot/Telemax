@@ -454,7 +454,9 @@ set_env_var() {
   local name="$1" value="$2"
   value=$(env_quote "$value")
   if grep -q "^${name}=" .env 2>/dev/null; then
-    awk -v n="$name" -v v="$value" 'index($0, n"=") == 1 { print n"=" v; next } { print }' .env > .env.tmp
+    # umask 077: .env.tmp carries every secret and root's default 022 made it world-readable 0644
+    # until the chmod below (the reconfigure menu runs before the script-wide umask).
+    (umask 077; awk -v n="$name" -v v="$value" 'index($0, n"=") == 1 { print n"=" v; next } { print }' .env > .env.tmp)
     mv .env.tmp .env
   else
     printf '%s=%s\n' "$name" "$value" >> .env
@@ -684,8 +686,28 @@ if command -v docker >/dev/null 2>&1; then
     echo "группы ниже не найдёт сообщение."
     read -rp "Остановить его сейчас? [Y/n] " STOP_OLD
     if [ "${STOP_OLD:-Y}" != "n" ] && [ "${STOP_OLD:-Y}" != "N" ]; then
-      docker compose down
-      echo "Остановлено."
+      # NOT a bare `docker compose down`: there is no .env here (that's why we're in first-time
+      # setup), so Compose would fall back to the directory basename as the project name. An install
+      # whose project got a suffix from unique_compose_name (telemax-2) would then be missed — and
+      # the basename project it hit instead belongs, by construction, to ANOTHER, working bridge.
+      # Stop exactly the containers of THIS directory's own project (read off the container's label),
+      # both labels in the filter, and don't depend on Compose being able to load a project without
+      # its env_file.
+      OLD_PROJECT=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$RUNNING" 2>/dev/null || true)
+      OLD_IDS=$(docker ps -aq --filter "label=com.docker.compose.project=${OLD_PROJECT}" --filter "label=com.docker.compose.project.working_dir=$(pwd)" 2>/dev/null || true)
+      if [ -n "$OLD_PROJECT" ] && [ -n "$OLD_IDS" ]; then
+        # shellcheck disable=SC2086 # one container id per word
+        docker stop $OLD_IDS >/dev/null 2>&1 || true
+        # shellcheck disable=SC2086
+        docker rm $OLD_IDS >/dev/null 2>&1 || true
+      else
+        docker stop "$RUNNING" >/dev/null 2>&1 || true
+      fi
+      if [ -n "$(docker ps -q --filter "label=com.docker.compose.project.working_dir=$(pwd)" 2>/dev/null || true)" ]; then
+        echo "⚠️  Не удалось остановить контейнер $RUNNING — остановите вручную: docker stop $RUNNING"
+      else
+        echo "Остановлено."
+      fi
     fi
     echo
   fi

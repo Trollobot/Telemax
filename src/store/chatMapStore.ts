@@ -30,6 +30,57 @@ export interface ChatMapping {
   pendingUserId?: string;
 }
 
+/**
+ * A stored history cursor as a plain ms number, or null when absent/unparseable. The field is
+ * written as a decimal string, but hand-edited or pre-normalization files can hold a raw number
+ * (and a BigInt can reach upsert straight from a MAX payload) — accept all three.
+ */
+export function cursorToMs(cursor: unknown): number | null {
+  if (cursor == null || cursor === '') return null;
+  if (typeof cursor !== 'number' && typeof cursor !== 'string' && typeof cursor !== 'bigint') return null;
+  const n = Number(cursor);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * Normalizes a freshly parsed chat-map.json: every maxChatId becomes its decimal string, and
+ * entries that name the same chat collapse into ONE. Files written before the string
+ * normalization can hold a legacy raw-number entry, and the old upsert (strict === against the
+ * normalized string) never matched it — it appended a string twin instead. Lookups found the
+ * legacy copy first while every write (cursor, /ban) landed in the twin nobody read, so the
+ * cursor never moved and bans didn't stick (review 2026-09-26). The later entry is the newer
+ * write (upsert appends), so its fields win; the cursor keeps the more advanced of the two.
+ * The merged entry stays at the first twin's position.
+ */
+export function normalizeChatMappings(raw: unknown): ChatMapping[] {
+  if (!Array.isArray(raw)) return [];
+  const out: ChatMapping[] = [];
+  const indexById = new Map<string, number>();
+  for (const entry of raw) {
+    if (!entry || typeof entry !== 'object') continue;
+    const m = entry as Omit<ChatMapping, 'maxChatId' | 'historyBackfillCursor'> & { maxChatId?: unknown; historyBackfillCursor?: unknown };
+    if (m.maxChatId == null) continue;
+    const maxChatId = String(m.maxChatId);
+    const cursorMs = cursorToMs(m.historyBackfillCursor);
+    const { historyBackfillCursor: _rawCursor, ...rest } = m;
+    const normalized: ChatMapping = { ...rest, maxChatId };
+    if (cursorMs != null) normalized.historyBackfillCursor = String(cursorMs);
+    const idx = indexById.get(maxChatId);
+    if (idx == null) {
+      indexById.set(maxChatId, out.length);
+      out.push(normalized);
+      continue;
+    }
+    const prev = out[idx] as ChatMapping;
+    const prevCursor = cursorToMs(prev.historyBackfillCursor);
+    const merged: ChatMapping = { ...prev, ...normalized };
+    const best = prevCursor == null ? cursorMs : cursorMs == null ? prevCursor : Math.max(prevCursor, cursorMs);
+    if (best != null) merged.historyBackfillCursor = String(best);
+    out[idx] = merged;
+  }
+  return out;
+}
+
 /** Persistent MAX chatId <-> Telegram forum topicId mapping (ТЗ.md §1.4). Not secret — plain JSON is fine. */
 export class ChatMapStore {
   private cache: ChatMapping[] | null = null;
@@ -48,10 +99,11 @@ export class ChatMapStore {
 
   async getByMaxChatId(maxChatId: unknown): Promise<ChatMapping | undefined> {
     const key = String(maxChatId);
-    // String() the stored side too — files written before the string-normalization
-    // fix can still contain raw-number entries; a strict === against those would
-    // silently miss and re-create a duplicate topic (hit live in prod 2026-08-08).
-    return (await this.load()).find((m) => String(m.maxChatId) === key);
+    // Files written before the string-normalization fix can still contain raw-number
+    // entries; a strict === against those would silently miss and re-create a duplicate
+    // topic (hit live in prod 2026-08-08). load() now normalizes every id to its string
+    // and merges legacy twins (normalizeChatMappings), so the strict compare is safe.
+    return (await this.load()).find((m) => m.maxChatId === key);
   }
 
   async getByTopicId(telegramTopicId: number): Promise<ChatMapping | undefined> {
@@ -69,7 +121,7 @@ export class ChatMapStore {
   }): Promise<void> {
     const normalized: ChatMapping = { ...mapping, maxChatId: String(mapping.maxChatId) };
     const all = await this.load();
-    const idx = all.findIndex((m) => m.maxChatId === normalized.maxChatId);
+    const idx = all.findIndex((m) => m.maxChatId === normalized.maxChatId); // stored ids normalized in load()
     if (idx >= 0) all[idx] = normalized;
     else all.push(normalized);
     this.cache = all;
@@ -83,19 +135,41 @@ export class ChatMapStore {
     await this.upsert({ ...existing, banned });
   }
 
+  /**
+   * Records a topic's new title after a rename. Re-reads the entry and merges only `title`: every
+   * rename awaits editForumTopic first, and writing back the whole entry read before that call
+   * dragged the cursor back, dropped a /ban set meanwhile or restored a mapping a topic recreate had
+   * just replaced (review 2026-09-26, catchup-r1#4). No-op when the chat is gone or now lives in a
+   * different topic than the one renamed.
+   */
+  async setTitle(maxChatId: unknown, telegramTopicId: number, title: string): Promise<void> {
+    const current = await this.getByMaxChatId(maxChatId);
+    if (!current || current.telegramTopicId !== telegramTopicId || current.title === title) return;
+    await this.upsert({ ...current, title });
+  }
+
   /** Drops a mapping entirely — used only to force a fresh topic when the current one was deleted in Telegram (see the recreate path in bridge/sync.ts). */
   async remove(maxChatId: unknown): Promise<void> {
     const key = String(maxChatId);
     const all = await this.load();
-    const filtered = all.filter((m) => String(m.maxChatId) !== key);
+    const filtered = all.filter((m) => m.maxChatId !== key);
     if (filtered.length === all.length) return;
     this.cache = filtered;
     await this.persist(filtered);
   }
 
+  /**
+   * Moves the chat's history cursor FORWARD to `time` (MAX server ms). Never backwards: a
+   * backfill replays a history snapshot oldest-first while live messages for the same chat
+   * keep arriving, and an unconditional write let the replay drag the cursor back behind
+   * messages already delivered live — the next catch-up then re-sent them (review 2026-09-26).
+   */
   async advanceHistoryCursor(maxChatId: unknown, time: number): Promise<void> {
+    if (!Number.isFinite(time)) return;
     const existing = await this.getByMaxChatId(maxChatId);
     if (!existing) return;
+    const current = cursorToMs(existing.historyBackfillCursor);
+    if (current != null && time <= current) return;
     await this.upsert({ ...existing, historyBackfillCursor: String(time) });
   }
 
@@ -117,7 +191,7 @@ export class ChatMapStore {
     this.pendingLoad ??= (async () => {
       try {
         const raw = await readFile(this.filePath, 'utf8');
-        this.cache = JSON.parse(raw) as ChatMapping[];
+        this.cache = normalizeChatMappings(JSON.parse(raw));
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code === 'ENOENT') this.cache = [];
         else throw err;

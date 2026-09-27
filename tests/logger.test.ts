@@ -10,7 +10,7 @@ describe('redactSecrets', () => {
 
   it('redacts the CHECK_PASSWORD payload shape (password + trackId)', () => {
     // The exact payload MaxClient.checkPassword() sends — this going to the
-    // web-panel packet log unmasked is the leak this suite exists to prevent.
+    // packet log unmasked is the leak this suite exists to prevent.
     const out = redactSecrets({ trackId: 'track-12345-abcdef', password: 'секретный пароль' }) as Record<string, unknown>;
     expect(out.password).toBe('[redacted]');
     expect(out.trackId).toBe('[redacted]');

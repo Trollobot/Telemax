@@ -7,7 +7,7 @@ function input(over: Partial<StatusInput> = {}): StatusInput {
   return {
     version: '0.6.0',
     uptimeSec: 3 * 86400 + 4 * 3600 + 5,
-    max: { connected: true, phone: '+79959809587', lastLoginAt: NOW - 2 * 3600_000, paused: null },
+    max: { connected: true, phone: '+79999999999', lastLoginAt: NOW - 2 * 3600_000, paused: null },
     chats: { active: 12, banned: 1 },
     lastInAt: NOW - 3 * 60_000,
     lastOutAt: NOW - 12 * 60_000,
@@ -38,23 +38,26 @@ describe('status formatting', () => {
   });
 
   it('maskPhone keeps a recognisable prefix/suffix only', () => {
-    expect(maskPhone('+79959809587')).toBe('+7995***9587');
-    expect(maskPhone('79959809587')).toBe('7995***9587');
+    expect(maskPhone('+79999999999')).toBe('+7999***9999');
+    expect(maskPhone('79999999999')).toBe('7999***9999');
     expect(maskPhone('')).toBe('не авторизован');
+    // formatting characters are ignored — only the digits (and a leading '+') matter
+    expect(maskPhone('+7 (999) 999-99-99')).toBe('+7999***9999');
+    expect(maskPhone('+375291234567')).toBe('+3752***4567');
     expect(maskPhone('12345')).toBe('***');
   });
 
   it('renders the full card', () => {
     const text = formatStatus(input());
     expect(text).toContain('Версия 0.6.0 · аптайм 3 дн 4 ч');
-    expect(text).toContain('MAX: 🟢 подключён · +7995***9587 · вход 2 ч назад');
+    expect(text).toContain('MAX: 🟢 подключён · +7999***9999 · вход 2 ч назад');
     expect(text).toContain('Telegram: 🟢 бот на связи · чатов 12 (в бане 1)');
     expect(text).toContain('Последнее сообщение: из MAX 3 мин назад · в MAX 12 мин назад');
     expect(text).toContain('Диск (данные): свободно 4.1 ГБ из 20.0 ГБ');
     expect(text).not.toContain('мало места');
     expect(text).toContain('load 0.12');
     expect(text).toContain('Обновление: актуальная версия');
-    expect(text).not.toContain('9809587'); // the full number never leaks
+    expect(text).not.toContain('99999'); // the full number never leaks (the mask never has five nines in a row)
   });
 
   it('flags low disk, a pending update, a failed check, pause and no-session', () => {
@@ -65,7 +68,7 @@ describe('status formatting', () => {
     expect(formatStatus(input({ max: { connected: false, phone: '', lastLoginAt: null, paused: null } }))).toContain('MAX: 🔴 не авторизован — /login');
     // a connected but unauthenticated socket (fresh install) must NOT be green
     expect(formatStatus(input({ max: { connected: true, phone: '', lastLoginAt: null, paused: null } }))).toContain('MAX: 🔴 не авторизован — /login');
-    expect(formatStatus(input({ max: { connected: false, phone: '+79959809587', lastLoginAt: null, paused: null } }))).toContain('MAX: 🔴 не подключён · +7995***9587');
+    expect(formatStatus(input({ max: { connected: false, phone: '+79999999999', lastLoginAt: null, paused: null } }))).toContain('MAX: 🔴 не подключён · +7999***9999');
     expect(formatStatus(input({ disk: null }))).not.toContain('Диск');
   });
 });

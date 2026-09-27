@@ -5,7 +5,6 @@
 export const OPCODES = {
   PING: 0x0001,
   INIT: 0x0006,
-  PROFILE: 0x0010,
   START_AUTH: 0x0011,
   CHECK_CODE: 0x0012,
   LOGIN: 0x0013,
@@ -18,15 +17,11 @@ export const OPCODES = {
   // but burns on success — a fresh SMS is needed for the next login attempt after that.
   CHECK_PASSWORD: 0x0073,
   CONTACT_INFO: 0x0020,
-  // Contact search — supplied by the user 2026-08-16. Search by name/nick ({query, count})
-  // and lookup by phone ({phone} — field is `phone`, not phoneNumber; `+` optional).
-  CONTACT_SEARCH: 0x0025,
   CONTACT_INFO_BY_PHONE: 0x002e,
   // Global directory search by name — CONTACT_SEARCH (0x0025) only hits the account's
   // LOCAL address book (empty book => total:0 even for existing users). Supplied by the
   // user 2026-08-16.
   PUBLIC_SEARCH: 0x003c,
-  CHAT_INFO: 0x0030,
   CHAT_HISTORY: 0x0031,
   // Not in max-protocol-full.md — supplied by the user 2026-08-10.
   CHAT_DELETE: 0x0034,
@@ -40,45 +35,28 @@ export const OPCODES = {
   CHAT_LEAVE: 0x003a,
   CHAT_MEMBERS: 0x003b,
   MSG_SEND: 0x0040,
-  // Corrected 2026-08-09 (was 0x0041, an untested guess) — still unused: Telegram's
-  // Bot API gives bots no way to detect a human typing, so there's nothing on the
-  // Telegram side that could ever trigger sending this to MAX. Kept for reference.
-  MSG_TYPING: 0x0065,
   // `{chatId, messageIds: [...], forMe: bool}` — supplied by the user 2026-08-10.
   MSG_DELETE: 0x0042,
   MSG_EDIT: 0x0043,
-  // `{chatId, message: {cid, link: {type: 'FORWARD', messageId, chatId}, attaches: []}, notify}`
-  // — supplied by the user 2026-08-10. `link.messageId` is a decimal STRING, not the usual int.
-  FORWARD: 0x0046,
-  MSG_GET: 0x0047,
   // Not in max-protocol-full.md — supplied by the user from their own reverse-engineering
   // (2026-08-07). {count} request; PHOTO/FILE return an upload slot {url, ...ids},
   // FILE_DOWNLOAD exchanges {chatId, messageId, fileId} for a signed {url}.
   PHOTO_UPLOAD: 0x0050,
-  // User-confirmed 2026-08-13 from their own reverse-engineering (real MAX client
-  // traffic) — a dedicated upload slot for stickers, distinct from FILE_UPLOAD/
-  // VIDEO_UPLOAD (uploading a .tgs through FILE_UPLOAD lands as a plain file
-  // attachment with an auto-generated preview, not a native rendered sticker).
-  STICKER_UPLOAD: 0x0051,
   VIDEO_UPLOAD: 0x0052,
   VIDEO_PLAY: 0x0053,
   FILE_UPLOAD: 0x0057,
   FILE_DOWNLOAD: 0x0058,
   PUSH_MESSAGE: 0x0080,
   PUSH_TYPING: 0x0081,
-  // Not in max-protocol-full.md — inferred live on 2026-08-06 from real traffic:
-  // payload {chatId, userId, mark, setAsUnread}, looks like a read-marker update.
-  PUSH_READ_MARK: 0x0082,
-  PUSH_PRESENCE: 0x0084,
   // Not in max-protocol-full.md — a "chat updated" push carrying the full chat
   // object, `{chat: {...}}`. Initially mistaken (2026-08-07) for the reaction-push
   // mechanism because `lastReactedMessageId`/`lastReaction` on the chat object kept
   // showing up right after our own reaction tests — but the user later confirmed
-  // MAX sends NO push at all for reactions (add or remove) through the normal
-  // message channel; those fields are just persistent chat state that happens to
-  // get echoed on unrelated resyncs. Real reaction notifications are NOTIF_MSG_*
-  // below. Not currently used for anything (kept documented as a dead end so it
-  // doesn't get "rediscovered" and misused the same way again).
+  // MAX sends NO dedicated push for reactions (add or remove) through the normal
+  // message channel; those fields are persistent chat state that also gets echoed on
+  // unrelated resyncs. The NOTIF_MSG_* reaction pushes below never fired live either,
+  // so bridge/sync.ts's handleMaxChatUpdate does use this push — for topic renames and,
+  // deduplicated against those echoes, as the only signal of a reaction ADDITION.
   CHAT_UPDATE: 0x0087,
   EVENTS: 0x0088,
   // Not in max-protocol-full.md — supplied by the user 2026-08-09. Real-time incoming-call
@@ -108,8 +86,37 @@ export const OPCODES = {
   MSG_GET_REACTIONS: 0x00b4,
   // Not in max-protocol-full.md — supplied by the user 2026-08-09. Poll creation
   // itself has no dedicated opcode — it's a MSG_SEND with an `_type: 'POLL'` attach
-  // (see bridge/sync.ts for the shape). These two are for voting on an existing poll.
+  // (see bridge/sync.ts for the shape). This one votes on an existing poll (its
+  // sibling VOTERS_LIST_BY_ANSWER is among the reference-only opcodes below).
   SEND_VOTE: 0x0130,
+
+  // ---- Reference-only: NOT used by the bridge. ----
+  // Kept, not deleted: they document the protocol as far as it's known (so a finding
+  // isn't "rediscovered" later), and every entry here also names its opcode in the
+  // packet logs (formatOpcode) — the PUSH_* ones do arrive live and show up there by
+  // name. Move an entry back up once the bridge sends or handles it.
+  PROFILE: 0x0010,
+  // Contact search — supplied by the user 2026-08-16. Search by name/nick ({query, count})
+  // and lookup by phone ({phone} — field is `phone`, not phoneNumber; `+` optional).
+  CONTACT_SEARCH: 0x0025,
+  CHAT_INFO: 0x0030,
+  // Corrected 2026-08-09 (was 0x0041, an untested guess) — still unused: Telegram's
+  // Bot API gives bots no way to detect a human typing, so there's nothing on the
+  // Telegram side that could ever trigger sending this to MAX. Kept for reference.
+  MSG_TYPING: 0x0065,
+  // `{chatId, message: {cid, link: {type: 'FORWARD', messageId, chatId}, attaches: []}, notify}`
+  // — supplied by the user 2026-08-10. `link.messageId` is a decimal STRING, not the usual int.
+  FORWARD: 0x0046,
+  MSG_GET: 0x0047,
+  // User-confirmed 2026-08-13 from their own reverse-engineering (real MAX client
+  // traffic) — a dedicated upload slot for stickers, distinct from FILE_UPLOAD/
+  // VIDEO_UPLOAD (uploading a .tgs through FILE_UPLOAD lands as a plain file
+  // attachment with an auto-generated preview, not a native rendered sticker).
+  STICKER_UPLOAD: 0x0051,
+  // Not in max-protocol-full.md — inferred live on 2026-08-06 from real traffic:
+  // payload {chatId, userId, mark, setAsUnread}, looks like a read-marker update.
+  PUSH_READ_MARK: 0x0082,
+  PUSH_PRESENCE: 0x0084,
   VOTERS_LIST_BY_ANSWER: 0x0131,
 } as const;
 
@@ -119,7 +126,7 @@ const OPCODE_NAMES: Record<number, string> = Object.fromEntries(
   Object.entries(OPCODES).map(([name, code]) => [code, name]),
 );
 
-export function opcodeName(opcode: number): string {
+function opcodeName(opcode: number): string {
   return OPCODE_NAMES[opcode] ?? 'UNKNOWN';
 }
 

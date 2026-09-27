@@ -129,7 +129,11 @@ async function uploadFileToMax(max: MaxClient, buffer: Buffer, filename: string)
  */
 async function uploadVoiceToMax(max: MaxClient, buffer: Buffer, filename: string, duration: number): Promise<{ _type: 'AUDIO'; audioId: unknown; token: string; duration: number }> {
   const slot = await max.requestVoiceUploadSlot();
-  const readyPromise = max.waitForAudioReady(); // start listening before the POST so the push can't arrive unheard
+  // Keyed on this slot's id: the voice's audioId IS the slot's videoId (see above).
+  const readyPromise = max.waitForAudioReady(slot.videoId); // start listening before the POST so the push can't arrive unheard
+  // If the POST throws first, this wait must not turn into an unhandled rejection later (a false
+  // "internal bridge error"); the await below still sees its outcome.
+  readyPromise.catch(() => {});
   const res = await maxFetch(slot.url, {
     method: 'POST',
     headers: {
@@ -155,7 +159,10 @@ async function uploadVideoToMax(
   contentType = 'video/mp4',
 ): Promise<{ _type: 'VIDEO'; videoId: unknown; token: string }> {
   const slot = await max.requestVideoUpload();
-  const readyPromise = max.waitForVideoReady(); // start listening before the POST so the push can't arrive unheard
+  const readyPromise = max.waitForVideoReady(slot.videoId); // start listening before the POST so the push can't arrive unheard
+  // If the POST throws first, this wait must not turn into an unhandled rejection later (a false
+  // "internal bridge error"); the await below still sees its outcome.
+  readyPromise.catch(() => {});
   const res = await maxFetch(slot.url, {
     method: 'POST',
     headers: {

@@ -15,6 +15,7 @@ import { gzipSync } from 'node:zlib';
 import type { MaxClient } from '../max/client.js';
 import { maxFetch } from '../max/ca.js';
 import { createLogger } from '../logger.js';
+import { isTransientHttpStatus, isTransientMaxError, isTransientNetworkError, TransientDownloadError } from './transient.js';
 
 const logger = createLogger('attachments');
 
@@ -94,23 +95,48 @@ export interface DownloadContext {
   // FILE_DOWNLOAD/VIDEO_PLAY retry with these when the primary (source) ids are denied.
   fallbackChatId?: unknown;
   fallbackMessageId?: unknown;
+  // Throw TransientDownloadError instead of returning null when the download failed for a
+  // reason that may pass (MAX socket down or timed out, CDN 5xx/network). Set by the history
+  // backfill, which must not advance its cursor past a file it could not fetch — the live path
+  // leaves it unset and keeps the text placeholder (review 2026-09-26, RECOVERY3).
+  throwOnTransient?: boolean;
 }
 
 // Generous — covers a large video on a slow CDN — but finite: a hung download must
 // not stall the relay handler forever (nothing else here bounds it).
 const DOWNLOAD_TIMEOUT_MS = 120_000;
+// Bot API upload limits (multipart, the only way this bridge uploads): 50 MB for any file, 10 MB
+// for a photo. Anything bigger is refused with 413, so it was never deliverable anyway.
+export const TELEGRAM_UPLOAD_LIMIT_BYTES = 50 * 1024 * 1024;
+export const TELEGRAM_PHOTO_LIMIT_BYTES = 10 * 1024 * 1024;
 // A response was buffered whole with no ceiling, so ONE oversized incoming file could exhaust the
-// container's memory and take the bridge down (and it would keep happening on every retry). Telegram
-// itself refuses to send anything above 50 MB, so nothing under this cap is ever lost in practice.
-const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024;
+// container's memory and take the bridge down (and it would keep happening on every retry). The cap
+// is Telegram's own upload limit: a bigger file could only fail on upload, so it gets the text
+// placeholder instead (the cap used to be 100 MB, and a 50–100 MB file aborted its whole message —
+// review 2026-09-26, INBOUND-EDGES1).
+const MAX_DOWNLOAD_BYTES = TELEGRAM_UPLOAD_LIMIT_BYTES;
+
+/**
+ * How a downloaded attachment of `bytes` can go to Telegram: its own kind when it fits, 'document'
+ * for a photo over sendPhoto's 10 MB limit (still under the 50 MB file limit), null when it is over
+ * the 50 MB limit altogether (the caller posts the placeholder). Pure + exported for unit testing.
+ */
+export function telegramSendKind(kind: DownloadedAttachment['kind'], bytes: number): DownloadedAttachment['kind'] | null {
+  if (bytes > TELEGRAM_UPLOAD_LIMIT_BYTES) return null;
+  if (kind === 'photo' && bytes > TELEGRAM_PHOTO_LIMIT_BYTES) return 'document';
+  return kind;
+}
 
 // Every URL that reaches this helper is a MAX-owned host (photo/sticker/file/video
 // CDN) — hence maxFetch, which trusts the Russian state chain those certs use.
+// Null for a permanent failure (4xx, over the size cap); throws TransientDownloadError for one
+// that may pass (5xx, network, timeout) — downloadMaxAttachment decides what the caller sees.
 async function downloadUrl(url: string): Promise<Buffer | null> {
   try {
     const res = await maxFetch(url, { signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
     if (!res.ok) {
       logger.error(`downloadUrl got non-OK response ${res.status} ${res.statusText} for ${url}`);
+      if (isTransientHttpStatus(res.status)) throw new TransientDownloadError(`MAX CDN answered ${res.status}`);
       return null;
     }
     const declared = Number(res.headers.get('content-length') ?? '');
@@ -126,14 +152,17 @@ async function downloadUrl(url: string): Promise<Buffer | null> {
     }
     return buf;
   } catch (err) {
+    if (err instanceof TransientDownloadError) throw err;
     logger.error(`downloadUrl threw for ${url}`, err);
+    if (isTransientNetworkError(err)) throw new TransientDownloadError(`MAX CDN download failed: ${(err as Error).message}`, err);
     return null;
   }
 }
 
 /** Runs a chat-scoped download (FILE_DOWNLOAD / VIDEO_PLAY) against the primary ids; if that
  * is denied and the context carries fallback ids (a forward's recipient chat), retries there.
- * Returns null when every attempt fails. */
+ * Returns null when every attempt fails for good; throws TransientDownloadError when the MAX
+ * socket was down or timed out (no point trying the fallback ids over the same dead socket). */
 async function withDownloadFallback<T>(
   ctx: DownloadContext,
   label: string,
@@ -142,6 +171,10 @@ async function withDownloadFallback<T>(
   try {
     return await attempt(ctx.chatId, ctx.messageId);
   } catch (primaryErr) {
+    if (isTransientMaxError(primaryErr)) {
+      logger.error(`${label} failed transiently (chatId=${String(ctx.chatId)}, messageId=${String(ctx.messageId)})`, primaryErr);
+      throw new TransientDownloadError(`${label}: ${(primaryErr as Error).message}`, primaryErr);
+    }
     const hasFallback =
       ctx.fallbackChatId != null &&
       (String(ctx.fallbackChatId) !== String(ctx.chatId) || String(ctx.fallbackMessageId) !== String(ctx.messageId));
@@ -161,12 +194,29 @@ async function withDownloadFallback<T>(
         `${label} failed on both source (chatId=${String(ctx.chatId)}) and recipient (chatId=${String(ctx.fallbackChatId)})`,
         fallbackErr,
       );
+      if (isTransientMaxError(fallbackErr)) throw new TransientDownloadError(`${label}: ${(fallbackErr as Error).message}`, fallbackErr);
       return null;
     }
   }
 }
 
+/**
+ * Downloads a MAX attachment for re-upload to Telegram. Null means "no file to send" — the caller
+ * posts describeAttachment()'s placeholder. A transient failure (see TransientDownloadError) is
+ * also null unless ctx.throwOnTransient is set, in which case it is thrown so the backfill can stop
+ * without moving its cursor past the file.
+ */
 export async function downloadMaxAttachment(att: MaxAttachment, ctx: DownloadContext): Promise<DownloadedAttachment | null> {
+  try {
+    return await downloadAttachmentOrThrow(att, ctx);
+  } catch (err) {
+    if (!(err instanceof TransientDownloadError) || ctx.throwOnTransient) throw err;
+    logger.error(`Transient failure downloading a MAX ${att._type ?? 'attachment'} — sending the placeholder instead`, err);
+    return null;
+  }
+}
+
+async function downloadAttachmentOrThrow(att: MaxAttachment, ctx: DownloadContext): Promise<DownloadedAttachment | null> {
   if (att._type === 'PHOTO' && att.baseUrl && att.photoToken) {
     const buffer = await downloadUrl(att.baseUrl + att.photoToken);
     if (!buffer) return null;
@@ -183,8 +233,14 @@ export async function downloadMaxAttachment(att: MaxAttachment, ctx: DownloadCon
   // Telegram as a `.tgs` was actually plain decompressed JSON, not a real gzip
   // file. Re-gzipping the already-decompressed buffer here fixes that.
   if (att._type === 'STICKER' && att.lottieUrl) {
-    const buffer = await downloadUrl(att.lottieUrl);
-    if (buffer) return { buffer: gzipSync(buffer), filename: `sticker_${String(att.stickerId ?? Date.now())}.tgs`, kind: 'sticker' };
+    try {
+      const buffer = await downloadUrl(att.lottieUrl);
+      if (buffer) return { buffer: gzipSync(buffer), filename: `sticker_${String(att.stickerId ?? Date.now())}.tgs`, kind: 'sticker' };
+    } catch (err) {
+      // The static preview below is still a sticker — only a transient failure with no
+      // preview to fall back on is worth reporting as such.
+      if (!att.url) throw err;
+    }
   }
 
   if (att._type === 'STICKER' && att.url) {
@@ -222,14 +278,17 @@ export async function downloadMaxAttachment(att: MaxAttachment, ctx: DownloadCon
       ctx.max.getVideoPlayUrls(chatId, messageId, videoId),
     );
     if (!urls) return null;
-    const mp4Key = Object.keys(urls)
-      .filter((k) => k.startsWith('MP4_'))
-      .sort((a, b) => Number(b.slice(4)) - Number(a.slice(4)))[0]; // highest resolution first
-    const url = mp4Key ? urls[mp4Key] : undefined;
-    if (!url) return null;
-    const buffer = await downloadUrl(url);
-    if (!buffer) return null;
-    return { buffer, filename: `video_${String(videoId)}.mp4`, kind: att.videoType === 1 ? 'video_note' : 'video' };
+    // Highest resolution first, stepping down while a quality is refused — typically for being
+    // over Telegram's 50 MB upload limit (downloadUrl's cap), where a lower one still fits.
+    const mp4Keys = Object.keys(urls)
+      .filter((k) => k.startsWith('MP4_') && urls[k])
+      .sort((a, b) => Number(b.slice(4)) - Number(a.slice(4)));
+    for (const mp4Key of mp4Keys) {
+      const buffer = await downloadUrl(urls[mp4Key] as string);
+      if (buffer) return { buffer, filename: `video_${String(videoId)}.mp4`, kind: att.videoType === 1 ? 'video_note' : 'video' };
+      logger.info(`VIDEO ${String(videoId)}: ${mp4Key} not usable — trying a lower quality`);
+    }
+    return null;
   }
 
   return null;

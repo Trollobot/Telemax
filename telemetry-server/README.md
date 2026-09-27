@@ -20,14 +20,18 @@ Listens on `:3100`. Make sure the host firewall allows inbound TCP 3100.
 ## Endpoints
 
 - `POST /ping` — `{ installId, version, ts }` from installs. Returns 204. (No key — anonymous.)
-- `GET /stats?key=<STATS_KEY>&days=30` — live-install count + version breakdown:
+- `GET /stats?days=30` with header `X-Stats-Key: <STATS_KEY>` — live-install count + version
+  breakdown. **HTTPS only**: it must come through the TLS reverse proxy in front of the server
+  (which sets `X-Forwarded-Proto: https`); a request straight to plain-HTTP `:3100` gets 403.
+  `?key=<STATS_KEY>` still works instead of the header, but the header keeps the key out of
+  access logs. `byVersion` keys are the bridge's `package.json` version (semver):
 
 ```json
-{ "totalEver": 42, "activeInWindow": 37, "windowDays": 30, "byVersion": { "46d2793": 30, "b23c4fb": 7 } }
+{ "totalEver": 42, "activeInWindow": 37, "windowDays": 30, "byVersion": { "1.0.1": 30, "1.0.0": 7 } }
 ```
 
 Read it any time:
 
 ```bash
-curl "http://zergont-gate.duckdns.org:3100/stats?key=<STATS_KEY>&days=30"
+curl -H "X-Stats-Key: <STATS_KEY>" "https://zergont-gate.duckdns.org/stats?days=30"
 ```

@@ -1,6 +1,9 @@
 import { type Telegraf, type Context } from 'telegraf';
 import { BugReportStore } from '../store/bugReportStore.js';
 import { createLogger } from '../logger.js';
+import { truncateUtf16 } from './text.js';
+import { isThreadNotFound } from './transient.js';
+import { parseEnvBool } from '../env.js';
 
 const logger = createLogger('bugreport');
 
@@ -9,10 +12,11 @@ const logger = createLogger('bugreport');
  * out), so hardcoding it in the repo is fine. */
 export const BUGREPORT_BOT_HANDLE = 'TelemaxSvv_bot';
 
-/** Telegram's "topic no longer exists" errors — same set the bridge's topic self-heal uses. */
-function isTopicGone(err: unknown): boolean {
-  const msg = err instanceof Error ? err.message : String(err);
-  return /message thread not found|thread not found|TOPIC_DELETED|TOPIC_ID_INVALID/i.test(msg);
+/** The inbox is ON where BUGREPORT_INBOX is set to anything but an off value (0/false/off/no —
+ * parseEnvBool); unset or empty means off. Exported for tests. */
+export function isBugReportInboxEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = env.BUGREPORT_INBOX;
+  return !!raw?.trim() && parseEnvBool(raw) !== false;
 }
 
 // Keep an open DM from flooding the maintainer's group: at most RATE_LIMIT messages per
@@ -64,7 +68,8 @@ export function createBugReports(deps: BugReportsDeps): BugReports {
 
   async function createReporterTopic(ctx: Context, reporterChatId: number): Promise<number> {
     const { name, username } = reporterLabel(ctx);
-    const title = `🐞 ${name}${username ? ` (@${username})` : ''}`.slice(0, 128);
+    // Surrogate-safe cut: a lone half of an emoji in the name makes Telegram refuse the topic.
+    const title = truncateUtf16(`🐞 ${name}${username ? ` (@${username})` : ''}`, 128);
     const topic = await bot.telegram.createForumTopic(targetGroupId, title);
     await store.upsert({ reporterChatId, topicId: topic.message_thread_id, username, name, createdAt: new Date().toISOString() });
     // Header so the maintainer knows who's on the other end even if the topic gets renamed.
@@ -83,7 +88,7 @@ export function createBugReports(deps: BugReportsDeps): BugReports {
     try {
       await bot.telegram.copyMessage(targetGroupId, reporterChatId, messageId, { message_thread_id: topicId });
     } catch (err) {
-      if (!isTopicGone(err)) throw err;
+      if (!isThreadNotFound(err)) throw err;
       await store.remove(reporterChatId);
       topicId = await createReporterTopic(ctx, reporterChatId);
       created = true;

@@ -50,7 +50,10 @@ export function formatBytes(b: number): string {
   return `${Math.round(b / 1024 ** 2)} МБ`;
 }
 
-/** +79959809587 -> +7995***9587: enough to recognise the number, not enough to dial it. */
+/**
+ * +79999999999 -> +7999***9999: enough to recognise the number, not enough to dial it. The ONE
+ * phone mask of the bridge — /status, the panel, /help, the /login DM flow and the logs all use it.
+ */
 export function maskPhone(p: string): string {
   const digits = p.replace(/\D/g, '');
   if (digits.length < 8) return p ? '***' : 'не авторизован';

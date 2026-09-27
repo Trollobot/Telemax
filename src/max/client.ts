@@ -52,24 +52,20 @@ export interface MaxHistoryMessage {
   link?: { type?: string; message?: { id?: unknown; text?: string; sender?: unknown; attaches?: unknown[] }; chatId?: unknown };
 }
 
+// Only what a caller actually sets. The port, the INIT user agent and the ping interval are fixed
+// (constants below), and the server's TLS certificate is always verified — the option to turn
+// that off was never passed by anything (review 2026-09-26, M15c).
 export interface MaxClientOptions {
   host?: string;
-  port?: number;
   sni?: string;
-  deviceId?: string;
-  appVersion?: string;
-  osVersion?: string;
-  locale?: string;
-  timezone?: string;
-  buildNumber?: number;
   /**
-   * Verify the MAX server's TLS certificate. Only pass `false` for local,
-   * throwaway protocol experiments — never in anything that touches a real
-   * session token (see ТЗ.md §3.1).
+   * The INIT deviceId; a random one when unset. NOTE: nothing passes it today, so every
+   * connect() of a new client presents a fresh random id — the one saved into the session
+   * (sessionStore's deviceId) is never read back, and MAX accepts the resumed token under the
+   * new id anyway. Deliberately left that way until reusing the saved id is verified live.
    */
-  rejectUnauthorized?: boolean;
+  deviceId?: string;
   reconnect?: boolean;
-  pingIntervalMs?: number;
 }
 
 // Connect by hostname, NOT a hardcoded IPv4 literal. A literal bypasses DNS entirely,
@@ -83,7 +79,97 @@ const DEFAULT_HOST = 'api2.oneme.ru';
 const DEFAULT_PORT = 443;
 const DEFAULT_SNI = 'api2.oneme.ru';
 const DEFAULT_PING_INTERVAL_MS = 50_000;
+// What INIT presents: the MAX desktop client's user agent.
+const USER_AGENT = {
+  deviceType: 'DESKTOP',
+  appVersion: '26.24.0',
+  osVersion: 'Ubuntu 24.04.4 LTS',
+  locale: 'ru',
+  screen: '2.0x',
+  timezone: 'Europe/Moscow',
+  buildNumber: 75261,
+} as const;
 const RECONNECT_DELAYS_MS = [1_000, 2_000, 5_000, 10_000, 30_000];
+// A connection counts as healthy — and the reconnect backoff starts over — only once it has
+// passed INIT and then stayed up this long. Resetting in the TLS connect callback made a server
+// that accepts TLS and drops the socket right away a reconnect loop once a second (review
+// 2026-09-26, M4).
+const STABLE_CONNECTION_MS = 30_000;
+// TCP keepalive on the MAX socket: a cheap extra probe for a silently dead path. The real
+// half-open detection is the unanswered-PING check in ping() — keepalive only fires on an idle
+// socket, and this one carries a PING every interval.
+const TCP_KEEPALIVE_DELAY_MS = 30_000;
+// Deadline for the TCP connect + TLS handshake. Before secureConnect there is no PING and no
+// keepalive: a path that accepts the TCP connection and then black-holes the ClientHello (DPI, a
+// hung TLS front end) left the socket "connecting" with no 'error' or 'close' — and so no reconnect —
+// until someone restarted the container (review 2026-09-26, client-r1#1).
+const TLS_HANDSHAKE_TIMEOUT_MS = 15_000;
+
+/**
+ * The server answered a request with an ERR frame — as opposed to a timeout, a socket error or
+ * an undecodable frame, which say nothing about the request itself. For LOGIN this is the only
+ * failure that means "this session token is rejected"; everything else is transient
+ * (review 2026-09-26, RECOVERY4). Carries the opcode and the server's machine error code
+ * (payload.error, when it is a string) — not the payload itself, which the logger would print.
+ */
+export class MaxServerError extends Error {
+  constructor(
+    message: string,
+    readonly opcode: number,
+    readonly serverCode?: string,
+  ) {
+    super(message);
+    this.name = 'MaxServerError';
+  }
+}
+
+/** True when `err` is an ERR answer from the MAX server (optionally: to this opcode). */
+export function isMaxServerError(err: unknown, opcode?: number): err is MaxServerError {
+  return err instanceof MaxServerError && (opcode === undefined || err.opcode === opcode);
+}
+
+/**
+ * The MAX socket went away (closed, errored, torn down by connect()/disconnect()/a frame desync)
+ * while something was waiting for an answer on it. That answer can never arrive on a new socket,
+ * so waiters fail at once instead of sitting out their timeout (review 2026-09-26, M3). The
+ * message is what bridge/transient.ts isTransientMaxError keys on; `cause` is the socket error.
+ */
+export class MaxConnectionLostError extends Error {
+  constructor(what: string, cause?: unknown) {
+    const reason = cause instanceof Error ? cause.message : cause != null ? String(cause) : 'socket closed';
+    super(`MaxClient connection lost while waiting for ${what}: ${reason}`, { cause });
+    this.name = 'MaxConnectionLostError';
+  }
+}
+
+/**
+ * True when an EVENTS push says the upload with this id is processed: `{videoId}` for video,
+ * `{audioId}` for a voice note (whose id is the upload slot's videoId). Ids compare via String()
+ * — they may arrive as number, BigInt or string. Matching any id let two parallel uploads cross:
+ * the first ready push released both waits and the second MSG_SEND went out with a file MAX had
+ * not processed yet (review 2026-09-26, OUTBOUND9).
+ */
+export function isUploadReadyPush(payload: unknown, key: 'videoId' | 'audioId', id: unknown): boolean {
+  if (!payload || typeof payload !== 'object' || id == null) return false;
+  const got = (payload as Record<string, unknown>)[key];
+  return got != null && String(got) === String(id);
+}
+
+/** One pending wait for a frame — a request's answer or an upload-ready push. See MaxClient.pending. */
+interface PendingWait {
+  readonly what: string;
+  accept(event: MaxMessageEvent): boolean;
+  resolve(event: MaxMessageEvent): void;
+  fail(err: Error): void;
+}
+
+/**
+ * The backoff step to use for the next reconnect: the running `attempt`, or 0 when the last
+ * connection passed INIT (`readyAt`) and then stayed up for STABLE_CONNECTION_MS.
+ */
+export function reconnectAttemptFor(attempt: number, readyAt: number | null, now: number = Date.now()): number {
+  return readyAt !== null && now - readyAt >= STABLE_CONNECTION_MS ? 0 : attempt;
+}
 
 function randomDeviceId(): string {
   return Array.from({ length: 18 }, () => Math.floor(Math.random() * 10)).join('');
@@ -112,17 +198,12 @@ function toUserId(id: unknown): bigint {
 
 interface ResolvedOptions {
   host: string;
-  port: number;
   sni: string;
-  appVersion: string;
-  osVersion: string;
-  locale: string;
-  timezone: string;
-  buildNumber: number;
-  rejectUnauthorized: boolean;
   reconnect: boolean;
-  pingIntervalMs: number;
 }
+
+/** What may go out on a socket before its LOGIN OK (MaxClient.authed). */
+const PRE_LOGIN_OPCODES = new Set<number>([OPCODES.INIT, OPCODES.PING, OPCODES.START_AUTH, OPCODES.CHECK_CODE, OPCODES.CHECK_PASSWORD, OPCODES.LOGIN]);
 
 export class MaxClient extends EventEmitter {
   readonly deviceId: string;
@@ -133,23 +214,30 @@ export class MaxClient extends EventEmitter {
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectAttempt = 0;
+  // When the current socket passed INIT (null before that) — see reconnectAttemptFor.
+  private readyAt: number | null = null;
+  // Set by this socket's LOGIN OK. Until then only the handshake and auth opcodes go out: a request
+  // written between connect() and LOGIN got MAX's session-state ERR, which reads as a permanent
+  // refusal — a download in that window became a placeholder for good (review 2026-09-27,
+  // client-r3.1#0). Such a request now fails as "not connected", i.e. transient.
+  private authed = false;
   private closedByUser = false;
+  // Everything waiting for a frame, keyed by the frame's opcode. ONE 'message' listener (the
+  // dispatcher registered in the constructor) settles them, and a lost socket fails them all at
+  // once (failPending). Before, every wait added its own 'message' + 'error' listeners, and ANY
+  // client 'error' — including an undecodable push of an unrelated opcode on a live socket —
+  // rejected every request in flight, while a clean close left them hanging for 20 s
+  // (review 2026-09-26, M3, M10).
+  private readonly pending = new Map<number, Set<PendingWait>>();
 
   constructor(options: MaxClientOptions = {}) {
     super();
+    this.on('message', (event: MaxMessageEvent) => this.dispatch(event));
     this.deviceId = options.deviceId ?? randomDeviceId();
     this.opts = {
       host: options.host ?? DEFAULT_HOST,
-      port: options.port ?? DEFAULT_PORT,
       sni: options.sni ?? DEFAULT_SNI,
-      appVersion: options.appVersion ?? '26.24.0',
-      osVersion: options.osVersion ?? 'Ubuntu 24.04.4 LTS',
-      locale: options.locale ?? 'ru',
-      timezone: options.timezone ?? 'Europe/Moscow',
-      buildNumber: options.buildNumber ?? 75261,
-      rejectUnauthorized: options.rejectUnauthorized ?? true,
       reconnect: options.reconnect ?? true,
-      pingIntervalMs: options.pingIntervalMs ?? DEFAULT_PING_INTERVAL_MS,
     };
   }
 
@@ -161,6 +249,8 @@ export class MaxClient extends EventEmitter {
     this.teardownSocket();
     this.buffer = Buffer.alloc(0);
     this.seq = 1;
+    this.readyAt = null;
+    this.authed = false;
 
     // `ca` REPLACES Node's default trust store for this socket, so MAX_TLS_CA re-includes
     // the bundled roots alongside the Russian state chain MAX's cert actually needs (scoped
@@ -172,16 +262,19 @@ export class MaxClient extends EventEmitter {
     // doesn't yet declare the net-level autoSelectFamily field that Node accepts at runtime.)
     const socketOpts: tls.ConnectionOptions & { autoSelectFamily?: boolean } = {
       servername: this.opts.sni,
-      rejectUnauthorized: this.opts.rejectUnauthorized,
+      rejectUnauthorized: true, // never off: this socket carries the session token
       ca: MAX_TLS_CA,
       autoSelectFamily: true,
     };
     this.socket = tls.connect(
-      this.opts.port,
+      DEFAULT_PORT,
       this.opts.host,
       socketOpts,
       () => {
-        this.reconnectAttempt = 0;
+        // The reconnect backoff is NOT reset here — only after INIT plus a stable stretch
+        // (reconnectAttemptFor, review 2026-09-26, M4).
+        this.socket?.setTimeout(0); // handshake done — PING and keepalive watch the socket from here
+        this.socket?.setKeepAlive(true, TCP_KEEPALIVE_DELAY_MS);
         this.emit('connected');
         this.startPing();
         this.sendDeviceInfo();
@@ -193,12 +286,23 @@ export class MaxClient extends EventEmitter {
       this.drainBuffer();
     });
 
-    this.socket.on('error', (err: Error) => {
+    const socket = this.socket;
+    // Destroyed with an error: 'error' then 'close' below, which reconnects with backoff.
+    socket.setTimeout(TLS_HANDSHAKE_TIMEOUT_MS, () => {
+      socket.destroy(Object.assign(new Error(`MAX TLS handshake timed out after ${TLS_HANDSHAKE_TIMEOUT_MS / 1000}s`), { code: 'ETIMEDOUT' }));
+    });
+    socket.on('error', (err: Error) => {
+      // Fail the waits first: whatever they wait for will not come on this socket.
+      this.failPending(err);
       this.emit('error', err);
     });
 
-    this.socket.on('close', () => {
+    socket.on('close', () => {
       this.stopPing();
+      // A closed socket is gone: send() now says "not connected" at once instead of writing
+      // into a destroyed stream and leaving the request to time out.
+      if (this.socket === socket) this.socket = null;
+      this.failPending(new Error('socket closed'));
       this.emit('disconnected');
       if (!this.closedByUser && this.opts.reconnect) this.scheduleReconnect();
     });
@@ -210,17 +314,33 @@ export class MaxClient extends EventEmitter {
     this.teardownSocket();
   }
 
+  /** True after disconnect() until the next connect() — a deliberate stop (pause, /kill, shutdown), not a drop. */
+  get stoppedByUser(): boolean {
+    return this.closedByUser;
+  }
+
+  /** True once this socket's LOGIN was accepted — until then only auth opcodes may go out (send). */
+  get loggedIn(): boolean {
+    return this.authed;
+  }
+
   private teardownSocket(): void {
     if (this.socket) {
       this.socket.removeAllListeners();
+      // destroy() can still deliver an 'error' queued before this call; with no listener it
+      // would become an uncaughtException (review 2026-09-26, M11).
+      this.socket.on('error', () => {});
       this.socket.destroy();
       this.socket = null;
     }
+    this.failPending(new Error('socket torn down'));
     this.stopPing();
   }
 
   private scheduleReconnect(): void {
     this.clearReconnectTimer();
+    this.reconnectAttempt = reconnectAttemptFor(this.reconnectAttempt, this.readyAt);
+    this.readyAt = null;
     const idx = Math.min(this.reconnectAttempt, RECONNECT_DELAYS_MS.length - 1);
     const delay = RECONNECT_DELAYS_MS[idx] as number;
     this.reconnectAttempt += 1;
@@ -236,7 +356,8 @@ export class MaxClient extends EventEmitter {
 
   private startPing(): void {
     this.stopPing();
-    this.pingTimer = setInterval(() => this.ping(), this.opts.pingIntervalMs);
+    this.lastPingSentAt = null; // a new socket: an unanswered PING of the old one doesn't count
+    this.pingTimer = setInterval(() => this.ping(), DEFAULT_PING_INTERVAL_MS);
   }
 
   private stopPing(): void {
@@ -246,9 +367,28 @@ export class MaxClient extends EventEmitter {
     }
   }
 
+  // Set when a PING goes out, cleared by its reply.
   private lastPingSentAt: number | null = null;
 
+  /**
+   * Half-open detection (review 2026-09-26, M1). The previous PING still unanswered a whole
+   * interval later means the path is dead even though the socket looks open (a NAT/CLAT
+   * mapping dropped, a server that went away without a FIN): the kernel would keep
+   * retransmitting for 15+ minutes before 'close', while sends time out one by one and nobody
+   * learns MAX is gone. Destroy the socket instead — its 'error' fails the in-flight requests at
+   * once, and 'close' runs the usual disconnected -> reconnect path.
+   */
   private ping(): void {
+    if (this.lastPingSentAt !== null) {
+      const silentMs = Date.now() - this.lastPingSentAt;
+      this.lastPingSentAt = null;
+      // code ETIMEDOUT: the failed in-flight requests classify as transient (bridge/transient.ts).
+      const err = Object.assign(new Error(`MAX did not answer PING for ${Math.round(silentMs / 1000)}s — connection is dead, reconnecting`), {
+        code: 'ETIMEDOUT',
+      });
+      this.socket?.destroy(err);
+      return;
+    }
     this.lastPingSentAt = Date.now();
     this.send(OPCODES.PING);
   }
@@ -263,8 +403,11 @@ export class MaxClient extends EventEmitter {
         // teardownSocket removes the socket's listeners, so no 'close' event will
         // fire to schedule a reconnect — without doing it here explicitly, a single
         // corrupt/desynced frame left the client permanently offline (silently: the
-        // process kept running, just never reconnected).
+        // process kept running, just never reconnected). For the same reason 'disconnected'
+        // is emitted here, exactly as the 'close' path does: without it app.ts kept
+        // maxConnected = true and never armed the outage notice (review 2026-09-26, C18).
         this.teardownSocket();
+        this.emit('disconnected');
         if (!this.closedByUser && this.opts.reconnect) this.scheduleReconnect();
         return;
       }
@@ -282,8 +425,11 @@ export class MaxClient extends EventEmitter {
           const items = decodeFramePayload(decompressed);
           payload = pickObject(items) ?? items[0] ?? null;
         } catch (err) {
+          // Diagnostic only, on its own event: the connection is fine, and this frame may be a
+          // push of an unrelated opcode — it must not fail the requests in flight (review
+          // 2026-09-26, M3). app.ts logs it.
           this.emit(
-            'error',
+            'decode-error',
             new Error(`Failed to decode payload for ${formatOpcode(header.opcode)}: ${(err as Error).message}`),
           );
           continue;
@@ -298,17 +444,24 @@ export class MaxClient extends EventEmitter {
         length: header.payloadLength,
       };
 
-      if (header.opcode === OPCODES.INIT && header.cmd === DIR.OK) this.emit('ready');
-      if (header.opcode === OPCODES.PING && this.lastPingSentAt !== null) {
-        this.emit('latency', Date.now() - this.lastPingSentAt);
-        this.lastPingSentAt = null;
+      if (header.opcode === OPCODES.INIT && header.cmd === DIR.OK) {
+        this.readyAt = Date.now();
+        this.emit('ready');
       }
+      // A refused INIT (e.g. an outdated appVersion) leaves an open socket nothing ever logs in on or
+      // reconnects: dropped instead, so the usual reconnect and outage notice follow (client-r3.3#2).
+      if (header.opcode === OPCODES.INIT && header.cmd === DIR.ERR) {
+        this.socket?.destroy(new Error(describeAuthError(payload, 'MAX rejected INIT')));
+        return;
+      }
+      if (header.opcode === OPCODES.LOGIN && header.cmd === DIR.OK) this.authed = true;
+      if (header.opcode === OPCODES.PING) this.lastPingSentAt = null;
       this.emit('message', event);
     }
   }
 
   send(opcode: number, payload?: unknown): void {
-    if (!this.socket) throw new Error('MaxClient.send called while not connected');
+    if (!this.socket || (!this.authed && !PRE_LOGIN_OPCODES.has(opcode))) throw new Error('MaxClient.send called while not connected');
     const payloadBuf = payload === undefined || payload === null ? Buffer.alloc(0) : pack(payload);
     const frame = encodeFrame(this.seq, opcode, payloadBuf);
     this.seq += 1;
@@ -318,18 +471,74 @@ export class MaxClient extends EventEmitter {
 
   private sendDeviceInfo(): void {
     this.send(OPCODES.INIT, {
-      userAgent: {
-        deviceType: 'DESKTOP',
-        appVersion: this.opts.appVersion,
-        osVersion: this.opts.osVersion,
-        locale: this.opts.locale,
-        screen: '2.0x',
-        timezone: this.opts.timezone,
-        buildNumber: this.opts.buildNumber,
-      },
+      userAgent: USER_AGENT,
       deviceId: this.deviceId,
       clientSessionId: Math.floor(Math.random() * 1000),
     });
+  }
+
+  /**
+   * Registers a wait for the first frame of `opcode` that `accept` takes. It settles exactly once:
+   * on that frame (via dispatch), on its timeout, on a lost socket (failPending) or through the
+   * returned `fail` (request() uses it when send() throws). Every path removes it from `pending`
+   * and clears its timer, so nothing outlives it.
+   */
+  private addWait(
+    opcode: number,
+    what: string,
+    accept: (event: MaxMessageEvent) => boolean,
+    timeoutMs: number,
+    timeoutMessage: string,
+  ): { promise: Promise<MaxMessageEvent>; fail: (err: Error) => void } {
+    let wait!: PendingWait;
+    const promise = new Promise<MaxMessageEvent>((resolve, reject) => {
+      let settled = false;
+      const settle = (): boolean => {
+        if (settled) return false;
+        settled = true;
+        clearTimeout(timer);
+        const set = this.pending.get(opcode);
+        set?.delete(wait);
+        if (set?.size === 0) this.pending.delete(opcode);
+        return true;
+      };
+      const timer = setTimeout(() => {
+        if (settle()) reject(new Error(timeoutMessage));
+      }, timeoutMs);
+      wait = {
+        what,
+        accept,
+        resolve: (event) => {
+          if (settle()) resolve(event);
+        },
+        fail: (err) => {
+          if (settle()) reject(err);
+        },
+      };
+    });
+    let set = this.pending.get(opcode);
+    if (!set) {
+      set = new Set();
+      this.pending.set(opcode, set);
+    }
+    set.add(wait);
+    return { promise, fail: (err) => wait.fail(err) };
+  }
+
+  /** The single 'message' listener behind every wait: settles the waits this frame answers. */
+  private dispatch(event: MaxMessageEvent): void {
+    const set = this.pending.get(event.opcode);
+    if (!set) return;
+    for (const wait of [...set]) {
+      if (wait.accept(event)) wait.resolve(event);
+    }
+  }
+
+  /** The socket is gone: every wait fails now with a MaxConnectionLostError (see there). */
+  private failPending(cause: Error): void {
+    for (const set of [...this.pending.values()]) {
+      for (const wait of [...set]) wait.fail(new MaxConnectionLostError(wait.what, cause));
+    }
   }
 
   /**
@@ -338,29 +547,8 @@ export class MaxClient extends EventEmitter {
    * which is only unambiguous while at most ONE request per opcode is in flight.
    * request() below enforces that, hence private.
    */
-  private waitForOpcode(opcode: number, timeoutMs = 20_000): Promise<MaxMessageEvent> {
-    return new Promise((resolve, reject) => {
-      const cleanup = () => {
-        clearTimeout(timer);
-        this.off('message', onMessage);
-        this.off('error', onError);
-      };
-      const onMessage = (event: MaxMessageEvent) => {
-        if (event.opcode !== opcode) return;
-        cleanup();
-        resolve(event);
-      };
-      const onError = (err: Error) => {
-        cleanup();
-        reject(err);
-      };
-      const timer = setTimeout(() => {
-        cleanup();
-        reject(new Error(`Timed out waiting for ${formatOpcode(opcode)}`));
-      }, timeoutMs);
-      this.on('message', onMessage);
-      this.on('error', onError);
-    });
+  private waitForOpcode(opcode: number, timeoutMs = 20_000): { promise: Promise<MaxMessageEvent>; fail: (err: Error) => void } {
+    return this.addWait(opcode, formatOpcode(opcode), () => true, timeoutMs, `Timed out waiting for ${formatOpcode(opcode)}`);
   }
 
   // Tail of the in-flight request chain per opcode — see request() below.
@@ -390,14 +578,25 @@ export class MaxClient extends EventEmitter {
    * Known residual gap: if a request times out and its response arrives late,
    * the NEXT same-opcode request may consume that stale frame — unavoidable
    * without seq correlation, and timeouts here usually mean the connection is
-   * about to be torn down and re-established anyway.
+   * about to be torn down and re-established anyway. A lost socket no longer takes
+   * the timeout path: failPending rejects the wait at once.
+   *
+   * Without a socket, send() throws and the wait is withdrawn on the spot: the call
+   * rejects with "not connected" and leaves no timer behind. Before, the orphaned
+   * wait timed out 20 s later as an unhandled rejection — a false "internal bridge
+   * error" for every message written while MAX was paused (review 2026-09-26, M2).
    */
   private request(opcode: number, payload?: unknown, timeoutMs?: number): Promise<MaxMessageEvent> {
     const prev = this.requestChains.get(opcode) ?? Promise.resolve();
     const run = prev.then(() => {
+      // Registered before send() so the answer cannot slip past; withdrawn if send() throws.
       const wait = this.waitForOpcode(opcode, timeoutMs);
-      this.send(opcode, payload);
-      return wait;
+      try {
+        this.send(opcode, payload);
+      } catch (err) {
+        wait.fail(err instanceof Error ? err : new Error(String(err)));
+      }
+      return wait.promise;
     });
     // Keep the chain alive on failure so the next request still runs.
     this.requestChains.set(opcode, run.catch(() => undefined));
@@ -468,8 +667,11 @@ export class MaxClient extends EventEmitter {
         payload && typeof payload === 'object' && !Array.isArray(payload)
           ? `keys=[${Object.keys(payload as object).join(',')}]`
           : `type=${typeof payload}`;
-      throw new Error(
+      const serverCode = (payload as { error?: unknown } | null)?.error;
+      throw new MaxServerError(
         `${describeAuthError(payload, 'LOGIN was rejected — the session token is no longer valid')} (dir=0x${dir.toString(16)}, ${shape})`,
+        OPCODES.LOGIN,
+        typeof serverCode === 'string' ? serverCode : undefined,
       );
     }
     // A successful LOGIN only SOMETIMES rotates the session token (returns a fresh 663-char string);
@@ -499,7 +701,7 @@ export class MaxClient extends EventEmitter {
     text: string | null,
     attaches: unknown[] = [],
     replyTo?: { messageId: unknown; chatId: unknown },
-  ): Promise<{ cid: number; messageId: unknown; attaches: unknown[] }> {
+  ): Promise<{ cid: number; messageId: unknown; attaches: unknown[]; time: unknown }> {
     const cid = this.nextCid();
     // Outgoing reply link shape is {type, messageId, chatId} — note this differs from
     // the INCOMING reply link ({type, message, chatId}); MAX uses two shapes (confirmed
@@ -510,9 +712,11 @@ export class MaxClient extends EventEmitter {
       message: { text, cid: BigInt(cid), elements: [], attaches, link },
       notify: true,
     });
-    const responseMessage = (payload as { message?: { id?: unknown; attaches?: unknown[] } } | null)?.message;
+    const responseMessage = (payload as { message?: { id?: unknown; attaches?: unknown[]; time?: unknown } } | null)?.message;
     if (dir === DIR.ERR) throw new Error(describeAuthError(payload, 'MSG_SEND failed'));
-    return { cid, messageId: responseMessage?.id, attaches: responseMessage?.attaches ?? [] };
+    // `time` is the echoed message's MAX server timestamp, raw (may be a BigInt, or absent) —
+    // the bridge stores it as the chat's history cursor (bridge/catchUp.ts liveCursorTime).
+    return { cid, messageId: responseMessage?.id, attaches: responseMessage?.attaches ?? [], time: responseMessage?.time };
   }
 
   /**
@@ -529,7 +733,7 @@ export class MaxClient extends EventEmitter {
     text: string,
     attaches: unknown[] = [],
     replyTo?: { messageId: unknown; chatId: unknown },
-  ): Promise<{ cid: number; messageId: unknown; chatId: unknown; attaches: unknown[] }> {
+  ): Promise<{ cid: number; messageId: unknown; chatId: unknown; attaches: unknown[]; time: unknown }> {
     const cid = this.nextCid();
     const link = replyTo ? { type: 'REPLY', messageId: replyTo.messageId, chatId: toChatId(replyTo.chatId) } : null;
     const { dir, payload } = await this.request(OPCODES.MSG_SEND, {
@@ -538,9 +742,9 @@ export class MaxClient extends EventEmitter {
       notify: true,
     });
     if (dir === DIR.ERR) throw new Error(describeAuthError(payload, 'Open-dialog send failed'));
-    const p = payload as { chatId?: unknown; message?: { id?: unknown; attaches?: unknown[] } } | null;
+    const p = payload as { chatId?: unknown; message?: { id?: unknown; attaches?: unknown[]; time?: unknown } } | null;
     if (p?.chatId == null) throw new Error('Open-dialog send did not return a chat id');
-    return { cid, messageId: p.message?.id, chatId: p.chatId, attaches: p.message?.attaches ?? [] };
+    return { cid, messageId: p.message?.id, chatId: p.chatId, attaches: p.message?.attaches ?? [], time: p.message?.time };
   }
 
   /** `answerIds` — MAX's own assigned ids (from the poll's `answers[].answerId`), not Telegram option indexes. */
@@ -672,7 +876,7 @@ export class MaxClient extends EventEmitter {
    * other ms-timestamp field here — must go over the wire as BigInt. Payload
    * shape supplied by the user from their own reverse engineering (2026-08-09).
    */
-  async getChatsList(marker: number): Promise<{ chats: unknown[]; marker: number | null }> {
+  private async getChatsList(marker: number): Promise<{ chats: unknown[]; marker: number | null }> {
     const { dir, payload } = await this.request(OPCODES.CHATS_LIST, { marker: BigInt(marker) });
     if (dir === DIR.ERR) throw new Error(describeAuthError(payload, 'CHATS_LIST failed'));
     const p = payload as { chats?: unknown[]; marker?: unknown } | null;
@@ -822,26 +1026,8 @@ export class MaxClient extends EventEmitter {
    * top level — NOT PUSH_MESSAGE (0x80) as max_send_attach.py's own comments
    * suggested (its check didn't actually pin the opcode, just dir+payload shape).
    */
-  waitForVideoReady(timeoutMs = 15_000): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const cleanup = () => {
-        clearTimeout(timer);
-        this.off('message', onMessage);
-      };
-      const onMessage = (event: MaxMessageEvent) => {
-        if (event.opcode !== OPCODES.EVENTS) return;
-        const payload = event.payload as { videoId?: unknown } | null;
-        if (payload && payload.videoId != null) {
-          cleanup();
-          resolve();
-        }
-      };
-      const timer = setTimeout(() => {
-        cleanup();
-        reject(new Error('Timed out waiting for the video-ready push'));
-      }, timeoutMs);
-      this.on('message', onMessage);
-    });
+  waitForVideoReady(videoId: unknown, timeoutMs = 15_000): Promise<void> {
+    return this.waitForUploadReady('videoId', videoId, 'video', timeoutMs);
   }
 
   /**
@@ -850,26 +1036,27 @@ export class MaxClient extends EventEmitter {
    * without this, MSG_SEND with the resulting audioId sometimes fails validation because
    * the file isn't actually processed yet — a fixed sleep isn't a reliable substitute.
    */
-  waitForAudioReady(timeoutMs = 15_000): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const cleanup = () => {
-        clearTimeout(timer);
-        this.off('message', onMessage);
-      };
-      const onMessage = (event: MaxMessageEvent) => {
-        if (event.opcode !== OPCODES.EVENTS) return;
-        const payload = event.payload as { audioId?: unknown } | null;
-        if (payload && payload.audioId != null) {
-          cleanup();
-          resolve();
-        }
-      };
-      const timer = setTimeout(() => {
-        cleanup();
-        reject(new Error('Timed out waiting for the audio-ready push'));
-      }, timeoutMs);
-      this.on('message', onMessage);
-    });
+  waitForAudioReady(audioId: unknown, timeoutMs = 15_000): Promise<void> {
+    return this.waitForUploadReady('audioId', audioId, 'audio', timeoutMs);
+  }
+
+  /**
+   * The ready wait behind waitForVideoReady / waitForAudioReady. Only the push for THIS upload's
+   * id counts (isUploadReadyPush, review 2026-09-26, OUTBOUND9), and a lost socket fails it at
+   * once through failPending instead of after the full timeout (M13) — the push would never come
+   * on a new socket. Without a socket at all it fails right away.
+   */
+  private waitForUploadReady(key: 'videoId' | 'audioId', id: unknown, kind: string, timeoutMs: number): Promise<void> {
+    const what = `the ${kind}-ready push for ${String(id)}`;
+    if (!this.socket) return Promise.reject(new MaxConnectionLostError(what, new Error('not connected')));
+    const wait = this.addWait(
+      OPCODES.EVENTS,
+      what,
+      (event) => isUploadReadyPush(event.payload, key, id),
+      timeoutMs,
+      `Timed out waiting for the ${kind}-ready push`,
+    );
+    return wait.promise.then(() => undefined);
   }
 
   /** Requests an upload slot for a single file (also used for GIFs — MAX only accepts those as FILE). */

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { classifyProbeResult, probeIntervalMs } from '../src/bridge/sync.js';
+import { classifyProbeResult, isReactionInvalid, probeIntervalMs, probeLinkGuard } from '../src/bridge/sync.js';
+import { isThreadNotFound } from '../src/bridge/transient.js';
 
 describe('probeIntervalMs (decay ladder)', () => {
   it('pings densely right after send (hot phase)', () => {
@@ -47,5 +48,52 @@ describe('classifyProbeResult', () => {
     expect(classifyProbeResult('Bad Gateway')).toBe('unknown');
     expect(classifyProbeResult('')).toBe('unknown');
     expect(classifyProbeResult('chat not found')).toBe('unknown'); // whole chat gone != message deleted
+  });
+});
+
+describe('isThreadNotFound (topic-gone detector, shared by restore and the probe)', () => {
+  it('recognizes a deleted topic in every shape Telegram answers', () => {
+    expect(isThreadNotFound(new Error('400: Bad Request: message thread not found'))).toBe(true);
+    expect(isThreadNotFound('Bad Request: message thread not found')).toBe(true); // description string
+    expect(isThreadNotFound('Bad Request: TOPIC_ID_INVALID')).toBe(true); // editForumTopic (live 2026-08-18)
+    expect(isThreadNotFound('Bad Request: TOPIC_DELETED')).toBe(true);
+  });
+
+  it('never reads throttling/network/other errors as a deleted topic', () => {
+    expect(isThreadNotFound('Too Many Requests: retry after 5')).toBe(false);
+    expect(isThreadNotFound(new Error('EFATAL: socket hang up'))).toBe(false);
+    expect(isThreadNotFound('Bad Request: message to react not found')).toBe(false);
+    expect(isThreadNotFound('')).toBe(false);
+  });
+});
+
+describe('isReactionInvalid', () => {
+  it('flags an emoji Telegram refuses, not a missing message', () => {
+    expect(isReactionInvalid('Bad Request: REACTION_INVALID')).toBe(true);
+    expect(isReactionInvalid('400: bad request: reaction_invalid')).toBe(true);
+    expect(isReactionInvalid('Bad Request: message to react not found')).toBe(false);
+    expect(isReactionInvalid('Bad Request: REACTION_EMPTY')).toBe(false);
+  });
+});
+
+describe('probeLinkGuard', () => {
+  const mapping = { telegramTopicId: 42 };
+
+  it('probes a link whose chat and topic are unchanged', () => {
+    expect(probeLinkGuard({ telegramTopicId: 42 }, mapping, false)).toBe('probe');
+    expect(probeLinkGuard({}, mapping, false)).toBe('probe'); // untagged link: topic check happens later
+  });
+
+  it('drops links of an unmapped (closed/rebooted) or banned chat', () => {
+    expect(probeLinkGuard({ telegramTopicId: 42 }, undefined, false)).toBe('drop');
+    expect(probeLinkGuard({ telegramTopicId: 42 }, { telegramTopicId: 42, banned: true }, false)).toBe('drop');
+  });
+
+  it('skips while the chat topic is being restored', () => {
+    expect(probeLinkGuard({ telegramTopicId: 42 }, mapping, true)).toBe('skip');
+  });
+
+  it('drops a link written in a topic that has since been recreated', () => {
+    expect(probeLinkGuard({ telegramTopicId: 41 }, mapping, false)).toBe('drop');
   });
 });

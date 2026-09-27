@@ -5,20 +5,29 @@ import { Markup, type Telegraf } from 'telegraf';
 import type { ChatAction, TelegramEmoji } from 'telegraf/types';
 import type { MaxClient, MaxMessageEvent, MaxHistoryMessage } from '../max/client.js';
 import { OPCODES, formatOpcode } from '../max/opcodes.js';
-import { resolveContactDisplayName, resolveChatName, type ContactProfile } from '../max/names.js';
-import type { ChatMapStore } from '../store/chatMapStore.js';
-import { ensureTopicForMaxChat } from '../telegram/bot.js';
-import { downloadMaxAttachment, describeAttachment, type MaxAttachment, type DownloadContext } from './attachments.js';
+import { resolveContactDisplayName, resolveChatName, isFallbackTitle, type ContactProfile } from '../max/names.js';
+import { cursorToMs, type ChatMapStore } from '../store/chatMapStore.js';
+import { ensureTopicForMaxChat, clampTopicTitle, withTopicLock } from '../telegram/bot.js';
+import {
+  downloadMaxAttachment,
+  describeAttachment,
+  telegramSendKind,
+  type MaxAttachment,
+  type DownloadContext,
+} from './attachments.js';
+import { splitTelegramText, truncateCodePoints, truncateUtf16, TELEGRAM_CAPTION_LIMIT, TELEGRAM_TEXT_LIMIT } from './text.js';
 import { uploadTelegramAttachmentToMax } from './upload.js';
 import { canRenderAnimatedStickers } from './lottie.js';
 import { reportBridgeError } from './errorReporter.js';
 import { wireControlPanel } from './panel.js';
-import { createBugReports, BUGREPORT_BOT_HANDLE, type BugReports } from './bugReports.js';
+import { createBugReports, isBugReportInboxEnabled, BUGREPORT_BOT_HANDLE, type BugReports } from './bugReports.js';
 import { createMaxAuthFlow, type MaxAuthCallbacks } from './maxAuthFlow.js';
 import { createTelemetry } from './telemetry.js';
 import { checkVersion, type VersionStatus } from './version.js';
-import { buildStatusText, collectHostStats } from './status.js';
+import { buildStatusText, collectHostStats, maskPhone } from './status.js';
 import { toTelegramReaction } from '../max/reactions.js';
+import { CatchUpTracker, ChatBannedError, StrikeCounter, SyncCancelledError, liveCursorTime } from './catchUp.js';
+import { isThreadNotFound, isTransientMaxError, isTransientTelegramError, TransientDownloadError } from './transient.js';
 import { createLogger, jsonStringify, redactSecrets } from '../logger.js';
 
 const logger = createLogger('bridge');
@@ -60,6 +69,27 @@ function describeForwardOrigin(origin: TelegramForwardOrigin | undefined): strin
     default:
       return null;
   }
+}
+
+/**
+ * A human label for Telegram message content the bridge has no MAX equivalent for, so the topic
+ * can say it was NOT relayed instead of it vanishing silently (review 2026-09-26, OUTBOUND6).
+ * Null for anything else — service updates (pins, joins, …) must stay silent, not draw a warning.
+ * Pure + exported for unit testing.
+ */
+export function describeUnrelayableTelegramMessage(message: object): string | null {
+  const m = message as Record<string, unknown>;
+  if (m.dice) {
+    const emoji = (m.dice as { emoji?: unknown }).emoji;
+    return typeof emoji === 'string' && emoji ? `кубик ${emoji}` : 'кубик';
+  }
+  if (m.story) return 'история';
+  if (m.game) return 'игра';
+  if (m.paid_media) return 'платное медиа';
+  if (m.invoice) return 'счёт на оплату';
+  if (m.giveaway || m.giveaway_winners) return 'розыгрыш';
+  if (m.checklist) return 'чек-лист';
+  return null;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -108,6 +138,37 @@ export function classifyProbeResult(errText: string): 'alive' | 'gone' | 'unknow
   return 'unknown';
 }
 
+/**
+ * Telegram refused the emoji itself (outside its fixed reaction set) — the probe
+ * re-affirming a relayed MAX reaction then learns nothing about the message, so it
+ * retries once with an empty set. Pure + exported for unit testing.
+ */
+export function isReactionInvalid(errText: string): boolean {
+  return /reaction_invalid|reaction_not_allowed/i.test(errText);
+}
+
+/**
+ * Pre-flight for one outgoing link before the deletion probe may touch it. A 'gone'
+ * probe ends in an irreversible forAll delete on MAX, so anything that means "the
+ * whole topic went away" rather than "the owner deleted this one message" must stop
+ * here (review 2026-09-26):
+ *  - no mapping (chat closed, /reboot, /kill) or a banned chat -> 'drop' the link;
+ *  - the chat's topic is being recreated right now -> 'skip' this round;
+ *  - the mapping now points at a different topic than the one the message was
+ *    written in (the old topic was deleted and recreated) -> 'drop'.
+ * Pure + exported for unit testing.
+ */
+export function probeLinkGuard(
+  link: { telegramTopicId?: number },
+  mapping: { telegramTopicId: number; banned?: boolean } | undefined,
+  restoring: boolean,
+): 'probe' | 'skip' | 'drop' {
+  if (!mapping || mapping.banned) return 'drop';
+  if (restoring) return 'skip';
+  if (link.telegramTopicId != null && link.telegramTopicId !== mapping.telegramTopicId) return 'drop';
+  return 'probe';
+}
+
 /** Telegram's flood-control 429 carries how long to wait — honor it instead of failing the send.
  * Capped: an endless 429 (the bot got flagged/limited for real) must eventually surface as an
  * error instead of holding a backfill loop hostage forever. */
@@ -124,12 +185,147 @@ async function withFloodRetry<T>(fn: () => Promise<T>): Promise<T> {
     }
   }
 }
+// NOTE: wrap ONE Telegram call, never a function that sends several messages — a retry re-runs
+// `fn` from the top, so everything it had already delivered before the 429 would be posted again
+// (review 2026-09-26, S2: a whole sendAttachments used to be wrapped and duplicated albums).
+
+/**
+ * How a relayed MAX message's Telegram copies are linked: the first text piece (or, with no text,
+ * the first attachment) is the anchor edits/replies/reactions use, and EVERY other message it
+ * produced — further text pieces of a split long text, every attachment of an album — goes into
+ * extraTelegramMessageIds, so deleting the MAX message deletes all of them instead of orphaning
+ * the rest of an album (review 2026-09-26, S5). Pure + exported for unit testing.
+ */
+export function buildLinkIds(
+  textIds: readonly number[],
+  attachIds: readonly number[],
+): { telegramMessageId: number; extraTelegramMessageIds?: number[] } | undefined {
+  const all = [...new Set([...textIds, ...attachIds])];
+  if (all.length === 0) return undefined;
+  const [telegramMessageId, ...extra] = all as [number, ...number[]];
+  return { telegramMessageId, ...(extra.length > 0 ? { extraTelegramMessageIds: extra } : {}) };
+}
+
+/**
+ * Telegram refused THIS message for good (400 bad request, 413 too large, …) — worth degrading
+ * to a text placeholder instead of failing the whole MAX message. Not a deleted topic (the caller
+ * recreates it and replays), and not a transient failure (429/5xx/network — the caller retries
+ * later; a placeholder now would stand in for a file that can still arrive).
+ */
+export function isPermanentTelegramRefusal(err: unknown): boolean {
+  return !(err instanceof TransientDownloadError) && !isThreadNotFound(err) && !isTransientTelegramError(err);
+}
+
+/**
+ * Sends a text that may exceed Telegram's 4096-unit limit as consecutive messages (see
+ * splitTelegramText), each through withFloodRetry. The reply goes on the first piece and the
+ * inline keyboard on the last, so it sits under the whole text. `paceMs` spaces the pieces out
+ * (the backfill's per-chat flood pacing). Returns every sent message_id in order; `sent`, when
+ * given, gets each id as soon as it is sent — so a caller still knows what went out when a later
+ * piece throws (discardPartialDelivery).
+ */
+export async function sendTextPieces(
+  bot: Telegraf,
+  groupId: string,
+  topicId: number,
+  text: string,
+  extra: {
+    replyParameters?: { message_id: number; allow_sending_without_reply: boolean };
+    replyMarkup?: InlineMarkup;
+    paceMs?: number;
+    sent?: number[];
+  } = {},
+): Promise<number[]> {
+  const pieces = splitTelegramText(text);
+  const ids: number[] = [];
+  for (let i = 0; i < pieces.length; i++) {
+    const piece = pieces[i] as string;
+    const sent = await withFloodRetry(() =>
+      bot.telegram.sendMessage(groupId, piece, {
+        message_thread_id: topicId,
+        ...(i === 0 && extra.replyParameters ? { reply_parameters: extra.replyParameters } : {}),
+        ...(i === pieces.length - 1 && extra.replyMarkup ? { reply_markup: extra.replyMarkup } : {}),
+      }),
+    );
+    ids.push(sent.message_id);
+    extra.sent?.push(sent.message_id);
+    if (extra.paceMs) await sleep(extra.paceMs);
+  }
+  return ids;
+}
+
+/**
+ * A MAX message goes out as several Telegram messages (text pieces, then each attachment). When a
+ * transient failure hits after some of them went out, the whole message is delivered again later
+ * (the next catch-up finds no link for it) — so the parts already posted are deleted here first,
+ * or they would show up twice (review 2026-09-26, b5-delivery/b2b-errors). Best effort: an id
+ * whose deletion fails too (Telegram still down) is kept under `key` and retried by
+ * retryPendingDiscards when the backfill reaches that message again or MAX reports it deleted. Bounded (FIFO).
+ */
+const pendingDiscards = new Map<string, number[]>();
+const PENDING_DISCARDS_CAP = 200;
+export async function discardPartialDelivery(bot: Pick<Telegraf, 'telegram'>, groupId: string, key: string, ids: readonly number[]): Promise<void> {
+  const failed: number[] = [];
+  for (const id of ids) {
+    try {
+      await bot.telegram.deleteMessage(groupId, id);
+    } catch (err) {
+      failed.push(id);
+      logger.error(`Failed to delete Telegram message ${id} left over from a partly delivered MAX message ${key}`, err);
+    }
+  }
+  if (failed.length === 0) return;
+  pendingDiscards.set(key, [...(pendingDiscards.get(key) ?? []), ...failed]);
+  while (pendingDiscards.size > PENDING_DISCARDS_CAP) {
+    const oldest = pendingDiscards.keys().next().value;
+    if (oldest === undefined) break;
+    pendingDiscards.delete(oldest);
+  }
+}
+
+/** One more try at deleting what discardPartialDelivery could not — called before the message behind `key` is sent again. Never throws. */
+export async function retryPendingDiscards(bot: Pick<Telegraf, 'telegram'>, groupId: string, key: string): Promise<void> {
+  const ids = pendingDiscards.get(key);
+  if (!ids) return;
+  pendingDiscards.delete(key);
+  for (const id of ids) {
+    await bot.telegram.deleteMessage(groupId, id).catch((err) => logger.error(`Failed to delete leftover Telegram message ${id} (${key}) — giving up on it`, err));
+  }
+}
+
+/** Deletes the bot's own Telegram messages one by one, so one failure doesn't keep the rest. Never throws; `why` names the cause in the error log. */
+async function deleteBotMessages(bot: Pick<Telegraf, 'telegram'>, groupId: string, ids: readonly number[], why: string): Promise<void> {
+  for (const id of ids) {
+    await bot.telegram.deleteMessage(groupId, id).catch((err) => logger.error(`Failed to delete Telegram message ${id} (${why})`, err));
+  }
+}
+
+/** A failure after which the MAX message is delivered again later (the catch-up) — its partial parts must go. */
+function isRetriedDeliveryFailure(err: unknown): boolean {
+  return err instanceof TransientDownloadError || isTransientTelegramError(err);
+}
+
+/**
+ * A MAX poll as plain text — the fallback when Telegram refuses it as a native poll (question over
+ * 300 chars, an option over 100, fewer than 2 or more than 10 options; review 2026-09-26,
+ * INBOUND-EDGES4). Voting stays on MAX; /poll in reply still shows the live tally.
+ */
+export function renderPollAsText(title: string | undefined, options: readonly string[], settings = 0): string {
+  const flags = [(settings & 1) !== 0 ? 'анонимный' : '', (settings & 2) !== 0 ? 'несколько ответов' : ''].filter(Boolean);
+  const lines = [`📊 Опрос: ${title || 'без названия'}${flags.length > 0 ? ` (${flags.join(', ')})` : ''}`];
+  for (const option of options) lines.push(`• ${option}`);
+  lines.push('', '💡 Голосовать — в MAX. Ответьте на это сообщение командой /poll, чтобы увидеть счёт.');
+  return lines.join('\n');
+}
 
 interface MaxPushPayload {
   chatId?: unknown; // may be a plain number, BigInt, or (large/negative — e.g. channels) only representable as BigInt
   message?: {
     id?: unknown; // BigInt — needed for FILE_DOWNLOAD
     cid?: number;
+    // MAX server ms timestamp (may arrive as a BigInt) — the same field CHAT_HISTORY returns
+    // (client.ts: a history message has the push message's shape). Feeds the history cursor.
+    time?: unknown;
     text?: string;
     sender?: unknown;
     attaches?: MaxAttachment[];
@@ -187,6 +383,38 @@ interface MessageLink {
   // Epoch ms this link was created — the probe uses it to place the message on the
   // decay ladder (hot right after send, cooling off over hours).
   createdAt?: number;
+  // Telegram topic the message was written in (set on outgoing links). The probe drops
+  // the link instead of deleting on MAX when the chat's mapping now points at a
+  // different topic — the old one (and every message in it) was deleted and recreated.
+  telegramTopicId?: number;
+  // True for the stub an EDIT of an unlinked message produced («✏️ Изменено (исходное сообщение не
+  // найдено)» — text only, attachments dropped). It keeps later edits/deletions working on the stub,
+  // but it is NOT a delivery of the original message: the history backfill still sends the original
+  // (isDeliveredLink) and then deletes the stub — or, when only part of the original went out or the
+  // stub is newer than the history snapshot, folds it into its link (review 2026-09-26,
+  // b2a-cursor/delivery-r2#2; 2026-09-27, delivery-r3.1#0).
+  orphanEdit?: boolean;
+  // Bot-written notices about this message (a poll's vote hint or reminder, a tally reply, an edit
+  // relayed as a reply): deleted with it and resolvable by getByTelegram (/poll, a native reply), but
+  // never the target of a 👎 delete, /delete or a relayed reaction — those used to delete the
+  // owner's poll on both sides for a 👎 on the «Опрос отправлен в MAX…» hint (review 2026-09-26,
+  // delivery-r2#0).
+  noticeTelegramMessageIds?: number[];
+}
+
+/** Whether a link means its MAX message is already in Telegram — what the backfill skips. An orphan-edit stub is not. Pure + exported for unit testing. */
+export function isDeliveredLink(link: { orphanEdit?: boolean } | undefined): boolean {
+  return link != null && !link.orphanEdit;
+}
+
+/** Every Telegram message a link covers: anchor, content extras, notices. Pure + exported for unit testing. */
+export function linkTelegramIds(link: Pick<MessageLink, 'telegramMessageId' | 'extraTelegramMessageIds' | 'noticeTelegramMessageIds'>): number[] {
+  return [...new Set([link.telegramMessageId, ...(link.extraTelegramMessageIds ?? []), ...(link.noticeTelegramMessageIds ?? [])])];
+}
+
+/** Whether `telegramMessageId` is one of the link's bot notices rather than a copy of the message itself (delivery-r2#0). */
+export function isNoticeOf(link: Pick<MessageLink, 'noticeTelegramMessageIds'>, telegramMessageId: number): boolean {
+  return link.noticeTelegramMessageIds?.includes(telegramMessageId) ?? false;
 }
 
 /** Bidirectional, bounded MAX messageId <-> Telegram message_id correlation — needed for edit/react to know which message on the other side to touch. In-memory only: lost on restart, same trade-off as the rest of this bridge's runtime state. */
@@ -194,12 +422,22 @@ export class MessageLinkStore {
   private readonly byMax = new Map<string, MessageLink>();
   private readonly byTelegram = new Map<number, MessageLink>();
   private readonly order: string[] = [];
+  // MAX messages a REMOVED push deleted — see noteRemoved. FIFO-bounded.
+  private readonly removed = new Set<string>();
+  // Links eviction passes over — see pin.
+  private readonly pinned = new Set<string>();
   constructor(private readonly capacity = 500) {}
 
   private key(maxChatId: unknown, maxMessageId: unknown): string {
     return `${String(maxChatId)}:${String(maxMessageId)}`;
   }
 
+  /**
+   * Links a MAX message. A link already stored for the same message is replaced cleanly — its
+   * Telegram ids and its place in the eviction order go first. A plain overwrite left the old ids
+   * in byTelegram pointing at a dead link and the key twice in `order`, so evicting the first copy
+   * dropped the current link early (review 2026-09-26, delivery-r2#4).
+   */
   add(link: MessageLink): void {
     if (link.maxMessageId == null) {
       // Dropping silently already cost a debugging session (2026-08-14): without
@@ -209,21 +447,41 @@ export class MessageLinkStore {
       return;
     }
     link.createdAt ??= Date.now();
+    this.remove(link.maxChatId, link.maxMessageId);
     const key = this.key(link.maxChatId, link.maxMessageId);
     this.byMax.set(key, link);
-    this.byTelegram.set(link.telegramMessageId, link);
-    for (const extraId of link.extraTelegramMessageIds ?? []) {
-      this.byTelegram.set(extraId, link);
-    }
+    for (const id of linkTelegramIds(link)) this.byTelegram.set(id, link);
     this.order.push(key);
-    if (this.order.length > this.capacity) {
-      const oldestKey = this.order.shift();
-      const old = oldestKey ? this.byMax.get(oldestKey) : undefined;
-      if (oldestKey) this.byMax.delete(oldestKey);
-      if (old) {
-        this.byTelegram.delete(old.telegramMessageId);
-        for (const extraId of old.extraTelegramMessageIds ?? []) this.byTelegram.delete(extraId);
-      }
+    while (this.order.length > this.capacity) {
+      const idx = this.order.findIndex((k) => !this.pinned.has(k));
+      if (idx < 0) break;
+      const oldestKey = this.order.splice(idx, 1)[0] as string;
+      const old = this.byMax.get(oldestKey);
+      this.byMax.delete(oldestKey);
+      if (old) this.unindex(old);
+    }
+  }
+
+  /**
+   * Keeps this message's link from being evicted until unpinChat. A live message delivered while
+   * its chat is not caught up is still in the chat's history snapshot, and only its link keeps the
+   * backfill from posting it again: a replay adding 500+ links before the pass reached that chat
+   * evicted it, and the message went out twice (review 2026-09-27, catchup-r3.2#0).
+   */
+  pin(maxChatId: unknown, maxMessageId: unknown): void {
+    this.pinned.add(this.key(maxChatId, maxMessageId));
+  }
+
+  /** Makes the chat's pinned links evictable again — once it is caught up (its cursor is past them). */
+  unpinChat(maxChatId: unknown): void {
+    const prefix = `${String(maxChatId)}:`;
+    for (const key of [...this.pinned]) if (key.startsWith(prefix)) this.pinned.delete(key);
+  }
+
+  /** Drops the link's Telegram ids from byTelegram — only those still pointing at this very link. */
+  private unindex(link: MessageLink): void {
+    for (const id of linkTelegramIds(link)) {
+      if (this.byTelegram.get(id) === link) this.byTelegram.delete(id);
     }
   }
 
@@ -231,8 +489,67 @@ export class MessageLinkStore {
     return this.byMax.get(this.key(maxChatId, maxMessageId));
   }
 
+  // Live deliveries still running, by MAX message: their link is added only once every part went
+  // out, so the history backfill waits for them instead of sending the same message too.
+  private readonly inFlight = new Map<string, Promise<void>>();
+
+  /** Registers a live delivery of one MAX message (settled either way when `run` is). */
+  trackDelivery(maxChatId: unknown, maxMessageId: unknown, run: Promise<unknown>): void {
+    const key = this.key(maxChatId, maxMessageId);
+    const settled = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.inFlight.set(key, settled);
+    void settled.then(() => {
+      if (this.inFlight.get(key) === settled) this.inFlight.delete(key);
+    });
+  }
+
+  /** The live delivery of this MAX message still in progress (never rejects), if any. */
+  pendingDelivery(maxChatId: unknown, maxMessageId: unknown): Promise<void> | undefined {
+    return this.inFlight.get(this.key(maxChatId, maxMessageId));
+  }
+
+  /**
+   * Adds a bot notice produced later for an already-linked MAX message (a poll's tally reply, an
+   * edit relayed as a reply) to its notices, so deleting the MAX message takes it along instead of
+   * leaving an orphan reply behind (review 2026-09-26, b5-delivery) — while a 👎 or /delete aimed at
+   * it does not delete the message itself (delivery-r2#0). No-op when the link is gone.
+   */
+  addNotice(maxChatId: unknown, maxMessageId: unknown, telegramMessageId: number): void {
+    const link = this.byMax.get(this.key(maxChatId, maxMessageId));
+    if (!link || linkTelegramIds(link).includes(telegramMessageId)) return;
+    link.noticeTelegramMessageIds = [...(link.noticeTelegramMessageIds ?? []), telegramMessageId];
+    this.byTelegram.set(telegramMessageId, link);
+  }
+
   getByTelegram(telegramMessageId: number): MessageLink | undefined {
     return this.byTelegram.get(telegramMessageId);
+  }
+
+  /**
+   * A REMOVED push deleted this MAX message — whether or not it had a link (none: relayed before a
+   * restart, not yet reached by a running backfill; or the link just went with the deletion). A
+   * history backfill walking a snapshot fetched before the deletion would still post it, and
+   * nothing would ever delete that copy, the deletion being consumed already — so the backfill
+   * skips what is noted here (review 2026-09-26, delivery-r2#1). Kept across clear() and
+   * removeByChat(): the replays after those are exactly the ones at risk.
+   */
+  noteRemoved(maxChatId: unknown, maxMessageId: unknown): void {
+    const key = this.key(maxChatId, maxMessageId);
+    this.removed.delete(key);
+    this.removed.add(key);
+    while (this.removed.size > this.capacity) {
+      const oldest = this.removed.values().next().value;
+      if (oldest === undefined) break;
+      this.removed.delete(oldest);
+    }
+  }
+
+  /** Whether a REMOVED push deleted this message (noteRemoved). */
+  wasRemoved(maxChatId: unknown, maxMessageId: unknown): boolean {
+    return this.removed.has(this.key(maxChatId, maxMessageId));
   }
 
   /** Snapshot of our own (outgoing) links — the deletion probe only watches these. Returned as an array so the caller can iterate without holding the live map. */
@@ -248,10 +565,28 @@ export class MessageLinkStore {
     const link = this.byMax.get(key);
     if (!link) return;
     this.byMax.delete(key);
-    this.byTelegram.delete(link.telegramMessageId);
-    for (const extraId of link.extraTelegramMessageIds ?? []) this.byTelegram.delete(extraId);
+    this.unindex(link);
     const idx = this.order.indexOf(key);
     if (idx >= 0) this.order.splice(idx, 1);
+  }
+
+  /**
+   * Drops every link of one MAX chat. Called BEFORE its Telegram topic is deleted
+   * (/ban, "Чат закрыт", a topic restore): deleting a topic takes all its messages with
+   * it, and a surviving outgoing link would then probe 'gone' and get mirror-deleted on
+   * MAX forAll — wiping the owner's messages for a topic removal, not a message deletion
+   * (review 2026-09-26). Returns how many links were dropped.
+   */
+  removeByChat(maxChatId: unknown): number {
+    const chatKey = String(maxChatId);
+    let dropped = 0;
+    for (const link of [...this.byMax.values()]) {
+      if (String(link.maxChatId) !== chatKey) continue;
+      this.remove(link.maxChatId, link.maxMessageId);
+      dropped++;
+    }
+    this.unpinChat(maxChatId);
+    return dropped;
   }
 
   /** Wipes every link — used by /reboot to force a full from-scratch resync. */
@@ -259,6 +594,7 @@ export class MessageLinkStore {
     this.byMax.clear();
     this.byTelegram.clear();
     this.order.length = 0;
+    this.pinned.clear();
   }
 }
 
@@ -317,7 +653,6 @@ class RecentCids {
   }
 }
 
-/** Returns the first sent Telegram message_id — one MAX message can carry several attaches, but we only need one anchor to link for edit/react. */
 /**
  * Whether sendAttachments will actually render this attach. Mirrors its silent skip (below) of
  * CONTROL/service events that aren't new/join/leave/title (e.g. 'system', pin). Used so a message
@@ -328,104 +663,148 @@ function isRenderableAttach(att: MaxAttachment): boolean {
   return !(att._type === 'CONTROL' && !['new', 'join', 'leave', 'title'].includes(String((att as { event?: unknown }).event)));
 }
 
-async function sendAttachments(
+type SentMessage = { message_id: number };
+type AttachmentSendOpts = { message_thread_id: number; reply_parameters?: { message_id: number; allow_sending_without_reply: boolean } };
+
+/**
+ * Sends a MAX message's attachments into a topic, one Telegram message each, and returns EVERY
+ * sent message_id in order — the caller links them all (buildLinkIds), so deleting the MAX message
+ * removes the whole album, not just its first photo (review 2026-09-26, S5).
+ *
+ * Each Telegram call is wrapped in withFloodRetry on its own: a 429 retries just that one send
+ * (wrapping the whole function re-sent the attachments already delivered — S2). And each
+ * attachment degrades on its own: one Telegram refuses for good (a file over the Bot API upload
+ * limit, a rejected format) becomes the same text placeholder as a failed download, and the rest
+ * still go out — instead of aborting the message and raising the misleading "check the bot's
+ * rights" alarm (INBOUND-EDGES1). Only a deleted topic, a transient failure (the caller retries
+ * later) or a refused placeholder propagate. `sent`, when given, gets each id as soon as it is
+ * sent (see sendTextPieces).
+ * `degradeTransient` (the backfill's last try on a message): a transient failure of one attachment
+ * degrades to its placeholder too, and the rest of the album still goes out — giving up used to drop
+ * the failing attachment and every one after it without a word (review 2026-09-26, delivery-r1#2).
+ */
+export async function sendAttachments(
   bot: Telegraf,
   groupId: string,
   topicId: number,
   attaches: MaxAttachment[],
   downloadCtx: DownloadContext,
   replyParameters?: { message_id: number; allow_sending_without_reply: boolean },
-): Promise<number | undefined> {
-  let firstMessageId: number | undefined;
+  paceMs?: number,
+  sent?: number[],
+  degradeTransient = false,
+): Promise<number[]> {
+  const ids: number[] = [];
   for (const att of attaches) {
-    let sent;
-    // Native reply (reply_parameters) applies only to the FIRST message this MAX message
-    // produces — subsequent attaches follow it normally.
-    const opts =
-      firstMessageId === undefined && replyParameters
-        ? { message_thread_id: topicId, reply_parameters: replyParameters }
-        : { message_thread_id: topicId };
-    if (att._type === 'LOCATION' && att.latitude != null && att.longitude != null) {
-      sent = await bot.telegram.sendLocation(groupId, att.latitude, att.longitude, opts);
-      firstMessageId ??= sent.message_id;
-      continue;
-    }
-    if (att._type === 'CONTACT') {
-      // Two distinct shapes seen live: a self-contained vCard-style card (`phone` right
-      // on the attach) and a reference to an existing MAX user (`contactId`, no phone —
-      // needs its own CONTACT_INFO lookup). sendContact requires a real number either
-      // way, so fall back to plain text (naming the contact) if neither yields one
-      // rather than fabricating a placeholder phone.
-      const displayName = [att.firstName, att.lastName].filter(Boolean).join(' ') || att.name || 'Контакт';
-      let phone = att.phone;
-      if (phone == null) {
-        const contactId = Number(att.contactId);
-        if (!Number.isNaN(contactId)) {
-          try {
-            const contacts = await downloadCtx.max.getContactInfo([contactId]);
-            phone = (contacts[0] as { phone?: unknown } | undefined)?.phone;
-          } catch (err) {
-            logger.error(`Failed to fetch CONTACT_INFO for shared contact ${contactId}`, err);
-          }
-        }
-      }
-      sent =
-        phone != null
-          ? await bot.telegram.sendContact(groupId, `+${String(phone)}`, displayName, opts)
-          : await bot.telegram.sendMessage(groupId, `👤 Контакт: ${displayName}`, opts);
-      firstMessageId ??= sent.message_id;
-      continue;
-    }
     // Chat-lifecycle CONTROL events with no useful rendering (notably `system` — a
-    // history-clear/other system marker, NOT a chat deletion; deletion is a CHAT_UPDATE
-    // with status:CLOSED, handled in handleMaxChatUpdate) shouldn't be relayed as a
+    // history-clear/other system marker; a chat deletion is also a `system` event, «Чат закрыт»,
+    // which handleMaxPush catches earlier and deletes the topic for) shouldn't be relayed as a
     // "[системное событие: system]" junk message. The meaningful ones (new/join/leave/
     // title) still fall through and render normally.
-    if (att._type === 'CONTROL' && !['new', 'join', 'leave', 'title'].includes(String(att.event))) {
-      continue;
+    if (!isRenderableAttach(att)) continue;
+    // Native reply (reply_parameters) applies only to the FIRST message this MAX message
+    // produces — subsequent attaches follow it normally.
+    const opts: AttachmentSendOpts =
+      ids.length === 0 && replyParameters
+        ? { message_thread_id: topicId, reply_parameters: replyParameters }
+        : { message_thread_id: topicId };
+    let msg: SentMessage;
+    try {
+      msg = await sendOneAttachment(bot, groupId, att, downloadCtx, opts);
+    } catch (err) {
+      if (isThreadNotFound(err) || (!degradeTransient && !isPermanentTelegramRefusal(err))) throw err;
+      logger.error(`Could not send a MAX ${att._type ?? 'attachment'} to Telegram — sending its placeholder instead`, err);
+      msg = await withFloodRetry(() => bot.telegram.sendMessage(groupId, describeAttachment(att), opts));
     }
-    const downloaded = await downloadMaxAttachment(att, downloadCtx);
-    if (!downloaded) {
-      sent = await bot.telegram.sendMessage(groupId, describeAttachment(att), opts);
-    } else {
-      const source = { source: downloaded.buffer, filename: downloaded.filename };
-      if (downloaded.kind === 'photo') {
-        sent = await bot.telegram.sendPhoto(groupId, source, opts);
-      } else if (downloaded.kind === 'video') {
-        sent = await bot.telegram.sendVideo(groupId, source, opts);
-      } else if (downloaded.kind === 'video_note') {
+    ids.push(msg.message_id);
+    sent?.push(msg.message_id);
+    // The backfill's per-chat pacing (HISTORY_SEND_DELAY_MS), per attachment: an album is
+    // several messages in a row, the likeliest thing to trip flood control.
+    if (paceMs) await sleep(paceMs);
+  }
+  return ids;
+}
+
+async function sendOneAttachment(
+  bot: Telegraf,
+  groupId: string,
+  att: MaxAttachment,
+  downloadCtx: DownloadContext,
+  opts: AttachmentSendOpts,
+): Promise<SentMessage> {
+  if (att._type === 'LOCATION' && att.latitude != null && att.longitude != null) {
+    const { latitude, longitude } = att;
+    return withFloodRetry(() => bot.telegram.sendLocation(groupId, latitude, longitude, opts));
+  }
+  if (att._type === 'CONTACT') {
+    // Two distinct shapes seen live: a self-contained vCard-style card (`phone` right
+    // on the attach) and a reference to an existing MAX user (`contactId`, no phone —
+    // needs its own CONTACT_INFO lookup). sendContact requires a real number either
+    // way, so fall back to plain text (naming the contact) if neither yields one
+    // rather than fabricating a placeholder phone.
+    const displayName = [att.firstName, att.lastName].filter(Boolean).join(' ') || att.name || 'Контакт';
+    let phone = att.phone;
+    if (phone == null) {
+      const contactId = Number(att.contactId);
+      if (!Number.isNaN(contactId)) {
         try {
-          // sendVideoNote is the only way Telegram renders the round "circle" bubble —
-          // sendVideo would show the same file as a regular rectangular player instead.
-          sent = await bot.telegram.sendVideoNote(groupId, source, opts);
+          const contacts = await downloadCtx.max.getContactInfo([contactId]);
+          phone = (contacts[0] as { phone?: unknown } | undefined)?.phone;
         } catch (err) {
-          logger.error('sendVideoNote failed, falling back to sendVideo', err);
-          sent = await bot.telegram.sendVideo(groupId, source, opts);
+          logger.error(`Failed to fetch CONTACT_INFO for shared contact ${contactId}`, err);
         }
-      } else if (downloaded.kind === 'voice') {
-        try {
-          // Telegram's voice bubble is picky about codec (wants OGG/OPUS) — MAX's actual
-          // encoding is unconfirmed, so fall back to a regular playable audio file rather
-          // than losing the message if sendVoice rejects the format.
-          sent = await bot.telegram.sendVoice(groupId, source, opts);
-        } catch (err) {
-          logger.error('sendVoice failed, falling back to sendAudio', err);
-          sent = await bot.telegram.sendAudio(groupId, source, opts);
-        }
-      } else if (downloaded.kind === 'sticker') {
-        try {
-          sent = await bot.telegram.sendSticker(groupId, source, opts);
-        } catch (err) {
-          logger.error('sendSticker failed, falling back to sendDocument', err);
-          sent = await bot.telegram.sendDocument(groupId, source, opts);
-        }
-      } else {
-        sent = await bot.telegram.sendDocument(groupId, source, opts);
       }
     }
-    firstMessageId ??= sent.message_id;
+    return phone != null
+      ? withFloodRetry(() => bot.telegram.sendContact(groupId, `+${String(phone)}`, displayName, opts))
+      : withFloodRetry(() => bot.telegram.sendMessage(groupId, `👤 Контакт: ${displayName}`, opts));
   }
-  return firstMessageId;
+  const downloaded = await downloadMaxAttachment(att, downloadCtx);
+  // Bot API upload limits: nothing over 50 MB at all, a photo only up to 10 MB (a bigger one
+  // still goes through as a file) — see telegramSendKind.
+  const kind = downloaded ? telegramSendKind(downloaded.kind, downloaded.buffer.byteLength) : null;
+  if (!downloaded || !kind) {
+    if (downloaded) {
+      logger.error(`MAX ${att._type ?? 'attachment'} is ${downloaded.buffer.byteLength} bytes — over Telegram's upload limit, sending its placeholder`);
+    }
+    return withFloodRetry(() => bot.telegram.sendMessage(groupId, describeAttachment(att), opts));
+  }
+  const source = { source: downloaded.buffer, filename: downloaded.filename };
+  if (kind === 'photo') return withFloodRetry(() => bot.telegram.sendPhoto(groupId, source, opts));
+  if (kind === 'video') return withFloodRetry(() => bot.telegram.sendVideo(groupId, source, opts));
+  if (kind === 'video_note') {
+    try {
+      // sendVideoNote is the only way Telegram renders the round "circle" bubble —
+      // sendVideo would show the same file as a regular rectangular player instead.
+      return await withFloodRetry(() => bot.telegram.sendVideoNote(groupId, source, opts));
+    } catch (err) {
+      if (!isPermanentTelegramRefusal(err)) throw err;
+      logger.error('sendVideoNote failed, falling back to sendVideo', err);
+      return withFloodRetry(() => bot.telegram.sendVideo(groupId, source, opts));
+    }
+  }
+  if (kind === 'voice') {
+    try {
+      // Telegram's voice bubble is picky about codec (wants OGG/OPUS) — MAX's actual
+      // encoding is unconfirmed, so fall back to a regular playable audio file rather
+      // than losing the message if sendVoice rejects the format.
+      return await withFloodRetry(() => bot.telegram.sendVoice(groupId, source, opts));
+    } catch (err) {
+      if (!isPermanentTelegramRefusal(err)) throw err;
+      logger.error('sendVoice failed, falling back to sendAudio', err);
+      return withFloodRetry(() => bot.telegram.sendAudio(groupId, source, opts));
+    }
+  }
+  if (kind === 'sticker') {
+    try {
+      return await withFloodRetry(() => bot.telegram.sendSticker(groupId, source, opts));
+    } catch (err) {
+      if (!isPermanentTelegramRefusal(err)) throw err;
+      logger.error('sendSticker failed, falling back to sendDocument', err);
+      return withFloodRetry(() => bot.telegram.sendDocument(groupId, source, opts));
+    }
+  }
+  return withFloodRetry(() => bot.telegram.sendDocument(groupId, source, opts));
 }
 
 const HISTORY_BATCH_SIZE = 100;
@@ -436,13 +815,31 @@ const HISTORY_MAX_BATCHES = 2000;
 // thousands of messages into one chat, so it paces itself instead of relying on
 // withFloodRetry alone (retrying after every 429 would still get flagged as abuse).
 const HISTORY_SEND_DELAY_MS = 1100;
+// Transient failures per MAX message across catch-up runs — see StrikeCounter (catchUp.ts). Given up
+// on only after 5 strikes spanning at least 3 hours: retry runs come minutes apart, so a run count
+// alone dropped a message after ~7.5 minutes of a partial Telegram outage (review 2026-09-26, b2b-errors).
+const BACKFILL_STRIKE_MIN_SPAN_MS = 3 * 60 * 60_000;
+const backfillStrikes = new StrikeCounter(5, 500, BACKFILL_STRIKE_MIN_SPAN_MS);
 
 /**
- * Walks CHAT_HISTORY backward from "now" until it runs dry, deduping by message
+ * Where fetchFullHistory starts paging: a little AHEAD of the local clock. CHAT_HISTORY only
+ * returns messages older than `from`, and the cursor is MAX server time (liveCursorTime): with a
+ * host clock running behind MAX's, "now" sat below messages that arrived during the gap — the
+ * first page missed them, its oldest message was already at/below the cursor, paging stopped and
+ * they were lost (review 2026-09-26, RECOVERY9 slow-clock half). A future `from` is accepted (a
+ * fast host clock always sent one); the `time > sinceTime` filter is unaffected.
+ * Pure + exported for unit testing.
+ */
+export const HISTORY_FROM_AHEAD_MS = 15 * 60_000;
+export function historyStartTime(now: number = Date.now()): number {
+  return now + HISTORY_FROM_AHEAD_MS;
+}
+
+/**
+ * Walks CHAT_HISTORY backward from "now" (historyStartTime) until it runs dry, deduping by message
  * id (batches can re-include the boundary message) and returning everything in
  * chronological (oldest-first) order, ready to replay into Telegram.
- */
-/**
+ *
  * `sinceTime`: when set, only messages strictly newer are returned, and pagination
  * stops as soon as a batch's oldest message is already at/before it — turns this
  * from "walk the whole chat" into a cheap "what's new since last time" call, used
@@ -450,11 +847,22 @@ const HISTORY_SEND_DELAY_MS = 1100;
  * (a live push arriving while we're between TCP sessions is otherwise lost forever —
  * hit live 2026-08-12, a message sent mid-redeploy never reached Telegram).
  */
-async function fetchFullHistory(max: MaxClient, chatId: unknown, sinceTime: number | null = null): Promise<MaxHistoryMessage[]> {
+/** When each fetchFullHistory result started to be read: an edit made later may be missing from it. */
+const historySnapshotAt = new WeakMap<MaxHistoryMessage[], number>();
+
+async function fetchFullHistory(
+  max: MaxClient,
+  chatId: unknown,
+  sinceTime: number | null = null,
+  isCancelled?: () => boolean,
+): Promise<MaxHistoryMessage[]> {
   const all: MaxHistoryMessage[] = [];
+  historySnapshotAt.set(all, Date.now());
   const seenIds = new Set<string>();
-  let fromTime = Date.now();
+  let fromTime = historyStartTime();
   for (let i = 0; i < HISTORY_MAX_BATCHES; i++) {
+    // A big chat pages for a minute or more — /reboot and /kill wait for the run to stop.
+    if (isCancelled?.()) throw new SyncCancelledError();
     const batch = await max.getChatHistory(chatId, fromTime, HISTORY_BATCH_SIZE);
     if (batch.length === 0) break;
     let oldestTime = fromTime;
@@ -482,39 +890,62 @@ async function fetchFullHistory(max: MaxClient, chatId: unknown, sinceTime: numb
   return all;
 }
 
+/** A received forward's `link` — the same shape on PUSH_MESSAGE and in CHAT_HISTORY. */
+type ForwardLink = { type?: string; message?: { id?: unknown; text?: string; sender?: unknown; attaches?: unknown[] }; chatId?: unknown };
+
+/** Where a forward's attachments are downloaded from: the source ids first, the wrapper's as the fallback. */
+export interface ForwardDownloadIds {
+  chatId: unknown;
+  messageId: unknown;
+  fallbackChatId: unknown;
+  fallbackMessageId: unknown;
+}
+
 /**
- * Replays fetched history into a freshly-created topic, oldest-first, pacing
- * sends to stay under Telegram's flood limit. Advances a persisted cursor
- * after every message (sent or not) so a restart mid-backfill — a crash, a
- * redeploy, or just a reconnect during a long flood-control wait — resumes
- * after the last one touched instead of replaying the whole chat and
- * duplicating everything already delivered (hit as a near-miss 2026-08-09).
+ * Download ids for a forward's attachments. Files live on the ORIGINAL message/chat (the source):
+ * FILE_DOWNLOAD/VIDEO_PLAY validate the fileId/videoId against the message+chat it was uploaded in,
+ * so the wrapper's own ids get rejected and the attachment silently drops (hit live 2026-08-13).
+ * That works when we're in the source chat. But a forward from a chat we're NOT in arrives with
+ * link.chatId = 0 (source hidden) and FILE_DOWNLOAD there is denied — so the RECIPIENT chat (the
+ * dialog the forward landed in) + the wrapper message id are the fallback: the file is present in
+ * our own chat with the forwarder. (Тимур -> Владимир -> нам: докачиваем через наш диалог с
+ * Владимиром, не через скрытый чат Тимура.)
  */
+export function forwardDownloadIds(link: ForwardLink, wrapperChatId: unknown, wrapperMessageId: unknown): ForwardDownloadIds {
+  return {
+    chatId: link.chatId != null ? link.chatId : wrapperChatId,
+    messageId: link.message?.id != null ? link.message.id : wrapperMessageId,
+    fallbackChatId: wrapperChatId,
+    fallbackMessageId: wrapperMessageId,
+  };
+}
+
 /**
- * Unwraps a forward's real content (link.message) with a "↩️ Переслано из..." prefix —
- * a forward's own text/attaches are empty, so without this it's silently dropped by
- * the `!text && attaches.length === 0` check below. Simpler cousin of handleMaxPush's
- * own inline version (no contactProfiles cache — backfill/catch-up runs infrequently
- * enough that a fresh CONTACT_INFO lookup per forward is fine).
+ * Unwraps a forward we RECEIVE: the wrapper message's own text/attaches are empty — the real
+ * content is in link.message (confirmed live 2026-08-13) — so without this it's silently dropped
+ * as an empty message. Returns its text with a "↩️ Переслано из «…» (от …):" prefix, its
+ * attachments and their download ids (forwardDownloadIds); null when `link` isn't a forward.
+ * (Sending a forward FROM us doesn't work yet — MAX's response to our own FORWARD request comes
+ * back essentially empty and no message is actually created; still unresolved.)
+ * One function for the live path and the history backfill: the backfill's own copy had drifted —
+ * no recipient-chat fallback, so a forward from a hidden chat lost its file in restored history
+ * (review 2026-09-26, S14b).
  */
-async function resolveForwardContent(
+export async function resolveForwardContent(
   max: MaxClient,
   chats: unknown[],
-  link: MaxHistoryMessage['link'],
-): Promise<{ text: string; attaches: MaxAttachment[]; sourceChatId: unknown; sourceMessageId: unknown } | null> {
+  link: ForwardLink | undefined,
+  wrapperChatId: unknown,
+  wrapperMessageId: unknown,
+  profiles?: Map<number, ContactProfile>,
+): Promise<{ text: string; attaches: MaxAttachment[]; download: ForwardDownloadIds } | null> {
   if (link?.type !== 'FORWARD') return null;
   const original = link.message;
   const attaches = Array.isArray(original?.attaches) ? (original.attaches as MaxAttachment[]) : [];
   const senderId = typeof original?.sender === 'number' ? original.sender : Number(original?.sender);
-  let senderName = Number.isNaN(senderId) ? 'неизвестно' : `MAX ID ${senderId}`;
-  if (!Number.isNaN(senderId)) {
-    try {
-      const contacts = await max.getContactInfo([senderId]);
-      if (contacts[0]) senderName = resolveContactDisplayName(senderId, contacts[0]);
-    } catch (err) {
-      logger.error(`Failed to fetch CONTACT_INFO for forward sender ${senderId}`, err);
-    }
-  }
+  const senderName = Number.isNaN(senderId)
+    ? 'неизвестно'
+    : resolveContactDisplayName(senderId, await resolveProfile(max, senderId, 'forward sender', profiles));
   const sourceChat = chats.find((c) => c && typeof c === 'object' && String((c as { id?: unknown }).id) === String(link.chatId)) as
     | { title?: string }
     | undefined;
@@ -523,29 +954,69 @@ async function resolveForwardContent(
   return {
     text: original?.text ? `${prefix}\n${original.text}` : prefix,
     attaches,
-    // Attachments were uploaded against the ORIGINAL message/chat, not the wrapper —
-    // FILE_DOWNLOAD/VIDEO_PLAY need those ids or they reject the request and the
-    // attachment silently drops (hit live 2026-08-13).
-    sourceChatId: link.chatId,
-    sourceMessageId: original?.id,
+    download: forwardDownloadIds(link, wrapperChatId, wrapperMessageId),
   };
 }
 
-/** Telegram's error when you touch a forum topic that's since been deleted. The exact
- * code depends on the method: sendMessage/sendPhoto to a dead thread answer "message
- * thread not found", while editForumTopic answers TOPIC_ID_INVALID (seen live 2026-08-18
- * from startDialog's liveness probe). Both mean the same thing — recreate the topic. */
-function isThreadNotFound(err: unknown): boolean {
-  const msg = err instanceof Error ? err.message : String(err);
-  return /message thread not found|thread not found|TOPIC_DELETED|TOPIC_ID_INVALID/i.test(msg);
+/**
+ * One history refill per chat at a time: the catch-up sync (syncAllChatsToTelegram) and a topic
+ * restore (restoreDeletedTopic) each walk the chat's history into its topic, deduplicated only by
+ * message links stored AFTER each send. Run side by side, both posted the same messages, and a
+ * sync that finished mid-restore marked the chat caught up while the restore was still replaying
+ * (review 2026-09-26, cross). Whoever comes second waits and then re-reads the mapping. A key space
+ * of its own in the shared lock map (topic locks are keyed by the group id). Exported for tests.
+ */
+export function withChatBackfillLock<T>(chatId: unknown, fn: () => Promise<T>): Promise<T> {
+  return withTopicLock(`backfill:${String(chatId)}`, fn);
+}
+
+/**
+ * The end of a chat's catch-up (sync) or topic refill (restore): marks it caught up — unless a
+ * reset or a failure came since `generation` — and moves its cursor up to the live messages
+ * delivered meanwhile, which the history snapshot could not contain (catchUp.ts,
+ * review 2026-09-26, catchup-r1#1).
+ */
+async function markChatCaughtUp(catchUp: CatchUpTracker, chatMapStore: ChatMapStore, messageLinks: MessageLinkStore, chatId: unknown, generation: number): Promise<void> {
+  if (!catchUp.markCaughtUp(chatId, generation)) return;
+  const live = catchUp.takeLiveCursor(chatId);
+  if (live != null) await chatMapStore.advanceHistoryCursor(chatId, live);
+  messageLinks.unpinChat(chatId); // the cursor is past the live messages now (catchup-r3.2#0)
 }
 
 /** Forces a fresh topic for a chat: drops the stale mapping so ensureTopicForMaxChat recreates it, and returns the new topic id. Reuses the deleted topic's stored title so the recreated one keeps the contact's name/nick instead of the bare "MAX chat <id>" fallback. Used to heal a topic the user deleted in Telegram. */
 async function recreateTopicForChat(bot: Telegraf, groupId: string, chatId: unknown, chatMapStore: ChatMapStore): Promise<number> {
-  const title = (await chatMapStore.getByMaxChatId(chatId))?.title;
+  const existing = await chatMapStore.getByMaxChatId(chatId);
+  // /ban deleted that topic on purpose — "healing" it recreated the topic with a mapping that no
+  // longer carried the ban (review 2026-09-26, cross).
+  if (existing?.banned) throw new ChatBannedError(String(chatId));
+  const title = existing?.title;
   await chatMapStore.remove(chatId);
   const { topicId } = await ensureTopicForMaxChat(bot, groupId, chatId, chatMapStore, title);
   return topicId;
+}
+
+/**
+ * One MAX profile by id: from `cache` when it's there, else one CONTACT_INFO round trip whose
+ * answer is stored back into `cache`. undefined when the lookup fails (logged under `what`, e.g.
+ * 'caller') or MAX knows no such user — callers then show "MAX ID <n>" (resolveContactDisplayName).
+ * Replaces six copies of the same fetch-and-cache block (review 2026-09-26, S14a).
+ */
+export async function resolveProfile(
+  max: Pick<MaxClient, 'getContactInfo'>,
+  id: number,
+  what: string,
+  cache?: Map<number, ContactProfile>,
+): Promise<ContactProfile | undefined> {
+  const cached = cache?.get(id);
+  if (cached) return cached;
+  try {
+    const profile = (await max.getContactInfo([id]))[0];
+    if (profile && cache) cache.set(id, profile);
+    return profile;
+  } catch (err) {
+    logger.error(`Failed to fetch CONTACT_INFO for ${what} ${id}`, err);
+    return undefined;
+  }
 }
 
 /**
@@ -554,7 +1025,9 @@ async function recreateTopicForChat(bot: Telegraf, groupId: string, chatId: unkn
  * history isn't an undifferentiated stream where our own lines look identical to the contact's. Other
  * people get "👤 Name:" only in GROUP chats (>2 participants); in a 1:1 the topic already IS the
  * contact, so their messages stay unprefixed. Returns '' when the sender can't be determined.
- * `profiles` is the live contact cache when available (handleMaxPush); backfill passes none.
+ * `profiles` caches the looked-up names: the live contact cache (handleMaxPush, and the backfill
+ * when the caller has it) or the backfill's own per-run map — without one, every group message of
+ * a synced history cost its own CONTACT_INFO round trip (review 2026-09-26, S1).
  */
 async function resolveAuthorPrefix(
   chat: unknown,
@@ -568,19 +1041,24 @@ async function resolveAuthorPrefix(
   if (myAccountId != null && id === myAccountId) return '🧑 Вы:\n';
   const participants = (chat as { participants?: Record<string, unknown> } | null)?.participants;
   if (!participants || Object.keys(participants).length <= 2) return ''; // 1:1 (or unknown) — contact's line stays plain
-  let profile = profiles?.get(id);
-  if (!profile) {
-    try {
-      const contacts = await max.getContactInfo([id]);
-      profile = contacts[0];
-      if (profile && profiles) profiles.set(id, profile);
-    } catch (err) {
-      logger.error(`Failed to resolve group sender ${id} for the author prefix`, err);
-    }
-  }
+  const profile = await resolveProfile(max, id, 'group sender', profiles);
   return `👤 ${resolveContactDisplayName(id, profile)}:\n`;
 }
 
+/**
+ * Replays fetched history into a freshly-created topic, oldest-first, pacing
+ * sends to stay under Telegram's flood limit. Advances a persisted cursor
+ * after every message (sent or not) so a restart mid-backfill — a crash, a
+ * redeploy, or just a reconnect during a long flood-control wait — resumes
+ * after the last one touched instead of replaying the whole chat and
+ * duplicating everything already delivered (hit as a near-miss 2026-08-09).
+ * "Not sent" means refused for good (a 4xx) — a transient failure is rethrown
+ * before the cursor moves (review 2026-09-26, C12).
+ * A topic found deleted mid-run is healed like restoreDeletedTopic does it: its links are
+ * forgotten, the topic is recreated (`onTopicRecreated` sends its info card) and the chat's WHOLE
+ * history is replayed into it from a null cursor — the messages before this one died with the old
+ * topic too (review 2026-09-26, C12/b2a-cursor).
+ */
 async function backfillHistoryToTelegram(
   bot: Telegraf,
   groupId: string,
@@ -592,15 +1070,69 @@ async function backfillHistoryToTelegram(
   chatMapStore: ChatMapStore,
   chats: unknown[],
   myAccountId: number | null,
+  isCancelled?: () => boolean,
+  profiles?: Map<number, ContactProfile>,
+  onTopicRecreated?: (topicId: number) => Promise<void>,
 ): Promise<void> {
   // May change mid-run if the topic turns out to be deleted (recreated on the fly).
   let currentTopicId = topicId;
   let recreatedOnce = false;
-  const backfillProfiles = new Map<number, ContactProfile>(); // per-run name cache for member events
-  for (const msg of messages) {
-    const forwarded = await resolveForwardContent(max, chats, msg.link);
+  // Replaced by the chat's full history when the topic is recreated mid-run.
+  let queue = messages;
+  // Name cache for member events and group author prefixes: the live contact cache when the caller
+  // passes it (names already fetched for cards/rosters are reused), else a per-run map.
+  const backfillProfiles = profiles ?? new Map<number, ContactProfile>();
+  for (let index = 0; index < queue.length; index++) {
+    const msg = queue[index] as MaxHistoryMessage;
+    // /reboot or /kill wiped the state this run writes into: stop before the next message
+    // instead of refilling topics that were just deleted (review 2026-09-26, C7).
+    if (isCancelled?.()) throw new SyncCancelledError();
+    // /ban landed mid-run: its topic is gone on purpose — stop here instead of recreating it
+    // below on "thread not found" and replaying the rest into it (review 2026-09-26, cross).
+    // Closed in MAX («Чат закрыт») mid-run: its topic and mapping went on purpose too — stop the
+    // same way, or the recreate below brought the chat back with its whole history
+    // (review 2026-09-27, catchup-r3.2#1). A recreate of our own never leaves the mapping missing
+    // here: one that fails throws out of this loop.
+    const mapping = await chatMapStore.getByMaxChatId(maxChatId);
+    if (mapping?.banned) throw new ChatBannedError(String(maxChatId));
+    if (!mapping) {
+      logger.info(`MAX chat ${String(maxChatId)} was closed during its backfill — stopping it`);
+      return;
+    }
+    // Already in Telegram: relayed live (either direction) while this chat was still waiting
+    // for its catch-up — the live path leaves the cursor alone until then (see catchUp.ts), so
+    // the history snapshot contains it too. Skip it instead of posting a duplicate. An orphan-edit
+    // stub is no delivery of the message (isDeliveredLink) — the message itself still goes out.
+    let existingLink = msg.id != null ? messageLinks.getByMax(maxChatId, msg.id) : undefined;
+    // A live push of this very message may still be on its way (MAX download + Telegram upload
+    // take a while, and its link is added only once everything went out): wait for it and look
+    // again, instead of posting the message a second time (review 2026-09-26, delivery-r1#6).
+    const liveDelivery = !isDeliveredLink(existingLink) && msg.id != null ? messageLinks.pendingDelivery(maxChatId, msg.id) : undefined;
+    if (liveDelivery) {
+      await liveDelivery;
+      existingLink = messageLinks.getByMax(maxChatId, msg.id);
+    }
+    const strikeKey = `${String(maxChatId)}:${String(msg.id ?? msg.time)}`;
+    // Before any skip below: a message deleted in MAX meanwhile is never sent again (delivery-r3.3#1).
+    await retryPendingDiscards(bot, groupId, strikeKey);
+    // Deleted in MAX after this snapshot was fetched: posting it now would leave a copy nothing ever
+    // deletes, the deletion being consumed already (review 2026-09-26, delivery-r2#1).
+    if (isDeliveredLink(existingLink) || (msg.id != null && messageLinks.wasRemoved(maxChatId, msg.id))) {
+      await chatMapStore.advanceHistoryCursor(maxChatId, msg.time);
+      continue;
+    }
+    const forwarded = await resolveForwardContent(max, chats, msg.link, maxChatId, msg.id, backfillProfiles);
     let text = forwarded ? forwarded.text : msg.text;
     let attaches = forwarded ? forwarded.attaches : Array.isArray(msg.attaches) ? (msg.attaches as MaxAttachment[]) : [];
+    // A poll goes out as its text rendering, options included: sendAttachments only knows a
+    // «[опрос: …]» placeholder for it, and a live poll that a transient failure discarded came back
+    // from the catch-up as just that (review 2026-09-26, delivery-r2#3).
+    const pollAttach = attaches.find((a) => a._type === 'POLL');
+    if (pollAttach) {
+      const pollText = renderPollAsText(pollAttach.title, (pollAttach.answers ?? []).map((a) => a.text || '—'), pollAttach.settings ?? 0);
+      text = text ? `${text}\n${pollText}` : pollText;
+      attaches = attaches.filter((a) => a !== pollAttach);
+    }
     if (!text && !attaches.some((a) => isRenderableAttach(a as MaxAttachment))) {
       await chatMapStore.advanceHistoryCursor(maxChatId, msg.time);
       continue;
@@ -616,48 +1148,114 @@ async function backfillHistoryToTelegram(
     } else {
       // Group chats: prefix the author so the topic isn't an anonymous stream (1:1 needs none).
       const chat = chats.find((c) => c && typeof c === 'object' && String((c as { id?: unknown }).id) === String(maxChatId));
-      const authorPrefix = await resolveAuthorPrefix(chat, (msg as { sender?: unknown }).sender, myAccountId, max);
+      const authorPrefix = await resolveAuthorPrefix(chat, (msg as { sender?: unknown }).sender, myAccountId, max, backfillProfiles);
       if (authorPrefix) text = text ? `${authorPrefix}${text}` : authorPrefix;
     }
-    // One retry: if the topic was deleted, recreate it (once per run) and re-send
-    // this same message. Without this, catch-up after a restart silently drops every
-    // message for a chat whose topic was removed (the cursor advances regardless).
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        let textMessageId: number | undefined;
-        let attachMessageId: number | undefined;
-        if (text) {
-          const sent = await withFloodRetry(() => bot.telegram.sendMessage(groupId, text, { message_thread_id: currentTopicId, ...(memberMarkup ? { reply_markup: memberMarkup } : {}) }));
-          textMessageId = sent.message_id;
-          await sleep(HISTORY_SEND_DELAY_MS);
+    // If the topic was deleted, recreate it (once per run) and replay the chat's whole history into
+    // it. Without this, catch-up after a restart silently drops every message for a chat whose topic
+    // was removed (the cursor advances regardless).
+    // A transient failure (Telegram/proxy down, 5xx, a MAX file not fetchable right now) instead
+    // stops this chat's backfill BEFORE the cursor moves — the error propagates as it is, and the
+    // caller asks for a catch-up retry — so the next catch-up resumes at this very message (review
+    // 2026-09-26, C12/RECOVERY3); the parts of it already posted are deleted first
+    // (discardPartialDelivery). A failure pinned on the message itself (its download, an attachment
+    // upload — never a text send, which only says Telegram is down) counts as a strike; once
+    // backfillStrikes says it is the last try, such a failure degrades to placeholders instead
+    // (download: throwOnTransient off; upload: sendAttachments' degradeTransient).
+    const lastTry = backfillStrikes.isLastTry(strikeKey);
+    const sent: number[] = [];
+    let phase: 'text' | 'attachments' = 'text';
+    try {
+      let textIds: number[] = [];
+      let attachIds: number[] = [];
+      if (text) {
+        // Split when over Telegram's 4096 limit (INBOUND-EDGES2), each piece paced like any message.
+        textIds = await sendTextPieces(bot, groupId, currentTopicId, text, { replyMarkup: memberMarkup, paceMs: HISTORY_SEND_DELAY_MS, sent });
+      }
+      if (attaches.length > 0) {
+        phase = 'attachments';
+        const downloadCtx: DownloadContext = {
+          max,
+          ...(forwarded ? forwarded.download : { chatId: maxChatId, messageId: msg.id }),
+          throwOnTransient: !lastTry,
+        };
+        // withFloodRetry lives INSIDE sendAttachments, around each single send — wrapping the
+        // whole call here re-sent the attachments already delivered on a 429 (S2).
+        attachIds = await sendAttachments(bot, groupId, currentTopicId, attaches, downloadCtx, undefined, HISTORY_SEND_DELAY_MS, sent, lastTry);
+      }
+      // One MAX message can become several Telegram messages (text + attachments — confirmed
+      // live 2026-08-13 for a forward; a split long text; an album): link them ALL, so a later
+      // deletion removes every one instead of orphaning the rest (buildLinkIds).
+      // What is linked to this message by now is looked up again right before linking: a live
+      // EDITED push may have posted its orphan-edit stub while the parts above went out, and adding
+      // over a stale read left that stub behind for good (review 2026-09-26, delivery-r2#4).
+      const prior = msg.id != null ? messageLinks.getByMax(maxChatId, msg.id) : undefined;
+      // Only a stub older than the history snapshot is replaced: one posted by an edit made while
+      // this run was under way may carry text the snapshot lacks, so it stays, folded in like any
+      // other copy (review 2026-09-27, delivery-r3.1#0).
+      const stub = prior?.orphanEdit && (prior.createdAt ?? Infinity) < (historySnapshotAt.get(queue) ?? 0) ? prior : undefined;
+      // Anything else found there (a live copy that raced this one) is folded in, so a deletion in
+      // MAX takes it along.
+      const linkIds = buildLinkIds(textIds, [...attachIds, ...(prior && !stub ? linkTelegramIds(prior) : [])]);
+      if (linkIds && msg.id != null) {
+        messageLinks.add({ maxChatId, maxMessageId: msg.id, ...linkIds });
+        // The original is in Telegram now, with the edited text: the stub only repeated that text
+        // while claiming the original was not found — it goes, instead of staying as a duplicate
+        // (review 2026-09-26, delivery-r2#2).
+        if (stub) await deleteBotMessages(bot, groupId, linkTelegramIds(stub), `orphan-edit stub of MAX message ${String(msg.id)}`);
+        // Deleted in MAX while its parts went out: that REMOVED push found nothing to delete yet.
+        if (messageLinks.wasRemoved(maxChatId, msg.id)) {
+          messageLinks.remove(maxChatId, msg.id);
+          await deleteBotMessages(bot, groupId, linkTelegramIds(linkIds), `MAX deletion of message ${String(msg.id)} during its backfill`);
         }
-        if (attaches.length > 0) {
-          const downloadCtx: DownloadContext = {
-            max,
-            chatId: forwarded?.sourceChatId ?? maxChatId,
-            messageId: forwarded?.sourceMessageId ?? msg.id,
-          };
-          attachMessageId = await withFloodRetry(() => sendAttachments(bot, groupId, currentTopicId, attaches, downloadCtx));
-          await sleep(HISTORY_SEND_DELAY_MS);
-        }
-        // A forward with both text AND an attachment sends TWO separate Telegram
-        // messages from one MAX message — track both so a later deletion removes both
-        // instead of orphaning the attachment (confirmed live 2026-08-13).
-        const telegramMessageId = textMessageId ?? attachMessageId;
-        if (telegramMessageId != null && msg.id != null) {
-          const extraTelegramMessageIds = textMessageId != null && attachMessageId != null && attachMessageId !== telegramMessageId ? [attachMessageId] : undefined;
-          messageLinks.add({ maxChatId, maxMessageId: msg.id, telegramMessageId, extraTelegramMessageIds });
-        }
-        break; // delivered
-      } catch (err) {
-        if (isThreadNotFound(err) && !recreatedOnce) {
-          recreatedOnce = true;
-          logger.info(`Backfill topic for MAX chat ${String(maxChatId)} was deleted — recreating and retrying`);
-          currentTopicId = await recreateTopicForChat(bot, groupId, maxChatId, chatMapStore);
-          continue; // retry this same message against the fresh topic
-        }
+      }
+      backfillStrikes.clear(strikeKey);
+    } catch (err) {
+      if (isThreadNotFound(err) && !recreatedOnce) {
+        recreatedOnce = true;
+        logger.info(`Backfill topic for MAX chat ${String(maxChatId)} was deleted — recreating it and replaying the chat's history`);
+        // Links first: they point into the dead topic — the skip above would keep their messages
+        // out of the new one, and the deletion probe would read them as deleted by the owner.
+        // Forgotten BEFORE the recreate, so a recreate that fails still leaves a clean slate for
+        // the retry run's full backfill.
+        messageLinks.removeByChat(maxChatId);
+        currentTopicId = await recreateTopicForChat(bot, groupId, maxChatId, chatMapStore);
+        await onTopicRecreated?.(currentTopicId).catch((cardErr) => logger.error('Failed to send the info card of a recreated topic', cardErr));
+        // The recreated mapping starts with a null cursor: replay everything, oldest-first.
+        queue = await fetchFullHistory(max, maxChatId, null, isCancelled);
+        index = -1; // the loop's index++ starts the fresh history from its first message
+        continue;
+      }
+      if (isRetriedDeliveryFailure(err)) {
+        // On the last try everything pinned on the message has degraded to placeholders already, so
+        // a transient error still escaping says Telegram itself is failing: retried like any outage,
+        // never given up on — that dropped the message without even a placeholder (review
+        // 2026-09-27, delivery-r3.1#1).
+        const messageSpecific = !lastTry && (err instanceof TransientDownloadError || phase === 'attachments');
+        const strikes = messageSpecific ? backfillStrikes.hit(strikeKey) : backfillStrikes.count(strikeKey);
+        await discardPartialDelivery(bot, groupId, strikeKey, sent);
+        logger.error(
+          `Backfill of MAX chat ${String(maxChatId)} stopped at message ${String(msg.id)} on a transient failure (${strikes}/${backfillStrikes.limit} strikes) — cursor left before it, the next catch-up resumes here`,
+          err,
+        );
+        throw err;
+      } else {
+        // A permanent refusal (4xx): resending won't help — log it and move past it.
         logger.error(`Failed to backfill MAX message ${String(msg.id)} in chat ${String(maxChatId)}`, err);
-        break;
+      }
+      // Whatever part of it did go out stays linked, so a later deletion in MAX removes it. An
+      // orphan-edit stub (looked up again, see delivery-r2#4 above) is folded in rather than deleted:
+      // with only part of the original out, it is the one visible copy of the edit (delivery-r1#7).
+      const prior = msg.id != null ? messageLinks.getByMax(maxChatId, msg.id) : undefined;
+      const partial = buildLinkIds(sent, prior ? linkTelegramIds(prior) : []);
+      if (sent.length > 0 && partial && msg.id != null) {
+        // Deleted in MAX while its parts went out, as on the success path (delivery-r3.2#1).
+        if (messageLinks.wasRemoved(maxChatId, msg.id)) {
+          messageLinks.remove(maxChatId, msg.id);
+          await deleteBotMessages(bot, groupId, linkTelegramIds(partial), `MAX deletion of message ${String(msg.id)} during its backfill`);
+        } else {
+          messageLinks.add({ maxChatId, maxMessageId: msg.id, ...partial });
+        }
       }
     }
     await chatMapStore.advanceHistoryCursor(maxChatId, msg.time);
@@ -872,13 +1470,22 @@ export interface BridgeOptions {
   triggerFullResync: () => Promise<void>;
   /** Disconnects from MAX and deletes the encrypted session — used by /kill. Awaited (unlike triggerFullResync) since /kill's own confirmation message should only go out once this has actually finished. */
   killEverything: () => Promise<void>;
-  /** MAX auth steps for the in-Telegram /login flow (same functions the web panel's /api/auth/* use). */
+  /**
+   * Cancels the in-flight history sync (server/app.ts's syncAllChatsToTelegram run), waits for it
+   * to stop, and holds off new runs until the returned release function is called — /reboot and
+   * /kill wrap their wipe in it so the old run can't refill (or recreate) the topics they delete
+   * (review 2026-09-26, C7).
+   */
+  suspendChatSync: () => Promise<() => void>;
+  /** MAX auth steps for the in-Telegram /login flow (server/app.ts's maxAuth* functions). */
   auth: MaxAuthCallbacks;
 }
 
 /** Wires MAX push messages <-> Telegram forum topics in both directions (ТЗ.md §1.2). */
 export interface WiredBridge {
   messageLinks: MessageLinkStore;
+  /** Which chats are caught up this MAX session — pass to syncAllChatsToTelegram (see catchUp.ts). */
+  catchUp: CatchUpTracker;
 }
 
 export function wireBridge({
@@ -893,16 +1500,17 @@ export function wireBridge({
   getMaxState,
   triggerFullResync,
   killEverything,
+  suspendChatSync,
   auth,
 }: BridgeOptions): WiredBridge {
   // Bug-report channel: private DMs from outsiders become bug reports. The inbox is only
   // ON where BUGREPORT_INBOX is set (the maintainer's prod bot); everywhere else the flag
   // is unset and outsiders just get a redirect stub to the maintainer's bot. Created before
   // the middlewares so the first one can route private chats into it.
-  const bugReportInboxEnabled = !!process.env.BUGREPORT_INBOX && !/^(0|false|off)$/i.test(process.env.BUGREPORT_INBOX);
+  const bugReportInboxEnabled = isBugReportInboxEnabled();
   const bugReports: BugReports = createBugReports({ bot, targetGroupId, enabled: bugReportInboxEnabled });
   // In-Telegram MAX (re)authorization — a private /login conversation (SMS code + optional 2FA
-  // password). Shares the exact auth steps the web panel uses; runs in DM so code/password stay
+  // password) — the bridge's only login path, driving server/app.ts's auth steps; runs in DM so code/password stay
   // private, and admin-gated so a stranger can't re-point the bridge at their own MAX account.
   const maxAuth = createMaxAuthFlow({ targetGroupId, auth });
 
@@ -941,7 +1549,8 @@ export function wireBridge({
   // But every BOT COMMAND (/kill, /reboot, /login, group management, …) is
   // admin-only: a plain member must not be able to wipe the session, leak the web
   // panel key, or manage MAX groups just by being in the chat. Commands and inline
-  // button presses go through here; everything else falls straight through.
+  // button presses go through here; everything else falls straight through. (The one
+  // destructive reaction — 👎-delete — checks isGroupAdmin itself in its handler.)
   bot.use(async (ctx, next) => {
     const text = (ctx.message as { text?: string } | undefined)?.text;
     const isCommand = typeof text === 'string' && text.startsWith('/');
@@ -951,8 +1560,7 @@ export function wireBridge({
     const userId = ctx.from?.id;
     if (userId == null) return; // anonymous group post / no sender — fail closed
     try {
-      const member = await ctx.telegram.getChatMember(targetGroupId, userId);
-      if (member.status === 'creator' || member.status === 'administrator') return next();
+      if (await isGroupAdmin(userId)) return next();
     } catch (err) {
       logger.error('Failed to check admin status for a bot command', err);
       return; // can't verify — fail closed
@@ -964,12 +1572,21 @@ export function wireBridge({
     }
   });
 
+  /** Creator/administrator of the bridge group — the one notion of "admin" for commands, buttons and the 👎 delete gesture. Throws when Telegram can't be asked; callers fail closed. */
+  async function isGroupAdmin(userId: number): Promise<boolean> {
+    const member = await bot.telegram.getChatMember(targetGroupId, userId);
+    return member.status === 'creator' || member.status === 'administrator';
+  }
+
   // When a message last crossed in each direction — for the panel's «📊 Статус» ("is it alive?").
   let lastInAt: number | null = null;
   let lastOutAt: number | null = null;
   const outgoingCids = new RecentCids();
   const messageLinks = new MessageLinkStore();
   const pollLinks = new PollLinkStore();
+  // Chats whose history is caught up this MAX session — the live paths below may only move
+  // a chat's history cursor once it is in here. Invariant and lifecycle: see catchUp.ts.
+  const catchUp = new CatchUpTracker();
 
   /**
    * `outgoingCids` and `messageLinks` are both in-memory only, so neither survives a
@@ -979,12 +1596,67 @@ export function wireBridge({
    * message naturally advances the cursor past it. Without this, that catch-up sees
    * our own just-sent message sitting past the stale cursor and relays it to
    * Telegram a second time — hit live 2026-08-13 testing the sticker relay. Advancing
-   * the cursor to "now" right after every outgoing send closes that window.
+   * the cursor to the sent message's MAX server time right after every outgoing send
+   * closes that window (advanceLiveCursor). While an incoming push of the same chat is still
+   * being delivered, the move waits until the chat's live queue has drained: jumping past that
+   * message now would lose it for good if it then failed (review 2026-09-26, delivery-r1#0).
    */
-  function rememberOutgoingSend(chatId: unknown, cid: number): void {
+  function rememberOutgoingSend(chatId: unknown, cid: number, serverTime: unknown, messageId: unknown): void {
     outgoingCids.remember(cid);
     lastOutAt = Date.now();
-    chatMapStore.advanceHistoryCursor(chatId, Date.now()).catch((err) => logger.error('Failed to advance history cursor after outgoing send', err));
+    const queue = liveQueues.get(String(chatId));
+    if (queue) {
+      queue.deferredCursor = Math.max(queue.deferredCursor ?? -Infinity, liveCursorTime(serverTime));
+      if (messageId != null && !catchUp.isCaughtUp(chatId)) messageLinks.pin(chatId, messageId);
+      return;
+    }
+    advanceLiveCursor(chatId, serverTime, 'outgoing send', messageId);
+  }
+
+  /**
+   * The one place a live message moves its chat's history cursor, to its MAX server time
+   * (liveCursorTime, RECOVERY9) — and only for a chat that is caught up (C3; invariant and
+   * lifecycle in catchUp.ts). For any other chat the time is noted instead, and whoever catches the
+   * chat up moves the cursor there (review 2026-09-26, catchup-r1#1); until then the message's link
+   * is pinned, since the backfill skips it by that link (catchup-r3.2#0).
+   */
+  function advanceLiveCursor(chatId: unknown, serverTime: unknown, what: string, messageId?: unknown): void {
+    const time = liveCursorTime(serverTime);
+    if (!catchUp.isCaughtUp(chatId)) {
+      catchUp.noteLiveDelivered(chatId, time);
+      if (messageId != null) messageLinks.pin(chatId, messageId);
+      return;
+    }
+    chatMapStore.advanceHistoryCursor(chatId, time).catch((err) => logger.error(`Failed to advance history cursor after ${what}`, err));
+  }
+
+  /**
+   * Live MAX events (pushes, call notices) run one chat at a time, in arrival order. Handled side
+   * by side, a later message delivered first moved the cursor past an earlier one still uploading,
+   * and when that one then failed, the catch-up (`time > cursor`) never fetched it again — while its
+   * already-posted parts had been deleted for the re-delivery (review 2026-09-26, delivery-r1#0).
+   * In order, a deletion also finds the link of a message whose delivery was still running
+   * (delivery-r1#5). `deferredCursor` is an outgoing send's cursor move held back while the queue
+   * is busy (rememberOutgoingSend), applied once it has drained.
+   */
+  const liveQueues = new Map<string, { tail: Promise<void>; pending: number; deferredCursor: number | null }>();
+  function enqueueLive(chatId: unknown, fn: () => Promise<void>): Promise<void> {
+    const key = String(chatId);
+    let queue = liveQueues.get(key);
+    if (!queue) {
+      queue = { tail: Promise.resolve(), pending: 0, deferredCursor: null };
+      liveQueues.set(key, queue);
+    }
+    const q = queue;
+    q.pending += 1;
+    const run = q.tail.then(fn).finally(() => {
+      q.pending -= 1;
+      if (q.pending > 0) return;
+      if (liveQueues.get(key) === q) liveQueues.delete(key);
+      if (q.deferredCursor != null) advanceLiveCursor(key, q.deferredCursor, 'outgoing send');
+    });
+    q.tail = run.catch(() => undefined);
+    return run;
   }
 
   // Keyed by `${chatId}:${messageId}` -> what we last relayed, so the sticky
@@ -994,6 +1666,47 @@ export function wireBridge({
   // original messageId (BigInt), not just its string form, since MSG_GET_REACTIONS
   // needs the same integer encoding as every other messageId-taking call.
   const lastRelayedReaction = new Map<string, { chatId: unknown; messageId: unknown; emoji: string }>();
+  // `${chatId}:${messageId}|${emoji}` pairs Telegram rejected as outside its reaction set
+  // (see handleMaxChatUpdate). FIFO-bounded like the other long-lived maps here.
+  const rejectedReactions = new Set<string>();
+  const REJECTED_REACTIONS_CAP = 200;
+
+  /** Forgets one message's link together with its relayed-reaction entry — once it's deleted on either side nothing should poll or probe it again. */
+  function forgetLink(maxChatId: unknown, maxMessageId: unknown): void {
+    messageLinks.remove(maxChatId, maxMessageId);
+    lastRelayedReaction.delete(`${String(maxChatId)}:${String(maxMessageId)}`);
+  }
+
+  /**
+   * A linked message is gone (deleted on MAX, or by /delete or 👎): forgets its link, THEN deletes
+   * every Telegram message it produced (anchor, extras and notices, plus `alsoIds` — /delete's own target),
+   * each on its own so one failure doesn't keep the rest. Forgetting first matters: the deletion
+   * probe must never see the copies vanish while the link is still there and mirror-delete on MAX
+   * (review 2026-09-26). `why` names the cause in the error log.
+   */
+  async function dropLinkedMessage(link: MessageLink, why: string, alsoIds: number[] = []): Promise<void> {
+    forgetLink(link.maxChatId, link.maxMessageId);
+    for (const id of new Set([...alsoIds, ...linkTelegramIds(link)])) {
+      await bot.telegram.deleteMessage(targetGroupId, id).catch((err) => logger.error(`Failed to delete Telegram message ${id} (${why})`, err));
+    }
+  }
+
+  /** Forgets every link (and relayed reaction) of one MAX chat — call BEFORE deleting its topic, see MessageLinkStore.removeByChat. */
+  function forgetChatLinks(maxChatId: unknown): void {
+    const dropped = messageLinks.removeByChat(maxChatId);
+    const prefix = `${String(maxChatId)}:`;
+    for (const key of [...lastRelayedReaction.keys()]) {
+      if (key.startsWith(prefix)) lastRelayedReaction.delete(key);
+    }
+    if (dropped > 0) logger.info(`Forgot ${dropped} message link(s) of MAX chat ${String(maxChatId)} — its topic is going away`);
+  }
+
+  /** Forgets ALL links — /reboot and /kill, before their topic-deletion loop. */
+  function forgetAllLinks(): void {
+    messageLinks.clear();
+    pollLinks.clear();
+    lastRelayedReaction.clear();
+  }
 
   // Poll votes arrive as a repeat PUSH_MESSAGE (same messageId, updated attaches[0].state) —
   // same mechanism as text edits, confirmed live 2026-08-10. Telegram's native poll widget has
@@ -1032,6 +1745,13 @@ export function wireBridge({
           lastRelayedReaction.delete(key);
         }
       } catch (err) {
+        // REACTION_EMPTY on the clearing call = Telegram found the message but there was
+        // no bot reaction to clear — already in the desired state, so stop polling it
+        // instead of logging the same error every minute.
+        if (classifyProbeResult(telegramErrorText(err)) === 'alive') {
+          lastRelayedReaction.delete(key);
+          continue;
+        }
         logger.error(`Failed to poll MAX reactions for chat ${relayed.chatId} message ${String(relayed.messageId)}`, err);
       }
     }
@@ -1042,8 +1762,9 @@ export function wireBridge({
    * poll our OWN relayed messages with an (invisible) setMessageReaction and read the
    * error text: a live message answers REACTION_EMPTY, a deleted one "message to react
    * not found" (classifyProbeResult). A gone message is mirror-deleted on MAX forAll —
-   * it's ours. Only outgoing messages are watched: MAX->Telegram deletions already
-   * arrive as a REMOVED push, and deleting someone else's MAX message for everyone
+   * it's ours — but only after probeLinkGuard and a topic-liveness check rule out that
+   * the whole topic went away (ban, chat close, reboot, a topic deleted by hand). Only
+   * outgoing messages are watched: MAX->Telegram deletions already arrive as a REMOVED push, and deleting someone else's MAX message for everyone
    * isn't ours to do. The decay ladder (probeIntervalMs) concentrates pings right
    * after send, where ~90% of deletions happen.
    *
@@ -1058,6 +1779,10 @@ export function wireBridge({
   const probeLastAt = new Map<string, number>();
   setInterval(() => void runProbeTick(), PROBE_TICK_MS).unref();
 
+  function telegramErrorText(err: unknown): string {
+    return String((err as { response?: { description?: string } })?.response?.description ?? (err as Error)?.message ?? '');
+  }
+
   async function probeMessageState(link: MessageLink): Promise<'alive' | 'gone' | 'unknown'> {
     const relayed = lastRelayedReaction.get(`${String(link.maxChatId)}:${String(link.maxMessageId)}`);
     // relayed.emoji is stored in MAX form (it's compared against MAX getReactions in
@@ -1067,11 +1792,52 @@ export function wireBridge({
       await bot.telegram.setMessageReaction(targetGroupId, link.telegramMessageId, reaction);
       return 'alive'; // ok — the message exists (reaction re-affirmed, or empty no-op accepted)
     } catch (err) {
-      return classifyProbeResult(String((err as { response?: { description?: string } })?.response?.description ?? (err as Error)?.message ?? ''));
+      const errText = telegramErrorText(err);
+      // Telegram rejected the relayed emoji itself (outside its reaction set), which says
+      // nothing about the message — retry once with the empty probe before classifying.
+      if (reaction.length > 0 && isReactionInvalid(errText)) {
+        try {
+          await bot.telegram.setMessageReaction(targetGroupId, link.telegramMessageId, []);
+          return 'alive';
+        } catch (retryErr) {
+          return classifyProbeResult(telegramErrorText(retryErr));
+        }
+      }
+      return classifyProbeResult(errText);
+    }
+  }
+
+  /**
+   * Is the forum topic still there? Asked only after a message probed 'gone', right
+   * before the irreversible forAll delete on MAX: a message that vanished together with
+   * its whole topic (deleted by hand in Telegram, raced by a /ban or /reboot) must not
+   * take the owner's MAX messages with it. Classified with the same isThreadNotFound
+   * that triggers restoreDeletedTopic; anything else (429, network) is 'unknown'.
+   * NOTE 2026-09-26: that sendChatAction on a deleted topic answers "message thread not
+   * found" still needs live confirmation — if it answers ok instead, the check reads
+   * 'alive' and we merely degrade to the pre-check behaviour, never worse.
+   * Known, accepted side effect: on a live topic this shows «бот печатает…» there for up
+   * to ~5 s with no message following — once per owner-side deletion the probe catches.
+   * The side-effect-free candidate (editForumTopic with the unchanged name, expecting
+   * TOPIC_NOT_MODIFIED) is unconfirmed for deleted topics and would rename back a topic
+   * renamed by hand in Telegram if our stored title is stale — so the visible indicator
+   * is the deliberate trade-off until one is confirmed live (review 2026-09-26, b1-deletes).
+   */
+  async function probeTopicState(topicId: number): Promise<'alive' | 'gone' | 'unknown'> {
+    try {
+      await bot.telegram.sendChatAction(targetGroupId, 'typing', { message_thread_id: topicId });
+      return 'alive';
+    } catch (err) {
+      return isThreadNotFound(telegramErrorText(err)) ? 'gone' : 'unknown';
     }
   }
 
   async function runProbeTick(): Promise<void> {
+    // /reboot or /kill is deleting every topic: each one's messages vanish with it, and a
+    // message written into a not-yet-deleted topic during the wipe got a fresh link after the
+    // wipe's forgetAllLinks. Nothing here may read that as the owner deleting it (the guard
+    // below re-checks per link, since a wipe can start mid-tick) (review 2026-09-26, b1-deletes).
+    if (wiping) return;
     const now = Date.now();
     const due: MessageLink[] = [];
     const liveKeys = new Set<string>();
@@ -1090,15 +1856,56 @@ export function wireBridge({
     for (const key of probeLastAt.keys()) {
       if (!liveKeys.has(key)) probeLastAt.delete(key);
     }
+    // Guard against the chat state (mapping, ban, restore, a running wipe) BEFORE and again
+    // AFTER the probe: a 'gone' probe deletes on MAX forAll, and a /ban, "Чат закрыт", topic
+    // restore, /reboot or /kill can land while the probe call is in flight.
+    const guard = async (link: MessageLink): Promise<{ verdict: 'probe' | 'skip' | 'drop'; topicId?: number }> => {
+      if (wiping) return { verdict: 'skip' };
+      const mapping = await chatMapStore.getByMaxChatId(link.maxChatId);
+      return { verdict: probeLinkGuard(link, mapping, restoring.has(String(link.maxChatId))), topicId: mapping?.telegramTopicId };
+    };
     for (const link of due.slice(0, PROBE_MAX_PER_TICK)) {
       const key = `${String(link.maxChatId)}:${String(link.maxMessageId)}`;
+      // Already dropped (a forgetChatLinks below, a concurrent /ban, /delete, 👎, a REMOVED
+      // push) — checked here and again right before the forAll delete below.
+      if (messageLinks.getByMax(link.maxChatId, link.maxMessageId) !== link) continue;
+      const before = await guard(link);
+      if (before.verdict === 'drop') {
+        forgetLink(link.maxChatId, link.maxMessageId);
+        continue;
+      }
+      if (before.verdict === 'skip') continue;
       probeLastAt.set(key, Date.now());
       const state = await probeMessageState(link);
       if (state !== 'gone') continue;
+      const after = await guard(link);
+      if (after.verdict !== 'probe' || after.topicId == null) {
+        if (after.verdict === 'drop') forgetLink(link.maxChatId, link.maxMessageId);
+        logger.info(`probe: Telegram message ${link.telegramMessageId} gone but chat ${String(link.maxChatId)} changed meanwhile (${after.verdict}) — not deleting on MAX`);
+        continue;
+      }
+      const topicState = await probeTopicState(after.topicId);
+      if (topicState === 'gone') {
+        // The whole topic went away, not this one message — forget the chat's links so
+        // none of them ever reaches the forAll delete below; restoreDeletedTopic brings
+        // the topic back on the next incoming message.
+        forgetChatLinks(link.maxChatId);
+        logger.info(`probe: Telegram message ${link.telegramMessageId} gone together with topic ${after.topicId} — dropped the chat's links, nothing deleted on MAX`);
+        continue;
+      }
+      if (topicState === 'unknown') continue; // 429/network — keep the link, retry on the ladder
+      // Forgotten while the probe calls were in flight (/delete, 👎, a REMOVED push — each forgets
+      // the link BEFORE deleting the Telegram copies, which is exactly what the probe then saw
+      // vanish): that deletion is already handled — a forAll here would turn a «/delete me» into
+      // a delete for everyone (review 2026-09-26, b1-deletes).
+      if (messageLinks.getByMax(link.maxChatId, link.maxMessageId) !== link) continue;
       try {
         await max.deleteMessages(link.maxChatId, [link.maxMessageId], false); // forAll — it's ours
-        messageLinks.remove(link.maxChatId, link.maxMessageId);
+        forgetLink(link.maxChatId, link.maxMessageId);
         probeLastAt.delete(key);
+        // Its bot notices (a poll's vote hint, tally replies) would stay as replies to nothing
+        // (review 2026-09-27, delivery-r3.1#3).
+        await deleteBotMessages(bot, targetGroupId, link.noticeTelegramMessageIds ?? [], 'probe-delete notices');
         logger.info(`probe-delete: Telegram message ${link.telegramMessageId} gone -> removed MAX message ${String(link.maxMessageId)} (forAll)`);
       } catch (err) {
         logger.error(`Probe saw Telegram message ${link.telegramMessageId} deleted but failed to mirror-delete on MAX`, err);
@@ -1132,25 +1939,42 @@ export function wireBridge({
     await bot.telegram.sendMessage(targetGroupId, text, { reply_markup: replyMarkup }).catch((err) => logger.error('Failed to send scheduled version-update notice', err));
   }
 
+  // A new MAX socket means a gap: whatever arrived while no session was up has to be caught
+  // up (syncAllChatsToTelegram) before a live message may move any chat's cursor again.
+  // 'connected' too, not just 'disconnected': a manual reconnect (session refresh, resume
+  // retry) tears the old socket down without emitting 'disconnected' (client.ts teardownSocket).
+  max.on('disconnected', () => catchUp.reset());
+  max.on('connected', () => catchUp.reset());
+
   max.on('message', (event: MaxMessageEvent) => {
     if (event.opcode === OPCODES.PUSH_MESSAGE) {
       // handleMaxPush's own try/catch only wraps its final send step — anything
       // thrown earlier (e.g. in forward-sender resolution) was an unhandled
       // rejection that silently vanished. Confirmed live 2026-08-13 while
       // debugging a forwarded FILE attachment that never reached Telegram.
-      handleMaxPush(event.payload as MaxPushPayload).catch((err) => logger.error('handleMaxPush crashed', err));
+      const payload = event.payload as MaxPushPayload;
+      const chatId = payload?.chatId;
+      const run = chatId != null ? enqueueLive(chatId, () => handleMaxPush(payload)) : handleMaxPush(payload);
+      // Registered at once, before the queue even gets to it: a catch-up backfill reaching this
+      // message meanwhile waits for it instead of sending it too (MessageLinkStore.pendingDelivery).
+      if (chatId != null && payload.message?.id != null) messageLinks.trackDelivery(chatId, payload.message.id, run);
+      run.catch((err) => logger.error('handleMaxPush crashed', err));
     } else if (event.opcode === OPCODES.PUSH_TYPING) {
       void handleMaxTyping(event.payload as MaxTypingPayload);
     } else if (event.opcode === OPCODES.CHAT_UPDATE) {
       void handleMaxChatUpdate(event.payload);
     } else if (event.opcode === OPCODES.NOTIF_CALL_START) {
-      void handleIncomingCall(event.payload as { caller?: unknown; callId?: unknown; chatId?: unknown });
+      const payload = event.payload as { caller?: unknown; callId?: unknown; chatId?: unknown } | null;
+      // Same per-chat queue as the pushes: a call can open a brand-new chat's topic.
+      if (payload?.chatId != null) void enqueueLive(payload.chatId, () => handleIncomingCall(payload));
     } else if (event.opcode === OPCODES.NOTIF_MSG_DELETE) {
       void handleMaxMessageDelete(event.payload);
     } else if (event.opcode === OPCODES.NOTIF_MSG_REACTIONS_CHANGED || event.opcode === OPCODES.NOTIF_MSG_YOU_REACTED) {
-      // Tested live 2026-08-08: never fired for a real reaction from another
-      // user. Logged in case it turns out to be conditional (e.g. group chats,
-      // a different client version) — CHAT_UPDATE below is what's actually wired up.
+      // Deliberate diagnostic, not dead code. Tested live 2026-08-08: never fired for a real
+      // reaction from another user — CHAT_UPDATE (handleMaxChatUpdate) is what's actually wired
+      // up. Kept so that if it turns out to be conditional (e.g. group chats, a different client
+      // version) its payload shape shows up in the normal logs: hence `info`, not `debug` (which
+      // the default LOG_LEVEL=info drops); it costs nothing while the opcode never arrives.
       // redactSecrets: an unknown payload shape may carry anything — never log it raw.
       logger.info(`${formatOpcode(event.opcode)} payload:`, jsonStringify(redactSecrets(event.payload)));
     }
@@ -1177,12 +2001,12 @@ export function wireBridge({
     if (chat.lastReactedMessageId == null || !chat.lastReaction) {
       const mapping = await chatMapStore.getByMaxChatId(chat.id);
       if (!mapping) return;
-      const name = resolveChatName(rawChat, getMyAccountId(), getContactProfiles());
-      if (!name || name === mapping.title || /^(CHAT|DIALOG|Chat|MAX chat|MAX ID) /i.test(name)) return;
+      const name = clampTopicTitle(resolveChatName(rawChat, getMyAccountId(), getContactProfiles()));
+      if (!name || name === mapping.title || isFallbackTitle(name)) return;
       await bot.telegram
-        .editForumTopic(targetGroupId, mapping.telegramTopicId, { name: name.slice(0, 128) })
+        .editForumTopic(targetGroupId, mapping.telegramTopicId, { name })
         .catch((err) => logger.error('Failed to rename topic on chat update', err));
-      await chatMapStore.upsert({ ...mapping, title: name });
+      await chatMapStore.setTitle(chat.id, mapping.telegramTopicId, name); // title only — see setTitle
       logger.info(`Renamed topic ${mapping.telegramTopicId} for MAX chat ${String(chat.id)} -> "${name}"`);
       return;
     }
@@ -1192,7 +2016,7 @@ export function wireBridge({
 
     const key = `${chat.id}:${String(chat.lastReactedMessageId)}`;
     if (lastRelayedReaction.get(key)?.emoji === chat.lastReaction) return;
-    lastRelayedReaction.set(key, { chatId: chat.id, messageId: chat.lastReactedMessageId, emoji: chat.lastReaction });
+    if (rejectedReactions.has(`${key}|${chat.lastReaction}`)) return; // Telegram already refused this emoji here
 
     try {
       // Telegram only accepts a fixed emoji set (TelegramEmoji); MAX's is presumably wider,
@@ -1200,32 +2024,55 @@ export function wireBridge({
       await bot.telegram.setMessageReaction(targetGroupId, link.telegramMessageId, [
         { type: 'emoji', emoji: toTelegramReaction(chat.lastReaction) as TelegramEmoji },
       ]);
+      // Recorded only once Telegram accepted it: the deletion probe re-affirms this exact
+      // emoji and pollReactionRemovals clears it, so a rejected (unsupported) emoji must
+      // not be remembered — and a transient failure must not mute the next retry.
+      lastRelayedReaction.set(key, { chatId: chat.id, messageId: chat.lastReactedMessageId, emoji: chat.lastReaction });
     } catch (err) {
+      // lastReaction is sticky across unrelated CHAT_UPDATEs, so an emoji Telegram refuses
+      // outright would otherwise be retried (and logged) on every one of them.
+      if (isReactionInvalid(telegramErrorText(err))) {
+        if (rejectedReactions.size >= REJECTED_REACTIONS_CAP) {
+          const oldest = rejectedReactions.values().next().value;
+          if (oldest !== undefined) rejectedReactions.delete(oldest);
+        }
+        rejectedReactions.add(`${key}|${chat.lastReaction}`);
+      }
       logger.error('Failed to relay MAX reaction to Telegram', err);
     }
   }
 
-  /** Reports a poll's new tally as a reply, since Telegram's native poll widget can't be updated with a vote it didn't itself receive. */
-  async function relayPollUpdate(chatId: unknown, telegramMessageId: number, pollAttach: MaxAttachment): Promise<void> {
+  /**
+   * Reports a poll's new tally as a reply, since Telegram's native poll widget can't be updated with
+   * a vote it didn't itself receive. The tally message joins the poll's link as a notice (addNotice), so deleting
+   * the poll in MAX takes it along instead of leaving an orphan reply (review 2026-09-26,
+   * INBOUND-EDGES4/b5-delivery). Returns its message_id.
+   */
+  async function relayPollUpdate(chatId: unknown, maxMessageId: unknown, telegramMessageId: number, pollAttach: MaxAttachment): Promise<number | undefined> {
     const mapping = await chatMapStore.getByMaxChatId(chatId);
-    if (!mapping) return;
+    if (!mapping) return undefined;
     const lines = (pollAttach.answers ?? []).map((a) => {
       const result = pollAttach.state?.result?.find((r) => String(r.answerId) === String(a.answerId));
       return `${a.text ?? '—'}: ${result?.voteCount ?? 0}`;
     });
-    await bot.telegram.sendMessage(targetGroupId, `🗳 Обновление опроса «${pollAttach.title ?? ''}»:\n${lines.join('\n')}`, {
-      message_thread_id: mapping.telegramTopicId,
-      reply_parameters: { message_id: telegramMessageId },
-    });
+    const sent = await withFloodRetry(() =>
+      bot.telegram.sendMessage(targetGroupId, `🗳 Обновление опроса «${pollAttach.title ?? ''}»:\n${lines.join('\n')}`, {
+        message_thread_id: mapping.telegramTopicId,
+        reply_parameters: { message_id: telegramMessageId },
+      }),
+    );
+    messageLinks.addNotice(chatId, maxMessageId, sent.message_id);
     logger.info(`Relayed poll tally update (pollId=${String(pollAttach.pollId)}) to Telegram topic ${mapping.telegramTopicId}`);
+    return sent.message_id;
   }
 
   /**
-   * Never once observed live (2026-08-13 testing showed deletions actually arrive as
-   * a repeat PUSH_MESSAGE with status:"REMOVED" — see handleMaxPush) — kept as a
-   * fallback in case this opcode does fire in some other scenario (e.g. group
-   * chats). Payload shape still unconfirmed; best-effort field names mirroring
-   * MSG_DELETE's own request shape.
+   * Deliberate fallback + diagnostic for NOTIF_MSG_DELETE — not dead code, though never once
+   * observed live (2026-08-13 testing showed deletions actually arrive as a repeat PUSH_MESSAGE
+   * with status:"REMOVED" — see handleMaxPush, the real path). Kept in case this opcode does fire
+   * in some other scenario (e.g. group chats). Its payload shape is unconfirmed: the field names
+   * are a best guess mirroring MSG_DELETE's own request shape, and any other shape is logged
+   * (redacted, at info so it shows in default logs) so a real one can be wired up from the log.
    */
   async function handleMaxMessageDelete(payload: unknown): Promise<void> {
     const p = payload as { chatId?: unknown; messageIds?: unknown[] } | null;
@@ -1237,37 +2084,32 @@ export function wireBridge({
     for (const messageId of p.messageIds) {
       const link = messageLinks.getByMax(p.chatId, messageId);
       if (!link) continue;
-      for (const id of [link.telegramMessageId, ...(link.extraTelegramMessageIds ?? [])]) {
-        try {
-          await bot.telegram.deleteMessage(targetGroupId, id);
-        } catch (err) {
-          logger.error(`Failed to relay MAX message deletion (messageId=${String(messageId)}, telegramMessageId=${id}) to Telegram`, err);
-        }
-      }
+      await dropLinkedMessage(link, `MAX NOTIF_MSG_DELETE of message ${String(messageId)}`);
     }
   }
 
-  /** Real-time "phone is ringing" notification — actually placing/joining the call needs WebRTC, out of scope for a Bot API bridge, so this is notification-only. */
+  /**
+   * Real-time "phone is ringing" notification — actually placing/joining the call needs WebRTC, out
+   * of scope for a Bot API bridge, so this is notification-only.
+   * Delivered like a push (deliverToTopic, the chat's live queue): a call can be a new contact's
+   * first sign of life, and the topic it used to open on its own skipped the born-live bookkeeping
+   * — the chat's cursor then stayed null all session and the next restart replayed everything
+   * relayed since — as well as the info card and the /reboot-/kill wipe, /ban and pending-restore
+   * checks (review 2026-09-26, catchup-r1#2).
+   */
   async function handleIncomingCall(payload: { caller?: unknown; callId?: unknown; chatId?: unknown }): Promise<void> {
-    if (payload?.chatId == null) return;
+    const chatId = payload?.chatId;
+    if (chatId == null || wiping) return;
     try {
-      const { topicId } = await ensureTopicForMaxChat(bot, targetGroupId, payload.chatId, chatMapStore);
+      if ((await chatMapStore.getByMaxChatId(chatId))?.banned) return;
       const callerId = typeof payload.caller === 'number' ? payload.caller : Number(payload.caller);
       let callerName = `MAX ID ${String(payload.caller)}`;
       if (!Number.isNaN(callerId)) {
-        let profile = getContactProfiles().get(callerId);
-        if (!profile) {
-          try {
-            const contacts = await max.getContactInfo([callerId]);
-            profile = contacts[0];
-            if (profile) getContactProfiles().set(callerId, profile);
-          } catch (err) {
-            logger.error(`Failed to fetch CONTACT_INFO for caller ${callerId}`, err);
-          }
-        }
-        callerName = resolveContactDisplayName(callerId, profile);
+        callerName = resolveContactDisplayName(callerId, await resolveProfile(max, callerId, 'caller', getContactProfiles()));
       }
-      await bot.telegram.sendMessage(targetGroupId, `📞 Входящий звонок от ${callerName}`, { message_thread_id: topicId });
+      await deliverToTopic(chatId, payload.caller, async (topicId) => {
+        await withFloodRetry(() => bot.telegram.sendMessage(targetGroupId, `📞 Входящий звонок от ${callerName}`, { message_thread_id: topicId }));
+      });
     } catch (err) {
       logger.error('Failed to relay incoming call notification to Telegram', err);
     }
@@ -1287,14 +2129,6 @@ export function wireBridge({
   }
 
   /**
-   * Sends the intro card the moment a topic is created for a chat we've never
-   * seen before. Prefers the normal chat-aware lookup (covers DIALOG and
-   * group/channel correctly); if the chat isn't in the last CHATS_LIST snapshot
-   * yet (a genuinely brand-new contact writing for the first time), falls back
-   * to the push's `message.sender` and fetches that one contact's CONTACT_INFO
-   * fresh, caching it for later /info calls and future auto-cards.
-   */
-  /**
    * Renames a topic stuck on a fallback title («MAX chat <id>») the moment the contact's
    * profile becomes known — the auto-card's CONTACT_INFO fetch is exactly that moment.
    * Closes the race where a fresh dialog's CHAT_UPDATE arrives BEFORE the profile is
@@ -1304,19 +2138,27 @@ export function wireBridge({
    * card already showed the person's name).
    */
   async function renameFallbackTopic(chatId: unknown, contactId: number, profile: ContactProfile | undefined): Promise<void> {
-    const name = resolveContactDisplayName(contactId, profile);
-    if (/^MAX ID /.test(name)) return; // profile fetch failed — still nothing real to rename to
+    const name = clampTopicTitle(resolveContactDisplayName(contactId, profile));
+    if (!name || isFallbackTitle(name)) return; // profile fetch failed — still nothing real to rename to
     const mapping = await chatMapStore.getByMaxChatId(chatId);
-    if (!mapping || (mapping.title && !/^(CHAT|DIALOG|Chat|MAX chat|MAX ID) /i.test(mapping.title))) return;
+    if (!mapping || (mapping.title && !isFallbackTitle(mapping.title))) return;
     try {
-      await bot.telegram.editForumTopic(targetGroupId, mapping.telegramTopicId, { name: name.slice(0, 128) });
-      await chatMapStore.upsert({ ...mapping, title: name });
+      await bot.telegram.editForumTopic(targetGroupId, mapping.telegramTopicId, { name });
+      await chatMapStore.setTitle(chatId, mapping.telegramTopicId, name); // title only — see setTitle
       logger.info(`Renamed topic ${mapping.telegramTopicId} for MAX chat ${String(chatId)} -> "${name}" (profile learned via auto-card)`);
     } catch (err) {
       logger.error('Failed to rename topic after contact profile fetch', err);
     }
   }
 
+  /**
+   * Sends the intro card the moment a topic is created for a chat we've never
+   * seen before. Prefers the normal chat-aware lookup (covers DIALOG and
+   * group/channel correctly); if the chat isn't in the last CHATS_LIST snapshot
+   * yet (a genuinely brand-new contact writing for the first time), falls back
+   * to the push's `message.sender` and fetches that one contact's CONTACT_INFO
+   * fresh, caching it for later /info calls and future auto-cards.
+   */
   async function sendAutoInfoCard(chatId: unknown, senderId: unknown, topicId: number): Promise<void> {
     const { chat, otherId, profile } = resolveDialogContact(String(chatId));
     if (chat) {
@@ -1327,16 +2169,7 @@ export function wireBridge({
       // person's name/phone instead of "MAX chat <id>" / "Тип: CHAT".
       const looksLikeDialog = chat.type === 'DIALOG' || (!chat.title && count === 2 && otherId != null);
       if (looksLikeDialog && otherId != null) {
-        let dialogProfile = profile;
-        if (!dialogProfile) {
-          try {
-            const contacts = await max.getContactInfo([otherId]);
-            dialogProfile = contacts[0];
-            if (dialogProfile) getContactProfiles().set(otherId, dialogProfile);
-          } catch (err) {
-            logger.error(`Failed to fetch CONTACT_INFO for dialog contact ${otherId}`, err);
-          }
-        }
+        const dialogProfile = profile ?? (await resolveProfile(max, otherId, 'dialog contact', getContactProfiles()));
         await renameFallbackTopic(chatId, otherId, dialogProfile);
         const messageId = await sendContactInfoCard(bot, targetGroupId, topicId, chat.title || `MAX chat ${String(chatId)}`, 'DIALOG', count, otherId, dialogProfile);
         await pinInfoCard(bot, targetGroupId, messageId);
@@ -1349,24 +2182,34 @@ export function wireBridge({
     }
     const id = typeof senderId === 'number' ? senderId : Number(senderId);
     if (Number.isNaN(id)) return;
-    let senderProfile = getContactProfiles().get(id);
-    if (!senderProfile) {
-      try {
-        const contacts = await max.getContactInfo([id]);
-        senderProfile = contacts[0];
-        if (senderProfile) getContactProfiles().set(id, senderProfile);
-      } catch (err) {
-        logger.error(`Failed to fetch CONTACT_INFO for new contact ${id}`, err);
-      }
-    }
+    const senderProfile = await resolveProfile(max, id, 'new contact', getContactProfiles());
     await renameFallbackTopic(chatId, id, senderProfile);
     const messageId = await sendContactInfoCard(bot, targetGroupId, topicId, `MAX ID ${id}`, 'DIALOG', undefined, id, senderProfile);
     await pinInfoCard(bot, targetGroupId, messageId);
   }
 
-  // Chats currently being recreated+restored, so a burst of messages to a
-  // just-deleted topic triggers exactly one recreate, not one per message.
-  const restoringChats = new Set<string>();
+  // In-flight topic restores by chat: a burst of messages to a just-deleted topic triggers exactly
+  // one recreate, not one per message, and /reboot and /kill stop and await them (cancelRestores).
+  const restoring = new Map<string, Promise<void>>();
+  // Chats whose topic restore failed before a new topic existed: chat id -> the dead topic's id.
+  // The next push for such a chat retries the restore instead of opening a bare topic (see
+  // deliverToTopic; review 2026-09-26, RECOVERY8).
+  const restorePending = new Map<string, number | undefined>();
+  // The restores' cancellation epoch — /reboot and /kill bump it.
+  let restoreEpoch = 0;
+  // True while /reboot or /kill wipes the group: pushes are dropped and deleted topics are not
+  // restored, or the wipe would recreate topics as fast as it deletes them. Nothing is lost:
+  // /reboot's resync starts from an empty chat map (full history), /kill logs out of MAX, and a
+  // wipe that fails before that point resets the catch-up state and asks for a catch-up run.
+  let wiping = false;
+
+  /** Stops every in-flight restore (they check restoreEpoch between steps and per message) and waits for them. */
+  async function cancelRestores(): Promise<void> {
+    restoreEpoch += 1;
+    restorePending.clear();
+    backfillStrikes.clearAll();
+    await Promise.allSettled([...restoring.values()]);
+  }
 
   /**
    * Recreates a deleted topic and refills it with the chat's full MAX history,
@@ -1374,38 +2217,99 @@ export function wireBridge({
    * empty shell (reported live 2026-08-15). The message that triggered this is
    * already in that history (newest), so it lands last, in order — nothing is sent
    * separately, hence no duplicate. Fire-and-forget: the backfill is flood-paced
-   * and can take a while; the guard set keeps concurrent pushes from re-triggering.
+   * and can take a while; the `restoring` map keeps concurrent pushes from re-triggering.
+   * `deadTopicId` is the topic found deleted. The work runs under the chat's backfill lock
+   * (withChatBackfillLock), so a catch-up sync of the same chat never replays its history in
+   * parallel. If that sync found the dead topic first and already recreated it (the id changed
+   * while this waited), only the cursor-bounded rest is fetched into the new topic — recreating
+   * again would orphan it (review 2026-09-26, cross). A chat banned meanwhile is left alone.
    */
-  function restoreDeletedTopic(chatId: unknown): void {
+  function restoreDeletedTopic(chatId: unknown, deadTopicId?: number): void {
     const key = String(chatId);
-    if (restoringChats.has(key)) return;
-    restoringChats.add(key);
-    void (async () => {
+    if (restoring.has(key)) return;
+    if (wiping) {
+      logger.info(`Not restoring the deleted topic of MAX chat ${key}: /reboot or /kill is wiping the group`);
+      return;
+    }
+    const epoch = restoreEpoch;
+    const cancelled = (): boolean => epoch !== restoreEpoch;
+    const run = (async () => {
+      let newTopicId: number | undefined;
       try {
-        logger.info(`Telegram topic for MAX chat ${key} was deleted — recreating and restoring its history`);
-        const newTopicId = await recreateTopicForChat(bot, targetGroupId, chatId, chatMapStore);
-        // Same pinned contact-info card a freshly-created topic gets — sent first so
-        // it sits at the top above the restored history, exactly like a from-scratch topic.
-        await sendAutoInfoCard(chatId, undefined, newTopicId).catch((err) => logger.error('Failed to send auto contact-info card on restore', err));
-        const history = await fetchFullHistory(max, chatId, null);
-        if (history.length > 0) {
-          await backfillHistoryToTelegram(bot, targetGroupId, newTopicId, history, max, chatId, messageLinks, chatMapStore, getChats(), getMyAccountId());
-        }
+        // The recreated topic is empty until the backfill below refills it: live messages
+        // arriving meanwhile are relayed but must not move the cursor (catchUp.ts). If the
+        // restore fails, the chat simply stays out until a catch-up run gets it through.
+        // Right away, not under the lock: a sync of this chat running now must not mark it either.
+        catchUp.markDirty(chatId);
+        // Until a new topic exists, the next push for this chat retries this restore (deliverToTopic).
+        if (!restorePending.has(key)) restorePending.set(key, deadTopicId ?? (await chatMapStore.getByMaxChatId(chatId))?.telegramTopicId);
+        const dead = restorePending.get(key);
+        await withChatBackfillLock(chatId, async () => {
+          if (cancelled()) return;
+          const current = await chatMapStore.getByMaxChatId(chatId);
+          if (current?.banned) throw new ChatBannedError(key);
+          // Closed in MAX while this waited: «Чат закрыт» dropped the mapping and restorePending
+          // on purpose — recreating brought the chat back (review 2026-09-27, catchup-r3.2#1). A
+          // retry after a failed recreate (RECOVERY8) has no mapping either, but keeps restorePending.
+          if (!current && !restorePending.has(key)) return;
+          let topicId: number;
+          let cursor: number | null = null;
+          if (current && dead != null && current.telegramTopicId !== dead) {
+            // Healed while this waited (a catch-up sync's own recreate): its links and cursor are
+            // the new topic's — keep them, fetch only what came after.
+            restorePending.delete(key);
+            topicId = current.telegramTopicId;
+            newTopicId = topicId;
+            cursor = cursorToMs(current.historyBackfillCursor);
+            logger.info(`Telegram topic for MAX chat ${key} was already recreated (topic ${topicId}) — catching it up instead of recreating it again`);
+          } else {
+            logger.info(`Telegram topic for MAX chat ${key} was deleted — recreating and restoring its history`);
+            // The old topic's messages died with it; their links would only make the deletion
+            // probe mirror-delete the owner's MAX messages forAll (review 2026-09-26).
+            forgetChatLinks(chatId);
+            newTopicId = await recreateTopicForChat(bot, targetGroupId, chatId, chatMapStore);
+            restorePending.delete(key);
+            if (cancelled()) return;
+            topicId = newTopicId;
+            // Same pinned contact-info card a freshly-created topic gets — sent first so
+            // it sits at the top above the restored history, exactly like a from-scratch topic.
+            await sendAutoInfoCard(chatId, undefined, topicId).catch((err) => logger.error('Failed to send auto contact-info card on restore', err));
+          }
+          const generation = catchUp.generation;
+          const history = await fetchFullHistory(max, chatId, cursor, cancelled);
+          if (history.length > 0) {
+            await backfillHistoryToTelegram(bot, targetGroupId, topicId, history, max, chatId, messageLinks, chatMapStore, getChats(), getMyAccountId(), cancelled, getContactProfiles(), (recreatedId) =>
+              sendAutoInfoCard(chatId, undefined, recreatedId),
+            );
+          }
+          if (!cancelled()) await markChatCaughtUp(catchUp, chatMapStore, messageLinks, chatId, generation);
+        });
       } catch (err) {
-        logger.error(`Failed to recreate/restore deleted topic for MAX chat ${key}`, err);
-      } finally {
-        restoringChats.delete(key);
+        if (err instanceof SyncCancelledError) return;
+        if (err instanceof ChatBannedError) {
+          // /ban deleted the topic on purpose. The dead topic stays recorded in restorePending,
+          // so after /unban the next message restores it.
+          logger.info(`Not restoring the topic of MAX chat ${key}: the chat was banned meanwhile`);
+          return;
+        }
+        // The message that triggered this restore was deliberately not relayed on its own (it is
+        // part of the history being replayed) — say where it will come from, so a failure here is
+        // never a silent loss (review 2026-09-26, RECOVERY8).
+        logger.error(
+          newTopicId == null
+            ? `Failed to recreate the deleted topic for MAX chat ${key} — its pending messages (incl. the one that triggered this) arrive when the next message from this chat retries the restore, or with the next catch-up sync`
+            : `Failed to refill the recreated topic ${newTopicId} for MAX chat ${key} — its cursor stays frozen and the next catch-up sync delivers the rest of the history (incl. the message that triggered this)`,
+          err,
+        );
+        catchUp.requestRetry(`restore of the deleted topic of MAX chat ${key} failed`);
       }
     })();
+    restoring.set(key, run);
+    void run.finally(() => {
+      if (restoring.get(key) === run) restoring.delete(key);
+    });
   }
 
-  /**
-   * Runs `send` against the chat's topic. If that topic was deleted out from under
-   * us (the user removed it in Telegram), recreates it and restores the full chat
-   * history into the fresh topic instead of re-sending just this one message —
-   * without this, deleting a topic silently black-holes every future message from
-   * that MAX contact (reported live 2026-08-15).
-   */
   /** A real display name for a chat from the cached snapshot, or undefined when only a
    * generic fallback ("CHAT <id>", "MAX chat <id>", "MAX ID <id>") is available — so we
    * never name/rename a topic TO a fallback. Names a topic at creation (the CONTROL
@@ -1414,15 +2318,49 @@ export function wireBridge({
     const key = String(chatId);
     const chat = getChats().find((c) => c && typeof c === 'object' && String((c as { id?: unknown }).id) === key);
     if (!chat) return undefined;
-    const name = resolveChatName(chat, getMyAccountId(), getContactProfiles());
-    if (!name || /^(CHAT|DIALOG|Chat|GROUP|CHANNEL) -?\d+$/.test(name) || /^MAX (chat|ID)\b/i.test(name)) return undefined;
-    return name.slice(0, 128);
+    const name = clampTopicTitle(resolveChatName(chat, getMyAccountId(), getContactProfiles()));
+    if (!name || isFallbackTitle(name)) return undefined;
+    return name;
   }
 
-  async function deliverToTopic(chatId: unknown, send: (topicId: number, created: boolean) => Promise<void>): Promise<void> {
+  /**
+   * Runs `send` against the chat's topic. If that topic was deleted out from under
+   * us (the user removed it in Telegram), recreates it and restores the full chat
+   * history into the fresh topic instead of re-sending just this one message —
+   * without this, deleting a topic silently black-holes every future message from
+   * that MAX contact (reported live 2026-08-15).
+   * A chat whose earlier restore failed before a new topic existed retries that restore
+   * instead of opening a bare topic (RECOVERY8, below); any other delivery failure is
+   * reported to the group (throttled, 'tg-deliver') and rethrown.
+   * A topic created here gets its info card (about `sender` when the chat is not cached yet) before
+   * `send` runs.
+   */
+  async function deliverToTopic(chatId: unknown, sender: unknown, send: (topicId: number) => Promise<void>): Promise<void> {
+    const pendingKey = String(chatId);
+    if (restorePending.has(pendingKey)) {
+      const mapping = await chatMapStore.getByMaxChatId(chatId);
+      if (!mapping || mapping.telegramTopicId === restorePending.get(pendingKey)) {
+        // An earlier restore of this chat's deleted topic failed before a new topic existed.
+        // Opening a bare topic here would count as a mapping born live — caught up, cursor free
+        // to jump past the whole history the restore never replayed (review 2026-09-26,
+        // RECOVERY8). Retry the restore instead; this message is part of what it replays.
+        logger.info(`MAX chat ${pendingKey}: retrying its failed topic restore — this message arrives with the restored history`);
+        restoreDeletedTopic(chatId);
+        return;
+      }
+      restorePending.delete(pendingKey); // a catch-up sync has recreated the topic meanwhile
+    }
     const first = await ensureTopicForMaxChat(bot, targetGroupId, chatId, chatMapStore, resolveTopicTitle(chatId));
+    if (first.created) {
+      // Mapping born live this session: caught up at once when nothing older can be waiting —
+      // otherwise (no catch-up pass since the reconnect, or an earlier message of this chat
+      // failed) the sync backfills it from a null cursor and skips what the live path delivered
+      // by its link (catchUp.ts, markBornLive; review 2026-09-26, b2a-cursor/b2b-errors).
+      catchUp.markBornLive(chatId);
+      await sendAutoInfoCard(chatId, sender, first.topicId).catch((err) => logger.error('Failed to send auto contact-info card', err));
+    }
     try {
-      await send(first.topicId, first.created);
+      await send(first.topicId);
     } catch (err) {
       if (!isThreadNotFound(err)) {
         // A real delivery failure (bot lost its rights, Telegram unreachable, …) —
@@ -1435,7 +2373,54 @@ export function wireBridge({
       }
       // Don't re-send `send` here: the triggering message is already part of the
       // history the restore replays, so a separate send would duplicate it.
-      restoreDeletedTopic(chatId);
+      restoreDeletedTopic(chatId, first.topicId);
+    }
+  }
+
+  /**
+   * A MAX edit that could not be applied to the anchor in place. Only logging it lost the edit
+   * silently — every caption added to a 1:1 photo (its anchor is the photo: "there is no text in the
+   * message to edit"), and any edit hit by a Telegram hiccup (review 2026-09-26, delivery-r1#9). A
+   * media anchor gets the text as its caption when it fits; otherwise the edit goes out as a reply to
+   * the anchor, joined to the message's link as a notice (addNotice) so a deletion in MAX takes it along. The
+   * same text again ("message is not modified") needs nothing, and an outgoing link's copy is the
+   * owner's own Telegram message — nothing the bot could edit or should answer.
+   */
+  async function relayEditFallback(chatId: unknown, maxMessageId: unknown, link: MessageLink, marked: string, err: unknown): Promise<void> {
+    const errText = telegramErrorText(err);
+    if (/message is not modified/i.test(errText)) return;
+    // The owner deleted the copy in Telegram: bringing the content back as a reply would undo that
+    // (review 2026-09-27, delivery-r3.1#4).
+    if (/message to edit not found/i.test(errText)) {
+      logger.info(`MAX edit of message ${String(maxMessageId)} not relayed: its Telegram copy was deleted`);
+      return;
+    }
+    if (link.outgoing) {
+      logger.error('Failed to relay MAX edit to Telegram (the copy is the owner\'s own message)', err);
+      return;
+    }
+    if (/no text in the message to edit/i.test(errText) && marked.length <= TELEGRAM_CAPTION_LIMIT) {
+      try {
+        await bot.telegram.editMessageCaption(targetGroupId, link.telegramMessageId, undefined, marked);
+        return;
+      } catch (captionErr) {
+        logger.error('Failed to put a MAX edit into the caption of its media message — sending it as a reply', captionErr);
+      }
+    } else {
+      logger.error('Failed to edit the Telegram copy of a MAX message — sending the edit as a reply', err);
+    }
+    const mapping = await chatMapStore.getByMaxChatId(chatId);
+    if (!mapping) return;
+    try {
+      const sent = await withFloodRetry(() =>
+        bot.telegram.sendMessage(targetGroupId, marked, {
+          message_thread_id: mapping.telegramTopicId,
+          reply_parameters: { message_id: link.telegramMessageId, allow_sending_without_reply: true },
+        }),
+      );
+      messageLinks.addNotice(chatId, maxMessageId, sent.message_id);
+    } catch (replyErr) {
+      logger.error('Failed to relay MAX edit to Telegram', replyErr);
     }
   }
 
@@ -1443,7 +2428,14 @@ export function wireBridge({
     const chatId = payload?.chatId;
     const message = payload?.message;
     if (chatId == null || !message) return;
-    if (message.cid != null && outgoingCids.has(message.cid)) return; // our own message echoed back
+    // /reboot or /kill is deleting every topic right now — a push would only recreate one.
+    if (wiping) return;
+    // Our own message echoed back. Only a NEW message is an echo: a deletion in the MAX app of a
+    // message sent from Telegram comes as a REMOVED repeat push carrying the same cid, and dropping
+    // it here left the Telegram copy (and its link) behind for good (review 2026-09-26,
+    // delivery-r1#4). An EDITED repeat stays dropped — that copy is the owner's own Telegram
+    // message, which the bot cannot edit, and our own Telegram-side edits come back that way too.
+    if (message.cid != null && outgoingCids.has(message.cid) && message.status !== 'REMOVED') return;
     // Banned chat (/ban): drop everything for it — no mirror, no topic recreate.
     const banCheck = await chatMapStore.getByMaxChatId(chatId);
     if (banCheck?.banned) return;
@@ -1459,8 +2451,12 @@ export function wireBridge({
       (a) => a?._type === 'CONTROL',
     );
     if (controlAttach?.event === 'system' && /закрыт/i.test(String(controlAttach.message ?? controlAttach.shortMessage ?? ''))) {
+      restorePending.delete(String(chatId)); // a deleted chat's topic must not be "restored" by a later push
       const mapping = await chatMapStore.getByMaxChatId(chatId);
       if (mapping) {
+        // Links first: the topic deletion takes every message with it, and the deletion
+        // probe must not read that as the owner deleting them (review 2026-09-26).
+        forgetChatLinks(chatId);
         await bot.telegram
           .deleteForumTopic(targetGroupId, mapping.telegramTopicId)
           .catch((err) => logger.error('Failed to delete Telegram topic on MAX chat deletion', err));
@@ -1469,52 +2465,16 @@ export function wireBridge({
       }
       return;
     }
-    // Attachments in a forward were uploaded against the ORIGINAL message/chat, not the
-    // wrapper — FILE_DOWNLOAD/VIDEO_PLAY need those ids, not the wrapper's own.
-    let downloadChatId: unknown = chatId;
-    let downloadMessageId: unknown = message.id;
-    let fallbackChatId: unknown;
-    let fallbackMessageId: unknown;
-
-    // A forward we RECEIVE: the wrapper message's own text/attaches are empty — the
-    // real content is in link.message. Confirmed live 2026-08-13. (Sending a forward
-    // FROM us doesn't work yet — MAX's response to our own FORWARD request comes back
-    // essentially empty and no message is actually created; still unresolved.)
-    if (message.link?.type === 'FORWARD') {
-      const original = message.link.message;
-      attaches = Array.isArray(original?.attaches) ? original.attaches : [];
-      // Files live on the ORIGINAL message/chat (the source), which works when we're in that
-      // chat — so keep it as the primary download context. But a forward from a chat we're
-      // NOT in arrives with link.chatId = 0 (source hidden) and FILE_DOWNLOAD there is denied.
-      // Keep the RECIPIENT chat (the dialog the forward landed in) + this wrapper message id
-      // as a fallback: the file is present in our own chat with the forwarder. (Тимур ->
-      // Владимир -> нам: докачиваем через наш диалог с Владимиром, не через скрытый чат Тимура.)
-      fallbackChatId = chatId;
-      fallbackMessageId = message.id;
-      if (message.link.chatId != null) downloadChatId = message.link.chatId;
-      if (original?.id != null) downloadMessageId = original.id;
-      const senderId = typeof original?.sender === 'number' ? original.sender : Number(original?.sender);
-      let senderName = Number.isNaN(senderId) ? 'неизвестно' : `MAX ID ${senderId}`;
-      if (!Number.isNaN(senderId)) {
-        let profile = getContactProfiles().get(senderId);
-        if (!profile) {
-          try {
-            const contacts = await max.getContactInfo([senderId]);
-            profile = contacts[0];
-            if (profile) getContactProfiles().set(senderId, profile);
-          } catch (err) {
-            logger.error(`Failed to fetch CONTACT_INFO for forward sender ${senderId}`, err);
-          }
-        }
-        senderName = resolveContactDisplayName(senderId, profile);
-      }
-      const sourceChat = getChats().find((c) => c && typeof c === 'object' && String((c as { id?: unknown }).id) === String(message.link?.chatId)) as
-        | { title?: string }
-        | undefined;
-      const sourceLabel = sourceChat?.title || `MAX chat ${String(message.link.chatId)}`;
-      const prefix = `↩️ Переслано из «${sourceLabel}» (от ${senderName}):`;
-      text = original?.text ? `${prefix}\n${original.text}` : prefix;
+    // A forward we RECEIVE: its real content, sender prefix and download ids (the source
+    // message/chat, with our dialog with the forwarder as the fallback) — resolveForwardContent.
+    const forwarded = await resolveForwardContent(max, getChats(), message.link, chatId, message.id, getContactProfiles());
+    if (forwarded) {
+      text = forwarded.text;
+      attaches = forwarded.attaches;
     }
+    // Whether the message has text of its own, before any forward/reply prefix: an orphan edit
+    // without it has nothing worth posting (delivery-r1#3, see below).
+    const hasOwnText = Boolean(forwarded ? message.link?.message?.text : message.text);
 
     // A reply we RECEIVE: link.type==='REPLY', link.message is the FULL quoted message
     // (its id is link.message.id — the incoming shape carries `message`, unlike the
@@ -1530,7 +2490,9 @@ export function wireBridge({
         replyParameters = { message_id: linked.telegramMessageId, allow_sending_without_reply: true };
       } else {
         const quotedText = typeof message.link.message?.text === 'string' ? message.link.message.text : '';
-        const snippet = quotedText ? `«${quotedText.slice(0, 80)}${quotedText.length > 80 ? '…' : ''}»` : 'сообщение';
+        // Cut by code points: a UTF-16 slice could end inside an emoji's surrogate pair, and
+        // Telegram refuses the whole message over the lone half (review 2026-09-26, INBOUND-EDGES5).
+        const snippet = quotedText ? `«${truncateCodePoints(quotedText, 80, '…')}»` : 'сообщение';
         const prefix = `↩️ В ответ на ${snippet}:`;
         text = text ? `${prefix}\n${text}` : prefix;
       }
@@ -1543,19 +2505,29 @@ export function wireBridge({
     // below) is apparently not how MAX actually signals a deletion; kept as a
     // fallback in case it fires in some other scenario, but this is the real path.
     const existingLink = message.id != null ? messageLinks.getByMax(chatId, message.id) : undefined;
+    // Noted either way: a running backfill may still reach it in a stale history snapshot (delivery-r2#1).
+    if (message.status === 'REMOVED' && message.id != null) messageLinks.noteRemoved(chatId, message.id);
     if (existingLink && message.status === 'REMOVED') {
-      const idsToDelete = [existingLink.telegramMessageId, ...(existingLink.extraTelegramMessageIds ?? [])];
-      for (const id of idsToDelete) {
-        try {
-          await bot.telegram.deleteMessage(targetGroupId, id);
-        } catch (err) {
-          logger.error(`Failed to relay MAX deletion to Telegram (telegramMessageId=${id})`, err);
-        }
-      }
+      // Dead link: nothing may poll its reactions or probe it any more — dropLinkedMessage
+      // forgets it before the Telegram copies go, so the deletion probe can't re-delete on MAX.
+      await dropLinkedMessage(existingLink, `MAX deletion of message ${String(message.id)}`);
+      return;
+    }
+    // A deletion for a message we hold no link for (relayed before a restart, evicted, or
+    // a repeat REMOVED push after the link above was forgotten) has nothing to delete —
+    // and must not fall through to the relay below, which would post the deleted
+    // message into Telegram as if it were new.
+    // Parts a failed live delivery of it could not delete are its only copies left: one more try.
+    if (message.status === 'REMOVED') {
+      await retryPendingDiscards(bot, targetGroupId, `${String(chatId)}:${String(message.id)}`);
       return;
     }
     if (existingLink) {
-      if (text != null) {
+      // A repeat push carrying a POLL is a tally update (relayed below), not a text edit — and the
+      // link's anchor is then the poll itself or its text rendering (INBOUND-EDGES4), which an
+      // edit marker must not overwrite.
+      const isPollUpdate = attaches.some((a) => (a as MaxAttachment)._type === 'POLL');
+      if (text != null && !isPollUpdate) {
         // Telegram never shows its own "edited" tag on bot-edited messages (deliberate
         // Bot API behavior — bots edit constantly for live UIs), so mark the edit in the
         // text itself. Group messages get the marker fused with the author prefix
@@ -1569,11 +2541,23 @@ export function wireBridge({
         // confirmed edit-timestamp field. Timezone mirrors the client's default (Europe/Moscow),
         // overridable via TZ — the container itself runs on UTC, which would look wrong.
         const editedAt = new Intl.DateTimeFormat('ru-RU', { hour: '2-digit', minute: '2-digit', timeZone: process.env.TZ || 'Europe/Moscow' }).format(new Date());
-        const marked = editAuthorPrefix ? `✏️ (${editedAt}) ${editAuthorPrefix}${text}` : `✏️ изменено в ${editedAt}:\n${text}`;
+        let marked = editAuthorPrefix ? `✏️ (${editedAt}) ${editAuthorPrefix}${text}` : `✏️ изменено в ${editedAt}:\n${text}`;
+        // Known limitation (review 2026-09-26, INBOUND-EDGES2): an edit only rewrites the ANCHOR
+        // message. A long text relayed as several pieces keeps its later pieces as they were, and
+        // an edited text over Telegram's 4096 limit is cut to fit (marked with «…») — the link
+        // doesn't record which extra ids are text pieces and which are attachments, so re-splitting
+        // the edit across them isn't possible.
+        if (marked.length > TELEGRAM_TEXT_LIMIT) {
+          logger.info(`MAX edit of message ${String(message.id)} is ${marked.length} chars — only its first ${TELEGRAM_TEXT_LIMIT} fit into the edited Telegram message`);
+          marked = `${truncateUtf16(marked, TELEGRAM_TEXT_LIMIT - 1)}…`;
+        }
+        // A stub now carries text newer than any history snapshot taken so far: a running backfill
+        // must keep it rather than replace it with the older snapshot text (delivery-r3.3#0).
+        if (existingLink.orphanEdit) existingLink.createdAt = Date.now();
         try {
           await bot.telegram.editMessageText(targetGroupId, existingLink.telegramMessageId, undefined, marked);
         } catch (err) {
-          logger.error('Failed to relay MAX edit to Telegram', err);
+          await relayEditFallback(chatId, message.id, existingLink, marked, err);
         }
       }
       const updatedPoll = attaches.find((a) => (a as MaxAttachment)._type === 'POLL') as MaxAttachment | undefined;
@@ -1582,12 +2566,28 @@ export function wireBridge({
         const version = typeof updatedPoll.version === 'number' ? updatedPoll.version : undefined;
         if (version == null || lastRelayedPollVersion.get(key) !== version) {
           if (version != null) rememberPollVersion(key, version);
-          await relayPollUpdate(chatId, existingLink.telegramMessageId, updatedPoll).catch((err) =>
+          await relayPollUpdate(chatId, message.id, existingLink.telegramMessageId, updatedPoll).catch((err) =>
             logger.error('Failed to relay poll update to Telegram', err),
           );
         }
       }
       return;
+    }
+    // An EDIT of a message we hold no link for (relayed before a restart, evicted from the
+    // 500-link store, or its first delivery failed) has no Telegram message to rewrite. Falling
+    // through relayed it as if it were NEW — unmarked, attachments downloaded and posted again,
+    // a poll re-created on every vote (review 2026-09-26, INBOUND-EDGES3). Post only its fresh
+    // text, marked as an edit of an older message; attachments are not re-sent, and it doesn't
+    // move the history cursor (it isn't a new message in the chat's history). No text of its own —
+    // nothing worth posting: a forward or reply prefix alone used to go out as a stub with no
+    // content (review 2026-09-26, delivery-r1#3).
+    const orphanEdit = message.status === 'EDITED';
+    if (orphanEdit) {
+      if (!hasOwnText) {
+        logger.info(`Skipped an edit of MAX message ${String(message.id)} in chat ${String(chatId)}: no link to it and no text to show`);
+        return;
+      }
+      attaches = [];
     }
 
     // Nothing to RENDER — no text AND every attach is a non-rendered CONTROL/service event.
@@ -1604,13 +2604,8 @@ export function wireBridge({
     if (!text && !attaches.some((a) => isRenderableAttach(a as MaxAttachment))) {
       const existingMapping = await chatMapStore.getByMaxChatId(chatId);
       if (!existingMapping) {
-        await deliverToTopic(chatId, async (topicId, created) => {
-          if (created) {
-            await sendAutoInfoCard(chatId, message.sender, topicId).catch((err) =>
-              logger.error('Failed to send auto contact-info card for service-only new chat', err),
-            );
-          }
-        }).catch((err) => logger.error('Failed to ensure topic for service-only MAX event', err));
+        // Nothing to send: deliverToTopic just opens the topic (born live, with its info card).
+        await deliverToTopic(chatId, message.sender, async () => {}).catch((err) => logger.error('Failed to ensure topic for service-only MAX event', err));
       }
       if (attaches.length > 0) {
         const kinds = attaches
@@ -1623,63 +2618,10 @@ export function wireBridge({
       return;
     }
 
-    const pollAttach = attaches.find((a) => (a as MaxAttachment)._type === 'POLL') as MaxAttachment | undefined;
-    if (pollAttach) {
-      try {
-        await deliverToTopic(chatId, async (topicId, created) => {
-          if (created) {
-            await sendAutoInfoCard(chatId, message.sender, topicId).catch((err) => logger.error('Failed to send auto contact-info card', err));
-          }
-          const options = (pollAttach.answers ?? []).map((a) => a.text || '—');
-          const settings = pollAttach.settings ?? 0;
-          const sentPoll = await bot.telegram.sendPoll(targetGroupId, pollAttach.title || 'Опрос', options, {
-            is_anonymous: (settings & 1) !== 0,
-            allows_multiple_answers: (settings & 2) !== 0,
-            message_thread_id: topicId,
-          });
-          logger.info(`Relayed MAX poll "${pollAttach.title}" (pollId=${String(pollAttach.pollId)}) to Telegram topic ${topicId}`);
-          // MAX sends no push for votes, and Telegram's native poll widget has no API for
-          // injecting one cast on MAX's side — so it will never reflect those on its own.
-          await bot.telegram
-            .sendMessage(targetGroupId, '💡 Голоса с MAX сюда не попадают — ответь на это сообщение командой /poll, чтобы увидеть актуальный счёт.', {
-              message_thread_id: topicId,
-              reply_parameters: { message_id: sentPoll.message_id },
-            })
-            .catch((err) => logger.error('Failed to send poll reminder', err));
-          if (message.id != null) messageLinks.add({ maxChatId: chatId, maxMessageId: message.id, telegramMessageId: sentPoll.message_id });
-          // Advance the backfill cursor so a reconnect's catch-up doesn't re-post this poll
-          // (same reason as the regular-message path below).
-          void chatMapStore.advanceHistoryCursor(chatId, Date.now()).catch((err) =>
-            logger.error('Failed to advance history cursor after incoming poll', err),
-          );
-          if (pollAttach.pollId != null) {
-            pollLinks.add(sentPoll.poll.id, {
-              maxChatId: chatId,
-              maxMessageId: message.id,
-              maxPollId: pollAttach.pollId,
-              answerIdByOptionIndex: (pollAttach.answers ?? []).map((a, i) => Number(a.answerId ?? i + 1)),
-            });
-          }
-          // A freshly created Telegram poll always starts at zero — there's no Bot API
-          // way to pre-seed a vote — so if the creator (or anyone) already voted by the
-          // time this push arrived (e.g. a client that auto-votes the creator's pick),
-          // that tally is otherwise invisible on the Telegram side. Report it right away.
-          if ((pollAttach.state?.result?.some((r) => (r.voteCount ?? 0) > 0)) && message.id != null) {
-            const key = `${String(chatId)}:${String(message.id)}`;
-            if (typeof pollAttach.version === 'number') rememberPollVersion(key, pollAttach.version);
-            await relayPollUpdate(chatId, sentPoll.message_id, pollAttach).catch((err) =>
-              logger.error('Failed to relay initial poll tally to Telegram', err),
-            );
-          }
-        });
-      } catch (err) {
-        logger.error('Failed to relay MAX poll to Telegram', err);
-      }
-      return;
-    }
-
     // A join/leave event becomes ONE actionable message (who + MAX ID + a «✍️» button to DM them) and
     // consumes the attach, so the bare "➖ Участник вышел" label isn't posted as a second bubble.
+    // Resolved before the poll branch below, which needs the same author prefix (a group poll
+    // used to arrive with no word of who created it — review 2026-09-26, INBOUND-EDGES4).
     let memberMarkup: InlineMarkup | undefined;
     const memberEvent = await renderMemberEvent(attaches as MaxAttachment[], text, message.sender, getMyAccountId(), max, getContactProfiles());
     if (memberEvent) {
@@ -1693,58 +2635,176 @@ export function wireBridge({
       const authorPrefix = await resolveAuthorPrefix(senderChat, message.sender, getMyAccountId(), max, getContactProfiles());
       if (authorPrefix) text = text ? `${authorPrefix}${text}` : authorPrefix;
     }
+    if (orphanEdit) text = `✏️ Изменено (исходное сообщение не найдено):\n${text ?? ''}`;
+
+    const pollAttach = attaches.find((a) => (a as MaxAttachment)._type === 'POLL') as MaxAttachment | undefined;
+    if (pollAttach) {
+      try {
+        await deliverToTopic(chatId, message.sender, async (topicId) => {
+          const options = (pollAttach.answers ?? []).map((a) => a.text || '—');
+          const settings = pollAttach.settings ?? 0;
+          const anonymous = (settings & 1) !== 0;
+          // Whatever the regular path would say around it — a group author, a forward's source, a
+          // reply quote, the message's own text — goes first as text, carrying the native reply;
+          // sendPoll itself has no room for any of it (review 2026-09-26, INBOUND-EDGES4).
+          // Every part as it goes out (header, poll, text fallback): a transient failure anywhere
+          // deletes them again, since the catch-up re-delivers the whole message
+          // (discardPartialDelivery). The header and the fallback used to sit outside that cleanup
+          // and stayed behind as unlinked duplicates (review 2026-09-26, delivery-r1#1).
+          const sent: number[] = [];
+          let linkIds: ReturnType<typeof buildLinkIds>;
+          const noticeIds: number[] = [];
+          try {
+            const headerIds = text ? await sendTextPieces(bot, targetGroupId, topicId, text, { replyParameters, sent }) : [];
+            const pollReply = headerIds.length === 0 && replyParameters ? { reply_parameters: replyParameters } : {};
+            let sentPoll: { message_id: number; poll: { id: string } } | undefined;
+            try {
+              sentPoll = await withFloodRetry(() =>
+                bot.telegram.sendPoll(targetGroupId, pollAttach.title || 'Опрос', options, {
+                  is_anonymous: anonymous,
+                  allows_multiple_answers: (settings & 2) !== 0,
+                  message_thread_id: topicId,
+                  ...pollReply,
+                }),
+              );
+            } catch (err) {
+              // Telegram's poll limits are tighter than MAX's (question ≤300, options 2–10 of ≤100
+              // chars): a refused poll used to vanish whole. Render it as text instead.
+              if (!isPermanentTelegramRefusal(err)) throw err;
+              logger.error(`Telegram refused MAX poll ${String(pollAttach.pollId)} as a native poll — relaying it as text`, err);
+            }
+            if (sentPoll) {
+              const pollMessageId = sentPoll.message_id;
+              sent.push(pollMessageId);
+              logger.info(`Relayed MAX poll "${pollAttach.title}" (pollId=${String(pollAttach.pollId)}) to Telegram topic ${topicId}`);
+              // MAX sends no push for votes, and Telegram's native poll widget has no API for
+              // injecting one cast on MAX's side — so it will never reflect those on its own. An
+              // anonymous poll doesn't work the other way either: Telegram sends a bot no
+              // poll_answer for it, so votes cast here never reach MAX (OUTBOUND8) — say so.
+              const hint = anonymous
+                ? '💡 Голоса с MAX сюда не попадают, а этот опрос анонимный — голоса отсюда тоже не уйдут в MAX. Голосуйте в MAX; ответьте на это сообщение командой /poll, чтобы увидеть актуальный счёт.'
+                : '💡 Голоса с MAX сюда не попадают — ответьте на это сообщение командой /poll, чтобы увидеть актуальный счёт.';
+              const reminder = await withFloodRetry(() =>
+                bot.telegram.sendMessage(targetGroupId, hint, {
+                  message_thread_id: topicId,
+                  reply_parameters: { message_id: pollMessageId },
+                }),
+              ).catch((err) => {
+                logger.error('Failed to send poll reminder', err);
+                return undefined;
+              });
+              // The poll stays the anchor (poll updates and /poll reply to it); the header is an extra
+              // and the reminder a notice (delivery-r2#0), so a deletion in MAX takes them along
+              // instead of orphaning them.
+              linkIds = buildLinkIds([pollMessageId], headerIds);
+              if (reminder) noticeIds.push(reminder.message_id);
+              if (pollAttach.pollId != null && !anonymous) {
+                pollLinks.add(sentPoll.poll.id, {
+                  maxChatId: chatId,
+                  maxMessageId: message.id,
+                  maxPollId: pollAttach.pollId,
+                  answerIdByOptionIndex: (pollAttach.answers ?? []).map((a, i) => Number(a.answerId ?? i + 1)),
+                });
+              }
+            } else {
+              const pollTextIds = await sendTextPieces(bot, targetGroupId, topicId, renderPollAsText(pollAttach.title, options, settings), {
+                ...(headerIds.length === 0 ? { replyParameters } : {}),
+                sent,
+              });
+              linkIds = buildLinkIds(pollTextIds, headerIds);
+            }
+          } catch (err) {
+            if (isRetriedDeliveryFailure(err)) await discardPartialDelivery(bot, targetGroupId, `${String(chatId)}:${String(message.id)}`, sent);
+            throw err;
+          }
+          if (linkIds && message.id != null) {
+            messageLinks.add({ maxChatId: chatId, maxMessageId: message.id, ...linkIds, ...(noticeIds.length > 0 ? { noticeTelegramMessageIds: noticeIds } : {}) });
+          }
+          // Advance the backfill cursor so a reconnect's catch-up doesn't re-post this poll.
+          advanceLiveCursor(chatId, message.time, 'incoming poll', message.id);
+          // A freshly created Telegram poll always starts at zero — there's no Bot API
+          // way to pre-seed a vote — so if the creator (or anyone) already voted by the
+          // time this push arrived (e.g. a client that auto-votes the creator's pick),
+          // that tally is otherwise invisible on the Telegram side. Report it right away.
+          if (linkIds && pollAttach.state?.result?.some((r) => (r.voteCount ?? 0) > 0) && message.id != null) {
+            const key = `${String(chatId)}:${String(message.id)}`;
+            if (typeof pollAttach.version === 'number') rememberPollVersion(key, pollAttach.version);
+            await relayPollUpdate(chatId, message.id, linkIds.telegramMessageId, pollAttach).catch((err) =>
+              logger.error('Failed to relay initial poll tally to Telegram', err),
+            );
+          }
+        });
+      } catch (err) {
+        logger.error('Failed to relay MAX poll to Telegram', err);
+        onLiveDeliveryFailed(chatId, err);
+      }
+      return;
+    }
 
     try {
-      await deliverToTopic(chatId, async (topicId, created) => {
-        if (created) {
-          await sendAutoInfoCard(chatId, message.sender, topicId).catch((err) => logger.error('Failed to send auto contact-info card', err));
-        }
-        let textMessageId: number | undefined;
-        let attachMessageId: number | undefined;
-        if (text)
-          textMessageId = (
-            await bot.telegram.sendMessage(targetGroupId, text, {
-              message_thread_id: topicId,
-              ...(replyParameters ? { reply_parameters: replyParameters } : {}),
-              ...(memberMarkup ? { reply_markup: memberMarkup } : {}),
-            })
-          ).message_id;
-        if (attaches.length > 0) {
-          // NOT `telegramMessageId ??= await sendAttachments(...)` — `??=` short-circuits
-          // and never even CALLS sendAttachments when telegramMessageId is already set,
-          // which it always is for a forward (the "↩️ Переслано из..." prefix always
-          // produces text, even when the original was attachment-only). That silently
-          // dropped every forwarded attachment with no error anywhere (root-caused live
-          // 2026-08-13 after the catch-up path — which calls sendAttachments
-          // unconditionally — kept delivering the same messages fine).
-          const downloadCtx: DownloadContext = { max, chatId: downloadChatId, messageId: downloadMessageId, fallbackChatId, fallbackMessageId };
-          // The reply goes on the text message when there is one; only a media-only reply
-          // threads reply_parameters into the first attachment.
-          attachMessageId = await sendAttachments(bot, targetGroupId, topicId, attaches, downloadCtx, text ? undefined : replyParameters);
-        }
-        // A forward with both text AND an attachment sends TWO separate Telegram
-        // messages from one MAX message — track both so a later deletion removes both
-        // instead of orphaning the attachment (confirmed live 2026-08-13).
-        const telegramMessageId = textMessageId ?? attachMessageId;
-        if (telegramMessageId != null) {
-          const extraTelegramMessageIds = textMessageId != null && attachMessageId != null && attachMessageId !== telegramMessageId ? [attachMessageId] : undefined;
-          messageLinks.add({ maxChatId: chatId, maxMessageId: message.id, telegramMessageId, extraTelegramMessageIds });
-          lastInAt = Date.now();
-          // Advance the backfill cursor for this live incoming message. Without it, a MAX
-          // reconnect's catch-up re-reads the message (it sits past the stale cursor) and
-          // relays it to Telegram a SECOND time — the mirror image of the rememberOutgoingSend
-          // fix for the Telegram -> MAX direction (see the cursor note near outgoingCids).
-          // Date.now() (receipt time), like that path, since the push payload carries no
-          // message time; the cursor is exclusive (fetchFullHistory: `time > cursor`), so this
-          // never skips messages that arrive while the bridge is offline.
-          void chatMapStore.advanceHistoryCursor(chatId, Date.now()).catch((err) =>
-            logger.error('Failed to advance history cursor after incoming message', err),
-          );
+      await deliverToTopic(chatId, message.sender, async (topicId) => {
+        // A text over Telegram's 4096 limit goes out as several messages instead of being refused
+        // whole (review 2026-09-26, INBOUND-EDGES2).
+        // Every part as it goes out: a transient failure halfway deletes them again, since the
+        // catch-up re-delivers the whole message (discardPartialDelivery).
+        const sent: number[] = [];
+        try {
+          const textIds = text ? await sendTextPieces(bot, targetGroupId, topicId, text, { replyParameters, replyMarkup: memberMarkup, sent }) : [];
+          let attachIds: number[] = [];
+          if (attaches.length > 0) {
+            // NOT `telegramMessageId ??= await sendAttachments(...)` — `??=` short-circuits
+            // and never even CALLS sendAttachments when telegramMessageId is already set,
+            // which it always is for a forward (the "↩️ Переслано из..." prefix always
+            // produces text, even when the original was attachment-only). That silently
+            // dropped every forwarded attachment with no error anywhere (root-caused live
+            // 2026-08-13 after the catch-up path — which calls sendAttachments
+            // unconditionally — kept delivering the same messages fine).
+            const downloadCtx: DownloadContext = { max, ...(forwarded ? forwarded.download : { chatId, messageId: message.id }) };
+            // The reply goes on the text message when there is one; only a media-only reply
+            // threads reply_parameters into the first attachment.
+            attachIds = await sendAttachments(bot, targetGroupId, topicId, attaches, downloadCtx, textIds.length > 0 ? undefined : replyParameters, undefined, sent);
+          }
+          // One MAX message can become several Telegram messages (text + attachments — confirmed
+          // live 2026-08-13 for a forward; a split long text; an album): link them ALL, so a later
+          // deletion removes every one instead of orphaning the rest (buildLinkIds).
+          const linkIds = buildLinkIds(textIds, attachIds);
+          if (linkIds) {
+            // An orphan edit's stub is marked as such: the original message it stands in for was
+            // never delivered, and the backfill must still send it (isDeliveredLink).
+            messageLinks.add({ maxChatId: chatId, maxMessageId: message.id, ...linkIds, ...(orphanEdit ? { orphanEdit: true } : {}) });
+            lastInAt = Date.now();
+            // Advance the backfill cursor for this live incoming message. Without it, a MAX
+            // reconnect's catch-up re-reads the message (it sits past the stale cursor) and
+            // relays it to Telegram a SECOND time — the mirror image of the rememberOutgoingSend
+            // fix for the Telegram -> MAX direction (advanceLiveCursor has the caught-up gate).
+            // An orphan edit is no new message in the history — it leaves the cursor alone.
+            if (!orphanEdit) advanceLiveCursor(chatId, message.time, 'incoming message', message.id);
+          }
+        } catch (err) {
+          if (isRetriedDeliveryFailure(err)) await discardPartialDelivery(bot, targetGroupId, `${String(chatId)}:${String(message.id)}`, sent);
+          throw err;
         }
       });
     } catch (err) {
       logger.error('MAX -> Telegram forward failed', err);
+      onLiveDeliveryFailed(chatId, err);
     }
+  }
+
+  /**
+   * A live MAX -> Telegram delivery failed. On a transient failure (Telegram/proxy unreachable,
+   * 5xx, flood limit) the message still sits in MAX's history above the chat's cursor — keep it
+   * reachable: take the chat out of the caught-up set, so later live messages that DO get through
+   * stop moving its cursor past it, and ask for a catch-up run, which re-delivers it once Telegram
+   * answers again (it probes first and backs off, so an outage doesn't spin). Before this the
+   * next delivered message moved the cursor past everything lost in the outage (review
+   * 2026-09-26, RECOVERY5). A permanent (4xx) refusal would fail the same way on every retry.
+   */
+  function onLiveDeliveryFailed(chatId: unknown, err: unknown): void {
+    if (!isTransientTelegramError(err)) return;
+    catchUp.markDirty(chatId);
+    logger.info(`MAX chat ${String(chatId)}: live delivery failed transiently — its cursor stays put until a catch-up sync re-delivers the message`);
+    catchUp.requestRetry(`live delivery for MAX chat ${String(chatId)} failed`);
   }
 
   /**
@@ -1791,7 +2851,7 @@ export function wireBridge({
   /** Full command reference + the two platform-level gaps that aren't discoverable from the UI. Doubles as the bot profile's setMyDescription text (server/app.ts), just with room to actually explain each command instead of a 512-char squeeze. */
   function buildHelpText(): string {
     const phone = getActivePhone();
-    return `🌉 Мост MAX${phone ? ` (${phone})` : ''} ↔ Telegram
+    return `🌉 Мост MAX${phone ? ` (${maskPhone(phone)})` : ''} ↔ Telegram
 
 Сообщения, файлы, голосовые, стикеры и опросы синхронизируются в обе стороны автоматически — команды нужны только для управления. Обычная пересылка сообщений (drag-forward) в тему тоже работает сама — прилетит в привязанный MAX-чат с пометкой «↩️ Переслано от/из...». Звонки — только текстовые уведомления (входящий звонит / завершённый / пропущенный), без передачи аудио — для этого нужен WebRTC, вне рамок Bot API-моста.
 
@@ -1808,7 +2868,7 @@ export function wireBridge({
 /deletegroup — удалить группу (требует подтверждения)
 
 Чаты:
-/ban — заглушить чат (диалог или группу): выбери из списка кнопкой, сообщения перестанут приходить, тема удалится
+/ban — заглушить чат (диалог или группу): выберите из списка кнопкой, сообщения перестанут приходить, тема удалится
 /unban — вернуть заглушённый чат (тема появится при следующем сообщении от него)
 
 Обслуживание бота:
@@ -1823,6 +2883,7 @@ export function wireBridge({
 ⚠️ Ограничения:
 • Удаление, сделанное в Telegram, мост ловит периодической проверкой (не мгновенно). Надёжнее — 👎 на своё сообщение или /delete в ответ. Но всё это работает только для недавних сообщений: связки теряются при перезапуске моста — такое удали в приложении MAX.
 • Голоса за опрос из MAX не отражаются в виджете Telegram — актуальный счёт через /poll в ответ на опрос.
+• Голоса в анонимных опросах и в опросах, созданных здесь, в Telegram, в MAX не передаются — голосуйте в MAX.
 
 🐞 Нашли баг или есть вопрос? Пишите: https://t.me/${BUGREPORT_BOT_HANDLE}
 
@@ -1834,7 +2895,7 @@ export function wireBridge({
   });
 
   bot.command('donate', async (ctx) => {
-    await bot.telegram.sendMessage(ctx.chat.id, '💛 Спасибо, что пользуешься мостом! Выбери способ:', {
+    await bot.telegram.sendMessage(ctx.chat.id, '💛 Спасибо, что пользуетесь мостом! Выберите способ:', {
       message_thread_id: ctx.message.message_thread_id,
       reply_markup: Markup.inlineKeyboard(
         [
@@ -1874,7 +2935,7 @@ export function wireBridge({
    * and update-requested is only ever consumed by the host watcher — which doesn't exist at all on an
    * install set up without root, or belongs to a different bridge on a multi-instance host. In both
    * cases the leftover file latched the «Обновить» button permanently: every later press answered
-   * "Обновление уже запущено — дождись сообщения о завершении", and no message was ever coming.
+   * "Обновление уже запущено — дождитесь сообщения о завершении", and no message was ever coming.
    * Nothing in the codebase deleted either marker, so the only cure was `rm` over SSH. A marker older
    * than the window below is treated as abandoned and removed, so the next press works.
    */
@@ -1913,7 +2974,7 @@ export function wireBridge({
     // this button answer "уже запущено" forever, with the message it promises never arriving.
     if ((await markerActive(UPDATE_REQUESTED_MARKER)) || (await markerActive(UPDATE_IN_PROGRESS_MARKER))) {
       await ctx.answerCbQuery('Обновление уже идёт');
-      await ctx.editMessageText('⏳ Обновление уже запущено — дождись сообщения о завершении.').catch(() => {});
+      await ctx.editMessageText('⏳ Обновление уже запущено — дождитесь сообщения о завершении.').catch(() => {});
       return;
     }
     // Is anything on the host actually going to pick this up? The marker is consumed only by the
@@ -1933,7 +2994,7 @@ export function wireBridge({
       await ctx.editMessageText('⏳ Обновление запрошено — история переписки не затрагивается.');
     } catch (err) {
       logger.error('Failed to write update-requested marker', err);
-      await ctx.editMessageText('❌ Не удалось запросить обновление — смотри логи контейнера.');
+      await ctx.editMessageText('❌ Не удалось запросить обновление — смотрите логи контейнера.');
     }
   });
 
@@ -1964,6 +3025,9 @@ export function wireBridge({
     if (!maxChatId) return;
     const mapping = await chatMapStore.getByMaxChatId(maxChatId);
     await chatMapStore.setBanned(maxChatId, true);
+    // Links first: deleting the topic deletes our messages in it, and the deletion probe
+    // would otherwise mirror-delete them on MAX forAll (review 2026-09-26).
+    forgetChatLinks(maxChatId);
     if (mapping) {
       await bot.telegram.deleteForumTopic(targetGroupId, mapping.telegramTopicId).catch((err) => logger.error('Failed to delete topic on ban', err));
     }
@@ -2200,17 +3264,7 @@ export function wireBridge({
             result.votes.map(async (v) => {
               const uid = Number(v.userId);
               if (Number.isNaN(uid)) return null;
-              let voterProfile = getContactProfiles().get(uid);
-              if (!voterProfile) {
-                try {
-                  const contacts = await max.getContactInfo([uid]);
-                  voterProfile = contacts[0];
-                  if (voterProfile) getContactProfiles().set(uid, voterProfile);
-                } catch (err) {
-                  logger.error(`Failed to fetch CONTACT_INFO for voter ${uid}`, err);
-                }
-              }
-              return resolveContactDisplayName(uid, voterProfile);
+              return resolveContactDisplayName(uid, await resolveProfile(max, uid, 'voter', getContactProfiles()));
             }),
           );
           const joined = names.filter(Boolean).join(', ');
@@ -2222,21 +3276,36 @@ export function wireBridge({
     return `🗳️ «${pollAttach.title ?? ''}»\n${lines.join('\n')}`;
   }
 
-  /** Re-fetches a poll's message from CHAT_HISTORY and posts its current tally as a reply. Throws if the poll/mapping can't be found — callers decide whether that's worth surfacing. */
+  /**
+   * Re-fetches a poll's message from CHAT_HISTORY and posts its current tally as a reply. Throws if
+   * the poll/mapping can't be found — callers decide whether that's worth surfacing. The reply joins
+   * the poll's link as a notice (addNotice) like relayPollUpdate's, so deleting the poll in MAX takes it along
+   * instead of leaving an orphan (review 2026-09-26, delivery-r1#8).
+   */
   async function postPollResults(maxChatId: unknown, maxMessageId: unknown, telegramMessageId: number): Promise<void> {
     const mapping = await chatMapStore.getByMaxChatId(maxChatId);
     if (!mapping) throw new Error(`No Telegram topic mapped for MAX chat ${String(maxChatId)}`);
-    const history = await max.getChatHistory(maxChatId, Date.now(), 50);
-    const msg = history.find((m) => String(m.id) === String(maxMessageId));
+    // Paged back (up to 1000 messages): a poll replayed by a backfill is often far older than the
+    // newest batch, and its text tells the owner to /poll it (review 2026-09-27, delivery-r3.3#2).
+    let msg: MaxHistoryMessage | undefined;
+    let from = historyStartTime();
+    for (let i = 0; i < 10 && !msg; i++) {
+      const batch = await max.getChatHistory(maxChatId, from, HISTORY_BATCH_SIZE);
+      msg = batch.find((m) => String(m.id) === String(maxMessageId));
+      const oldest = Math.min(...batch.map((m) => Number(m.time)));
+      if (!(oldest < from)) break;
+      from = oldest;
+    }
     const pollAttach = (Array.isArray(msg?.attaches) ? msg.attaches : []).find((a) => (a as MaxAttachment)._type === 'POLL') as
       | MaxAttachment
       | undefined;
     if (!pollAttach) throw new Error(`Poll message ${String(maxMessageId)} not found in chat ${String(maxChatId)} history`);
     const text = await formatPollResultsText(pollAttach);
-    await bot.telegram.sendMessage(targetGroupId, text, {
+    const sent = await bot.telegram.sendMessage(targetGroupId, text, {
       message_thread_id: mapping.telegramTopicId,
       reply_parameters: { message_id: telegramMessageId },
     });
+    messageLinks.addNotice(maxChatId, maxMessageId, sent.message_id);
   }
 
   /** On-demand poll results. Reply to the poll message with /poll to use it. */
@@ -2245,7 +3314,7 @@ export function wireBridge({
     if (!topicId) return;
     const replyTo = (ctx.message as { reply_to_message?: { message_id: number } }).reply_to_message;
     if (!replyTo) {
-      await bot.telegram.sendMessage(targetGroupId, 'Ответь этой командой на сообщение с опросом.', { message_thread_id: topicId });
+      await bot.telegram.sendMessage(targetGroupId, 'Ответьте этой командой на сообщение с опросом.', { message_thread_id: topicId });
       return;
     }
     const link = messageLinks.getByTelegram(replyTo.message_id);
@@ -2270,7 +3339,8 @@ export function wireBridge({
     }
     try {
       const { chatId } = await max.createGroup(title, []);
-      const { topicId } = await ensureTopicForMaxChat(bot, targetGroupId, chatId, chatMapStore, title);
+      const { topicId, created } = await ensureTopicForMaxChat(bot, targetGroupId, chatId, chatMapStore, title);
+      if (created) catchUp.markCaughtUp(chatId); // a group we just created has no history to catch up (catchUp.ts)
       await bot.telegram.sendMessage(targetGroupId, `✅ Группа «${title}» создана. Пригласить участников: /invite <MAX ID> в этой теме.`, {
         message_thread_id: topicId,
       });
@@ -2337,7 +3407,7 @@ export function wireBridge({
     }
     try {
       await max.updateChatInfo(mapping.maxChatId, { title });
-      await chatMapStore.upsert({ ...mapping, title });
+      await chatMapStore.setTitle(mapping.maxChatId, topicId, title); // title only — see setTitle
       await bot.telegram.editForumTopic(targetGroupId, topicId, { name: title }).catch(() => undefined);
       // Confirmed live 2026-08-10: MAX sometimes silently keeps the old title despite
       // an OK response (same class of quirk as avatarId being accepted-but-ignored) —
@@ -2422,7 +3492,7 @@ export function wireBridge({
     // and sent MAX lastEventTime: 0.
     const lastEventTime = Number(chat?.lastEventTime);
     if (!Number.isSafeInteger(lastEventTime) || lastEventTime <= 0) {
-      await bot.telegram.sendMessage(targetGroupId, 'Не нашёл lastEventTime этого чата — попробуй чуть позже (после следующей синхронизации).', {
+      await bot.telegram.sendMessage(targetGroupId, 'Не нашёл lastEventTime этого чата — попробуйте чуть позже (после следующей синхронизации).', {
         message_thread_id: topicId,
       });
       return;
@@ -2443,6 +3513,100 @@ export function wireBridge({
   });
 
   /**
+   * The shared core of /reboot and /kill: stops everything that writes topics, deletes every
+   * topic and wipes all local MAX<->Telegram state (the persisted chat map, the in-memory
+   * message/poll links, the catch-up state). `startText` is the progress notice for N topics.
+   * `finish` runs afterwards with syncs still held off; it calls `resume` once they may run again
+   * (/reboot, right before its resync) — otherwise they resume when it returns. A failure
+   * anywhere is logged and reported to the group as «Не удалось выполнить <command>.».
+   * Only one wipe at a time: a second confirmation while one runs would interleave two deletion
+   * loops, so it just gets a "wait" notice.
+   * The wipe runs in the background: one topic per ~1.1 s outlasts telegraf's 90 s
+   * handlerTimeout at ~80 topics, and a timed-out handler used to stop Telegram polling
+   * (review 2026-09-26, C2). Progress and the result still go to the group.
+   */
+  async function wipeAllTopics(
+    command: 'reboot' | 'kill',
+    startText: (topicCount: number) => string,
+    finish: (resume: () => void) => Promise<void>,
+  ): Promise<void> {
+    if (wiping) {
+      await bot.telegram.sendMessage(targetGroupId, '⏳ Уже идёт /reboot или /kill — дождитесь окончания.').catch(() => {});
+      return;
+    }
+    void (async () => {
+      let releaseSync: (() => void) | undefined;
+      // Idempotent: /reboot's finish resumes early and the finally below resumes again — the
+      // second call must not clear `wiping` for a /kill accepted in between (review 2026-09-26, b8-cleanup).
+      let resumed = false;
+      // Set once the chat map and the catch-up state are gone (see the catch below).
+      let stateWiped = false;
+      const resume = (): void => {
+        if (resumed) return;
+        resumed = true;
+        wiping = false;
+        releaseSync?.();
+      };
+      try {
+        // Stop everything that writes topics first — a history sync still walking its old chat
+        // snapshot, a topic restore — and hold new syncs off until the wipe is done. Otherwise the
+        // old run kept refilling the topics being deleted (and /reboot's resync collapsed into
+        // it, leaving the chats it had already passed without topics; /kill's came back, cards
+        // and all, after the «стёрто» confirmation) (review 2026-09-26, C7).
+        wiping = true;
+        // Restores are cancelled FIRST (the epoch bump is synchronous): a sync run may be waiting
+        // for a restore's backfill lock (withChatBackfillLock), and awaiting that run before
+        // cancelling the restore held the wipe up for the whole flood-paced replay.
+        const restoresStopped = cancelRestores();
+        releaseSync = await suspendChatSync();
+        await restoresStopped;
+        // A live push that passed its `wiping` check just before may still be creating its topic:
+        // its mapping would land after the snapshot below and clear() would orphan the topic. New
+        // pushes return on `wiping`, so the queues drain (review 2026-09-27, catchup-r3.1#0).
+        await Promise.allSettled([...liveQueues.values()].map((q) => q.tail));
+        const mappings = await chatMapStore.list();
+        // Only a progress notice: a flood wait or a network blip here must not fail the wipe.
+        await withFloodRetry(() => bot.telegram.sendMessage(targetGroupId, startText(mappings.length))).catch((err) =>
+          logger.error(`Failed to post the ${command} start notice`, err),
+        );
+        // Links BEFORE the topics: the deletion loop is slow (one topic per ~1.1s) and the
+        // deletion probe would read each vanished topic's messages as deleted by the owner
+        // and mirror-delete them on MAX forAll (review 2026-09-26).
+        forgetAllLinks();
+        for (const mapping of mappings) {
+          await withFloodRetry(() => bot.telegram.deleteForumTopic(targetGroupId, mapping.telegramTopicId)).catch((err) => {
+            logger.error(`Failed to delete Telegram topic ${mapping.telegramTopicId} during ${command}`, err);
+          });
+          await sleep(HISTORY_SEND_DELAY_MS);
+        }
+        // Again after the loop: a message written into a topic not yet deleted got a fresh link
+        // meanwhile (the Telegram -> MAX relay keeps running during the wipe). Before the map goes,
+        // so no probe ever sees such a link with its mapping still in place.
+        forgetAllLinks();
+        await chatMapStore.clear();
+        // Every cursor went with the map: no chat is caught up until a resync backfills it (catchUp.ts).
+        catchUp.reset();
+        stateWiped = true;
+        await finish(resume);
+      } catch (err) {
+        logger.error(`${command === 'reboot' ? 'Reboot' : 'Kill'} failed`, err);
+        if (!stateWiped) {
+          // Pushes were dropped while `wiping` was set (handleMaxPush, calls, restores), and the
+          // chats they belong to were still caught up: their next live message moved the cursor
+          // past the dropped ones — lost for good. With nothing caught up the cursors stay put
+          // until the catch-up run requested here (it starts once the hold is released) fetches
+          // them (review 2026-09-26, catchup-r2#1).
+          catchUp.reset();
+          catchUp.requestRetry(`${command} failed before the wipe was complete`);
+        }
+        await bot.telegram.sendMessage(targetGroupId, `Не удалось выполнить ${command}.`).catch(() => {});
+      } finally {
+        resume();
+      }
+    })();
+  }
+
+  /**
    * Nukes every Telegram topic + all local MAX<->Telegram state (persisted chat map,
    * in-memory message/poll links) and re-runs the full backfill from scratch — for
    * when something's drifted enough that "just redeploy" won't fix it. Not scoped to
@@ -2454,72 +3618,54 @@ export function wireBridge({
     if (confirm !== 'ПОДТВЕРДИТЬ') {
       await bot.telegram.sendMessage(
         targetGroupId,
-        '⚠️ Это удалит ВСЕ темы и историю в этой Telegram-группе (сообщения в MAX не пострадают) и запустит полную пересинхронизацию с нуля. Подтверди: /reboot ПОДТВЕРДИТЬ',
+        '⚠️ Это удалит ВСЕ темы и историю в этой Telegram-группе (сообщения в MAX не пострадают) и запустит полную пересинхронизацию с нуля. Подтвердите: /reboot ПОДТВЕРДИТЬ',
       );
       return;
     }
-    try {
-      const mappings = await chatMapStore.list();
-      await bot.telegram.sendMessage(targetGroupId, `🔄 Удаляю ${mappings.length} тем и запускаю полную пересинхронизацию...`);
-      for (const mapping of mappings) {
-        await bot.telegram.deleteForumTopic(targetGroupId, mapping.telegramTopicId).catch((err) => {
-          logger.error(`Failed to delete Telegram topic ${mapping.telegramTopicId} during reboot`, err);
-        });
-        await sleep(HISTORY_SEND_DELAY_MS);
-      }
-      await chatMapStore.clear();
-      messageLinks.clear();
-      pollLinks.clear();
-      triggerFullResync().catch((err) => logger.error('Full resync after /reboot failed', err));
-      await bot.telegram.sendMessage(targetGroupId, '✅ Пересинхронизация запущена — темы появятся по мере обработки.');
-    } catch (err) {
-      logger.error('Reboot failed', err);
-      await bot.telegram.sendMessage(targetGroupId, 'Не удалось выполнить reboot.');
-    }
+    await wipeAllTopics(
+      'reboot',
+      (n) => `🔄 Удаляю ${n} тем и запускаю полную пересинхронизацию...`,
+      async (resume) => {
+        // Wipe done: let syncs run again, then start the fresh one.
+        resume();
+        triggerFullResync().catch((err) => logger.error('Full resync after /reboot failed', err));
+        await bot.telegram.sendMessage(targetGroupId, '✅ Пересинхронизация запущена — темы появятся по мере обработки.');
+      },
+    );
   });
 
   /**
    * Beyond everything /reboot wipes, this also logs the bridge OUT of MAX: deletes
    * the encrypted session file (server/app.ts's killEverything), so a fresh SMS
-   * login is required before the bridge can do anything again. No known MAX opcode
-   * for a real server-side logout was ever reverse-engineered, so this is a local
-   * "forget the credentials and disconnect" — the session token itself may remain
-   * valid on MAX's servers until it naturally expires, we just stop holding it.
-   * The process keeps running so the web UI stays reachable to re-authenticate.
+   * login (/login in the bot's DM) is required before the bridge can do anything again.
+   * MAX exposes no logout/revoke opcode (checked 2026-09-11), so this can only drop OUR
+   * copy of the session and disconnect — the session token itself stays valid on MAX's
+   * side until it expires. The texts below say so and point at the app's device list;
+   * don't promise a server-side logout. The process keeps running so /login can
+   * re-authenticate.
    */
-  // NOTE: MAX exposes no logout/revoke opcode (checked 2026-09-11), so this can only drop OUR copy of
-  // the session and disconnect — the session stays valid on MAX's side until it expires. The texts
-  // below say so and point at the app's device list; don't promise a server-side logout.
   bot.command('kill', async (ctx) => {
     const confirm = (ctx as unknown as { payload?: string }).payload?.trim().toUpperCase();
     if (confirm !== 'УНИЧТОЖИТЬ') {
       await bot.telegram.sendMessage(
         targetGroupId,
-        '☢️ Это отключит мост от MAX и сотрёт сохранённую ЗДЕСЬ сессию (после потребуется новая авторизация через /login в личке бота), а также ВСЕ темы, историю и связки в этой Telegram-группе. ⚠️ Саму сессию на стороне MAX мост завершить не может — после /kill завершите её в приложении MAX: Настройки → Устройства. Необратимо. Подтверди: /kill УНИЧТОЖИТЬ',
+        '☢️ Это отключит мост от MAX и сотрёт сохранённую ЗДЕСЬ сессию (после потребуется новая авторизация через /login в личке бота), а также ВСЕ темы, историю и связки в этой Telegram-группе. ⚠️ Саму сессию на стороне MAX мост завершить не может — после /kill завершите её в приложении MAX: Настройки → Устройства. Необратимо. Подтвердите: /kill УНИЧТОЖИТЬ',
       );
       return;
     }
-    try {
-      const mappings = await chatMapStore.list();
-      await bot.telegram.sendMessage(targetGroupId, `☢️ Удаляю ${mappings.length} тем, разлогиниваю MAX и стираю все данные...`);
-      for (const mapping of mappings) {
-        await bot.telegram.deleteForumTopic(targetGroupId, mapping.telegramTopicId).catch((err) => {
-          logger.error(`Failed to delete Telegram topic ${mapping.telegramTopicId} during kill`, err);
-        });
-        await sleep(HISTORY_SEND_DELAY_MS);
-      }
-      await chatMapStore.clear();
-      messageLinks.clear();
-      pollLinks.clear();
-      await killEverything();
-      await bot.telegram.sendMessage(
-        targetGroupId,
-        '✅ Готово. Мост отключён от MAX, сохранённая здесь сессия и все данные стёрты. ⚠️ Не забудьте завершить сессию и в приложении MAX (Настройки → Устройства) — мост сделать это не может. Чтобы продолжить — авторизуйся заново: /login (в личке бота).',
-      );
-    } catch (err) {
-      logger.error('Kill failed', err);
-      await bot.telegram.sendMessage(targetGroupId, 'Не удалось выполнить kill.');
-    }
+    // Syncs stay held off until MAX is logged out: after killEverything the chat list is empty
+    // and MAX is disconnected, so a sync has nothing left to recreate.
+    await wipeAllTopics(
+      'kill',
+      (n) => `☢️ Удаляю ${n} тем, разлогиниваю MAX и стираю все данные...`,
+      async () => {
+        await killEverything();
+        await bot.telegram.sendMessage(
+          targetGroupId,
+          '✅ Готово. Мост отключён от MAX, сохранённая здесь сессия и все данные стёрты. ⚠️ Не забудьте завершить сессию и в приложении MAX (Настройки → Устройства) — мост сделать это не может. Чтобы продолжить — авторизуйтесь заново: /login (в личке бота).',
+        );
+      },
+    );
   });
 
   /** Reply to a message with /delete to remove it on MAX (and, since we sent it, on Telegram too). */
@@ -2528,13 +3674,13 @@ export function wireBridge({
     if (!topicId) {
       // Typed in General — there's no mapped MAX chat to delete from, and silence
       // here already cost a debugging session (2026-08-14), so say so.
-      await bot.telegram.sendMessage(targetGroupId, '/delete работает только внутри темы чата — ответь им на сообщение, которое нужно удалить.').catch(() => {});
+      await bot.telegram.sendMessage(targetGroupId, '/delete работает только внутри темы чата — ответьте им на сообщение, которое нужно удалить.').catch(() => {});
       return;
     }
     const replyTo = (ctx.message as { reply_to_message?: { message_id: number } }).reply_to_message;
     if (!replyTo) {
       logger.info(`/delete in topic ${topicId}: no reply target`);
-      await bot.telegram.sendMessage(targetGroupId, 'Ответь этой командой на сообщение, которое нужно удалить. /delete me — удалить только у себя.', {
+      await bot.telegram.sendMessage(targetGroupId, 'Ответьте этой командой на сообщение, которое нужно удалить. /delete me — удалить только у себя.', {
         message_thread_id: topicId,
       });
       return;
@@ -2549,11 +3695,23 @@ export function wireBridge({
       );
       return;
     }
+    // A reply to a bot notice (a poll hint, a tally, an edit relayed as a reply) is not a reply to
+    // the message: deleting the MAX message for it wiped a poll the owner only meant to declutter
+    // (review 2026-09-26, delivery-r2#0).
+    if (isNoticeOf(link, replyTo.message_id)) {
+      await bot.telegram.sendMessage(targetGroupId, 'Это служебное сообщение бота — ответьте /delete на само сообщение, которое нужно удалить.', {
+        message_thread_id: topicId,
+      });
+      return;
+    }
     const forMe = (ctx as unknown as { payload?: string }).payload?.trim().toLowerCase() === 'me';
     try {
       await max.deleteMessages(link.maxChatId, [link.maxMessageId], forMe);
       logger.info(`/delete: removed MAX message ${String(link.maxMessageId)} in chat ${String(link.maxChatId)} (forMe=${forMe})`);
-      await bot.telegram.deleteMessage(targetGroupId, replyTo.message_id).catch((err) => logger.error('Failed to delete Telegram message', err));
+      // The link is forgotten BEFORE the Telegram copies vanish (dropLinkedMessage): otherwise
+      // the deletion probe sees them gone and mirror-deletes on MAX forAll — turning "/delete me"
+      // into a delete for everyone (review 2026-09-26). Every Telegram copy goes, like the 👎 path.
+      await dropLinkedMessage(link, '/delete', [replyTo.message_id]);
     } catch (err) {
       logger.error('Failed to delete MAX message', err);
       await bot.telegram.sendMessage(targetGroupId, 'Не удалось удалить сообщение.', { message_thread_id: topicId });
@@ -2607,6 +3765,8 @@ export function wireBridge({
     const poll = (ctx.message as { poll?: { id: string; question: string; options: Array<{ text: string }>; is_anonymous: boolean; allows_multiple_answers: boolean } }).poll;
     const location = (ctx.message as { location?: { latitude: number; longitude: number } }).location;
     const contact = (ctx.message as { contact?: { phone_number: string; first_name: string; last_name?: string } }).contact;
+    // A music/audio FILE (mp3 & co — not a voice note): MAX takes it as an ordinary file.
+    const audio = (ctx.message as { audio?: { file_id: string; file_name?: string } }).audio;
 
     // INFO-level on purpose, and BEFORE any branch: silent relay paths already
     // cost two blind debugging sessions (2026-08-14/15). The text branch returns
@@ -2614,7 +3774,7 @@ export function wireBridge({
     const kind =
       location ? 'location' : contact ? 'contact' : poll ? 'poll' : text ? 'text'
       : photo?.length ? 'photo' : video ? 'video' : videoNote ? 'video_note' : document ? 'document'
-      : animation ? 'animation' : voice ? 'voice' : sticker ? 'sticker' : 'unsupported type';
+      : animation ? 'animation' : voice ? 'voice' : audio ? 'audio' : sticker ? 'sticker' : 'unsupported type';
     logger.info(`TG -> MAX: message ${ctx.message.message_id} in topic ${topicId} (${kind}) -> chat ${mapping.maxChatId}`);
 
     try {
@@ -2624,7 +3784,7 @@ export function wireBridge({
       // MAX needs non-empty text for a first message; media/files go in follow-ups once it exists.
       if (mapping.pendingUserId) {
         const hasAttachment = !!(
-          photo?.length || document || animation || video || videoNote || voice || sticker || poll || location || contact
+          photo?.length || document || animation || video || videoNote || voice || audio || sticker || poll || location || contact
         );
         if (!text || hasAttachment) {
           await bot.telegram.sendMessage(
@@ -2650,6 +3810,12 @@ export function wireBridge({
             .catch((e) => logger.error('Failed to report pending-dialog open failure to Telegram', e));
           return;
         }
+        // Echo guard FIRST, before any disk await: MAX echoes our first message back as a push, and
+        // while the two chat-map writes below are on disk that echo would find no cid to drop it —
+        // and, with the pending mapping already gone, open a duplicate «MAX chat <id>» topic with
+        // our own message in it (review 2026-09-26, C8). rememberOutgoingSend below repeats this
+        // (a no-op for the cid) and moves the cursor once the real mapping exists.
+        outgoingCids.remember(opened.cid);
         await chatMapStore.remove(mapping.maxChatId); // drop the "pending:<userId>" sentinel entry
         await chatMapStore.upsert({
           maxChatId: opened.chatId,
@@ -2657,11 +3823,14 @@ export function wireBridge({
           title: mapping.title,
           createdAt: mapping.createdAt,
         });
-        rememberOutgoingSend(opened.chatId, opened.cid);
+        // The dialog was born with this very message — no older history to catch up (catchUp.ts).
+        catchUp.markCaughtUp(opened.chatId);
+        rememberOutgoingSend(opened.chatId, opened.cid, opened.time, opened.messageId);
         messageLinks.add({
           maxChatId: opened.chatId,
           maxMessageId: opened.messageId,
           telegramMessageId: ctx.message.message_id,
+          telegramTopicId: topicId,
           outgoing: true,
         });
         logger.info(
@@ -2672,9 +3841,9 @@ export function wireBridge({
 
       if (location) {
         const locationAttach = { _type: 'LOCATION', latitude: location.latitude, longitude: location.longitude, zoom: 14 };
-        const { cid, messageId } = await max.sendMessage(mapping.maxChatId, null, [locationAttach]);
-        rememberOutgoingSend(mapping.maxChatId, cid);
-        messageLinks.add({ maxChatId: mapping.maxChatId, maxMessageId: messageId, telegramMessageId: ctx.message.message_id, outgoing: true });
+        const { cid, messageId, time } = await max.sendMessage(mapping.maxChatId, null, [locationAttach]);
+        rememberOutgoingSend(mapping.maxChatId, cid, time, messageId);
+        messageLinks.add({ maxChatId: mapping.maxChatId, maxMessageId: messageId, telegramMessageId: ctx.message.message_id, telegramTopicId: topicId, outgoing: true });
         return;
       }
 
@@ -2691,9 +3860,9 @@ export function wireBridge({
           vcfBody: buildVcard(contact.first_name, lastName, contact.phone_number),
           name: contact.first_name,
         };
-        const { cid, messageId } = await max.sendMessage(mapping.maxChatId, null, [contactAttach]);
-        rememberOutgoingSend(mapping.maxChatId, cid);
-        messageLinks.add({ maxChatId: mapping.maxChatId, maxMessageId: messageId, telegramMessageId: ctx.message.message_id, outgoing: true });
+        const { cid, messageId, time } = await max.sendMessage(mapping.maxChatId, null, [contactAttach]);
+        rememberOutgoingSend(mapping.maxChatId, cid, time, messageId);
+        messageLinks.add({ maxChatId: mapping.maxChatId, maxMessageId: messageId, telegramMessageId: ctx.message.message_id, telegramTopicId: topicId, outgoing: true });
         return;
       }
 
@@ -2705,25 +3874,34 @@ export function wireBridge({
           answers: poll.options.map((o) => ({ text: o.text, answerId: null })),
           settings,
         };
-        const { cid, messageId, attaches } = await max.sendMessage(mapping.maxChatId, null, [pollAttach]);
-        rememberOutgoingSend(mapping.maxChatId, cid);
-        messageLinks.add({ maxChatId: mapping.maxChatId, maxMessageId: messageId, telegramMessageId: ctx.message.message_id, outgoing: true });
-        const createdPoll = attaches.find((a) => (a as MaxAttachment)._type === 'POLL') as MaxAttachment | undefined;
-        if (createdPoll?.pollId != null) {
-          pollLinks.add(poll.id, {
-            maxChatId: mapping.maxChatId,
-            maxMessageId: messageId,
-            maxPollId: createdPoll.pollId,
-            answerIdByOptionIndex: (createdPoll.answers ?? []).map((a, i) => Number(a.answerId ?? i + 1)),
+        const { cid, messageId, time } = await max.sendMessage(mapping.maxChatId, null, [pollAttach]);
+        rememberOutgoingSend(mapping.maxChatId, cid, time, messageId);
+        // Linked right away, not after the hint below: a catch-up reaching the poll during that extra
+        // round trip found no link and posted it again (review 2026-09-27, delivery-r3.1#2).
+        messageLinks.add({ maxChatId: mapping.maxChatId, maxMessageId: messageId, telegramMessageId: ctx.message.message_id, telegramTopicId: topicId, outgoing: true });
+        // Votes cast on THIS Telegram poll can't reach MAX: Telegram sends a bot poll_answer only
+        // for polls the bot itself sent, and this one was sent by a group member (anonymous polls
+        // never produce one at all). Its pollLinks entry was dead code; say it in the topic instead
+        // of letting the vote counts silently drift apart (review 2026-09-26, OUTBOUND8).
+        const hint = await bot.telegram
+          .sendMessage(
+            targetGroupId,
+            'ℹ️ Опрос отправлен в MAX. Голоса, поданные здесь, в MAX не попадут — Telegram не сообщает боту о голосах в опросах, созданных участниками. Голосуйте в MAX; актуальный счёт — /poll ответом на опрос.',
+            { message_thread_id: topicId, reply_parameters: { message_id: ctx.message.message_id, allow_sending_without_reply: true } },
+          )
+          .catch((err) => {
+            logger.error('Failed to send the poll-votes hint', err);
+            return undefined;
           });
-        }
+        // A notice, not a copy of the poll: a 👎 on it must not delete the poll (delivery-r2#0).
+        if (hint) messageLinks.addNotice(mapping.maxChatId, messageId, hint.message_id);
         return;
       }
 
       if (text) {
-        const { cid, messageId } = await max.sendMessage(mapping.maxChatId, text, [], replyLink);
-        rememberOutgoingSend(mapping.maxChatId, cid);
-        messageLinks.add({ maxChatId: mapping.maxChatId, maxMessageId: messageId, telegramMessageId: ctx.message.message_id, outgoing: true });
+        const { cid, messageId, time } = await max.sendMessage(mapping.maxChatId, text, [], replyLink);
+        rememberOutgoingSend(mapping.maxChatId, cid, time, messageId);
+        messageLinks.add({ maxChatId: mapping.maxChatId, maxMessageId: messageId, telegramMessageId: ctx.message.message_id, telegramTopicId: topicId, outgoing: true });
         return;
       }
 
@@ -2744,6 +3922,9 @@ export function wireBridge({
         attach = await uploadTelegramAttachmentToMax(bot, max, animation.file_id, 'document', animation.file_name ?? 'animation.gif');
       } else if (voice) {
         attach = await uploadTelegramAttachmentToMax(bot, max, voice.file_id, 'voice', 'voice.ogg', voice.duration ?? 0);
+      } else if (audio) {
+        // No MAX audio-track attach is known — the file pipeline delivers it as a playable file.
+        attach = await uploadTelegramAttachmentToMax(bot, max, audio.file_id, 'document', audio.file_name ?? 'audio.mp3');
       } else if (sticker) {
         // No confirmed MAX-side sticker-upload opcode. Static webp is a real raster
         // image, so it goes through the PHOTO pipeline to render inline (confirmed
@@ -2765,11 +3946,27 @@ export function wireBridge({
           attach = await uploadTelegramAttachmentToMax(bot, max, sticker.file_id, 'photo');
         }
       }
-      if (!attach) return; // nothing we know how to forward
+      if (!attach) {
+        // Nothing we know how to forward (a dice, a story, a game, an animated sticker on the slim
+        // image with no thumbnail, …). This used to return silently — to the sender a lost message
+        // looks exactly like a delivered one (review 2026-09-26, OUTBOUND6). Say so in the topic;
+        // unknown non-content updates stay a log line (describeUnrelayableTelegramMessage).
+        const label = sticker ? 'анимированный стикер' : describeUnrelayableTelegramMessage(ctx.message);
+        if (label) {
+          logger.info(`TG -> MAX: message ${ctx.message.message_id} (${label}) can't be relayed — told the topic`);
+          await bot.telegram
+            .sendMessage(targetGroupId, `⚠️ Этот тип сообщения не передаётся в MAX: ${label}.`, {
+              message_thread_id: topicId,
+              reply_parameters: { message_id: ctx.message.message_id, allow_sending_without_reply: true },
+            })
+            .catch((e) => logger.error('Failed to report an unrelayable message type to Telegram', e));
+        }
+        return;
+      }
 
-      const { cid, messageId } = await max.sendMessage(mapping.maxChatId, caption, [attach], replyLink);
-      rememberOutgoingSend(mapping.maxChatId, cid);
-      messageLinks.add({ maxChatId: mapping.maxChatId, maxMessageId: messageId, telegramMessageId: ctx.message.message_id, outgoing: true });
+      const { cid, messageId, time } = await max.sendMessage(mapping.maxChatId, caption, [attach], replyLink);
+      rememberOutgoingSend(mapping.maxChatId, cid, time, messageId);
+      messageLinks.add({ maxChatId: mapping.maxChatId, maxMessageId: messageId, telegramMessageId: ctx.message.message_id, telegramTopicId: topicId, outgoing: true });
     } catch (err) {
       logger.error('Telegram -> MAX forward failed', err);
       // Don't fail silently — a swallowed send is indistinguishable from success to the sender.
@@ -2805,6 +4002,9 @@ export function wireBridge({
     const update = ctx.messageReaction;
     const link = messageLinks.getByTelegram(update.message_id);
     if (!link) return;
+    // A bot notice about the message (a poll hint, a tally, …) is not the message: no delete, no
+    // reaction relayed onto it (review 2026-09-26, delivery-r2#0).
+    if (isNoticeOf(link, update.message_id)) return;
 
     const oldEmojis = new Set(update.old_reaction.filter((r) => r.type === 'emoji').map((r) => r.emoji));
     const newEmojis = update.new_reaction.filter((r) => r.type === 'emoji').map((r) => r.emoji);
@@ -2814,12 +4014,26 @@ export function wireBridge({
     // Scoped to outgoing only: on an incoming (MAX-origin) copy a genuine 👎 still
     // relays as an ordinary reaction below instead of deleting anything.
     if (added && DELETE_REACTION_EMOJIS.has(added) && link.outgoing) {
+      // Irreversible forAll delete — same admin gate as /delete (the command middleware
+      // never sees reactions). An anonymous admin reacts as the group itself (actor_chat);
+      // anyone else, or an unverifiable user, is ignored — fail closed (review 2026-09-26).
+      const actorChatId = (update as { actor_chat?: { id: number } }).actor_chat?.id;
+      let allowed = actorChatId != null && String(actorChatId) === targetGroupId;
+      if (!allowed && update.user) {
+        try {
+          allowed = await isGroupAdmin(update.user.id);
+        } catch (err) {
+          logger.error('Failed to check admin status for a 👎 delete', err);
+        }
+      }
+      if (!allowed) {
+        logger.info(`👎 on Telegram message ${update.message_id} by a non-admin (user ${update.user?.id ?? '?'}) — ignored, nothing deleted`);
+        return;
+      }
       try {
         await max.deleteMessages(link.maxChatId, [link.maxMessageId], false);
-        for (const id of [link.telegramMessageId, ...(link.extraTelegramMessageIds ?? [])]) {
-          await bot.telegram.deleteMessage(targetGroupId, id).catch((err) => logger.error(`Failed to delete Telegram message ${id} after 👎`, err));
-        }
-        messageLinks.remove(link.maxChatId, link.maxMessageId);
+        // Forgets the link before the Telegram copies vanish, so the deletion probe never races in.
+        await dropLinkedMessage(link, '👎');
         logger.info(`👎-delete: removed MAX message ${String(link.maxMessageId)} in chat ${String(link.maxChatId)} (forAll)`);
       } catch (err) {
         logger.error('Failed to delete MAX message after 👎 reaction', err);
@@ -2838,8 +4052,10 @@ export function wireBridge({
     }
   });
 
-  // Telegram only tells a bot about votes on polls the bot itself sent — exactly
-  // the polls this bridge mirrors, so pollLinks always has a match when it matters.
+  // Telegram only tells a bot about votes on NON-anonymous polls the bot itself sent —
+  // i.e. MAX polls this bridge mirrored into a topic (pollLinks holds exactly those). A poll
+  // a group member creates in a topic, and any anonymous poll, never produces a poll_answer:
+  // the bridge says so in the topic instead (review 2026-09-26, OUTBOUND8).
   // Note this can't run the other way: Telegram's native poll widget has no API for
   // injecting a vote cast by a MAX user, so votes cast on the MAX side don't show up
   // here even though the underlying poll message does get a repeat push on change.
@@ -2863,7 +4079,7 @@ export function wireBridge({
     }
   });
 
-  return { messageLinks };
+  return { messageLinks, catchUp };
 }
 
 /**
@@ -2875,6 +4091,16 @@ export function wireBridge({
  * disconnect and reconnect (a live push is otherwise lost forever if it
  * arrives while we're offline — hit live 2026-08-12, mid-redeploy). Safe to
  * call on every LOGIN (fresh auth or a reconnect's resumed session).
+ * Each chat whose fetch + backfill completes is marked in `catchUp` — only then
+ * may the live paths move its cursor (see catchUp.ts for the invariant). A chat that
+ * fails on a transient error stays unmarked and asks `catchUp` for a retry run.
+ * After the snapshot, mapped chats it did not contain get the same catch-up: a CHATS_LIST
+ * failure leaves only the LOGIN snapshot (capped at 50, known to omit chats), and a chat
+ * born live meanwhile may not be in it either — left out, such a chat's cursor stayed frozen
+ * all session and the next restart re-sent everything it relayed (review 2026-09-26,
+ * b2a-cursor). A run that got through all of it tells `catchUp` (markSyncPassComplete).
+ * `isCancelled` (/reboot, /kill) is checked before every chat and every message;
+ * once it says so the run stops where it is (review 2026-09-26, C7).
  */
 export async function syncAllChatsToTelegram(
   bot: Telegraf,
@@ -2886,46 +4112,134 @@ export async function syncAllChatsToTelegram(
   messageLinks: MessageLinkStore,
   myAccountId: number | null,
   contactProfiles: Map<number, ContactProfile>,
+  catchUp?: CatchUpTracker,
+  isCancelled?: () => boolean,
 ): Promise<void> {
+  // Captured at the start: a reconnect mid-run means this pass did not see the new gap.
+  const passGeneration = catchUp?.generation;
+  // The chat's info card at the top of a topic this run creates (or recreates mid-backfill).
+  const sendCard = async (c: { id?: unknown; type?: string; participants?: Record<string, unknown> }, name: string, topicId: number): Promise<void> => {
+    // Same intro card the live-push path sends on first contact (sendAutoInfoCard) —
+    // this bulk-sync path (used by /reboot and startup resync) never went through
+    // that code and silently skipped it for every topic it creates.
+    const participantIds = c.participants ? Object.keys(c.participants).map(Number) : [];
+    const otherId = participantIds.find((id) => id !== myAccountId);
+    const participantCount = c.participants ? participantIds.length : undefined;
+    try {
+      const roster = await buildRoster(c.participants, c.type, max, myAccountId, contactProfiles);
+      const messageId = await sendContactInfoCard(bot, targetGroupId, topicId, name, c.type, participantCount, otherId, otherId != null ? contactProfiles.get(otherId) : undefined, roster);
+      await pinInfoCard(bot, targetGroupId, messageId);
+    } catch (err) {
+      logger.error('Failed to send auto contact-info card', err);
+    }
+  };
+  // Fetch + backfill of one chat whose topic exists; marks it caught up when done. Runs under the
+  // chat's backfill lock (withChatBackfillLock) — hence the mapping is read here, not trusted from
+  // before: a topic restore that held the lock may have replaced the topic and moved the cursor.
+  const catchUpChat = async (chat: unknown, chatId: unknown, name: string): Promise<void> => {
+    // Captured BEFORE the fetch: a reconnect after this point opens a gap this fetch can't
+    // see, so the chat must not be marked caught up below (catchUp.ts).
+    const generation = catchUp?.generation;
+    const mapping = await chatMapStore.getByMaxChatId(chatId);
+    // Gone (a failed topic restore — it retries itself) or banned meanwhile: nothing to fill.
+    if (!mapping || mapping.banned) return;
+    const cursor = cursorToMs(mapping.historyBackfillCursor);
+    const history = await fetchFullHistory(max, chatId, cursor, isCancelled);
+    if (history.length > 0) {
+      logger.info(`${cursor == null ? 'Backfilling' : 'Catching up on'} ${history.length} messages for MAX chat ${String(chatId)}`);
+      await backfillHistoryToTelegram(bot, targetGroupId, mapping.telegramTopicId, history, max, chatId, messageLinks, chatMapStore, chats, myAccountId, isCancelled, contactProfiles, (recreatedId) =>
+        sendCard((chat ?? {}) as { id?: unknown; type?: string; participants?: Record<string, unknown> }, name, recreatedId),
+      );
+    }
+    // Caught up (even with nothing to backfill): from now on live messages may move its cursor.
+    if (catchUp && generation != null) await markChatCaughtUp(catchUp, chatMapStore, messageLinks, chatId, generation);
+  };
+  // true = keep going; false = the run was cancelled.
+  const onChatError = (chatId: unknown, err: unknown): boolean => {
+    if (err instanceof SyncCancelledError) {
+      logger.info('Chat sync cancelled (/reboot or /kill) — stopping this run');
+      return false;
+    }
+    if (err instanceof ChatBannedError) {
+      logger.info(`MAX chat ${String(chatId)} was banned during its catch-up — left alone`);
+      return true;
+    }
+    logger.error(`Failed to sync MAX chat ${String(chatId)} to Telegram`, err);
+    // Not caught up: its cursor stays frozen until a later run gets through. Marked dirty, too: a
+    // chat whose topic creation failed here has no mapping yet, and without this the pass still
+    // completed as if it had been caught up — the next live message then opened its topic as a
+    // mapping born live, moved the cursor to itself and the messages that arrived while the bridge
+    // was offline were never fetched again (review 2026-09-26, catchup-r1#0).
+    catchUp?.markDirty(chatId);
+    // A transient failure gets that run scheduled (with backoff) instead of waiting for the next
+    // LOGIN, which may never come while the MAX socket stays up (review 2026-09-26, C12).
+    if (isRetriedDeliveryFailure(err) || isTransientMaxError(err)) {
+      catchUp?.requestRetry(`sync of MAX chat ${String(chatId)} hit a transient failure`);
+    }
+    return true;
+  };
+
+  const inSnapshot = new Set<string>();
   for (const chat of chats) {
+    if (isCancelled?.()) {
+      logger.info('Chat sync cancelled (/reboot or /kill) — stopping this run');
+      return;
+    }
     if (!chat || typeof chat !== 'object') continue;
     const c = chat as { id?: unknown; type?: string; status?: string; participants?: Record<string, unknown>; lastMessage?: { text?: string } };
     if (c.id == null) continue;
     // CHATS_LIST keeps returning chats the account left/closed (status "CLOSED") —
     // MAX's own client hides those, so mirror that instead of creating a Telegram
     // topic for an abandoned test group every full resync (confirmed live 2026-08-13).
+    // Not counted as in the snapshot: a mapped one still gets the second loop's catch-up, or its
+    // live messages (the owner re-added meanwhile) never moved its cursor (catchup-r3.3#1).
     if (c.status && c.status !== 'ACTIVE') continue;
+    inSnapshot.add(String(c.id));
 
     try {
-      // Banned chats (/ban) stay muted through a full resync too — don't recreate their topic.
-      const existing = await chatMapStore.getByMaxChatId(c.id);
-      if (existing?.banned) continue;
-      const name = resolveDisplayName(chat);
-      const { topicId, created } = await ensureTopicForMaxChat(bot, targetGroupId, c.id, chatMapStore, name);
-      if (created) {
-        // Same intro card the live-push path sends on first contact (sendAutoInfoCard) —
-        // this bulk-sync path (used by /reboot and startup resync) never went through
-        // that code and silently skipped it for every topic it creates.
-        const participantIds = c.participants ? Object.keys(c.participants).map(Number) : [];
-        const otherId = participantIds.find((id) => id !== myAccountId);
-        const participantCount = c.participants ? participantIds.length : undefined;
-        try {
-          const roster = await buildRoster(c.participants, c.type, max, myAccountId, contactProfiles);
-          const messageId = await sendContactInfoCard(bot, targetGroupId, topicId, name, c.type, participantCount, otherId, otherId != null ? contactProfiles.get(otherId) : undefined, roster);
-          await pinInfoCard(bot, targetGroupId, messageId);
-        } catch (err) {
-          logger.error('Failed to send auto contact-info card', err);
-        }
-      }
-      const mapping = await chatMapStore.getByMaxChatId(c.id);
-      const cursor = mapping?.historyBackfillCursor != null ? Number(mapping.historyBackfillCursor) : null;
-      const history = await fetchFullHistory(max, c.id, cursor);
-      if (history.length > 0) {
-        logger.info(`${cursor == null ? 'Backfilling' : 'Catching up on'} ${history.length} messages for MAX chat ${String(c.id)}`);
-        await backfillHistoryToTelegram(bot, targetGroupId, topicId, history, max, c.id, messageLinks, chatMapStore, chats, myAccountId);
-      }
+      const chatId = c.id;
+      await withChatBackfillLock(chatId, async () => {
+        // Checked again once the lock is ours: a topic restore of this chat may have held it for minutes.
+        if (isCancelled?.()) throw new SyncCancelledError();
+        // Banned chats (/ban) stay muted through a full resync too — don't recreate their topic.
+        const existing = await chatMapStore.getByMaxChatId(chatId);
+        if (existing?.banned) return;
+        const name = resolveDisplayName(chat);
+        const { topicId, created } = await ensureTopicForMaxChat(bot, targetGroupId, chatId, chatMapStore, name);
+        if (created) await sendCard(c, name, topicId);
+        if (isCancelled?.()) throw new SyncCancelledError();
+        await catchUpChat(chat, chatId, name);
+      });
     } catch (err) {
-      logger.error(`Failed to sync MAX chat ${c.id} to Telegram`, err);
+      if (!onChatError(c.id, err)) return;
     }
   }
+
+  // Mapped chats the snapshot did not contain (see above) — their topics exist, so only the
+  // cursor-bounded catch-up. A chat already caught up (born live after an earlier pass) needs none.
+  let mappings: Awaited<ReturnType<ChatMapStore['list']>> = [];
+  try {
+    mappings = await chatMapStore.list();
+  } catch (err) {
+    logger.error('Chat sync: failed to list mapped chats — skipping the ones missing from the chat list', err);
+    return;
+  }
+  for (const mapping of mappings) {
+    if (isCancelled?.()) {
+      logger.info('Chat sync cancelled (/reboot or /kill) — stopping this run');
+      return;
+    }
+    // A pending 1:1 ("pending:<userId>", no MAX dialog yet) has no history to fetch.
+    if (mapping.banned || mapping.pendingUserId != null || inSnapshot.has(String(mapping.maxChatId)) || catchUp?.isCaughtUp(mapping.maxChatId)) continue;
+    try {
+      logger.info(`MAX chat ${String(mapping.maxChatId)} is mapped but missing from the chat list — catching it up anyway`);
+      await withChatBackfillLock(mapping.maxChatId, async () => {
+        if (isCancelled?.()) throw new SyncCancelledError();
+        await catchUpChat(undefined, mapping.maxChatId, mapping.title ?? `MAX chat ${String(mapping.maxChatId)}`);
+      });
+    } catch (err) {
+      if (!onChatError(mapping.maxChatId, err)) return;
+    }
+  }
+  if (passGeneration != null) catchUp?.markSyncPassComplete(passGeneration);
 }

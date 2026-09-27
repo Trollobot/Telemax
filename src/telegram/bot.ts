@@ -1,6 +1,8 @@
 import type { Telegraf } from 'telegraf';
 import type { ChatMapStore } from '../store/chatMapStore.js';
 import { createLogger } from '../logger.js';
+import { isFallbackTitle } from '../max/names.js';
+import { truncateUtf16 } from '../bridge/text.js';
 
 const logger = createLogger('telegram');
 
@@ -59,25 +61,71 @@ async function warnAboutKnownTelegramError(bot: Telegraf, groupId: string, err: 
   await bot.telegram.sendMessage(groupId, known.advice).catch((sendErr) => logger.error('Failed to report known Telegram error to the group', sendErr));
 }
 
+/** Telegram's limit for a forum topic name, in UTF-16 units. */
+export const TOPIC_TITLE_LIMIT = 128;
+
+/** A topic title Telegram accepts: trimmed, at most 128 units without splitting an emoji; undefined when blank. */
+export function clampTopicTitle(title: string | undefined | null): string | undefined {
+  const clamped = truncateUtf16((title ?? '').trim(), TOPIC_TITLE_LIMIT).trim();
+  return clamped || undefined;
+}
+
+// One ensureTopicForMaxChat at a time per chat. MAX pushes aren't serialized (handleMaxPush runs
+// per frame without awaiting the previous one) and a brand-new chat arrives as a burst (CONTROL
+// 'new', CHAT_UPDATE, the first message) — two concurrent check-then-create runs each opened a
+// topic, the later upsert won and the first topic was orphaned along with the message sent into
+// it (review 2026-09-26, S3). Serializing per chat makes the second caller find the mapping the
+// first one just wrote (created: false, so only one of them seeds the topic).
+const topicLocks = new Map<string, Promise<unknown>>();
+
+/** Runs `fn` after every earlier call holding the same key has settled. Exported for tests. */
+export function withTopicLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const previous = topicLocks.get(key) ?? Promise.resolve();
+  const run = previous.then(fn, fn);
+  const tail = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  topicLocks.set(key, tail);
+  void tail.then(() => {
+    if (topicLocks.get(key) === tail) topicLocks.delete(key);
+  });
+  return run;
+}
+
 /**
  * Finds the Telegram forum topic for a MAX chat, creating one on first contact.
  * If the resolved display name has since changed (e.g. a better name became
  * available via CONTACT_INFO, or a contact renamed themselves) and the topic
- * already exists, renames it in place instead of leaving the stale title.
+ * already exists, renames it in place instead of leaving the stale title — but
+ * never to a generic fallback («MAX ID n», «CHAT n», … — see isFallbackTitle): a
+ * full resync passes resolveChatName's raw result, which is exactly that while
+ * contact profiles are still unknown (review 2026-09-26, C5). Titles are clamped
+ * to Telegram's 128-unit limit for both rename and create.
  */
-export async function ensureTopicForMaxChat(
+export function ensureTopicForMaxChat(
   bot: Telegraf,
   groupId: string,
   maxChatId: unknown,
   chatMapStore: ChatMapStore,
   title?: string,
 ): Promise<EnsuredTopic> {
+  return withTopicLock(`${groupId}:${String(maxChatId)}`, () => ensureTopicUnlocked(bot, groupId, maxChatId, chatMapStore, clampTopicTitle(title)));
+}
+
+async function ensureTopicUnlocked(
+  bot: Telegraf,
+  groupId: string,
+  maxChatId: unknown,
+  chatMapStore: ChatMapStore,
+  title: string | undefined,
+): Promise<EnsuredTopic> {
   const existing = await chatMapStore.getByMaxChatId(maxChatId);
   if (existing) {
-    if (title && title !== existing.title) {
+    if (title && title !== existing.title && !isFallbackTitle(title)) {
       try {
         await bot.telegram.editForumTopic(groupId, existing.telegramTopicId, { name: title });
-        await chatMapStore.upsert({ ...existing, maxChatId, title });
+        await chatMapStore.setTitle(maxChatId, existing.telegramTopicId, title); // title only — see setTitle
         logger.info(`Renamed Telegram topic ${existing.telegramTopicId} for MAX chat ${String(maxChatId)}: "${existing.title}" -> "${title}"`);
       } catch (err) {
         logger.error(`Failed to rename Telegram topic for MAX chat ${String(maxChatId)}`, err);

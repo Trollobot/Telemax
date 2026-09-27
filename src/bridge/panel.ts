@@ -5,6 +5,7 @@ import type { MaxClient, MaxContactInfo } from '../max/client.js';
 import { getAppVersion } from './version.js';
 import { maskPhone } from './status.js';
 import { createLogger } from '../logger.js';
+import { truncateUtf16 } from './text.js';
 
 const logger = createLogger('panel');
 
@@ -60,6 +61,21 @@ function isPaused(): boolean {
   return pauseUntil != null;
 }
 
+/** Whether MAX is paused from the panel right now — /login refuses to run over a pause. */
+export function isMaxPaused(): boolean {
+  return isPaused();
+}
+
+/**
+ * Forgets a panel pause WITHOUT reconnecting: /kill (MAX stays down anyway) and a sessionless /login
+ * (which connects on its own). Otherwise the pause timer fired a max.connect() later — lifting /kill,
+ * or tearing down the socket a /login auth chain was running on (review 2026-09-26, client-r1#2).
+ */
+export function clearPause(): void {
+  clearPauseTimer();
+  pauseUntil = null;
+}
+
 // --- Contact-search force-reply correlation ------------------------------------------
 type SearchMode = 'phone' | 'nick' | 'id';
 const pendingSearch = new Map<number, { mode: SearchMode; requesterId: number }>();
@@ -82,7 +98,8 @@ function contactName(c: MaxContactInfo): string {
   const names = c.names ?? [];
   const primary = names.find((n) => n.type === 'ONEME') ?? names[0];
   const full = [primary?.firstName, primary?.lastName].filter(Boolean).join(' ').trim();
-  return (primary?.name || full || `MAX ${String(c.id)}`).slice(0, 120);
+  // Surrogate-safe cut: a lone half of an emoji makes Telegram refuse the whole button list.
+  return truncateUtf16(primary?.name || full || `MAX ${String(c.id)}`, 120);
 }
 function isOnMax(c: MaxContactInfo): boolean {
   return Array.isArray(c.options) && c.options.includes('ONEME');
@@ -300,7 +317,7 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
       text = await getStatus(pausedLabel);
     } catch (err) {
       logger.error('panel status failed', err);
-      text = '❌ Не удалось собрать статус — смотри логи контейнера.';
+      text = '❌ Не удалось собрать статус — смотрите логи контейнера.';
     }
     await ctx
       .editMessageText(text, {
@@ -311,6 +328,13 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
 
   // --- Pause / resume -----------------------------------------------------------------
   bot.action('tlmx_panel:resume', async (ctx) => {
+    // A stale button (the pause already ended: its timer, /login, /kill) must not tear down the
+    // live socket — an auth chain may be running on it (review 2026-09-27, client-r3.1#3).
+    if (!isPaused()) {
+      await ctx.answerCbQuery('MAX не на паузе').catch(() => {});
+      await edit(ctx, systemView());
+      return;
+    }
     clearPauseTimer();
     pauseUntil = null;
     max.connect();

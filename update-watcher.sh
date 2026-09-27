@@ -36,4 +36,6 @@ rm -f "$MARKER"
 # Overwrite, not append: every run dumps the full image-build output (~100-200 KB),
 # and only the LAST run's log is ever useful for diagnostics — appending just
 # grew the file forever.
-./update.sh > data/update.log 2>&1
+# `bash ./update.sh`, not `./update.sh`: a checkout made on Windows loses the exec bit (same reason
+# the dispatcher in setup.sh runs `bash ./update-watcher.sh`).
+bash ./update.sh > data/update.log 2>&1

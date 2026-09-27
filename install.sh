@@ -6,7 +6,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/Trollobot/Telemax/main/install.sh | bash
 #
 # Safe to re-run: skips steps that are already done (git/Docker already
-# installed, repo already cloned — pulls latest instead).
+# installed, repo already cloned — updates it to the latest SIGNED release instead).
 set -euo pipefail
 
 REPO_URL="https://github.com/Trollobot/Telemax.git"
@@ -21,7 +21,11 @@ if [ -n "${INSTALL_DIR:-}" ]; then INSTALL_DIR_EXPLICIT=1; else INSTALL_DIR_EXPL
 # The maintainer's release-signing key, pinned HERE as well as in the repo's allowed_signers:
 # update.sh trusts whatever allowed_signers the checkout carries, so a tampered clone (a
 # compromised transport swapping in an attacker's key) would otherwise bootstrap a poisoned
-# trust chain. As long as THIS script arrived over HTTPS, the check below catches that swap.
+# trust chain. It is the trust anchor for the CODE too: a fresh clone and an updated checkout are
+# both moved only onto a release tag whose signature verifies against this key (see
+# try_verified_source / checkout_signed_release), and the allowed_signers check further down only
+# confirms the checkout carries the same key — comparing a public key file proves nothing about the
+# code next to it. As long as THIS script arrived over HTTPS, a tampered source is refused.
 EXPECTED_SIGNER='release@telemax namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILE1HMFVabDZUp6fRrnnt2lMgTY57ghrMP1pp+dE5MIe'
 
 bold() { printf '\033[1m%s\033[0m\n' "$1"; }
@@ -79,8 +83,27 @@ apt_get() {
   fi
 }
 
+# Release tags are verified with SSH signatures (git -c gpg.format=ssh verify-tag), which git only
+# understands since 2.34. An older git (Debian 11: 2.30, Ubuntu 20.04: 2.25) failed every tag, and a
+# fresh install stopped with «возможна подмена источника» — wrong, and no retry could ever help
+# (review 2026-09-26, shell-r2#1). True when the installed git is new enough.
+git_verifies_ssh_signatures() {
+  local v major minor
+  v=$(git --version 2>/dev/null | awk '{print $3}')
+  major=${v%%.*}
+  minor=${v#*.}
+  minor=${minor%%.*}
+  case "$major$minor" in '' | *[!0-9]*) return 1 ;; esac
+  [ "$major" -gt 2 ] || { [ "$major" -eq 2 ] && [ "$minor" -ge 34 ]; }
+}
+git_too_old_advice() {
+  echo "   Установите git 2.34 или новее (на Debian 11 — например, из bullseye-backports) или обновите ОС"
+  echo "   до Ubuntu 22.04+ / Debian 12+ — и запустите install.sh снова."
+}
+
 # Preflight: name the reasons an install would fail BEFORE spending minutes on apt/Docker. Hard
-# stops only for what can't work at all (arch, disk); everything else is a warning with the fix.
+# stops only for what can't work at all (arch, disk, a git too old to verify a release on a fresh
+# install); everything else is a warning with the fix.
 preflight() {
   local fail=0 free_mb mem_mb hp net_ts skew
   . /etc/os-release 2>/dev/null || true
@@ -92,6 +115,16 @@ preflight() {
     x86_64 | aarch64) echo "  Архитектура: $(uname -m) — OK" ;;
     *) echo "  ❌ Архитектура $(uname -m) не поддерживается (нужна x86_64 или arm64)."; fail=1 ;;
   esac
+  # Checked again after step [2/6], when git was only just installed.
+  if command -v git >/dev/null 2>&1 && ! git_verifies_ssh_signatures; then
+    if [ -d "$INSTALL_DIR/.git" ]; then
+      echo "  ⚠️  $(git --version) не умеет проверять подписи релизов (нужен 2.34+) — обновить мост не получится, только перенастроить."
+    else
+      echo "  ❌ $(git --version) не умеет проверять подписи релизов (нужен git 2.34+) — без этого установка невозможна."
+      git_too_old_advice
+      fail=1
+    fi
+  fi
   free_mb=$(df -Pm / | awk 'NR==2{print $4}')
   if [ "${free_mb:-0}" -lt 3072 ]; then
     echo "  ❌ Свободно ${free_mb} МБ на / — нужно минимум 3 ГБ (образ ~1.7 ГБ + сборка)."; fail=1
@@ -162,23 +195,50 @@ install_status() {
 }
 # Saves the only irreplaceable parts (.env = tokens/keys, data/ = MAX session + chat map)
 # before anything destructive. Prints the archive path, or nothing if there was nothing to save.
+# Returns NON-ZERO when there WAS something to save and no archive came out — callers must then
+# refuse to delete anything. (It used to fail silently: an `if` without `else` returns 0, so under
+# `set -e` the caller went straight on to `rm -rf` after the menu had promised a backup.)
 backup_install() {
-  local dir="$1" slug out items=()
+  local dir="$1" slug base out items=() rc=0 n=0
   slug=$(basename "$dir" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_-]//g')
-  out="/root/telemax-backup-${slug:-telemax}-$(date +%Y%m%d-%H%M%S).tar.gz"
+  base="/root/telemax-backup-${slug:-telemax}-$(date +%Y%m%d-%H%M%S)"
+  # Never over an existing archive: /opt/telemax and /root/Telemax share a slug, and two backups
+  # in the same second replaced the first one after its install was deleted (review 2026-09-27, shell-r3.1#6).
+  out="$base.tar.gz"
+  while [ -e "$out" ]; do n=$((n + 1)); out="$base-$n.tar.gz"; done
   [ -f "$dir/.env" ] && items+=(.env)
   [ -d "$dir/data" ] && items+=(data)
-  if [ "${#items[@]}" -gt 0 ] && tar -czf "$out" -C "$dir" "${items[@]}" 2>/dev/null; then
+  [ "${#items[@]}" -gt 0 ] || return 0
+  # umask 077: the archive holds the bot token and MAX_SESSION_KEY — root-only, like .env itself
+  # (root's default umask would have made it world-readable 0644). GNU tar exits 1 for "file
+  # changed as we read it" (the running bridge writes to data/) — the archive is still written, so
+  # only >= 2 (fatal) counts as a failure. tar's own stderr stays visible so the reason is on screen.
+  ( umask 077; tar -czf "$out" -C "$dir" "${items[@]}" ) >&2 || rc=$?
+  if [ "$rc" -le 1 ] && [ -s "$out" ]; then
     printf '%s' "$out"
+    return 0
   fi
+  rm -f "$out"
+  return 1
 }
 delete_install() {
-  local dir="$1" bak
+  local dir="$1" bak ids
   echo "Удаляю мост в $dir..."
-  bak=$(backup_install "$dir")
+  if ! bak=$(backup_install "$dir"); then
+    echo "❌ Не удалось сохранить бэкап настроек и данных ($dir/.env, $dir/data) в /root — мост НЕ удаляю."
+    echo "   Проверьте место на диске (df -h /root) и запустите install.sh снова."
+    exit 1
+  fi
   if [ -n "$bak" ]; then echo "  На всякий случай настройки и данные сохранены: $bak"; fi
-  if command -v docker >/dev/null 2>&1 && [ -f "$dir/docker-compose.yml" ]; then
-    (cd "$dir" && docker compose down -v --rmi local --remove-orphans) </dev/null || true
+  if command -v docker >/dev/null 2>&1; then
+    # compose needs .env (env_file, COMPOSE_PROJECT_NAME): without it, it fails on older Compose or
+    # falls back to the directory name — another bridge's project. Whatever still carries this
+    # directory's label is removed either way, or it kept relaying with the old token.
+    if [ -f "$dir/docker-compose.yml" ] && [ -f "$dir/.env" ]; then
+      (cd "$dir" && docker compose down -v --rmi local --remove-orphans) </dev/null || true
+    fi
+    ids=$(docker ps -aq --filter "label=com.docker.compose.project.working_dir=$dir" 2>/dev/null || true)
+    [ -z "$ids" ] || docker rm -f $ids >/dev/null 2>&1 || true
   fi
   rm -rf "$dir"
   if [ -f /etc/telemax/instances ]; then
@@ -314,13 +374,21 @@ apt_get upgrade -y
 echo
 echo "[2/6] Проверяю git и jq..."
 # jq: used by setup.sh to auto-detect the Telegram group id (no need to hunt for it
-# manually — see setup.sh). (update.sh's release-signature check uses ssh-keygen, which
-# ships with openssh and is already present on any host you can SSH into — no extra pkg.)
+# manually — see setup.sh). The release-signature check (below when updating an existing
+# checkout, and in update.sh) uses ssh-keygen from openssh-client — normally already present on
+# any host you can SSH into; installed here only if it is missing.
 for pkg in git jq; do
   if ! command -v "$pkg" >/dev/null 2>&1; then
     apt_get install -y "$pkg"
   fi
 done
+command -v ssh-keygen >/dev/null 2>&1 || apt_get install -y openssh-client
+# A git installed just now is the distro's — on an older release too old to verify a signed release.
+if [ ! -d "$INSTALL_DIR/.git" ] && ! git_verifies_ssh_signatures; then
+  echo "❌ $(git --version) не умеет проверять подписи релизов (нужен git 2.34+) — без этого установка невозможна."
+  git_too_old_advice
+  exit 1
+fi
 
 echo
 echo "[3/6] Проверяю Docker..."
@@ -425,32 +493,211 @@ EOF
       ;;
   esac
 fi
+# Updating an EXISTING checkout follows the same rule as update.sh: fetch -> verify a signed
+# release tag in the INCOMING main -> only then fast-forward. This path used to be a bare
+# `git pull --ff-only`, which moved an install onto whatever main held — including untagged commits
+# between releases — and setup.sh then built that into the image. Not delegated to update.sh itself:
+# that one also rebuilds/restarts the container and reports to Telegram, while here setup.sh comes
+# next and decides that. Trust anchor: EXPECTED_SIGNER pinned in THIS script (a very old checkout
+# may not even carry allowed_signers). Keep in sync with update.sh's try_source (which, unlike this
+# one, takes only a release on main's tip).
+#
+# try_verified_source: fetches main + tags from $2 into FETCH_HEAD WITHOUT touching the working tree
+# and accepts the newest v* tag in that main that verifies against the pinned key, if it contains
+# what is already installed (a stale or diverged source must not win). On success sets
+# VERIFIED_COMMIT / VERIFIED_TAG. GIT_TERMINAL_PROMPT=0 so a flagged/unreachable GitHub fails fast
+# instead of hanging on a credential prompt.
+# Every failed attempt appends why to UPDATE_FAIL_REASONS (network | nosig | older | stale |
+# localchanges | nokeygen | oldgit), so the final message can give advice that fits instead of
+# always "wait for a release".
+VERIFIED_COMMIT=""
+VERIFIED_TAG=""
+UPDATE_FAIL_REASONS=""
+try_verified_source() {
+  local dir="$1" url="$2" label="$3" signers="$4" cand head t seen=0
+  echo "  Получаю main (${label})..."
+  if ! GIT_TERMINAL_PROMPT=0 git -C "$dir" fetch "$url" main >/dev/null 2>&1; then
+    echo "  ${label}: недоступен"
+    UPDATE_FAIL_REASONS="$UPDATE_FAIL_REASONS network"
+    return 1
+  fi
+  cand=$(git -C "$dir" rev-parse FETCH_HEAD)
+  GIT_TERMINAL_PROMPT=0 git -C "$dir" fetch "$url" "+refs/tags/*:refs/tags/*" >/dev/null 2>&1 || echo "  ${label}: теги не скачались"
+  head=$(git -C "$dir" rev-parse HEAD)
+  # The newest signed release in the source's main — on its tip or, with untagged work after it,
+  # further down, as checkout_signed_release takes it for a fresh clone (review 2026-09-27, shell-r3.1#2).
+  for t in $(git -C "$dir" tag -l 'v[0-9]*' 2>/dev/null | sort -rV); do
+    git -C "$dir" merge-base --is-ancestor "$t" "$cand" 2>/dev/null || continue
+    seen=1
+    git -C "$dir" -c gpg.format=ssh -c gpg.ssh.allowedSignersFile="$signers" verify-tag "$t" >/dev/null 2>&1 || continue
+    if git -C "$dir" merge-base --is-ancestor "$head" "$t" 2>/dev/null; then
+      VERIFIED_COMMIT=$(git -C "$dir" rev-parse "$t^{commit}")
+      VERIFIED_TAG="$t"
+      echo "  ${label}: подпись релиза OK (ssh): ${t}"
+      return 0
+    fi
+    # An install newer than the source (it lags behind, e.g. a frozen GitHub) needs nothing done;
+    # only a diverged history does (review 2026-09-27, shell-r3.1#3).
+    if git -C "$dir" merge-base --is-ancestor "$t" "$head" 2>/dev/null; then
+      echo "  ${label}: там релиз ${t}, а установлен более новый — не подходит"
+      UPDATE_FAIL_REASONS="$UPDATE_FAIL_REASONS older"
+    else
+      echo "  ${label}: история установки разошлась с релизом ${t} — не подходит"
+      UPDATE_FAIL_REASONS="$UPDATE_FAIL_REASONS stale"
+    fi
+    return 1
+  done
+  if [ "$seen" = "1" ]; then
+    echo "  ${label}: ни один тег релиза в main не подписан корректно"
+  else
+    echo "  ${label}: в main нет тега релиза"
+  fi
+  UPDATE_FAIL_REASONS="$UPDATE_FAIL_REASONS nosig"
+  return 1
+}
+# Returns non-zero (tree untouched) when no source offers a verified release or it can't be
+# fast-forwarded to.
+update_existing_checkout() {
+  local dir="$1" signers rc=0
+  command -v ssh-keygen >/dev/null 2>&1 || { echo "  Нет ssh-keygen — подпись релиза проверить нечем."; UPDATE_FAIL_REASONS="$UPDATE_FAIL_REASONS nokeygen"; return 1; }
+  # Not 'nosig': every tag would fail on the old git, and «подписанного релиза сейчас нет» was wrong.
+  git_verifies_ssh_signatures || { echo "  $(git --version) не умеет проверять подписи релизов."; UPDATE_FAIL_REASONS="$UPDATE_FAIL_REASONS oldgit"; return 1; }
+  signers=$(mktemp)
+  printf '%s\n' "$EXPECTED_SIGNER" > "$signers"
+  if try_verified_source "$dir" origin "GitHub" "$signers" \
+    || try_verified_source "$dir" "$MIRROR_GIT_URL" "зеркало" "$signers"; then
+    if git -C "$dir" merge --ff-only "$VERIFIED_COMMIT" >/dev/null 2>&1; then
+      echo "Исходники на релизе ${VERIFIED_TAG} (подпись проверена)."
+    else
+      echo "  Локальные изменения мешают обновиться (нужен fast-forward)."
+      UPDATE_FAIL_REASONS="$UPDATE_FAIL_REASONS localchanges"
+      rc=1
+    fi
+  else
+    rc=1
+  fi
+  rm -f "$signers"
+  return "$rc"
+}
+
+# A FRESH clone follows the same rule (review 2026-09-26, shell-r1#0): it used to build main HEAD —
+# from GitHub, or from the mirror when GitHub was down — with no signature check at all, so a
+# tampered mirror ran its own setup.sh as root, and a clone between releases built untagged work in
+# progress. Stays on main when a v* tag on HEAD verifies against the pinned key; otherwise moves the
+# local main to the newest v* tag that verifies. Returns non-zero when no release verifies.
+checkout_signed_release() {
+  local dir="$1" signers t rc=1
+  command -v ssh-keygen >/dev/null 2>&1 || { echo "  Нет ssh-keygen — подпись релиза проверить нечем."; return 1; }
+  signers=$(mktemp)
+  printf '%s\n' "$EXPECTED_SIGNER" > "$signers"
+  for t in $(git -C "$dir" tag --points-at HEAD 2>/dev/null | grep -E '^v[0-9]' | sort -rV); do
+    if git -C "$dir" -c gpg.format=ssh -c gpg.ssh.allowedSignersFile="$signers" verify-tag "$t" >/dev/null 2>&1; then
+      echo "Исходники на релизе ${t} (подпись проверена)."
+      rc=0
+      break
+    fi
+    echo "  Подпись тега ${t} НЕ прошла проверку — пробую следующий"
+  done
+  if [ "$rc" -ne 0 ]; then
+    for t in $(git -C "$dir" tag -l 'v[0-9]*' 2>/dev/null | sort -rV); do
+      if git -C "$dir" -c gpg.format=ssh -c gpg.ssh.allowedSignersFile="$signers" verify-tag "$t" >/dev/null 2>&1 \
+        && git -C "$dir" checkout -q -B main "$t" >/dev/null 2>&1; then
+        echo "Исходники на последнем подписанном релизе ${t} (подпись проверена)."
+        rc=0
+        break
+      fi
+    done
+  fi
+  rm -f "$signers"
+  return "$rc"
+}
+
+# The final advice when an existing checkout could not be updated — by the reasons collected above.
+# «Переустановка начисто» is NOT advice here: it keeps the git checkout (only .env and data are
+# wiped), so the same update fails again with the same message — an endless loop (review
+# 2026-09-26, shell-r2#0). What does help: removing the bridge (the menu backs it up first) and
+# installing it anew, or moving the checkout onto a release by hand.
+explain_update_failure() {
+  case "$UPDATE_FAIL_REASONS" in
+    *oldgit*)
+      echo "   Нужен git 2.34+, чтобы проверить подпись релиза."
+      git_too_old_advice ;;
+    *localchanges*)
+      echo "   В $INSTALL_DIR изменены файлы проекта — обновление только fast-forward, поверх правок не пойдёт."
+      echo "   Посмотрите, что изменено: git -C $INSTALL_DIR status. Уберите правки (git -C $INSTALL_DIR stash)"
+      echo "   и запустите install.sh снова. Или удалите мост (запустите install.sh без INSTALL_DIR → пункт 3"
+      echo "   «Удалить мост»; настройки и данные сначала сохраняются в бэкап в /root) и установите его заново." ;;
+    *stale*)
+      echo "   История установки разошлась с опубликованным релизом."
+      echo "   Удалите мост (запустите install.sh без INSTALL_DIR → пункт 3 «Удалить мост»; настройки и данные"
+      echo "   сначала сохраняются в бэкап в /root) и установите его заново. Или вручную переведите исходники"
+      echo "   на последний релиз командой git -C $INSTALL_DIR fetch --tags $REPO_URL main"
+      echo "   и затем git -C $INSTALL_DIR reset --hard vX.Y.Z (последний тег) — и запустите install.sh снова." ;;
+    *older*)
+      echo "   Установлена версия новее, чем сейчас есть в доступном источнике, — обновлять нечего."
+      echo "   Если ждёте новый релиз, повторите install.sh позже." ;;
+    *nokeygen*)
+      echo "   Нет ssh-keygen для проверки подписи: apt-get install -y openssh-client — и запустите install.sh снова." ;;
+    *nosig*)
+      echo "   Подписанного релиза, до которого можно обновиться, сейчас нет. Повторите install.sh позже, после выхода релиза." ;;
+    *)
+      echo "   Не удалось связаться ни с GitHub, ни с резервным зеркалом. Проверьте сеть сервера и запустите install.sh снова." ;;
+  esac
+}
+
 echo
 echo "[5/6] Скачиваю проект в $INSTALL_DIR..."
+# 1 when an existing checkout was left exactly as it was (no verified release to move to).
+CHECKOUT_UNCHANGED=0
+# 1 when $INSTALL_DIR was cloned just now (nothing user-owned in it yet).
+FRESH_CLONE=0
 if [ -d "$INSTALL_DIR/.git" ]; then
-  echo "Уже склонировано — обновляю до последней версии..."
-  # GIT_TERMINAL_PROMPT=0 so a flagged/unreachable GitHub fails fast instead of hanging on a
-  # credential prompt; then fall back to the mirror.
-  GIT_TERMINAL_PROMPT=0 git -C "$INSTALL_DIR" pull --ff-only || {
-    echo "GitHub недоступен — обновляю с резервного зеркала..."
-    git -C "$INSTALL_DIR" fetch "$MIRROR_GIT_URL" main
-    git -C "$INSTALL_DIR" merge --ff-only FETCH_HEAD
-  }
+  echo "Уже склонировано — обновляю до последнего подписанного релиза..."
+  # A failure here leaves the install on its current, already-trusted version (the working tree is
+  # only moved after a successful verification) — setup.sh still runs, e.g. to reconfigure a proxy.
+  if ! update_existing_checkout "$INSTALL_DIR"; then
+    echo "⚠️  Не обновил (причины выше) — остаюсь на установленной версии."
+    # Advice for every install left behind, not only one too old to go on: a diverged install that
+    # setup.sh keeps running used to get none, and update.sh refuses it too (shell-r2#0).
+    explain_update_failure
+    CHECKOUT_UNCHANGED=1
+  fi
 elif GIT_TERMINAL_PROMPT=0 git clone "$REPO_URL" "$INSTALL_DIR"; then
-  : # cloned from GitHub
+  FRESH_CLONE=1 # cloned from GitHub
 else
   echo "GitHub недоступен — устанавливаю с резервного зеркала..."
   git clone "$MIRROR_GIT_URL" "$INSTALL_DIR"
+  FRESH_CLONE=1
   # Keep origin pointing at GitHub (the canonical source) so ordinary updates prefer it once it's
   # back; the mirror stays the fallback (see update.sh).
   git -C "$INSTALL_DIR" remote set-url origin "$REPO_URL"
 fi </dev/null  # same stdin guard as the apt calls — keep git off the curl|bash pipe
+
+# A fresh clone is built only from a signed release (checkout_signed_release). With none, it goes
+# again — git clone only succeeds into a new or empty directory, so nothing of the user's is in it.
+if [ "$FRESH_CLONE" -eq 1 ] && ! checkout_signed_release "$INSTALL_DIR" </dev/null; then
+  rm -rf "$INSTALL_DIR"
+  echo "❌ В скачанном репозитории нет релиза с действительной подписью — установка остановлена."
+  echo "   Возможна подмена источника (GitHub/зеркала) или временный сбой. Повторите install.sh позже."
+  exit 1
+fi
 
 cd "$INSTALL_DIR"
 
 # Bootstrap-trust check (see EXPECTED_SIGNER above): the cloned repo must carry exactly the
 # pinned release key. Missing file counts as failure — every release since v0.4.1 ships it.
 if ! grep -qxF "$EXPECTED_SIGNER" allowed_signers 2>/dev/null; then
+  # An existing checkout the update above left untouched that predates allowed_signers (installed
+  # before v0.4.1): nothing was fetched into it, it just has no key to check yet and no signed
+  # release was available to move it to. Still stopped, but not reported as a compromised source
+  # (review 2026-09-26, b6-installer-docs).
+  if [ "$CHECKOUT_UNCHANGED" -eq 1 ] && [ ! -e allowed_signers ]; then
+    # The advice fitting the reason (explain_update_failure) was printed where the update failed:
+    # waiting for a release never fixes local edits or a diverged history (review 2026-09-26,
+    # shell-r1#1).
+    echo "❌ Установка слишком старая (до v0.4.1): в ней ещё нет ключа подписи релизов, и обновить её не вышло (что делать — см. выше)."
+    exit 1
+  fi
   echo "❌ Ключ подписи релизов в скачанном репозитории не совпадает с ожидаемым."
   echo "   Возможна компрометация источника (GitHub/зеркала) — установка остановлена."
   exit 1
@@ -462,7 +709,11 @@ fi
 if [ "$CLEAN_REINSTALL" -eq 1 ]; then
   echo
   echo "Переустановка начисто: сбрасываю настройки и данные..."
-  BAK=$(backup_install "$INSTALL_DIR")
+  if ! BAK=$(backup_install "$INSTALL_DIR"); then
+    echo "❌ Не удалось сохранить бэкап настроек и данных в /root — переустановку начисто отменяю, ничего не удалено."
+    echo "   Проверьте место на диске (df -h /root) и запустите install.sh снова."
+    exit 1
+  fi
   if [ -n "$BAK" ]; then echo "  Старые настройки и данные сохранены: $BAK"; fi
   docker compose down -v --remove-orphans </dev/null 2>/dev/null || true
   rm -f .env
@@ -472,6 +723,15 @@ fi
 echo
 bold "Окружение готово, переходим к настройке."
 echo
+# The update above moved only the sources: the running container stays on its version until it is
+# rebuilt, and leaving the menu with «0» rebuilds nothing (review 2026-09-27, shell-r3.1#1). Only when
+# the container really runs another commit (its GIT_COMMIT, as update.sh reads it): an install already
+# on the release was told to rebuild for nothing (shell-r3.2#0).
+DEPLOYED=$(docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$(docker compose ps -q 2>/dev/null | head -1)" 2>/dev/null | sed -n 's/^GIT_COMMIT=//p' | head -1) || DEPLOYED=""
+if [ "$FRESH_CLONE" -eq 0 ] && [ "$CHECKOUT_UNCHANGED" -eq 0 ] && [ -f .env ] && [ "$DEPLOYED" != "$(git rev-parse HEAD)" ]; then
+  echo "ℹ️  Новая версия заработает после пересборки: в меню ниже выберите «6) Пересобрать и перезапустить контейнер»."
+  echo
+fi
 
 # curl | bash consumes stdin for the script itself — reconnect to the real
 # terminal so setup.sh's prompts (bot token, group id) actually work.

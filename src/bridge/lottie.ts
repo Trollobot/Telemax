@@ -19,6 +19,7 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { createRequire } from 'node:module';
 import puppeteer from 'puppeteer-core';
 import { createLogger } from '../logger.js';
 
@@ -34,14 +35,15 @@ const CHROMIUM_PATH = process.env.CHROMIUM_PATH || '/usr/bin/chromium';
 export function canRenderAnimatedStickers(): boolean {
   return existsSync(CHROMIUM_PATH);
 }
-// esbuild bundles this whole module into dist/server.mjs — import.meta.url at
-// runtime points at THAT file's location (/app/dist/server.mjs), not this
-// source file's, so the relative path has to be resolved from there.
-const LOTTIE_WEB_PATH = new URL('../node_modules/lottie-web/build/player/lottie.min.js', import.meta.url);
+// Node's own module resolution, so it works both from the esbuild bundle (dist/server.mjs, where
+// import.meta.url is the bundle) and from source under tsx (`npm run dev`, where it is this file):
+// a path relative to import.meta.url only matched the bundle's location. lottie-web declares no
+// "exports", so its build file is resolvable by subpath. Resolved lazily with the file read.
+const requireFromHere = createRequire(import.meta.url);
 
 let lottieScriptCache: string | null = null;
 function getLottieScript(): string {
-  lottieScriptCache ??= readFileSync(LOTTIE_WEB_PATH, 'utf8');
+  lottieScriptCache ??= readFileSync(requireFromHere.resolve('lottie-web/build/player/lottie.min.js'), 'utf8');
   return lottieScriptCache;
 }
 

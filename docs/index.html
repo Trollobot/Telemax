@@ -103,9 +103,6 @@
   .phone{margin:0}
   .phone img{width:100%;display:block;border-radius:16px;border:1px solid var(--line);box-shadow:var(--shadow);background:#0d1117}
   .phone figcaption{text-align:center;font-size:.86rem;color:var(--muted);margin-top:10px}
-  .webshot{margin:0 auto;max-width:840px}
-  .webshot img{width:100%;display:block;border-radius:12px;border:1px solid var(--line);box-shadow:var(--shadow);background:#0d1117}
-  .webshot figcaption{text-align:center;font-size:.9rem;color:var(--muted);margin-top:12px}
   /* support */
   .support-box{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);
     padding:34px;text-align:center;box-shadow:var(--shadow)}
@@ -222,7 +219,7 @@
         <div class="feat"><div class="ic">🌐</div><h3>Прокси для Telegram</h3><p>SOCKS5/HTTP, если сервер ходит в Telegram только через прокси. MAX при этом идёт напрямую.</p></div>
         <div class="feat"><div class="ic">🔔</div><h3>Уведомления о сбоях</h3><p>Потеря связи, ошибки доставки — прилетают в группу, с защитой от спама.</p></div>
         <div class="feat"><div class="ic">⬆️</div><h3>Обновления по кнопке</h3><p>Бот сам сообщает о новом релизе и обновляется по нажатию — история переписки не затрагивается.</p></div>
-        <div class="feat"><div class="ic">🖥️</div><h3>Веб-панель</h3><p>Статус подключения, живые метрики, экран первой авторизации — по HTTPS.</p></div>
+        <div class="feat"><div class="ic">🔐</div><h3>Вход в MAX прямо в боте</h3><p>Команда <code>/login</code> в личке: номер, код из SMS и пароль 2FA — в группу они не попадают.</p></div>
       </div>
     </div>
   </section>
@@ -245,9 +242,9 @@
       <div class="kicker">Установка</div>
       <h2>Три шага — и мост работает</h2>
       <div class="steps" style="margin-top:30px">
-        <div class="step"><h3>Дешёвый VPS</h3><p>Любой сервер на Ubuntu/Debian — подойдёт самый бюджетный.</p></div>
+        <div class="step"><h3>Дешёвый VPS</h3><p>Любой сервер на Ubuntu 22.04+ или Debian 12+ — подойдёт самый бюджетный.</p></div>
         <div class="step"><h3>Свой бот в Telegram</h3><p>Создаёте бота в <code>@BotFather</code> и вставляете токен при установке. Бот ваш.</p></div>
-        <div class="step"><h3>setup.sh</h3><p>Скрипт спросит номер и код из SMS — и мост поднимется. Дальше всё в Telegram.</p></div>
+        <div class="step"><h3>setup.sh и /login</h3><p>Скрипт сам найдёт группу и поднимет мост, а номер и код из SMS вы введёте боту в личке командой <code>/login</code>. Дальше всё в Telegram.</p></div>
       </div>
       <p class="center" style="margin-top:32px">
         <a class="btn btn-primary" href="https://github.com/Trollobot/Telemax#быстрый-старт">Инструкция по установке</a>
@@ -266,8 +263,6 @@
         <figure class="phone"><img src="search.png" alt="Поиск контакта MAX по номеру или нику" loading="lazy"><figcaption>Поиск контакта</figcaption></figure>
         <figure class="phone"><img src="contact.png" alt="Карточка контакта, закреплённая в теме" loading="lazy"><figcaption>Карточка контакта</figcaption></figure>
       </div>
-      <p class="sub" style="margin:36px 0 18px">И веб-панель мониторинга — статус подключения, метрики, авторизация:</p>
-      <figure class="webshot"><img src="webpanel.png" alt="Веб-панель мониторинга Telemax: статус MAX/Telegram, метрики, аутентификация" loading="lazy"><figcaption>Веб-панель — статус MAX/Telegram и метрики в реальном времени</figcaption></figure>
     </div>
   </section>
 
