@@ -5,7 +5,7 @@ import { isTransientMaxError } from './transient.js';
 
 const logger = createLogger('maxauth');
 
-/** The MAX auth steps this flow drives — implemented in server/app.ts (maxAuth*), the only place a MAX login happens. */
+/** The MAX auth steps this flow drives — implemented by MaxSessionController (server/maxSession.ts), the only place a MAX login happens. */
 export interface MaxAuthCallbacks {
   /** Last phone we authenticated with ('' if none) — lets the flow offer a one-tap re-auth. */
   getLastKnownPhone: () => string;

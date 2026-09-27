@@ -34,8 +34,19 @@ export interface ControlPanelDeps {
    * miss). Lets the group-roster "Открыть личку" name a participant without a blocking CONTACT_INFO
    * round-trip — the same instant-name behaviour the search path gets from its own card cache. */
   resolveContactName?: (uid: string) => string | undefined;
-  /** Builds the «📊 Статус» text; `pausedLabel` is the panel-owned pause state (null when not paused). */
+  /** Builds the «📊 Статус» text; `pausedLabel` is the pause state (null when not paused). */
   getStatus?: (pausedLabel: string | null) => Promise<string>;
+  /** The MAX pause (server/maxSession.ts owns it): a deliberate disconnect with no auto-reconnect until resumed or the timer fires. */
+  pause: PauseControl;
+}
+
+export interface PauseControl {
+  /** Disconnects MAX for `seconds` (0 = until stop()). */
+  start(seconds: number): void;
+  /** Reconnects; false when not paused (a stale button). */
+  stop(): boolean;
+  /** Epoch ms the pause ends at (Number.POSITIVE_INFINITY = until stop()); null when not paused. */
+  until(): number | null;
 }
 
 // The panel message id is remembered in ./data so the same pinned message is edited
@@ -43,37 +54,10 @@ export interface ControlPanelDeps {
 // marker in server/app.ts).
 const PANEL_MARKER = path.join(process.cwd(), '.data', 'panel-message');
 
-// --- Pause state (panel-owned) -------------------------------------------------------
-// A deliberate pause disconnects MAX and suppresses auto-reconnect until resumed or the
-// timer fires. max.disconnect() removes its socket listeners, so no "connection lost"
-// alarm goes out for a deliberate pause. Not persisted — a container restart brings MAX
-// back online.
-let pauseUntil: number | null = null; // epoch ms; Number.POSITIVE_INFINITY = "forever"
-let pauseTimer: ReturnType<typeof setTimeout> | null = null;
-
-function clearPauseTimer(): void {
-  if (pauseTimer) {
-    clearTimeout(pauseTimer);
-    pauseTimer = null;
-  }
-}
-function isPaused(): boolean {
-  return pauseUntil != null;
-}
-
-/** Whether MAX is paused from the panel right now — /login refuses to run over a pause. */
-export function isMaxPaused(): boolean {
-  return isPaused();
-}
-
-/**
- * Forgets a panel pause WITHOUT reconnecting: /kill (MAX stays down anyway) and a sessionless /login
- * (which connects on its own). Otherwise the pause timer fired a max.connect() later — lifting /kill,
- * or tearing down the socket a /login auth chain was running on (review 2026-09-26, client-r1#2).
- */
-export function clearPause(): void {
-  clearPauseTimer();
-  pauseUntil = null;
+/** «до возобновления…» / «~N мин» for a pause ending at `until`; null when not paused. Pause lives in memory only: any container restart — including an auto-update — resumes MAX, so «навсегда» was a promise the code never kept. */
+function pauseLabel(until: number | null): string | null {
+  if (until == null) return null;
+  return until === Number.POSITIVE_INFINITY ? 'до возобновления или перезапуска моста' : `~${Math.max(0, Math.round((until - Date.now()) / 60000))} мин`;
 }
 
 // --- Contact-search force-reply correlation ------------------------------------------
@@ -107,16 +91,12 @@ function isOnMax(c: MaxContactInfo): boolean {
 
 type View = { text: string; markup: ReturnType<typeof Markup.inlineKeyboard>['reply_markup'] };
 
-function rootView(phone: string): View {
+function rootView(phone: string, pausedUntil: number | null): View {
   const version = getAppVersion();
+  const paused = pauseLabel(pausedUntil);
   let status: string;
-  if (isPaused()) {
-    status =
-      pauseUntil === Number.POSITIVE_INFINITY
-        // Pause lives in memory only: any container restart — including an auto-update — resumes MAX.
-        // Calling it «навсегда» was a promise the code never kept.
-        ? '⏸ MAX на паузе (до возобновления или перезапуска моста)'
-        : `⏸ MAX на паузе (~${Math.max(0, Math.round((pauseUntil! - Date.now()) / 60000))} мин)`;
+  if (paused) {
+    status = `⏸ MAX на паузе (${paused})`;
   } else if (!phone) {
     // No session yet (fresh install, or after /kill): must not look green — the user read it as "ok".
     status = '🔴 MAX: не авторизован — /login';
@@ -166,8 +146,8 @@ function webView(botUsername?: string): View {
     markup: Markup.inlineKeyboard(rows).reply_markup,
   };
 }
-function systemView(): View {
-  const pauseBtn = isPaused()
+function systemView(paused: boolean): View {
+  const pauseBtn = paused
     ? Markup.button.callback('▶️ Возобновить MAX', 'tlmx_panel:resume')
     : Markup.button.callback('⏸ Пауза MAX', 'tlmx_panel:pause');
   return {
@@ -192,14 +172,16 @@ function pauseView(): View {
 }
 
 export function wireControlPanel(deps: ControlPanelDeps): void {
-  const { bot, targetGroupId, max, getActivePhone, triggerFullResync, leaves, startDialog, resolveContactName, getStatus } = deps;
+  const { bot, targetGroupId, max, getActivePhone, triggerFullResync, leaves, startDialog, resolveContactName, getStatus, pause } = deps;
+  const root = (): View => rootView(getActivePhone(), pause.until());
+  const system = (): View => systemView(pause.until() != null);
 
   const edit = (ctx: Context, view: View) => ctx.editMessageText(view.text, { reply_markup: view.markup }).catch(() => {});
   const chatIdOf = (ctx: Context): number => ctx.chat?.id ?? Number(targetGroupId);
 
   // --- Startup: edit the remembered pinned panel, or post + pin a fresh one -----------
   async function postAndPin(): Promise<void> {
-    const { text, markup } = rootView(getActivePhone());
+    const { text, markup } = root();
     const sent = await bot.telegram.sendMessage(targetGroupId, text, { reply_markup: markup });
     await bot.telegram.pinChatMessage(targetGroupId, sent.message_id, { disable_notification: true }).catch(() => {});
     await mkdir(path.dirname(PANEL_MARKER), { recursive: true }).catch(() => {});
@@ -213,7 +195,7 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
       stored = null;
     }
     if (stored != null) {
-      const { text, markup } = rootView(getActivePhone());
+      const { text, markup } = root();
       try {
         await bot.telegram.editMessageText(targetGroupId, stored, undefined, text, { reply_markup: markup });
         await bot.telegram.pinChatMessage(targetGroupId, stored, { disable_notification: true }).catch(() => {});
@@ -245,7 +227,7 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
   // --- Navigation ---------------------------------------------------------------------
   bot.action('tlmx_panel:root', async (ctx) => {
     await ctx.answerCbQuery();
-    await edit(ctx, rootView(getActivePhone()));
+    await edit(ctx, root());
   });
   bot.action('tlmx_panel:contacts', async (ctx) => {
     await ctx.answerCbQuery();
@@ -261,7 +243,7 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
   });
   bot.action('tlmx_panel:system', async (ctx) => {
     await ctx.answerCbQuery();
-    await edit(ctx, systemView());
+    await edit(ctx, system());
   });
   bot.action('tlmx_panel:pause', async (ctx) => {
     await ctx.answerCbQuery();
@@ -307,14 +289,9 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
   bot.action('tlmx_panel:status', async (ctx) => {
     await ctx.answerCbQuery().catch(() => {});
     if (!getStatus) return;
-    const pausedLabel = isPaused()
-      ? pauseUntil === Number.POSITIVE_INFINITY
-        ? 'до возобновления или перезапуска моста'
-        : `~${Math.max(0, Math.round(((pauseUntil ?? Date.now()) - Date.now()) / 60000))} мин`
-      : null;
     let text: string;
     try {
-      text = await getStatus(pausedLabel);
+      text = await getStatus(pauseLabel(pause.until()));
     } catch (err) {
       logger.error('panel status failed', err);
       text = '❌ Не удалось собрать статус — смотрите логи контейнера.';
@@ -330,34 +307,13 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
   bot.action('tlmx_panel:resume', async (ctx) => {
     // A stale button (the pause already ended: its timer, /login, /kill) must not tear down the
     // live socket — an auth chain may be running on it (review 2026-09-27, client-r3.1#3).
-    if (!isPaused()) {
-      await ctx.answerCbQuery('MAX не на паузе').catch(() => {});
-      await edit(ctx, systemView());
-      return;
-    }
-    clearPauseTimer();
-    pauseUntil = null;
-    max.connect();
-    await ctx.answerCbQuery('MAX возобновлён');
-    await edit(ctx, systemView());
+    await ctx.answerCbQuery(pause.stop() ? 'MAX возобновлён' : 'MAX не на паузе').catch(() => {});
+    await edit(ctx, system());
   });
   bot.action(/^tlmx_panel:pause:(\d+)$/, async (ctx) => {
-    const secs = Number(ctx.match[1]);
-    clearPauseTimer();
-    max.disconnect();
-    if (secs === 0) {
-      pauseUntil = Number.POSITIVE_INFINITY;
-    } else {
-      pauseUntil = Date.now() + secs * 1000;
-      pauseTimer = setTimeout(() => {
-        pauseUntil = null;
-        pauseTimer = null;
-        max.connect();
-      }, secs * 1000);
-      pauseTimer.unref();
-    }
+    pause.start(Number(ctx.match[1]));
     await ctx.answerCbQuery('MAX на паузе');
-    await edit(ctx, systemView());
+    await edit(ctx, system());
   });
 
   // --- Contact search -----------------------------------------------------------------

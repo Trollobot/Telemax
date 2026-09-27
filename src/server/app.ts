@@ -2,21 +2,19 @@ import dns from 'node:dns';
 import { Telegraf } from 'telegraf';
 import path from 'node:path';
 import { readFile, unlink, writeFile } from 'node:fs/promises';
-import { MaxClient, isMaxServerError, type MaxMessageEvent, type MaxContactInfo } from '../max/client.js';
+import { MaxClient, type MaxMessageEvent, type MaxContactInfo } from '../max/client.js';
 import { DIR, OPCODES } from '../max/opcodes.js';
 import { dialogParticipantIds, extractMyAccountId, resolveChatName, type ContactProfile } from '../max/names.js';
-import { SessionStore, type MaxSession } from '../store/sessionStore.js';
+import { SessionStore } from '../store/sessionStore.js';
 import { ChatMapStore } from '../store/chatMapStore.js';
 import { wireBridge, syncAllChatsToTelegram, type ChatCatchUp } from '../bridge/sync.js';
 import { RetryBackoff } from '../bridge/catchUp.js';
 import { isTransientTelegramError } from '../bridge/transient.js';
-import { clearPause, isMaxPaused } from '../bridge/panel.js';
-import { MaxAuthUnavailableError } from '../bridge/maxAuthFlow.js';
-import { configureErrorReporter, reportBridgeError, resetErrorKey } from '../bridge/errorReporter.js';
+import { configureErrorReporter, reportBridgeError } from '../bridge/errorReporter.js';
 import { getAppVersion } from '../bridge/version.js';
-import { maskPhone } from '../bridge/status.js';
 import { createLogger } from '../logger.js';
 import { config } from './config.js';
+import { MaxSessionController } from './maxSession.js';
 import { getTelegramProxyAgent, initTelegramProxy } from '../telegram/proxy.js';
 
 const logger = createLogger('server');
@@ -51,23 +49,6 @@ const max = new MaxClient({ host: config.maxHost, sni: config.maxSni });
 let bot: Telegraf | null = null;
 let chatSync: ChatCatchUp | null = null;
 let tgActive = false;
-let maxConnected = false;
-let lastLoginAt: number | null = null; // set on every successful LOGIN (fresh or resumed) — shown in the panel's status
-let activePhone = '';
-let pendingPhone = '';
-// The phone we last authenticated with. Unlike currentSession/activePhone (wiped on a session
-// rejection), this SURVIVES so the Telegram /login flow can offer "re-auth with +7999***9999?" after a
-// reconnect failure — two taps instead of retyping the number. Cleared only by /kill or change-number.
-let lastKnownPhone = '';
-let pendingAuthToken: string | null = null;
-/** Set when verifyCode() comes back password_required — cleared only on a successful login, since the trackId survives a wrong password and can be retried (confirmed live 2026-08-14). */
-let pendingPasswordTrackId: string | null = null;
-// When the /login auth chain (START_AUTH -> CHECK_CODE -> LOGIN) started on the current socket; null
-// when none runs. A pending resume retry defers itself while it is fresh (scheduleResumeReconnect).
-// Bounded by AUTH_CHAIN_TTL_MS, the /login flow's own lifetime: an abandoned flow never ends it.
-let authChainStartedAt: number | null = null;
-const AUTH_CHAIN_TTL_MS = 10 * 60_000;
-let currentSession: MaxSession | null = null;
 // LOGIN's embedded chat list is capped at chatsCount (<=50) and, live, has also
 // been observed to just omit chats a later resumed-session LOGIN included —
 // cachedChats gets replaced with the real, fully-paginated CHATS_LIST result
@@ -77,6 +58,19 @@ let myAccountId: number | null = null;
 // Populated from CONTACT_INFO per DIALOG participant — not from LOGIN's contacts[],
 // which only has a single `name` per type (no firstName/lastName/phone).
 let contactProfiles: Map<number, ContactProfile> = new Map();
+
+// The MAX leg's state (socket, session, /login chain, resume retries, pause, outage notice) lives in
+// the controller; this file only feeds it the client's events and reacts to a login or /kill.
+const maxSession = new MaxSessionController({
+  client: max,
+  store: sessionStore,
+  onLogin: async (payload) => {
+    applyLoginPayload(payload);
+    await refreshChatsAndNames();
+    void syncChatsIfPossible();
+  },
+  postReauthNotice: (text) => (bot ? bot.telegram.sendMessage(config.targetTelegramGroup, text, maxLoginKeyboard()) : Promise.resolve()),
+});
 
 function extractChats(loginPayload: unknown): unknown[] {
   if (loginPayload && typeof loginPayload === 'object' && Array.isArray((loginPayload as { chats?: unknown }).chats)) {
@@ -131,119 +125,6 @@ async function refreshChatsAndNames(): Promise<void> {
   if (failed > 0) logger.warn(`CONTACT_INFO: ${failed} of ${participantIds.length} dialog profile(s) not fetched — those topics may carry a «MAX ID» name until the next refresh`);
 }
 const CONTACT_INFO_BATCH = 100;
-
-/** Shared tail end of both auth paths (plain SMS, and SMS + password) — exchanges a login token for a session and persists it. */
-async function completeMaxLogin(loginToken: string): Promise<void> {
-  let login: Awaited<ReturnType<typeof max.login>>;
-  try {
-    login = await max.login(loginToken);
-  } catch (err) {
-    // The SMS code (or password) is spent by now: «пришлите ещё раз» only hit «no pending auth».
-    // The chain is over, so a pending resume retry no longer defers to it (review 2026-09-27, client-r3.1#2).
-    authChainStartedAt = null;
-    // The raw client error is English or carries log-only diagnostics — logged, not shown (client-r3.2#1).
-    logger.error('LOGIN after a successful auth chain failed', err);
-    throw new MaxAuthUnavailableError(`Не удалось завершить вход в MAX: ${isMaxServerError(err) ? 'MAX отклонил вход' : 'MAX не ответил'}. Начните заново: /login`);
-  }
-  const session: MaxSession = {
-    sessionToken: login.sessionToken,
-    phone: pendingPhone,
-    deviceId: max.deviceId,
-    savedAt: new Date().toISOString(),
-  };
-  // In memory at once, like a resumed LOGIN: set only after the refresh and the save, a failed write
-  // or a reconnect meanwhile left a relaying bridge that /status called unauthorized and that never
-  // logged in again (review 2026-09-27, client-r3.1#1).
-  currentSession = session;
-  activePhone = session.phone;
-  lastKnownPhone = session.phone;
-  // No group notice from here: the /login flow (maxAuthFlow.announceAuthed) already posts
-  // «✅ MAX-авторизация восстановлена.» to the group, and this used to post it a second time
-  // (review 2026-09-26, client-r1#5). A resumed LOGIN keeps its own group notice.
-  maxSessionLostReported = false;
-  // A pending resume retry must not reconnect over this socket (review 2026-09-26, b3-liveness).
-  noteLoginSucceeded();
-  applyLoginPayload(login.payload);
-  try {
-    await sessionStore.save(session);
-  } catch (err) {
-    logger.error('MAX login succeeded but the session could not be saved to disk — running on the in-memory copy:', err);
-    reportBridgeError('session-save-failed', SESSION_SAVE_FAILED_TEXT);
-  }
-  await refreshChatsAndNames();
-  void syncChatsIfPossible();
-}
-
-const SESSION_SAVE_FAILED_TEXT =
-  '⚠️ Не удалось сохранить MAX-сессию на диск (нет места или нет прав на папку data?). Мост работает, но после перезапуска может понадобиться повторный вход. Подробности в логах контейнера (docker compose logs).';
-
-/** Bookkeeping shared by both successful LOGIN paths (fresh auth and a resumed session). */
-function noteLoginSucceeded(): void {
-  clearResumeRetryTimer();
-  authChainStartedAt = null;
-  resumeFailures = 0;
-  resumeBackoff.reset();
-  lastLoginAt = Date.now();
-  // With a session, "MAX is up" means a LOGIN went through, not just INIT (client-r2#1).
-  noteMaxUp();
-}
-
-// --- MAX auth steps: driven by the Telegram /login flow (maxAuthFlow.ts) — the only way to log in ---
-
-async function maxAuthRequestSms(rawPhone: string): Promise<void> {
-  const phone = rawPhone.replace(/[^\d+]/g, '');
-  if (!phone) throw new Error('Пустой номер телефона');
-  // No active session (first login / re-auth after loss / change-number): bring up a FRESH socket
-  // first — a socket left over from a rejected session refuses START_AUTH (hit live 2026-08-18).
-  // A panel pause (max.disconnect()) emits no 'disconnected', so maxConnected alone kept reading true:
-  // /login then failed on a raw «MaxClient.send called while not connected», or — without a session —
-  // connect() quietly lifted the pause while the panel still showed it, and the pause timer's own
-  // connect() later tore down the socket the SMS auth chain ran on (review 2026-09-26, client-r1#2).
-  if (!currentSession) {
-    clearPause(); // this login needs the connection: the pause ends here, timer included
-    await freshConnectForAuth();
-  } else if (isMaxPaused()) {
-    // Typed: the /login flow shows these alone and ends, no «Проверьте номер…» (client-r2#2).
-    throw new MaxAuthUnavailableError('MAX на паузе — снимите паузу в /panel (▶️ Возобновить MAX) и повторите /login.');
-  } else if (!maxConnected || max.stoppedByUser) {
-    throw new MaxAuthUnavailableError('Нет связи с MAX — подождите минуту и повторите /login.');
-  }
-  // An auth chain (START_AUTH -> CHECK_CODE -> LOGIN) now runs on this socket: a pending resume
-  // retry defers itself meanwhile instead of tearing the socket down under the user typing the SMS
-  // code (b3-liveness). It is NOT cleared: it is the only thing that reconnects after a rejected or
-  // timed-out resume LOGIN, and clearing it here left the bridge on that dead socket for good when
-  // START_AUTH then failed («Недопустимое состояние сессии») or the user abandoned the flow (review
-  // 2026-09-26, client-r2#0).
-  authChainStartedAt = Date.now();
-  try {
-    pendingAuthToken = await max.requestSms(phone);
-  } catch (err) {
-    authChainStartedAt = null;
-    throw err;
-  }
-  pendingPhone = phone;
-}
-
-async function maxAuthVerifyCode(code: string): Promise<{ ok: true } | { passwordRequired: true; hint: string | null }> {
-  if (!pendingAuthToken) throw new MaxAuthUnavailableError('Код уже использован или устарел — начните заново: /login');
-  const verified = await max.verifyCode(pendingAuthToken, code);
-  if (verified.status === 'password_required') {
-    pendingPasswordTrackId = verified.challenge.trackId;
-    return { passwordRequired: true, hint: verified.challenge.hint ?? null };
-  }
-  pendingAuthToken = null;
-  await completeMaxLogin(verified.loginToken);
-  return { ok: true };
-}
-
-async function maxAuthCheckPassword(password: string): Promise<void> {
-  if (!pendingPasswordTrackId) throw new MaxAuthUnavailableError('Проверка пароля уже завершена или устарела — начните заново: /login');
-  // NOT cleared on a throw: the trackId survives a wrong password on MAX's side, so the user can
-  // retry the password without a fresh SMS (confirmed live 2026-08-14). Only success clears it.
-  const loginToken = await max.checkPassword(pendingPasswordTrackId, password);
-  pendingPasswordTrackId = null;
-  await completeMaxLogin(loginToken);
-}
 
 /**
  * Idempotent — safe to call after every LOGIN (fresh auth or a reconnect's
@@ -370,13 +251,11 @@ function scheduleCatchUpRetry(reason: string): void {
 
 async function runCatchUpRetry(): Promise<void> {
   const bot_ = bot;
-  // Paused from the panel (or /kill): MAX is down on purpose — the LOGIN after the resume syncs.
-  // max.stoppedByUser, not maxConnected alone: a pause drops the socket without a 'disconnected'
-  // event, and every retry then failed each chat on "not connected" and re-armed itself for as
-  // long as the pause lasted (review 2026-09-26, cross). max.loggedIn too: maxConnected is TLS-level
-  // only, and on a socket whose LOGIN failed or timed out every chat failed on "not connected" the
-  // same way — the LOGIN that succeeds syncs (review 2026-09-27, client-r3.2#0).
-  if (!bot_ || !maxConnected || max.stoppedByUser || !max.loggedIn) return;
+  // Only over an accepted LOGIN. Paused from the panel (or /kill), MAX is down on purpose and every
+  // retry failed each chat on "not connected" and re-armed itself for as long as the pause lasted
+  // (review 2026-09-26, cross); on a socket whose LOGIN failed or timed out the same happened —
+  // the LOGIN that succeeds syncs (review 2026-09-27, client-r3.2#0).
+  if (!bot_ || maxSession.state !== 'loggedIn') return;
   try {
     await bot_.telegram.getMe();
   } catch (err) {
@@ -390,29 +269,12 @@ async function runCatchUpRetry(): Promise<void> {
   void syncChatsIfPossible();
 }
 
-/**
- * /kill's full teardown: disconnects the live MAX connection (closedByUser — no
- * auto-reconnect) and deletes the encrypted session so nothing short of a fresh
- * SMS login via /login in the bot's DM can bring the bridge back. Also resets every
- * in-memory cache derived from the old account so nothing lingers after a
- * different number logs in later. The server process itself keeps running —
- * only the MAX-side identity is torn down, not the whole service.
- */
+/** /kill: the controller closes the connection and deletes the session; every in-memory cache derived from the old account goes with it so nothing lingers after a different number logs in later. */
 async function killMaxSession(): Promise<void> {
-  max.disconnect();
-  clearResumeRetryTimer(); // a pending resume retry would max.connect() right back
-  clearPause(); // ...and so would a panel pause's timer (review 2026-09-26, client-r1#2)
-  await sessionStore.clear();
-  currentSession = null;
-  activePhone = '';
-  pendingPhone = '';
-  lastKnownPhone = '';
-  pendingAuthToken = null;
-  authChainStartedAt = null;
+  await maxSession.kill();
   cachedChats = [];
   myAccountId = null;
   contactProfiles = new Map();
-  maxConnected = false;
 }
 
 /** Keeps the LOGIN-derived chat snapshot from going stale as messages flow in either direction. Ids compare via String() — cached ids can be number OR BigInt (channels), and a strict === across those types silently never matches. */
@@ -435,55 +297,6 @@ function upsertCachedChat(chat: unknown): void {
   else cachedChats.push(chat);
 }
 
-// Set once we've told the group the MAX session was lost, so a "restored" notice only
-// fires after an actual loss — and only once.
-let maxSessionLostReported = false;
-
-// A resume LOGIN can fail transiently (a blip mid-handshake, a momentary server hiccup),
-// so we don't nuke the saved session on the first miss — we reconnect a fresh socket and let
-// 'ready' retry, only demanding a fresh SMS after several genuine failures in a row. resumeInFlight
-// collapses overlapping resumes (two 'ready' events racing) into one.
-// Only a server REJECTION (an ERR answer to LOGIN, MaxServerError) counts toward resumeFailures.
-// A timeout, a socket error or a bad frame says nothing about the token: those just reconnect
-// with backoff (resumeBackoff) and never wipe the session — before, three network blips in a row
-// deleted a valid session and demanded a fresh SMS (review 2026-09-26, RECOVERY4).
-let resumeFailures = 0;
-let resumeInFlight = false;
-const MAX_RESUME_RETRIES = 3;
-const RESUME_RETRY_DELAY_MS = 5_000;
-const resumeBackoff = new RetryBackoff(5_000, 60_000);
-let resumeRetryTimer: ReturnType<typeof setTimeout> | null = null;
-
-/**
- * Reconnects a fresh socket after `delayMs` so 'ready' retries the resume LOGIN. One timer at a time;
- * every successful LOGIN clears it (noteLoginSucceeded). connect() tears down whatever socket there
- * is and clears the client's own "stopped" flag, so the timer stands down when a LOGIN is running,
- * when MAX was stopped on purpose (a stale timer used to quietly lift a pause or undo /kill), and
- * when the socket is down — the client is then already reconnecting and its 'ready' retries the
- * LOGIN, which a connect() here would only cut short (review 2026-09-26, M14).
- */
-function scheduleResumeReconnect(delayMs: number): void {
-  clearResumeRetryTimer();
-  resumeRetryTimer = setTimeout(() => {
-    resumeRetryTimer = null;
-    if (resumeInFlight || max.stoppedByUser || !maxConnected) return;
-    // A /login auth chain runs on this socket: look again later instead of tearing it down under
-    // the user typing the SMS code — kept pending, not dropped (client-r2#0).
-    if (authChainStartedAt != null && Date.now() - authChainStartedAt < AUTH_CHAIN_TTL_MS) {
-      scheduleResumeReconnect(delayMs);
-      return;
-    }
-    max.connect();
-  }, delayMs);
-}
-
-function clearResumeRetryTimer(): void {
-  if (resumeRetryTimer) {
-    clearTimeout(resumeRetryTimer);
-    resumeRetryTimer = null;
-  }
-}
-
 /** Inline keyboard: a deep link into the bot's DM that kicks off the /login flow. undefined until the bot knows its own @username (Telegraf sets botInfo during launch). */
 function maxLoginKeyboard(): { reply_markup: { inline_keyboard: { text: string; url: string }[][] } } | undefined {
   const username = bot?.botInfo?.username;
@@ -491,189 +304,8 @@ function maxLoginKeyboard(): { reply_markup: { inline_keyboard: { text: string; 
   return { reply_markup: { inline_keyboard: [[{ text: '🔐 Войти в MAX', url: `https://t.me/${username}?start=login` }]] } };
 }
 
-/** Tells the group the MAX session was rejected and offers the in-bot re-auth flow (button + /login). Fires once per loss — guarded by maxSessionLostReported, reset by notifyMaxSessionRestored. */
-function notifyReauthNeeded(): void {
-  if (maxSessionLostReported) return;
-  maxSessionLostReported = true;
-  const text =
-    '❌ MAX-сессия отклонена — нужна повторная авторизация (номер + код из SMS). ' +
-    'Нажмите «🔐 Войти в MAX» и авторизуйтесь в личке бота (или напишите боту в личку /login). Пока переписка не пересылается.';
-  bot?.telegram
-    .sendMessage(config.targetTelegramGroup, text, maxLoginKeyboard())
-    .catch((err) => logger.error('Failed to send re-auth notice', err));
-}
-
-/** After a reported session loss, tells the group it's back — on resume or re-auth. */
-function notifyMaxSessionRestored(): void {
-  if (!maxSessionLostReported) return;
-  maxSessionLostReported = false;
-  reportBridgeError('max-session-ok', '✅ MAX-авторизация восстановлена.');
-}
-
-/** Forces a clean MAX socket and resolves once it has finished INIT (the 'ready' event).
- * Used before (re)authentication: a socket left over from a rejected session refuses
- * START_AUTH with "Недопустимое состояние сессии", so instead of requiring a manual
- * container restart (hit live 2026-08-18), we reconnect a fresh socket first. */
-function freshConnectForAuth(timeoutMs = 15000): Promise<void> {
-  return new Promise<void>((resolve, reject) => {
-    const onReady = (): void => {
-      clearTimeout(timer);
-      resolve();
-    };
-    const timer = setTimeout(() => {
-      max.off('ready', onReady);
-      reject(new MaxAuthUnavailableError('MAX не ответил при переподключении для авторизации — подождите минуту и повторите /login.'));
-    }, timeoutMs);
-    max.once('ready', onReady);
-    max.connect(); // tears down any stale socket and starts a fresh INIT
-  });
-}
-
-async function loginWithSession(session: MaxSession): Promise<void> {
-  if (resumeInFlight) return; // two 'ready' events (e.g. a racy reconnect) must not double-LOGIN
-  resumeInFlight = true;
-  try {
-    let login: Awaited<ReturnType<MaxClient['login']>>;
-    try {
-      login = await max.login(session.sessionToken);
-    } catch (err) {
-      await onResumeLoginFailed(err);
-      return;
-    }
-    const { sessionToken, payload } = login;
-    noteLoginSucceeded();
-    applyLoginPayload(payload);
-    activePhone = session.phone;
-    lastKnownPhone = session.phone;
-    // MAX rotates the session token on every LOGIN and eventually invalidates the previous
-    // one. The fresh-auth path (completeMaxLogin) already persists the new token; a resumed
-    // login must do the same — otherwise every reconnect keeps presenting the ORIGINAL token
-    // and, once its lifetime lapses, MAX rejects it. The "rotated"/"unchanged" tag confirms
-    // whether re-LOGIN actually hands back a NEW token (it must, for the proactive refresh
-    // below to keep the session alive on a rock-stable connection).
-    const refreshed: MaxSession = { ...session, sessionToken, savedAt: new Date().toISOString() };
-    currentSession = refreshed;
-    // A failed write (disk full, EACCES) is not a session failure: LOGIN succeeded and the token in
-    // memory is valid, so keep running on it. Counting it as one used to reconnect with the OLD
-    // token and, on the third try, delete a valid session (review 2026-09-26, C9).
-    try {
-      await sessionStore.save(refreshed);
-    } catch (err) {
-      logger.error('MAX login succeeded but the refreshed session could not be saved to disk — running on the in-memory copy:', err);
-      reportBridgeError('session-save-failed', SESSION_SAVE_FAILED_TEXT);
-    }
-    logger.info(`Resumed session for ${maskPhone(session.phone)} (token ${sessionToken === session.sessionToken ? 'unchanged' : 'rotated'})`);
-    notifyMaxSessionRestored();
-    await refreshChatsAndNames();
-    void syncChatsIfPossible();
-  } finally {
-    resumeInFlight = false;
-  }
-}
-
-/** The resume LOGIN threw — see the note above resumeFailures for which failures count. */
-async function onResumeLoginFailed(err: unknown): Promise<void> {
-  const msg = err instanceof Error ? err.message : String(err);
-  if (!isMaxServerError(err)) {
-    // Timeout (an undecodable answer ends up here too) or a lost socket: nothing is known about
-    // the token. Reconnect with backoff; the session stays as it is. After a lost socket the
-    // client is already reconnecting and the timer stands down (scheduleResumeReconnect).
-    const delay = resumeBackoff.next();
-    logger.warn(`Resume login did not complete (not a rejection), reconnecting in ${Math.round(delay / 1000)}s: ${msg}`);
-    scheduleResumeReconnect(delay);
-    // This loop (reconnect, INIT OK, LOGIN times out) never emits 'disconnected': without arming
-    // the outage notice here a LOGIN that never completes went on silently forever (client-r2#1).
-    armMaxDownNotice();
-    return;
-  }
-  resumeFailures += 1;
-  if (resumeFailures < MAX_RESUME_RETRIES) {
-    // The socket stays up after a rejected LOGIN (no 'disconnected' fires). Reconnect a fresh
-    // socket and let 'ready' retry rather than nuking a possibly-still-valid session on one
-    // transient miss — a single failure used to brick the bridge until a manual SMS re-auth.
-    logger.warn(`Resume login rejected (attempt ${resumeFailures}/${MAX_RESUME_RETRIES}), reconnecting to retry: ${msg}`);
-    scheduleResumeReconnect(RESUME_RETRY_DELAY_MS);
-  } else {
-    resumeFailures = 0;
-    logger.warn('Saved session was rejected after retries, clearing it:', msg);
-    currentSession = null;
-    activePhone = '';
-    // lastKnownPhone deliberately kept — the re-auth flow offers a one-tap "войти с +7999***9999?".
-    await sessionStore.clear().catch((clearErr) => logger.error('Failed to delete the rejected session file', clearErr));
-    // The connection itself is up (the server answered): without a session that is all "MAX is up"
-    // means, and the re-auth notice below replaces an outage notice (client-r2#1).
-    noteMaxUp();
-    // The bridge is functionally dead until someone re-authenticates. Prompt the in-bot flow.
-    notifyReauthNeeded();
-  }
-}
-
-// --- MAX outage notice ---
-// A brief MAX drop during a reconnect is normal and shouldn't ping the group — only a sustained
-// outage (still down 60s later) earns an operator notice, paired with a "recovered" once it's back.
-// "Back" means a LOGIN went through when there is a session (noteLoginSucceeded), and INIT OK
-// ('ready') only without one. Clearing it on INIT alone let a LOGIN that never completes — timing
-// out on every retry, or the socket reset right after INIT — go on without any notice while /status
-// read «подключён» (review 2026-09-26, client-r2#1). Not on the TLS handshake ('connected') either:
-// a server that accepts TLS and drops the socket right away restarted the 60 s window on every
-// attempt (review 2026-09-26, M4).
-let maxDownTimer: ReturnType<typeof setTimeout> | null = null;
-let maxDownReported = false;
-
-/** Starts the 60 s outage window unless one runs or an outage is already reported. */
-function armMaxDownNotice(): void {
-  if (maxDownTimer != null || maxDownReported) return;
-  maxDownTimer = setTimeout(() => {
-    maxDownTimer = null;
-    // Stopped on purpose meanwhile (panel pause, /kill — max.disconnect() emits nothing): no
-    // reconnect is coming, so «пытаюсь переподключиться» would be false (review 2026-09-26,
-    // client-r1#4).
-    if (max.stoppedByUser) return;
-    maxDownReported = true;
-    // Every reported loss gets its «✅» — 'max-up' has its own cooldown, which used to swallow
-    // the recovery of a second outage within 10 minutes while its «❌» went out.
-    resetErrorKey('max-up');
-    reportBridgeError('max-down', '❌ Потеряна связь с MAX. Пытаюсь переподключиться…');
-  }, 60_000);
-}
-
-/** MAX is up again: cancels a running outage window, and reports the recovery of a reported outage. */
-function noteMaxUp(): void {
-  if (maxDownTimer) {
-    clearTimeout(maxDownTimer);
-    maxDownTimer = null;
-  }
-  if (maxDownReported) {
-    maxDownReported = false;
-    resetErrorKey('max-down');
-    reportBridgeError('max-up', '✅ Связь с MAX восстановлена.');
-  }
-}
-
 async function startServer(): Promise<void> {
-  currentSession = await sessionStore.load();
-  if (currentSession) lastKnownPhone = currentSession.phone;
-
-  // --- MAX client wiring ---
-  max.on('connected', () => {
-    maxConnected = true;
-  });
-
-  max.on('ready', () => {
-    if (currentSession) void loginWithSession(currentSession);
-    else noteMaxUp();
-  });
-
-  max.on('disconnected', () => {
-    maxConnected = false;
-    // An auth chain dies with its socket.
-    authChainStartedAt = null;
-    // The client reconnects on its own and 'ready' retries the LOGIN; a pending resume retry
-    // would only cut that attempt short (review 2026-09-26, M14).
-    clearResumeRetryTimer();
-    armMaxDownNotice();
-  });
-
+  // --- MAX client wiring: the lifecycle events go to the controller, the rest is cache upkeep ---
   max.on('error', (err: Error) => logger.error('MAX client error:', err.message));
   // An undecodable frame on a live socket: diagnostic only, nothing waiting on the socket fails.
   max.on('decode-error', (err: Error) => logger.warn('MAX frame could not be decoded, skipped:', err.message));
@@ -692,7 +324,7 @@ async function startServer(): Promise<void> {
     }
   });
 
-  max.connect();
+  maxSession.start(await sessionStore.load());
 
   // Build the Telegram proxy agent (TELEGRAM_PROXY from .env) before the bot is
   // built — Telegraf binds its agent at construction time, so this has to run
@@ -728,18 +360,21 @@ async function startServer(): Promise<void> {
         getChats: () => cachedChats,
         getMyAccountId: () => myAccountId,
         getContactProfiles: () => contactProfiles,
-        getActivePhone: () => activePhone,
-        // Connected = LOGIN accepted while a session exists: a socket whose LOGIN keeps failing read
-        // «🟢 подключён» next to «❌ Потеряна связь с MAX» (review 2026-09-27, client-r3.2#0).
-        getMaxState: () => ({ connected: maxConnected && (max.loggedIn || !currentSession), lastLoginAt }),
+        getActivePhone: () => maxSession.activePhone,
+        getMaxState: () => maxSession.status(),
         triggerFullResync: () => refreshChatsAndNames().then(() => syncChatsIfPossible()),
         killEverything: killMaxSession,
         suspendChatSync,
         auth: {
-          getLastKnownPhone: () => lastKnownPhone,
-          requestSms: maxAuthRequestSms,
-          verifyCode: maxAuthVerifyCode,
-          checkPassword: maxAuthCheckPassword,
+          getLastKnownPhone: () => maxSession.lastKnownPhone,
+          requestSms: (phone) => maxSession.requestSms(phone),
+          verifyCode: (code) => maxSession.verifyCode(code),
+          checkPassword: (password) => maxSession.checkPassword(password),
+        },
+        pause: {
+          start: (seconds) => maxSession.pause(seconds),
+          stop: () => maxSession.unpause(),
+          until: () => maxSession.pausedUntil,
         },
       }));
       chatSync.setRetryHandler(scheduleCatchUpRetry);
@@ -771,7 +406,7 @@ async function startServer(): Promise<void> {
     } catch {
       // bot may not have launched (bad token, mid-retry) — nothing to stop
     }
-    max.disconnect();
+    maxSession.shutdown();
     // Let in-flight work (a mid-write store persist, the polling loop's teardown)
     // drain naturally; the timer is the failsafe so a lingering keep-alive socket
     // or maintenance interval can't hold the process past docker's stop timeout.
@@ -933,7 +568,7 @@ async function launchTelegramBotWithRetry(bot: Telegraf, attempt = 0): Promise<v
   // MAX_SESSION_KEY — the usual cause is restoring ./data without carrying .env across). The bridge
   // is up but unauthenticated, so say so in the group with the same re-auth prompt a rejected
   // session gets; otherwise it just sits there silently doing nothing.
-  if (sessionStore.corruptedOnLoad) notifyReauthNeeded();
+  if (sessionStore.corruptedOnLoad) maxSession.notifyReauthNeeded();
   void announceGroupReadyOnce(bot);
 
   // message_reaction and poll_answer are opt-in — Telegram omits them from the default update set unless
@@ -965,7 +600,7 @@ function createBotSafely(token: string): Telegraf | null {
 startServer().catch((err) => {
   logger.error('Fatal startup error:', err);
   try {
-    max.disconnect();
+    maxSession.shutdown();
   } catch {
     // exiting anyway
   }

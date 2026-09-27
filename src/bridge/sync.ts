@@ -19,7 +19,7 @@ import { splitTelegramText, truncateCodePoints, truncateUtf16, TELEGRAM_CAPTION_
 import { uploadTelegramAttachmentToMax } from './upload.js';
 import { canRenderAnimatedStickers } from './lottie.js';
 import { reportBridgeError } from './errorReporter.js';
-import { wireControlPanel } from './panel.js';
+import { wireControlPanel, type PauseControl } from './panel.js';
 import { createBugReports, isBugReportInboxEnabled, BUGREPORT_BOT_HANDLE, type BugReports } from './bugReports.js';
 import { createMaxAuthFlow, type MaxAuthCallbacks } from './maxAuthFlow.js';
 import { createTelemetry } from './telemetry.js';
@@ -1442,8 +1442,10 @@ export interface BridgeOptions {
    * (review 2026-09-26, C7).
    */
   suspendChatSync: () => Promise<() => void>;
-  /** MAX auth steps for the in-Telegram /login flow (server/app.ts's maxAuth* functions). */
+  /** MAX auth steps for the in-Telegram /login flow (server/maxSession.ts). */
   auth: MaxAuthCallbacks;
+  /** The panel's MAX pause (server/maxSession.ts). */
+  pause: PauseControl;
 }
 
 /** Wires MAX push messages <-> Telegram forum topics in both directions (ТЗ.md §1.2). */
@@ -1466,6 +1468,7 @@ export function wireBridge({
   killEverything,
   suspendChatSync,
   auth,
+  pause,
 }: BridgeOptions): WiredBridge {
   // Bug-report channel: private DMs from outsiders become bug reports. The inbox is only
   // ON where BUGREPORT_INBOX is set (the maintainer's prod bot); everywhere else the flag
@@ -2928,6 +2931,7 @@ export function wireBridge({
     getActivePhone,
     triggerFullResync,
     startDialog,
+    pause,
     // Warm-cache name lookup for the group-roster "Открыть личку" button — buildRoster already
     // fetched every participant's profile, so this resolves instantly with no MAX round-trip
     // (undefined on a genuine miss, which lets the panel fall back to a CONTACT_INFO lookup).
