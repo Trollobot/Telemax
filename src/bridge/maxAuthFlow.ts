@@ -20,8 +20,8 @@ export interface MaxAuthCallbacks {
 /**
  * requestSms refusing because of the connection state (MAX paused, no connection), not the number:
  * the flow shows the message alone and ends, instead of «Проверьте номер…» and waiting for a number
- * that would only hit the same refusal (review 2026-09-26, client-r2#2). Likewise a code or password
- * already spent on a LOGIN that then failed (review 2026-09-27, client-r3.1#2).
+ * that would only hit the same refusal. Likewise a code or password already spent on a LOGIN
+ * that then failed.
  */
 export class MaxAuthUnavailableError extends Error {
   constructor(message: string) {
@@ -110,7 +110,7 @@ export function createMaxAuthFlow(opts: { targetGroupId: string; auth: MaxAuthCa
   /**
    * A MaxAuthUnavailableError is shown alone and ends the flow: resending would only hit it again.
    * A timeout or dropped socket says nothing about the number, code or password: a plain retry hint
-   * instead of the raw English client error, and the flow stays open (review 2026-09-27, client-r3.3#0).
+   * instead of the raw English client error, and the flow stays open.
    */
   async function replyKnownError(ctx: Context, chatId: number, err: unknown): Promise<boolean> {
     if (err instanceof MaxAuthUnavailableError) {

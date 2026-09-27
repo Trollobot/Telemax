@@ -5,10 +5,9 @@
 
 /**
  * The cursor value for a message relayed live: its MAX server time (a push's message.time, the
- * MSG_SEND response's message.time), so the cursor stays in the same clock fetchFullHistory
- * compares against. Local receipt time is only the fallback when the server gave none — a
- * skewed VPS clock otherwise cut off (fast clock) or re-sent (slow clock) messages at the next
- * catch-up (review 2026-09-26, RECOVERY9).
+ * MSG_SEND response's message.time), so the cursor stays in the clock fetchFullHistory compares
+ * against. Local receipt time is only the fallback — a skewed host clock otherwise cut off or
+ * re-sent messages at the next catch-up.
  */
 export function liveCursorTime(serverTime: unknown, now: number = Date.now()): number {
   if (typeof serverTime === 'number' || typeof serverTime === 'bigint' || (typeof serverTime === 'string' && serverTime.trim() !== '')) {
@@ -19,10 +18,9 @@ export function liveCursorTime(serverTime: unknown, now: number = Date.now()): n
 }
 
 /**
- * Thrown out of a chat's backfill or topic restore when the chat was banned (/ban) meanwhile. /ban
- * deletes the topic, and the recreate-on-thread-not-found healing used to bring it straight back:
- * a fresh mapping without the `banned` flag, the history replayed into it (review 2026-09-26, cross).
- * Stops that one chat only; nothing is retried.
+ * Thrown out of a chat's backfill or topic restore when the chat was banned (/ban) meanwhile —
+ * the thread-not-found healing must not bring the deleted topic straight back. Stops that one
+ * chat only; nothing is retried.
  */
 export class ChatBannedError extends Error {
   constructor(readonly chatId: string) {
@@ -31,7 +29,7 @@ export class ChatBannedError extends Error {
   }
 }
 
-/** Thrown out of the history sync when /reboot or /kill cancelled it (review 2026-09-26, C7). */
+/** Thrown out of the history sync when /reboot or /kill cancelled it. */
 export class SyncCancelledError extends Error {
   constructor() {
     super('Chat sync cancelled');
@@ -40,14 +38,12 @@ export class SyncCancelledError extends Error {
 }
 
 /**
- * Counts transient failures per key (one MAX message) across catch-up runs. The backfill stops on a
- * transient error and is retried later — but a failure that only LOOKS transient and repeats every
- * time (a proxy that always drops one oversized upload, a CDN file that always times out) would
- * park the chat's cursor on that message forever. After `limit` strikes spread over at least
- * `minSpanMs` the next try degrades it to placeholders (isLastTry). The span keeps a plain outage
- * from counting as "this message is broken": a catch-up now runs on every push of the chat, so
- * three strikes can land within seconds of a short Telegram hiccup (review 2026-09-26, b2b-errors).
- * Bounded (FIFO, `cap`). `now` is injectable for tests.
+ * Counts transient failures per key (one MAX message) across catch-up runs: a failure that only
+ * LOOKS transient and repeats every time (a CDN file that always times out) would park the chat's
+ * cursor on that message forever. After `limit` strikes spread over at least `minSpanMs` the next
+ * try degrades it to placeholders (isLastTry); the span keeps a short outage from counting as
+ * "this message is broken" (a catch-up runs on every push, so three strikes can land within
+ * seconds). Bounded (FIFO, `cap`). `now` is injectable for tests.
  */
 export class StrikeCounter {
   private readonly strikes = new Map<string, { n: number; firstAt: number }>();

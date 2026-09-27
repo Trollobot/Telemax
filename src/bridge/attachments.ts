@@ -1,15 +1,12 @@
 /**
  * MAX <-> Telegram attachment handling.
  *
- * PHOTO and STICKER carry a ready-to-use URL right in the push (max-protocol-full.md
- * §1.6). FILE and VIDEO deliberately do not — both are gated behind a two-step
- * exchange (undocumented in max-protocol-full.md, supplied by the user from their
- * own reverse-engineering on 2026-08-07):
+ * PHOTO and STICKER carry a ready-to-use URL right in the push (max-protocol-full.md §1.6). FILE
+ * and VIDEO are gated behind a two-step exchange (reverse-engineered 2026-08-07):
  *   FILE:  FILE_DOWNLOAD  (0x58) {chatId, messageId, fileId}  -> {url}
  *   VIDEO: VIDEO_PLAY     (0x53) {chatId, messageId, videoId} -> {MP4_240, EXTERNAL, ...}
- * VIDEO has its own id namespace — videoId is NOT a fileId, and FILE_DOWNLOAD
- * rejects it with "file not found". Pick any `MP4_*` key from the VIDEO_PLAY
- * response; there's no guarantee which qualities exist for a given video.
+ * VIDEO has its own id namespace — FILE_DOWNLOAD rejects a videoId with "file not found". No
+ * guarantee which `MP4_*` qualities exist for a given video.
  */
 import { gzipSync } from 'node:zlib';
 import type { MaxClient } from '../max/client.js';
@@ -32,10 +29,8 @@ export interface MaxAttachment {
   size?: number;
   token?: string;
   videoId?: unknown;
-  // `videoType: 1` is a round video message ("кружочек") — Telegram needs a dedicated
-  // API call (sendVideoNote) to render it as a circle instead of a regular rectangle;
-  // `0` is an ordinary video. Confirmed live 2026-08-13 (both examples were square,
-  // width===height, but only videoType told them apart).
+  // `videoType: 1` is a round video message ("кружочек", Telegram's sendVideoNote); `0` an
+  // ordinary video. Confirmed live 2026-08-13 — only videoType tells them apart, not the dimensions.
   videoType?: number;
   // POLL
   title?: string;
@@ -62,8 +57,7 @@ export interface MaxAttachment {
   event?: string;
   chatType?: string;
   userIds?: unknown[];
-  // AUDIO (voice message) — unlike FILE/VIDEO, carries a ready-to-use `url` right in
-  // the attach, same as PHOTO/STICKER — no FILE_DOWNLOAD-style exchange needed.
+  // AUDIO (voice message) — carries a ready-to-use `url` like PHOTO/STICKER.
   audioId?: unknown;
   wave?: unknown;
   // LOCATION — a shared point on the map, no download step at all.
@@ -90,30 +84,22 @@ export interface DownloadContext {
   max: MaxClient;
   chatId: unknown;
   messageId: unknown;
-  // For a forward whose source chat we can't access (link.chatId comes back as 0), the file
-  // is still reachable via the chat the forward LANDED in — our dialog with the forwarder.
-  // FILE_DOWNLOAD/VIDEO_PLAY retry with these when the primary (source) ids are denied.
+  // Retried with these when the primary (source) ids are denied — see sync.ts forwardDownloadIds.
   fallbackChatId?: unknown;
   fallbackMessageId?: unknown;
-  // Throw TransientDownloadError instead of returning null when the download failed for a
-  // reason that may pass (MAX socket down or timed out, CDN 5xx/network). Set by the history
-  // backfill, which must not advance its cursor past a file it could not fetch — the live path
-  // leaves it unset and keeps the text placeholder (review 2026-09-26, RECOVERY3).
+  // Throw TransientDownloadError instead of returning null when the download failed for a reason
+  // that may pass (MAX socket down, CDN 5xx/network). Set by the backfill, which must not advance
+  // its cursor past a file it could not fetch; the live path keeps the text placeholder.
   throwOnTransient?: boolean;
 }
 
-// Generous — covers a large video on a slow CDN — but finite: a hung download must
-// not stall the relay handler forever (nothing else here bounds it).
+// Generous (a large video on a slow CDN) but finite: a hung download must not stall the relay forever.
 const DOWNLOAD_TIMEOUT_MS = 120_000;
-// Bot API upload limits (multipart, the only way this bridge uploads): 50 MB for any file, 10 MB
-// for a photo. Anything bigger is refused with 413, so it was never deliverable anyway.
+// Bot API upload limits (multipart): 50 MB for any file, 10 MB for a photo — bigger is refused with 413.
 export const TELEGRAM_UPLOAD_LIMIT_BYTES = 50 * 1024 * 1024;
 export const TELEGRAM_PHOTO_LIMIT_BYTES = 10 * 1024 * 1024;
-// A response was buffered whole with no ceiling, so ONE oversized incoming file could exhaust the
-// container's memory and take the bridge down (and it would keep happening on every retry). The cap
-// is Telegram's own upload limit: a bigger file could only fail on upload, so it gets the text
-// placeholder instead (the cap used to be 100 MB, and a 50–100 MB file aborted its whole message —
-// review 2026-09-26, INBOUND-EDGES1).
+// A response is buffered whole, so an unbounded download could exhaust the container's memory.
+// A file over Telegram's upload limit could only fail on upload anyway — it gets the placeholder.
 const MAX_DOWNLOAD_BYTES = TELEGRAM_UPLOAD_LIMIT_BYTES;
 
 /**
@@ -127,10 +113,9 @@ export function telegramSendKind(kind: DownloadedAttachment['kind'], bytes: numb
   return kind;
 }
 
-// Every URL that reaches this helper is a MAX-owned host (photo/sticker/file/video
-// CDN) — hence maxFetch, which trusts the Russian state chain those certs use.
+// Every URL here is a MAX-owned CDN host — hence maxFetch, which trusts the Russian state chain.
 // Null for a permanent failure (4xx, over the size cap); throws TransientDownloadError for one
-// that may pass (5xx, network, timeout) — downloadMaxAttachment decides what the caller sees.
+// that may pass (5xx, network, timeout).
 async function downloadUrl(url: string): Promise<Buffer | null> {
   try {
     const res = await maxFetch(url, { signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
@@ -159,10 +144,9 @@ async function downloadUrl(url: string): Promise<Buffer | null> {
   }
 }
 
-/** Runs a chat-scoped download (FILE_DOWNLOAD / VIDEO_PLAY) against the primary ids; if that
- * is denied and the context carries fallback ids (a forward's recipient chat), retries there.
- * Returns null when every attempt fails for good; throws TransientDownloadError when the MAX
- * socket was down or timed out (no point trying the fallback ids over the same dead socket). */
+/** Runs a chat-scoped download (FILE_DOWNLOAD / VIDEO_PLAY) against the primary ids, retrying with
+ * the fallback ids (a forward's recipient chat) when denied. Null when every attempt fails for good;
+ * throws TransientDownloadError when the MAX socket was down (no point retrying over the same dead socket). */
 async function withDownloadFallback<T>(
   ctx: DownloadContext,
   label: string,
@@ -223,22 +207,15 @@ async function downloadAttachmentOrThrow(att: MaxAttachment, ctx: DownloadContex
     return { buffer, filename: `photo_${String(att.photoId ?? Date.now())}.jpg`, kind: 'photo' };
   }
 
-  // Animated stickers (`stickerType: 'LOTTIE'`) carry a `lottieUrl` pointing at a
-  // gzip-compressed Lottie JSON that's already structurally a valid Telegram `.tgs`
-  // (512x512 canvas, 60fps, ~2.5s, pure vector shape/precomp layers, even carries
-  // Telegram's own `tgs:1` marker — inspected live 2026-08-13). First attempt at
-  // sending it via sendSticker showed a broken "Unknown Track" placeholder — root
-  // cause turned out to be `downloadUrl`'s fetch() transparently auto-decompressing
-  // the gzip Content-Encoding (standard fetch behavior), so what we forwarded to
-  // Telegram as a `.tgs` was actually plain decompressed JSON, not a real gzip
-  // file. Re-gzipping the already-decompressed buffer here fixes that.
+  // Animated stickers carry a `lottieUrl`: gzip-compressed Lottie JSON that is already a valid
+  // Telegram `.tgs` (inspected live 2026-08-13). fetch() transparently un-gzips it, so it must be
+  // re-gzipped — plain JSON sent as `.tgs` shows a broken "Unknown Track" placeholder.
   if (att._type === 'STICKER' && att.lottieUrl) {
     try {
       const buffer = await downloadUrl(att.lottieUrl);
       if (buffer) return { buffer: gzipSync(buffer), filename: `sticker_${String(att.stickerId ?? Date.now())}.tgs`, kind: 'sticker' };
     } catch (err) {
-      // The static preview below is still a sticker — only a transient failure with no
-      // preview to fall back on is worth reporting as such.
+      // The static preview below is still a sticker — only with no preview is a transient failure worth reporting.
       if (!att.url) throw err;
     }
   }
@@ -246,8 +223,7 @@ async function downloadAttachmentOrThrow(att: MaxAttachment, ctx: DownloadContex
   if (att._type === 'STICKER' && att.url) {
     const buffer = await downloadUrl(att.url);
     if (!buffer) return null;
-    // Confirmed live 2026-08-13: this preview URL serves image/png regardless of
-    // sticker type, so it renders properly through the PHOTO pipeline.
+    // Confirmed live 2026-08-13: the preview URL serves image/png regardless of sticker type.
     return { buffer, filename: `sticker_${String(att.stickerId ?? Date.now())}.png`, kind: 'photo' };
   }
 
@@ -259,9 +235,8 @@ async function downloadAttachmentOrThrow(att: MaxAttachment, ctx: DownloadContex
     if (!url) return null;
     const buffer = await downloadUrl(url);
     if (!buffer) return null;
-    // A literal quote in a MAX-side filename breaks telegraf's multipart Content-Disposition —
-    // Telegram's server drops the connection mid-response and sendDocument dies with "invalid
-    // json response body" (hit live 2026-08-15 with names an earlier upload bug had quoted).
+    // A literal quote in a filename breaks telegraf's multipart Content-Disposition — sendDocument
+    // dies with "invalid json response body" (hit live 2026-08-15).
     const safeName = (att.name ?? `file_${Date.now()}`).replace(/[\r\n"\\]/g, '_');
     return { buffer, filename: safeName, kind: 'document' };
   }
@@ -278,8 +253,7 @@ async function downloadAttachmentOrThrow(att: MaxAttachment, ctx: DownloadContex
       ctx.max.getVideoPlayUrls(chatId, messageId, videoId),
     );
     if (!urls) return null;
-    // Highest resolution first, stepping down while a quality is refused — typically for being
-    // over Telegram's 50 MB upload limit (downloadUrl's cap), where a lower one still fits.
+    // Highest resolution first, stepping down while a quality is over the size cap.
     const mp4Keys = Object.keys(urls)
       .filter((k) => k.startsWith('MP4_') && urls[k])
       .sort((a, b) => Number(b.slice(4)) - Number(a.slice(4)));

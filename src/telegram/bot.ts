@@ -6,10 +6,8 @@ import { truncateUtf16 } from '../bridge/text.js';
 
 const logger = createLogger('telegram');
 
-// Telegram only accepts these six fixed values for a forum topic's icon_color —
-// no arbitrary RGB, and no way to use an actual photo (Bot API limitation, not
-// ours). Hashing the MAX chat id picks one deterministically, so the same
-// contact's topic always gets the same color, even recreated after /reboot.
+// Telegram only accepts these six values for a forum topic's icon_color. Hashing the MAX chat id
+// picks one deterministically, so a contact's topic keeps its color even recreated after /reboot.
 const TOPIC_ICON_COLORS = [0x6fb9f0, 0xffd67e, 0xcb86db, 0x8eee98, 0xff93b2, 0xfb6f5f] as const;
 
 function pickTopicIconColor(maxChatId: unknown): (typeof TOPIC_ICON_COLORS)[number] {
@@ -25,12 +23,9 @@ export interface EnsuredTopic {
   created: boolean;
 }
 
-// Recognized Telegram API failures we can give the group admin actionable advice
-// for, instead of leaving them to dig through server logs (or, worse, just see
-// nothing happen at all) — extend as new patterns turn up. `not enough rights to
-// create a topic` confirmed live 2026-08-14: "Manage Topics" isn't part of
-// Telegram's default admin preset, so every single chat failed the same way with
-// no visible explanation to whoever set the bot up.
+// Telegram API failures the group admin gets actionable advice for instead of digging through
+// logs. `not enough rights to create a topic` confirmed live 2026-08-14: "Manage Topics" isn't in
+// Telegram's default admin preset, so every chat failed the same way with no visible explanation.
 const KNOWN_TELEGRAM_ERRORS: { match: string; advice: string }[] = [
   {
     match: 'not enough rights to create a topic',
@@ -47,10 +42,8 @@ const KNOWN_TELEGRAM_ERRORS: { match: string; advice: string }[] = [
   },
 ];
 
-// Module-level, not per-call — the same misconfiguration will otherwise repeat
-// for every single chat in a bulk resync (confirmed live: 14 identical failures
-// in one /reboot run). Cleared once a create actually succeeds, so a real fix
-// gets acknowledged instead of the warning going stale forever.
+// Module-level: the same misconfiguration repeats for every chat in a bulk resync (confirmed live:
+// 14 identical failures in one /reboot). Cleared once a create succeeds, so a real fix is acknowledged.
 let lastWarnedAdvice: string | null = null;
 
 async function warnAboutKnownTelegramError(bot: Telegraf, groupId: string, err: unknown): Promise<void> {
@@ -62,7 +55,7 @@ async function warnAboutKnownTelegramError(bot: Telegraf, groupId: string, err: 
 }
 
 /** Telegram's limit for a forum topic name, in UTF-16 units. */
-export const TOPIC_TITLE_LIMIT = 128;
+const TOPIC_TITLE_LIMIT = 128;
 
 /** A topic title Telegram accepts: trimmed, at most 128 units without splitting an emoji; undefined when blank. */
 export function clampTopicTitle(title: string | undefined | null): string | undefined {
@@ -70,12 +63,9 @@ export function clampTopicTitle(title: string | undefined | null): string | unde
   return clamped || undefined;
 }
 
-// One ensureTopicForMaxChat at a time per chat. MAX pushes aren't serialized (handleMaxPush runs
-// per frame without awaiting the previous one) and a brand-new chat arrives as a burst (CONTROL
-// 'new', CHAT_UPDATE, the first message) — two concurrent check-then-create runs each opened a
-// topic, the later upsert won and the first topic was orphaned along with the message sent into
-// it (review 2026-09-26, S3). Serializing per chat makes the second caller find the mapping the
-// first one just wrote (created: false, so only one of them seeds the topic).
+// One ensureTopicForMaxChat at a time per chat: a brand-new chat arrives as a burst (CONTROL 'new',
+// CHAT_UPDATE, the first message), and two concurrent check-then-create runs each opened a topic,
+// orphaning one. Serialized, the second caller finds the mapping the first just wrote (created: false).
 const topicLocks = new Map<string, Promise<unknown>>();
 
 /** Runs `fn` after every earlier call holding the same key has settled. Exported for tests. */
@@ -94,14 +84,10 @@ export function withTopicLock<T>(key: string, fn: () => Promise<T>): Promise<T> 
 }
 
 /**
- * Finds the Telegram forum topic for a MAX chat, creating one on first contact.
- * If the resolved display name has since changed (e.g. a better name became
- * available via CONTACT_INFO, or a contact renamed themselves) and the topic
- * already exists, renames it in place instead of leaving the stale title — but
- * never to a generic fallback («MAX ID n», «CHAT n», … — see isFallbackTitle): a
- * full resync passes resolveChatName's raw result, which is exactly that while
- * contact profiles are still unknown (review 2026-09-26, C5). Titles are clamped
- * to Telegram's 128-unit limit for both rename and create.
+ * Finds the Telegram forum topic for a MAX chat, creating one on first contact. An existing topic
+ * whose resolved display name changed (a better name via CONTACT_INFO, a contact renamed) is
+ * renamed in place — but never to a generic fallback («MAX ID n», «CHAT n», see isFallbackTitle),
+ * which is what a full resync passes while contact profiles are still unknown.
  */
 export function ensureTopicForMaxChat(
   bot: Telegraf,

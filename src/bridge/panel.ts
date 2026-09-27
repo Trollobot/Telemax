@@ -306,7 +306,7 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
   // --- Pause / resume -----------------------------------------------------------------
   bot.action('tlmx_panel:resume', async (ctx) => {
     // A stale button (the pause already ended: its timer, /login, /kill) must not tear down the
-    // live socket — an auth chain may be running on it (review 2026-09-27, client-r3.1#3).
+    // live socket — an auth chain may be running on it.
     await ctx.answerCbQuery(pause.stop() ? 'MAX возобновлён' : 'MAX не на паузе').catch(() => {});
     await edit(ctx, system());
   });

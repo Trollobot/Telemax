@@ -9,7 +9,7 @@
  * We do the equivalent after unpacking: walk the decoded object and return
  * the first string that is exactly 663 characters long AND looks like a token.
  *
- * Length alone is not enough (review 2026-09-26, M5): a LOGIN OK response carries
+ * Length alone is not enough: a LOGIN OK response carries
  * the whole account snapshot (chats with their last messages, messages, contacts,
  * config), and any 663-char string in there — a channel post, a description — was
  * taken for a rotated session token, saved, and bricked the session on the next

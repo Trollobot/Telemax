@@ -45,36 +45,27 @@ export interface MaxHistoryMessage {
   attaches?: unknown[];
   status?: string;
   reactions?: unknown;
-  // Present when this message is a forward — its own text/attaches are empty, the
-  // real content is in link.message. Same shape as PUSH_MESSAGE's link field.
-  // `link.message.id` + `link.chatId` are the ORIGINAL message/chat the attachment
-  // was uploaded against — FILE_DOWNLOAD/VIDEO_PLAY need those, not the wrapper's own.
+  // A forward — same shape as PUSH_MESSAGE's link field (see bridge/sync.ts MaxPushPayload).
   link?: { type?: string; message?: { id?: unknown; text?: string; sender?: unknown; attaches?: unknown[] }; chatId?: unknown };
 }
 
-// Only what a caller actually sets. The port, the INIT user agent and the ping interval are fixed
-// (constants below), and the server's TLS certificate is always verified — the option to turn
-// that off was never passed by anything (review 2026-09-26, M15c).
+// The port, the INIT user agent and the ping interval are fixed (constants below), and the
+// server's TLS certificate is always verified.
 export interface MaxClientOptions {
   host?: string;
   sni?: string;
   /**
-   * The INIT deviceId; a random one when unset. NOTE: nothing passes it today, so every
-   * connect() of a new client presents a fresh random id — the one saved into the session
-   * (sessionStore's deviceId) is never read back, and MAX accepts the resumed token under the
-   * new id anyway. Deliberately left that way until reusing the saved id is verified live.
+   * The INIT deviceId; a random one when unset. Nothing passes it today: the id saved into the
+   * session is never read back, and MAX accepts the resumed token under a new id anyway —
+   * deliberately left so until reusing the saved id is verified live.
    */
   deviceId?: string;
   reconnect?: boolean;
 }
 
-// Connect by hostname, NOT a hardcoded IPv4 literal. A literal bypasses DNS entirely,
-// so an IPv6-only host can't use DNS64/NAT64 (that only kicks in on a name lookup) and
-// is left depending on flaky CLAT/464XLAT — the cause of the ~4h reconnect churn seen on
-// an IPv6-only client (the gateway hard-caps the translated session). Resolving the name
-// hands IPv6-only hosts the DNS64-synthesized AAAA (native IPv6 → NAT64, stable) and keeps
-// IPv4/dual-stack hosts on the same endpoint as before, auto-following server IP changes.
-// Pin the literal via MAX_HOST=155.212.204.150 if DNS for oneme.ru is ever unreachable.
+// Connect by hostname, NOT an IPv4 literal: a literal bypasses DNS64/NAT64, leaving an IPv6-only
+// host on flaky CLAT/464XLAT — the cause of ~4h reconnect churn seen on one. Pin the literal via
+// MAX_HOST=155.212.204.150 if DNS for oneme.ru is ever unreachable.
 const DEFAULT_HOST = 'api2.oneme.ru';
 const DEFAULT_PORT = 443;
 const DEFAULT_SNI = 'api2.oneme.ru';
@@ -91,26 +82,21 @@ const USER_AGENT = {
 } as const;
 const RECONNECT_DELAYS_MS = [1_000, 2_000, 5_000, 10_000, 30_000];
 // A connection counts as healthy — and the reconnect backoff starts over — only once it has
-// passed INIT and then stayed up this long. Resetting in the TLS connect callback made a server
-// that accepts TLS and drops the socket right away a reconnect loop once a second (review
-// 2026-09-26, M4).
+// passed INIT and then stayed up this long. Resetting on TLS connect made a server that accepts
+// TLS and drops the socket right away a reconnect loop once a second.
 const STABLE_CONNECTION_MS = 30_000;
-// TCP keepalive on the MAX socket: a cheap extra probe for a silently dead path. The real
-// half-open detection is the unanswered-PING check in ping() — keepalive only fires on an idle
-// socket, and this one carries a PING every interval.
+// TCP keepalive: a cheap extra probe for a silently dead path. The real half-open detection is
+// the unanswered-PING check in ping() — keepalive only fires on an idle socket.
 const TCP_KEEPALIVE_DELAY_MS = 30_000;
-// Deadline for the TCP connect + TLS handshake. Before secureConnect there is no PING and no
-// keepalive: a path that accepts the TCP connection and then black-holes the ClientHello (DPI, a
-// hung TLS front end) left the socket "connecting" with no 'error' or 'close' — and so no reconnect —
-// until someone restarted the container (review 2026-09-26, client-r1#1).
+// Deadline for TCP connect + TLS handshake. Before secureConnect there is no PING and no
+// keepalive: a path that black-holes the ClientHello left the socket "connecting" forever.
 const TLS_HANDSHAKE_TIMEOUT_MS = 15_000;
 
 /**
  * The server answered a request with an ERR frame — as opposed to a timeout, a socket error or
  * an undecodable frame, which say nothing about the request itself. For LOGIN this is the only
- * failure that means "this session token is rejected"; everything else is transient
- * (review 2026-09-26, RECOVERY4). Carries the opcode and the server's machine error code
- * (payload.error, when it is a string) — not the payload itself, which the logger would print.
+ * failure that means "this session token is rejected"; everything else is transient. Carries the
+ * opcode and the server's machine error code (payload.error) — not the payload, which the logger would print.
  */
 export class MaxServerError extends Error {
   constructor(
@@ -129,10 +115,9 @@ export function isMaxServerError(err: unknown, opcode?: number): err is MaxServe
 }
 
 /**
- * The MAX socket went away (closed, errored, torn down by connect()/disconnect()/a frame desync)
- * while something was waiting for an answer on it. That answer can never arrive on a new socket,
- * so waiters fail at once instead of sitting out their timeout (review 2026-09-26, M3). The
- * message is what bridge/transient.ts isTransientMaxError keys on; `cause` is the socket error.
+ * The MAX socket went away while something was waiting for an answer on it. That answer can never
+ * arrive on a new socket, so waiters fail at once instead of sitting out their timeout. The message
+ * is what bridge/transient.ts isTransientMaxError keys on; `cause` is the socket error.
  */
 export class MaxConnectionLostError extends Error {
   constructor(what: string, cause?: unknown) {
@@ -145,9 +130,7 @@ export class MaxConnectionLostError extends Error {
 /**
  * True when an EVENTS push says the upload with this id is processed: `{videoId}` for video,
  * `{audioId}` for a voice note (whose id is the upload slot's videoId). Ids compare via String()
- * — they may arrive as number, BigInt or string. Matching any id let two parallel uploads cross:
- * the first ready push released both waits and the second MSG_SEND went out with a file MAX had
- * not processed yet (review 2026-09-26, OUTBOUND9).
+ * (number, BigInt or string on the wire). Matching any id let two parallel uploads cross.
  */
 export function isUploadReadyPush(payload: unknown, key: 'videoId' | 'audioId', id: unknown): boolean {
   if (!payload || typeof payload !== 'object' || id == null) return false;
@@ -176,22 +159,15 @@ function randomDeviceId(): string {
 }
 
 /**
- * MAX chatId can arrive as a plain number, a BigInt (large/negative ids — seen
- * live on channels — decode that way because of their wire type), or a decimal
- * string (from our own stores, which normalize to string to survive JSON).
- * Always repack as BigInt before sending: msgpackr only emits a proper integer
- * type for BigInt regardless of magnitude — a plain number beyond ~2^32 silently
- * degrades to float64, which the server rejects (same failure mode `cid` hit).
+ * A chatId arrives as a plain number, a BigInt (large/negative ids — seen live on channels) or a
+ * decimal string (our stores). Always repack as BigInt: msgpackr only emits a proper integer for
+ * BigInt — a plain number beyond ~2^32 degrades to float64, which the server rejects.
  */
 function toChatId(chatId: unknown): bigint {
   return typeof chatId === 'bigint' ? chatId : BigInt(chatId as string | number);
 }
 
-/**
- * User/contact ids share chatId's overflow trap: bot accounts (@id…_bot) have ids above 2^32
- * (seen live: 4725009270), which a plain number degrades to float64 and the server rejects
- * with "Ошибка валидации". Repack every outgoing user id the same way.
- */
+/** User ids share chatId's overflow trap: bot accounts have ids above 2^32 (seen live: 4725009270). */
 function toUserId(id: unknown): bigint {
   return typeof id === 'bigint' ? id : BigInt(id as string | number);
 }
@@ -217,17 +193,12 @@ export class MaxClient extends EventEmitter {
   // When the current socket passed INIT (null before that) — see reconnectAttemptFor.
   private readyAt: number | null = null;
   // Set by this socket's LOGIN OK. Until then only the handshake and auth opcodes go out: a request
-  // written between connect() and LOGIN got MAX's session-state ERR, which reads as a permanent
-  // refusal — a download in that window became a placeholder for good (review 2026-09-27,
-  // client-r3.1#0). Such a request now fails as "not connected", i.e. transient.
+  // written before LOGIN gets MAX's session-state ERR, which reads as a permanent refusal — it
+  // must fail as "not connected" (transient) instead.
   private authed = false;
   private closedByUser = false;
-  // Everything waiting for a frame, keyed by the frame's opcode. ONE 'message' listener (the
-  // dispatcher registered in the constructor) settles them, and a lost socket fails them all at
-  // once (failPending). Before, every wait added its own 'message' + 'error' listeners, and ANY
-  // client 'error' — including an undecodable push of an unrelated opcode on a live socket —
-  // rejected every request in flight, while a clean close left them hanging for 20 s
-  // (review 2026-09-26, M3, M10).
+  // Everything waiting for a frame, keyed by opcode. ONE 'message' listener (dispatch) settles
+  // them, and a lost socket fails them all at once (failPending).
   private readonly pending = new Map<number, Set<PendingWait>>();
 
   constructor(options: MaxClientOptions = {}) {
@@ -243,8 +214,7 @@ export class MaxClient extends EventEmitter {
 
   connect(): void {
     this.closedByUser = false;
-    // Cancel any pending auto-reconnect so a manual connect() (proactive session refresh,
-    // resume retry) can't leave a stale timer that fires a second, overlapping connect later.
+    // A manual connect() must not leave a stale reconnect timer that fires a second, overlapping connect.
     this.clearReconnectTimer();
     this.teardownSocket();
     this.buffer = Buffer.alloc(0);
@@ -252,14 +222,11 @@ export class MaxClient extends EventEmitter {
     this.readyAt = null;
     this.authed = false;
 
-    // `ca` REPLACES Node's default trust store for this socket, so MAX_TLS_CA re-includes
-    // the bundled roots alongside the Russian state chain MAX's cert actually needs (scoped
-    // here instead of NODE_EXTRA_CA_CERTS — see ca.ts).
-    // autoSelectFamily (Happy Eyeballs): race IPv6 and IPv4, keep whichever connects first. On
-    // an IPv6-only host only the DNS64-synthesized AAAA is reachable; on dual-stack this avoids
-    // stalling on a dead address family. Default-true on Node 22, set explicitly so it doesn't
-    // hinge on that default. (Typed as an intersection because @types/node's tls.ConnectionOptions
-    // doesn't yet declare the net-level autoSelectFamily field that Node accepts at runtime.)
+    // `ca` REPLACES Node's default trust store for this socket, so MAX_TLS_CA re-includes the
+    // bundled roots alongside the Russian state chain MAX's cert needs (see ca.ts).
+    // autoSelectFamily (Happy Eyeballs): race IPv6 and IPv4 so an IPv6-only host reaches the
+    // DNS64 AAAA and dual-stack doesn't stall on a dead family. (Intersection type: @types/node's
+    // tls.ConnectionOptions doesn't declare the net-level field Node accepts at runtime.)
     const socketOpts: tls.ConnectionOptions & { autoSelectFamily?: boolean } = {
       servername: this.opts.sni,
       rejectUnauthorized: true, // never off: this socket carries the session token
@@ -271,8 +238,7 @@ export class MaxClient extends EventEmitter {
       this.opts.host,
       socketOpts,
       () => {
-        // The reconnect backoff is NOT reset here — only after INIT plus a stable stretch
-        // (reconnectAttemptFor, review 2026-09-26, M4).
+        // The reconnect backoff is NOT reset here — only after INIT plus a stable stretch (reconnectAttemptFor).
         this.socket?.setTimeout(0); // handshake done — PING and keepalive watch the socket from here
         this.socket?.setKeepAlive(true, TCP_KEEPALIVE_DELAY_MS);
         this.emit('connected');
@@ -299,8 +265,7 @@ export class MaxClient extends EventEmitter {
 
     socket.on('close', () => {
       this.stopPing();
-      // A closed socket is gone: send() now says "not connected" at once instead of writing
-      // into a destroyed stream and leaving the request to time out.
+      // send() must say "not connected" at once, not write into a destroyed stream.
       if (this.socket === socket) this.socket = null;
       this.failPending(new Error('socket closed'));
       this.emit('disconnected');
@@ -327,8 +292,7 @@ export class MaxClient extends EventEmitter {
   private teardownSocket(): void {
     if (this.socket) {
       this.socket.removeAllListeners();
-      // destroy() can still deliver an 'error' queued before this call; with no listener it
-      // would become an uncaughtException (review 2026-09-26, M11).
+      // destroy() can still deliver a queued 'error'; with no listener it becomes an uncaughtException.
       this.socket.on('error', () => {});
       this.socket.destroy();
       this.socket = null;
@@ -371,12 +335,10 @@ export class MaxClient extends EventEmitter {
   private lastPingSentAt: number | null = null;
 
   /**
-   * Half-open detection (review 2026-09-26, M1). The previous PING still unanswered a whole
-   * interval later means the path is dead even though the socket looks open (a NAT/CLAT
-   * mapping dropped, a server that went away without a FIN): the kernel would keep
-   * retransmitting for 15+ minutes before 'close', while sends time out one by one and nobody
-   * learns MAX is gone. Destroy the socket instead — its 'error' fails the in-flight requests at
-   * once, and 'close' runs the usual disconnected -> reconnect path.
+   * Half-open detection. The previous PING still unanswered a whole interval later means the path
+   * is dead even though the socket looks open (a NAT/CLAT mapping dropped, a server gone without
+   * a FIN): the kernel would keep retransmitting for 15+ minutes before 'close'. Destroy the socket
+   * instead — 'error' fails the in-flight requests, 'close' runs the usual reconnect path.
    */
   private ping(): void {
     if (this.lastPingSentAt !== null) {
@@ -400,12 +362,9 @@ export class MaxClient extends EventEmitter {
         header = readFrameHeader(this.buffer);
       } catch (err) {
         this.emit('error', err as Error);
-        // teardownSocket removes the socket's listeners, so no 'close' event will
-        // fire to schedule a reconnect — without doing it here explicitly, a single
-        // corrupt/desynced frame left the client permanently offline (silently: the
-        // process kept running, just never reconnected). For the same reason 'disconnected'
-        // is emitted here, exactly as the 'close' path does: without it app.ts kept
-        // maxConnected = true and never armed the outage notice (review 2026-09-26, C18).
+        // teardownSocket removes the socket's listeners, so no 'close' will fire: the reconnect
+        // and 'disconnected' the 'close' path would do happen here — or a single desynced frame
+        // leaves the client permanently offline, silently.
         this.teardownSocket();
         this.emit('disconnected');
         if (!this.closedByUser && this.opts.reconnect) this.scheduleReconnect();
@@ -425,9 +384,8 @@ export class MaxClient extends EventEmitter {
           const items = decodeFramePayload(decompressed);
           payload = pickObject(items) ?? items[0] ?? null;
         } catch (err) {
-          // Diagnostic only, on its own event: the connection is fine, and this frame may be a
-          // push of an unrelated opcode — it must not fail the requests in flight (review
-          // 2026-09-26, M3). app.ts logs it.
+          // Diagnostic only, on its own event: the connection is fine, and a push of an unrelated
+          // opcode must not fail the requests in flight. app.ts logs it.
           this.emit(
             'decode-error',
             new Error(`Failed to decode payload for ${formatOpcode(header.opcode)}: ${(err as Error).message}`),
@@ -448,8 +406,8 @@ export class MaxClient extends EventEmitter {
         this.readyAt = Date.now();
         this.emit('ready');
       }
-      // A refused INIT (e.g. an outdated appVersion) leaves an open socket nothing ever logs in on or
-      // reconnects: dropped instead, so the usual reconnect and outage notice follow (client-r3.3#2).
+      // A refused INIT (e.g. an outdated appVersion) leaves an open socket nothing ever logs in
+      // on: dropped instead, so the usual reconnect and outage notice follow.
       if (header.opcode === OPCODES.INIT && header.cmd === DIR.ERR) {
         this.socket?.destroy(new Error(describeAuthError(payload, 'MAX rejected INIT')));
         return;
@@ -479,9 +437,8 @@ export class MaxClient extends EventEmitter {
 
   /**
    * Registers a wait for the first frame of `opcode` that `accept` takes. It settles exactly once:
-   * on that frame (via dispatch), on its timeout, on a lost socket (failPending) or through the
-   * returned `fail` (request() uses it when send() throws). Every path removes it from `pending`
-   * and clears its timer, so nothing outlives it.
+   * on that frame (dispatch), on its timeout, on a lost socket (failPending) or through the
+   * returned `fail`. Every path removes it from `pending` and clears its timer.
    */
   private addWait(
     opcode: number,
@@ -542,10 +499,9 @@ export class MaxClient extends EventEmitter {
   }
 
   /**
-   * Resolves with the first response frame matching `opcode`. The server doesn't
-   * reliably echo `seq`, so opcode matching is the only correlation available —
-   * which is only unambiguous while at most ONE request per opcode is in flight.
-   * request() below enforces that, hence private.
+   * Resolves with the first response frame matching `opcode`. The server doesn't reliably echo
+   * `seq`, so opcode matching is the only correlation — unambiguous only while at most ONE request
+   * per opcode is in flight, which request() enforces (hence private).
    */
   private waitForOpcode(opcode: number, timeoutMs = 20_000): { promise: Promise<MaxMessageEvent>; fail: (err: Error) => void } {
     return this.addWait(opcode, formatOpcode(opcode), () => true, timeoutMs, `Timed out waiting for ${formatOpcode(opcode)}`);
@@ -565,26 +521,18 @@ export class MaxClient extends EventEmitter {
   }
 
   /**
-   * Sends `payload` and resolves with the first response frame carrying `opcode`,
-   * serializing same-opcode requests: the next one is only sent once the previous
-   * one's response (or timeout) settled. Without this, two concurrent calls for
-   * the same opcode both resolved on whichever response frame landed first —
-   * a real race, not theoretical: Telegraf handles a poll batch's updates
-   * concurrently, so two quick Telegram messages fired two overlapping MSG_SENDs
-   * and could cross-wire the messageId links that edit/delete rely on. Different
-   * opcodes still run in parallel (the backfill's CHAT_HISTORY doesn't wait for
-   * an unrelated FILE_DOWNLOAD).
+   * Sends `payload` and resolves with the first response frame carrying `opcode`, serializing
+   * same-opcode requests: two concurrent calls for one opcode would both resolve on whichever
+   * response landed first (a real race: Telegraf handles a poll batch's updates concurrently, and
+   * two quick messages cross-wired the messageId links). Different opcodes still run in parallel.
    *
-   * Known residual gap: if a request times out and its response arrives late,
-   * the NEXT same-opcode request may consume that stale frame — unavoidable
-   * without seq correlation, and timeouts here usually mean the connection is
-   * about to be torn down and re-established anyway. A lost socket no longer takes
-   * the timeout path: failPending rejects the wait at once.
+   * Known residual gap: if a request times out and its response arrives late, the NEXT same-opcode
+   * request may consume that stale frame — unavoidable without seq correlation, and a timeout
+   * usually means the connection is about to be torn down anyway.
    *
-   * Without a socket, send() throws and the wait is withdrawn on the spot: the call
-   * rejects with "not connected" and leaves no timer behind. Before, the orphaned
-   * wait timed out 20 s later as an unhandled rejection — a false "internal bridge
-   * error" for every message written while MAX was paused (review 2026-09-26, M2).
+   * Without a socket, send() throws and the wait is withdrawn on the spot: the call rejects with
+   * "not connected" and leaves no timer behind (an orphaned wait timed out 20 s later as an
+   * unhandled rejection for every message written while MAX was paused).
    */
   private request(opcode: number, payload?: unknown, timeoutMs?: number): Promise<MaxMessageEvent> {
     const prev = this.requestChains.get(opcode) ?? Promise.resolve();
@@ -613,10 +561,9 @@ export class MaxClient extends EventEmitter {
   }
 
   /**
-   * A password-protected MAX account (2FA on top of SMS) makes CHECK_CODE respond
-   * with a `passwordChallenge` instead of a login token — confirmed live 2026-08-14.
-   * Distinguishing that from a genuinely wrong SMS code (rather than just throwing
-   * either way) is what lets the caller ask for a password instead of a fresh code.
+   * A password-protected account (2FA on top of SMS) makes CHECK_CODE respond with a
+   * `passwordChallenge` instead of a login token — confirmed live 2026-08-14. Distinguished from a
+   * wrong SMS code so the caller can ask for a password instead of a fresh code.
    */
   async verifyCode(authToken: string, code: string): Promise<VerifyCodeResult> {
     const { dir, payload } = await this.request(OPCODES.CHECK_CODE, { token: authToken, verifyCode: code });
@@ -628,10 +575,8 @@ export class MaxClient extends EventEmitter {
     if (challenge) {
       return { status: 'password_required', challenge };
     }
-    // No login token AND no password challenge. Besides a wrong/stale code, the other common cause
-    // is a number that isn't registered in MAX yet — a fresh number pushes MAX into its REGISTRATION
-    // flow (create account), which returns no login token. The bridge only LOGS IN to an existing
-    // account, so spell both out instead of only blaming the code.
+    // No login token AND no password challenge: a wrong/stale code, or a number not registered in
+    // MAX yet (its REGISTRATION flow returns no login token) — spell out both.
     throw new Error(
       describeAuthError(
         payload,
@@ -641,10 +586,8 @@ export class MaxClient extends EventEmitter {
   }
 
   /**
-   * The second factor for password-protected accounts, following up a
-   * verifyCode() that returned `password_required`. `trackId` survives a wrong
-   * password (safe to retry with the same one) but is consumed on success —
-   * confirmed live 2026-08-14 — so a following login attempt needs a fresh SMS.
+   * The second factor after a verifyCode() that returned `password_required`. `trackId` survives a
+   * wrong password (safe to retry) but is consumed on success — confirmed live 2026-08-14.
    */
   async checkPassword(trackId: string, password: string): Promise<string> {
     const { dir, payload } = await this.request(OPCODES.CHECK_PASSWORD, { trackId, password });
@@ -661,8 +604,7 @@ export class MaxClient extends EventEmitter {
     }
     const { dir, payload } = await this.request(OPCODES.LOGIN, { token, interactive: true, chatsCount });
     if (dir === DIR.ERR) {
-      // Genuine rejection. Append a safe shape hint (frame direction + top-level field NAMES, never
-      // values) so a resume failure is self-diagnosing in the logs.
+      // A safe shape hint (top-level field NAMES, never values) makes a resume failure self-diagnosing.
       const shape =
         payload && typeof payload === 'object' && !Array.isArray(payload)
           ? `keys=[${Object.keys(payload as object).join(',')}]`
@@ -674,28 +616,20 @@ export class MaxClient extends EventEmitter {
         typeof serverCode === 'string' ? serverCode : undefined,
       );
     }
-    // A successful LOGIN only SOMETIMES rotates the session token (returns a fresh 663-char string);
-    // when it doesn't, the presented token is still valid and the OK response just carries the account
-    // snapshot with no new token. That is success — fall back to the token we authenticated with.
-    // Treating a token-less OK response as expiry was bricking still-valid sessions and forcing a
-    // needless SMS re-auth (confirmed live: dir=0x1 OK, keys=[profile,chats,messages,contacts,
-    // presence,config,time,updates], no token). Only a dir=ERR frame is a real rejection.
+    // A successful LOGIN only SOMETIMES rotates the session token; a token-less OK (confirmed live:
+    // keys=[profile,chats,messages,…], no token) means the presented token is still valid. Treating
+    // it as expiry bricked valid sessions. Only a dir=ERR frame is a real rejection.
     const sessionToken = findLongToken(payload) ?? token;
     return { sessionToken, payload };
   }
 
   /**
-   * Resolves once the server echoes the message back, with both the `cid` it
-   * generated (for recognizing our own messages echoed as pushes) and the
-   * real MAX-assigned `messageId` (needed to later edit/react to this message).
-   *
-   * `cid` must be packed as a genuine msgpack integer (BigInt forces msgpackr to emit
-   * int64 rather than float64) — the server's decoder rejects a float64 there with a
-   * "proto.payload / Expected number" validation error. Confirmed live against a real
-   * account: plain `Date.now()` (packed as float64) was rejected, `BigInt(Date.now())`
-   * (packed as int64, matching how real messages' cid arrives over the wire) was not.
+   * Resolves once the server echoes the message back, with the `cid` (for recognizing our own
+   * messages echoed as pushes) and the MAX-assigned `messageId` (for later edit/react/delete).
+   * `cid` must be packed as int64 (BigInt) — a float64 there is rejected with "proto.payload /
+   * Expected number" (confirmed live). `text: null` for attach-only sends (e.g. polls) — MAX
+   * expects null there, not an empty string.
    */
-  /** `text: null` for attach-only sends (e.g. polls) — MAX accepts and expects null there, not an empty string. */
   async sendMessage(
     chatId: unknown,
     text: string | null,
@@ -703,9 +637,8 @@ export class MaxClient extends EventEmitter {
     replyTo?: { messageId: unknown; chatId: unknown },
   ): Promise<{ cid: number; messageId: unknown; attaches: unknown[]; time: unknown }> {
     const cid = this.nextCid();
-    // Outgoing reply link shape is {type, messageId, chatId} — note this differs from
-    // the INCOMING reply link ({type, message, chatId}); MAX uses two shapes (confirmed
-    // 2026-08-16). messageId is the quoted MAX message's id (BigInt from the link store).
+    // The OUTGOING reply link is {type, messageId, chatId}; the INCOMING one carries `message`
+    // instead (two shapes, confirmed 2026-08-16). messageId is the quoted message's BigInt id.
     const link = replyTo ? { type: 'REPLY', messageId: replyTo.messageId, chatId: toChatId(replyTo.chatId) } : null;
     const { dir, payload } = await this.request(OPCODES.MSG_SEND, {
       chatId: toChatId(chatId),
@@ -714,19 +647,15 @@ export class MaxClient extends EventEmitter {
     });
     const responseMessage = (payload as { message?: { id?: unknown; attaches?: unknown[]; time?: unknown } } | null)?.message;
     if (dir === DIR.ERR) throw new Error(describeAuthError(payload, 'MSG_SEND failed'));
-    // `time` is the echoed message's MAX server timestamp, raw (may be a BigInt, or absent) —
-    // the bridge stores it as the chat's history cursor (bridge/catchUp.ts liveCursorTime).
+    // `time` is the echoed message's MAX server timestamp, raw — the chat's history cursor (liveCursorTime).
     return { cid, messageId: responseMessage?.id, attaches: responseMessage?.attaches ?? [], time: responseMessage?.time };
   }
 
   /**
-   * Opens a 1:1 dialog with a FRESH contact (never messaged before) by sending the first message
-   * with a top-level `userId` (NOT `chatId`) — MAX creates the dialog server-side and returns its
-   * real positive `chatId` in the response. This is how the official app's "Открыть чат" works
-   * (confirmed live 2026-08-21). The old createDialog `CONTROL {event:'new', chatType:'DIALOG'}` hack
-   * created a GROUP instead (the server doesn't recognize DIALOG in a control attach — it fell back
-   * to a group with a negative id). `text` MUST be non-empty (the server rejects an empty first
-   * message with "Message text must not be empty").
+   * Opens a 1:1 dialog with a FRESH contact by sending the first message with a top-level `userId`
+   * (NOT `chatId`) — MAX creates the dialog and returns its real `chatId`; how the official app's
+   * "Открыть чат" works (confirmed live 2026-08-21). A `CONTROL {event:'new', chatType:'DIALOG'}`
+   * creates a GROUP instead. `text` MUST be non-empty ("Message text must not be empty").
    */
   async sendToNewDialog(
     userId: unknown,
@@ -760,11 +689,9 @@ export class MaxClient extends EventEmitter {
   }
 
   /**
-   * Contradicts the spec we were given (which said `messageId` should be a decimal
-   * string for this call): a live 406-style validation error ("Expected number" at
-   * the exact byte where the string value started) showed the server actually wants
-   * the same integer encoding as MSG_EDIT/MSG_CANCEL_REACTION. Pass `messageId`
-   * through as-is (already a BigInt from wherever it was captured) — do not stringify.
+   * Contrary to the spec (decimal string), the server wants `messageId` in the same integer
+   * encoding as MSG_EDIT/MSG_CANCEL_REACTION — a live "Expected number" validation error at the
+   * string's byte proved it. Pass the BigInt through; do not stringify.
    */
   async addReaction(chatId: unknown, messageId: unknown, emoji: string): Promise<void> {
     const { dir, payload } = await this.request(OPCODES.MSG_REACTION, { chatId: toChatId(chatId), messageId, reaction: { reactionType: 'EMOJI', id: toMaxReaction(emoji) } });
@@ -777,24 +704,19 @@ export class MaxClient extends EventEmitter {
   }
 
   /**
-   * Polling fallback for reaction removal — MAX sends no live push for it (see
-   * bridge/sync.ts). Returns the current reaction counters, or `[]` once none remain.
+   * Polling fallback for reaction removal — MAX sends no live push for it (see bridge/sync.ts).
+   * Returns the current reaction counters, or `[]` once none remain.
    *
-   * IMPORTANT: `messageIds` (plural, array) — sending the singular `messageId` we
-   * first guessed doesn't just get rejected, it gets the whole TCP connection
-   * dropped by the server (confirmed live: a validation error response was
-   * immediately followed by full reconnect+re-login). Treat any unverified MAX
-   * request the same way going forward — a malformed payload here isn't just an
-   * error, it can cost the live session.
+   * IMPORTANT: `messageIds` (plural, array) — the singular `messageId` doesn't just get rejected,
+   * the server drops the whole TCP connection (confirmed live). A malformed payload to MAX can
+   * cost the live session, not just an error.
    */
   async getReactions(chatId: unknown, messageId: unknown): Promise<Array<{ reaction: string; count: number }>> {
     const { dir, payload } = await this.request(OPCODES.MSG_GET_REACTIONS, { chatId: toChatId(chatId), messageIds: [messageId] });
     if (dir === DIR.ERR) throw new Error(describeAuthError(payload, 'MSG_GET_REACTIONS failed'));
     // Real shape confirmed live 2026-08-15: `{messagesReactions: {"<messageId>": {counters:[...]}}}`.
-    // The old reactionInfo/reactions guesses NEVER matched, so this always returned []
-    // — which made pollReactionRemovals think every relayed reaction had been removed
-    // and strip it in Telegram after ~60s ("reactions disappear over time"). Keep the
-    // old shapes as fallbacks, but this branch is the one that fires.
+    // The reactionInfo/reactions guesses never matched (every relayed reaction then looked removed
+    // and was stripped in Telegram after ~60 s); kept as fallbacks only.
     type Counters = Array<{ reaction: string; count: number }>;
     const p = payload as
       | { messagesReactions?: Record<string, { counters?: Counters }> }
@@ -804,8 +726,7 @@ export class MaxClient extends EventEmitter {
     if (p && 'messagesReactions' in p && p.messagesReactions) {
       const byId = p.messagesReactions[String(messageId)];
       if (byId?.counters) return byId.counters;
-      // We only ever ask for one messageId, so the sole entry is ours even if the
-      // key's string form doesn't match exactly.
+      // Only one messageId is ever asked for, so the sole entry is ours even if the key's string form differs.
       const first = Object.values(p.messagesReactions)[0];
       if (first?.counters) return first.counters;
     }
@@ -815,11 +736,9 @@ export class MaxClient extends EventEmitter {
   }
 
   /**
-   * Contact profile details (name variants, country, phone, registration time) —
-   * not present in LOGIN's contacts[]/CHATS_LIST's participants, needs its own
-   * round trip per batch of ids. Payload shape supplied by the user from their
-   * own reverse engineering (2026-08-09); response wrapper key unconfirmed, so
-   * this tries the plausible ones rather than assuming `contacts`.
+   * Contact profile details (name variants, country, phone, registration time) — not in LOGIN's
+   * contacts[]/CHATS_LIST's participants, needs its own round trip per batch of ids. Response
+   * wrapper key unconfirmed (reverse-engineered 2026-08-09), so the plausible ones are tried.
    */
   async getContactInfo(contactIds: unknown[]): Promise<MaxContactInfo[]> {
     const { dir, payload } = await this.request(OPCODES.CONTACT_INFO, { contactIds: contactIds.map(toUserId) });
@@ -831,33 +750,26 @@ export class MaxClient extends EventEmitter {
   }
 
   /**
-   * Finds a contact by phone number (CONTACT_INFO_BY_PHONE, 0x002E). The field is
-   * `phone` (NOT phoneNumber — the server rejects that with "Field requirement failed:
-   * phone"); the leading `+` is optional. Response `{contact}` — a single contact, or
-   * null if none. Shapes from the user's live reverse engineering (2026-08-16);
-   * response wrapper unconfirmed beyond `contact`, so try the plausible keys.
+   * Finds a contact by phone number (CONTACT_INFO_BY_PHONE, 0x002E). The field is `phone` (NOT
+   * phoneNumber — "Field requirement failed: phone"); the leading `+` is optional. Response
+   * `{contact}` (live shapes 2026-08-16).
    */
   async searchContactByPhone(phone: string): Promise<MaxContactInfo | null> {
     const { dir, payload } = await this.request(OPCODES.CONTACT_INFO_BY_PHONE, { phone });
     if (dir === DIR.ERR) {
-      // "not found" comes back as an ERROR frame ({error:"not.found"}), not an empty
-      // result — for us that just means the number isn't a MAX user, so return null.
-      // Any OTHER error is real and propagates. (Contrast CONTACT_SEARCH, which returns
-      // an empty list without erroring.)
+      // "not found" is an ERROR frame ({error:"not.found"}), not an empty result — the number
+      // isn't a MAX user. Any OTHER error propagates.
       const err = (payload as { error?: string } | null)?.error;
       if (err === 'not.found') return null;
       throw new Error(describeAuthError(payload, 'CONTACT_INFO_BY_PHONE failed'));
     }
-    // On success the payload is always a single-key map `{contact: {...}}`.
     return (payload as { contact?: MaxContactInfo } | null)?.contact ?? null;
   }
 
   /**
-   * Global directory search by name/nickname (PUBLIC_SEARCH, 0x003C) — unlike
-   * CONTACT_SEARCH (local address book only), this hits the whole MAX catalog, so it's
-   * what "find contact by name" should use. Request/response shape UNCONFIRMED — assumed
-   * to mirror CONTACT_SEARCH (`{result: [{contact}], total}`); verify live. Returns the
-   * matched contacts.
+   * Global directory search by name/nickname (PUBLIC_SEARCH, 0x003C) — unlike CONTACT_SEARCH
+   * (local address book only), this hits the whole MAX catalog. Request/response shape
+   * UNCONFIRMED — assumed to mirror CONTACT_SEARCH (`{result: [{contact}], total}`); verify live.
    */
   async publicSearch(query: string, count = 10): Promise<MaxContactInfo[]> {
     const { dir, payload } = await this.request(OPCODES.PUBLIC_SEARCH, { query, count });
@@ -870,11 +782,9 @@ export class MaxClient extends EventEmitter {
 
 
   /**
-   * One page of the account's full chat list (not the capped ≤50 LOGIN snapshot).
-   * `marker` starts as "now" (ms) and each response's `marker` feeds the next call;
-   * an empty `chats` array means the walk is done. Same overflow trap as every
-   * other ms-timestamp field here — must go over the wire as BigInt. Payload
-   * shape supplied by the user from their own reverse engineering (2026-08-09).
+   * One page of the account's full chat list (not the capped ≤50 LOGIN snapshot). `marker` starts
+   * as "now" (ms, BigInt on the wire) and each response's `marker` feeds the next call; an empty
+   * `chats` means the walk is done (reverse-engineered 2026-08-09).
    */
   private async getChatsList(marker: number): Promise<{ chats: unknown[]; marker: number | null }> {
     const { dir, payload } = await this.request(OPCODES.CHATS_LIST, { marker: BigInt(marker) });
@@ -902,8 +812,7 @@ export class MaxClient extends EventEmitter {
         all.push(c);
         addedAny = true;
       }
-      // Either nothing new came back, or the marker stopped moving forward —
-      // both mean we've reached the end (same guard as fetchFullHistory).
+      // Nothing new, or the marker stopped moving — the end (same guard as fetchFullHistory).
       if (!addedAny || page.marker == null || !(page.marker < marker)) break;
       marker = page.marker;
     }
@@ -911,10 +820,8 @@ export class MaxClient extends EventEmitter {
   }
 
   /**
-   * Creates a group or channel — the one MSG_SEND call in this client with no
-   * `chatId` (there isn't one yet). Payload shape supplied by the user from their
-   * own reverse engineering (2026-08-10): `event: 'new'` (lowercase), `userIds`
-   * invites members immediately.
+   * Creates a group or channel — the one MSG_SEND with no `chatId` (there isn't one yet).
+   * `event: 'new'` (lowercase); `userIds` invites members immediately (reverse-engineered 2026-08-10).
    */
   async createGroup(title: string, userIds: number[] = [], chatType: 'CHAT' | 'CHANNEL' = 'CHAT'): Promise<{ chatId: unknown; owner: unknown }> {
     const { dir, payload } = await this.request(OPCODES.MSG_SEND, {
@@ -960,16 +867,13 @@ export class MaxClient extends EventEmitter {
   }
 
   /**
-   * One page of chat history, newest-first from `from` (ms timestamp, exclusive
-   * upper bound). Payload shape supplied by the user from their own reverse
-   * engineering (2026-08-08) — same CamelModel convention as every other opcode
-   * here, message objects match PUSH_MESSAGE's shape exactly.
+   * One page of chat history, newest-first from `from` (ms timestamp, exclusive upper bound).
+   * Message objects match PUSH_MESSAGE's shape exactly (reverse-engineered 2026-08-08).
    */
   async getChatHistory(chatId: unknown, from: number, backward = 100): Promise<MaxHistoryMessage[]> {
     const { dir, payload } = await this.request(OPCODES.CHAT_HISTORY, {
       chatId: toChatId(chatId),
-      // `from` is a ms timestamp (~1.7e12) — same overflow trap as cid/messageId/chatId:
-      // a plain number that size packs as float64 and the server rejects it outright.
+      // A ms timestamp (~1.7e12) — same overflow trap as cid/messageId/chatId (see toChatId).
       from: BigInt(from),
       backward,
       forward: 0,
@@ -1006,10 +910,8 @@ export class MaxClient extends EventEmitter {
   }
 
   /**
-   * Voice notes go through the SAME upload opcode as video (0x52) — `type: 2` is what
-   * marks it as audio instead of an actual video (`type: 0`). Confirmed live by the
-   * user 2026-08-13; this was the whole reason voice uploads never fired VOICE_READY
-   * before — FILE_UPLOAD (0x57) simply isn't the right opcode for it at all.
+   * Voice notes go through the SAME upload opcode as video (0x52) — `type: 2` marks audio,
+   * `type: 0` video. Confirmed live 2026-08-13; FILE_UPLOAD (0x57) is not the opcode for it.
    */
   async requestVoiceUploadSlot(): Promise<{ url: string; videoId: unknown; token: string }> {
     const { dir, payload } = await this.request(OPCODES.VIDEO_UPLOAD, { count: 1, type: 2, uploaderType: 0, profile: false });
@@ -1021,20 +923,16 @@ export class MaxClient extends EventEmitter {
   }
 
   /**
-   * Waits for the server-side "video is ready" signal. Confirmed live 2026-08-07:
-   * arrives as an EVENTS push (opcode 0x88), payload `{videoId: "..."}` at the
-   * top level — NOT PUSH_MESSAGE (0x80) as max_send_attach.py's own comments
-   * suggested (its check didn't actually pin the opcode, just dir+payload shape).
+   * Waits for the server-side "video is ready" signal: an EVENTS push (0x88) with `{videoId}` at
+   * the top level — NOT PUSH_MESSAGE (0x80). Confirmed live 2026-08-07.
    */
   waitForVideoReady(videoId: unknown, timeoutMs = 15_000): Promise<void> {
     return this.waitForUploadReady('videoId', videoId, 'video', timeoutMs);
   }
 
   /**
-   * Waits for the server-side "voice note is ready" signal — same EVENTS push (0x88) as
-   * video-ready, just keyed on `audioId` instead. Confirmed live by the user 2026-08-13:
-   * without this, MSG_SEND with the resulting audioId sometimes fails validation because
-   * the file isn't actually processed yet — a fixed sleep isn't a reliable substitute.
+   * Same EVENTS push as video-ready, keyed on `audioId`. Confirmed live 2026-08-13: without it
+   * MSG_SEND with the audioId sometimes fails validation because the file isn't processed yet.
    */
   waitForAudioReady(audioId: unknown, timeoutMs = 15_000): Promise<void> {
     return this.waitForUploadReady('audioId', audioId, 'audio', timeoutMs);
@@ -1042,9 +940,8 @@ export class MaxClient extends EventEmitter {
 
   /**
    * The ready wait behind waitForVideoReady / waitForAudioReady. Only the push for THIS upload's
-   * id counts (isUploadReadyPush, review 2026-09-26, OUTBOUND9), and a lost socket fails it at
-   * once through failPending instead of after the full timeout (M13) — the push would never come
-   * on a new socket. Without a socket at all it fails right away.
+   * id counts (isUploadReadyPush), and a lost socket fails it at once (failPending) — the push
+   * would never come on a new socket.
    */
   private waitForUploadReady(key: 'videoId' | 'audioId', id: unknown, kind: string, timeoutMs: number): Promise<void> {
     const what = `the ${kind}-ready push for ${String(id)}`;
@@ -1079,11 +976,7 @@ export class MaxClient extends EventEmitter {
     return url;
   }
 
-  /**
-   * VIDEO has its own opcode and id namespace, separate from FILE — FILE_DOWNLOAD
-   * rejects a videoId with "file not found". Returns quality-keyed URLs (e.g.
-   * MP4_240) plus an EXTERNAL link; callers pick whichever MP4_* they want.
-   */
+  /** VIDEO has its own id namespace — FILE_DOWNLOAD rejects a videoId with "file not found". Returns quality-keyed URLs (MP4_240, …) plus EXTERNAL. */
   async getVideoPlayUrls(chatId: unknown, messageId: unknown, videoId: unknown): Promise<Record<string, string>> {
     const { dir, payload } = await this.request(OPCODES.VIDEO_PLAY, { chatId: toChatId(chatId), messageId, videoId });
     const urls = payload as Record<string, string> | null;

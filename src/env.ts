@@ -1,5 +1,5 @@
 /**
- * The one boolean-env parser (review 2026-09-26, A12): true for 1/true/yes/on, false for
+ * The one boolean-env parser: true for 1/true/yes/on, false for
  * 0/false/off/no — any case, surrounding whitespace ignored — and undefined for anything else,
  * including unset/empty. Each caller decides what undefined means for its variable (its default,
  * and how a value outside both sets counts), so every variable keeps its own default.

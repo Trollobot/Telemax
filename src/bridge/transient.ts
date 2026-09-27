@@ -1,13 +1,10 @@
 /**
- * Transient-vs-permanent error classification for the history cursor (review 2026-09-26, C12 /
- * RECOVERY3 / RECOVERY5).
+ * Transient-vs-permanent error classification for the history cursor.
  *
- * The backfill used to treat every failed send as "done": log, advance the cursor, move on. For a
- * permanent refusal (a 4xx — the message is bad and resending won't help) that is still right. For
- * an outage (Telegram/proxy unreachable, 5xx, flood limit, MAX socket down mid-download) it lost
- * everything the outage touched for good, because the cursor is the lower bound of every later
- * catch-up. These helpers tell the two apart so a transient failure can stop the chat's backfill
- * WITHOUT moving its cursor and leave the rest to the next catch-up run.
+ * A permanent refusal (a 4xx — the message is bad and resending won't help) is "done": log, move
+ * the cursor on. An outage (Telegram/proxy unreachable, 5xx, flood limit, MAX socket down
+ * mid-download) must stop the chat's backfill WITHOUT moving its cursor — the cursor is the lower
+ * bound of every later catch-up, so everything the outage touched would be lost for good.
  *
  * Pure + exported for unit testing.
  */
@@ -106,9 +103,7 @@ export class TransientDownloadError extends Error {
  * code depends on the method: sendMessage/sendPhoto to a dead thread answer "message
  * thread not found", while editForumTopic answers TOPIC_ID_INVALID (seen live 2026-08-18
  * from startDialog's liveness probe). Both mean the same thing — the topic is gone.
- * Neither transient nor a plain refusal, but the same kind of pure error test, so it lives
- * here: shared by the topic self-heal and deletion probe (sync.ts) and the bug-report
- * inbox (bugReports.ts, which had its own copy of the regex — review 2026-09-26, C19). */
+ * Shared by the topic self-heal and deletion probe (sync.ts) and the bug-report inbox (bugReports.ts). */
 export function isThreadNotFound(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
   return /message thread not found|thread not found|TOPIC_DELETED|TOPIC_ID_INVALID/i.test(msg);

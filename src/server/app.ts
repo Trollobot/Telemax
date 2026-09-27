@@ -102,8 +102,7 @@ async function refreshChatsAndNames(): Promise<void> {
 
   // Only 1:1 dialogs (their topics are named after the other side), in batches: one request with
   // every group member's id grew to thousands and a single failure left every new dialog topic of
-  // the resync named «MAX ID <n>» (review 2026-09-26, C5/b5-delivery). A failed batch keeps what
-  // the others fetched, merged into the profiles we already had.
+  // the resync named «MAX ID <n>». A failed batch keeps what the others fetched.
   const participantIds = dialogParticipantIds(cachedChats, myAccountId);
   if (participantIds.length === 0) return;
   const profiles = new Map(contactProfiles);
@@ -176,9 +175,7 @@ function syncChatsIfPossible(): Promise<void> {
     .finally(() => {
       chatSyncInFlight = null;
       // A run that needed no retry means the trouble is over: the next one starts at the base delay
-      // again. Without this the backoff only started over after a quiet HOUR, so isolated blips
-      // (each fixed by one retry) climbed to the 15-minute cap and stayed there (review 2026-09-26,
-      // b2b-errors).
+      // again (otherwise isolated blips climbed the backoff to the 15-minute cap and stayed there).
       if (!catchUpRetryRequestedDuringRun && generation === chatSyncGeneration) catchUpBackoff.reset();
       if (chatSyncRerun) {
         chatSyncRerun = false;
@@ -191,14 +188,10 @@ function syncChatsIfPossible(): Promise<void> {
 /**
  * /reboot and /kill: cancels the in-flight sync run, waits until it has stopped, and keeps new
  * runs (LOGIN, a scheduled catch-up retry, the panel) from starting until the returned release
- * is called. Before, the old run went on over its stale chat snapshot while the wipe deleted
- * topics — refilling them, recreating them after /kill, and swallowing /reboot's own resync
- * (review 2026-09-26, C7).
- * Whatever the hold swallowed — a pending retry timer, a retry request, a LOGIN's sync — is made
- * up for on release with a scheduled catch-up retry. A successful /reboot starts its own resync
- * anyway, but a failed wipe (or /kill, which leaves MAX down — the retry then stands down) did
- * nothing, and the swallowed catch-up waited for the next reconnect, possibly days on a stable
- * socket (review 2026-09-26, catchup-r1#3).
+ * is called — otherwise the old run goes on over its stale chat snapshot while the wipe deletes
+ * topics, refilling them. Whatever the hold swallowed — a pending retry timer, a retry request, a
+ * LOGIN's sync — is made up for on release with a scheduled catch-up retry (a failed wipe, or
+ * /kill, starts no resync of its own, and the next reconnect may be days away on a stable socket).
  */
 async function suspendChatSync(): Promise<() => void> {
   chatSyncHolds += 1;
@@ -224,10 +217,9 @@ async function suspendChatSync(): Promise<() => void> {
 
 /**
  * Catch-up retries after a transient failure (a live delivery or a backfill that hit a
- * Telegram/proxy outage, a failed topic restore — reported through chatSync.requestRetry). Before,
- * only a MAX LOGIN ever ran a catch-up, and a Telegram outage doesn't cause one, so the chats it
- * hit stayed behind (review 2026-09-26, RECOVERY5). One timer at a time, backing off
- * (RetryBackoff); each firing first checks that Telegram answers (getMe) and waits again if not,
+ * Telegram/proxy outage, a failed topic restore — reported through chatSync.requestRetry): a
+ * Telegram outage causes no MAX LOGIN, so the chats it hit would otherwise stay behind. One timer
+ * at a time, backing off (RetryBackoff); each firing first checks that Telegram answers (getMe) and waits again if not,
  * so an outage is polled, not spun on. MAX being down is left to the LOGIN on reconnect, which
  * syncs anyway.
  */
@@ -251,10 +243,8 @@ function scheduleCatchUpRetry(reason: string): void {
 
 async function runCatchUpRetry(): Promise<void> {
   const bot_ = bot;
-  // Only over an accepted LOGIN. Paused from the panel (or /kill), MAX is down on purpose and every
-  // retry failed each chat on "not connected" and re-armed itself for as long as the pause lasted
-  // (review 2026-09-26, cross); on a socket whose LOGIN failed or timed out the same happened —
-  // the LOGIN that succeeds syncs (review 2026-09-27, client-r3.2#0).
+  // Only over an accepted LOGIN: paused (or /kill), or on a socket whose LOGIN failed, every retry
+  // would fail each chat on "not connected" and re-arm itself — the LOGIN that succeeds syncs.
   if (!bot_ || maxSession.state !== 'loggedIn') return;
   try {
     await bot_.telegram.getMe();
@@ -338,10 +328,10 @@ async function startServer(): Promise<void> {
       // Without this, telegraf's default handler rethrows a handler error (or its 90 s
       // handlerTimeout), which stops the polling loop until retryTelegramLaunch restarts it, sets
       // process.exitCode = 1 and console.error()s the raw update — with a /login DM step in it,
-      // an SMS code or the 2FA password (review 2026-09-26, C2). Log the update TYPE only.
+      // an SMS code or the 2FA password. Log the update TYPE only.
       bot.catch((err, ctx) => {
         // The 90 s handlerTimeout only stops waiting: the handler (a big upload, a /login step's
-        // chat refresh) keeps running and usually succeeds — no false error notice (client-r3.3#3).
+        // chat refresh) keeps running and usually succeeds — no false error notice.
         if ((err as Error)?.name === 'TimeoutError') {
           logger.warn(`Telegram handler still running past telegraf's 90 s limit (update type: ${ctx.updateType})`);
           return;
@@ -397,8 +387,7 @@ async function startServer(): Promise<void> {
   // receives it). Stop polling Telegram and close the MAX socket cleanly instead of letting the
   // runtime kill mid-write; the backfill cursor is persisted per message, so an in-flight
   // backfill resumes where it left off either way. A FILE/VIDEO whose download dies with the
-  // socket stops that backfill before the cursor passes it (TransientDownloadError), instead
-  // of leaving a text placeholder behind for good (review 2026-09-26, RECOVERY3).
+  // socket stops that backfill before the cursor passes it (TransientDownloadError).
   const shutdown = (signal: string): void => {
     logger.info(`Received ${signal}, shutting down`);
     try {

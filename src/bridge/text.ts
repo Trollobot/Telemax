@@ -1,5 +1,5 @@
 /**
- * Length limits for user text on its way into Telegram (review 2026-09-26, INBOUND-EDGES2/5).
+ * Length limits for user text on its way into Telegram.
  *
  * Telegram counts message/caption/topic-name limits in UTF-16 code units, and rejects a string
  * that carries a lone surrogate ("text must be encoded in UTF-8") — so a naive `.slice(0, n)`
