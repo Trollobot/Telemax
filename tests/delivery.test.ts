@@ -10,13 +10,11 @@ import {
   discardPartialDelivery,
   HISTORY_FROM_AHEAD_MS,
   historyStartTime,
-  isDeliveredLink,
   isNoticeOf,
   isPermanentTelegramRefusal,
   linkTelegramIds,
   MessageLinkStore,
   renderPollAsText,
-  retryPendingDiscards,
   sendAttachments,
   sendTextPieces,
 } from '../src/bridge/sync.js';
@@ -335,31 +333,17 @@ describe('partial delivery (review 2026-09-26, b5-delivery/b2b-errors)', () => {
     expect(sent).toEqual([1, 2]);
   });
 
-  it('discardPartialDelivery deletes what went out and keeps the undeletable ones for the next try', async () => {
+  it('discardPartialDelivery deletes what went out and moves past an id it cannot delete', async () => {
     const deleted: number[] = [];
-    let telegramDown = true;
     const deleteMessage = vi.fn(async (_chat: string, id: number) => {
-      if (telegramDown && id === 11) throw answered(502);
+      if (id === 11) throw answered(502);
       deleted.push(id);
       return true;
     });
     const bot = { telegram: { deleteMessage } } as unknown as Telegraf;
-    await discardPartialDelivery(bot, 'g', 'chat:1', [10, 11]);
-    expect(deleted).toEqual([10]);
-    telegramDown = false;
-    await retryPendingDiscards(bot, 'g', 'chat:1');
-    expect(deleted).toEqual([10, 11]);
-    // Retried once only — nothing is left for this key.
-    await retryPendingDiscards(bot, 'g', 'chat:1');
+    await expect(discardPartialDelivery(bot, 'g', [10, 11, 12])).resolves.toBeUndefined();
+    expect(deleted).toEqual([10, 12]);
     expect(deleteMessage).toHaveBeenCalledTimes(3);
-  });
-});
-
-describe('orphan-edit links (review 2026-09-26, b2a-cursor)', () => {
-  it('an orphan-edit stub does not count as a delivery of its message', () => {
-    expect(isDeliveredLink(undefined)).toBe(false);
-    expect(isDeliveredLink({})).toBe(true);
-    expect(isDeliveredLink({ orphanEdit: true })).toBe(false);
   });
 });
 
@@ -399,45 +383,18 @@ describe('MessageLinkStore.addNotice (poll tally, b5-delivery / delivery-r2#0)',
   });
 });
 
-describe('MessageLinkStore — replacing a link and remembering deletions (delivery-r2#1/#4)', () => {
+describe('MessageLinkStore — replacing a link (delivery-r2#4)', () => {
   it('replaces an existing link for the same message cleanly', () => {
     const store = new MessageLinkStore(2);
-    // An orphan-edit stub, then the backfill links the original over it.
-    store.add({ maxChatId: 1, maxMessageId: 5n, telegramMessageId: 90, orphanEdit: true });
+    // A partial delivery linked first, then the whole message linked over it.
+    store.add({ maxChatId: 1, maxMessageId: 5n, telegramMessageId: 90 });
     store.add({ maxChatId: 1, maxMessageId: 5n, telegramMessageId: 50, extraTelegramMessageIds: [51] });
-    expect(store.getByTelegram(90)).toBeUndefined(); // no stale id left pointing at the dead stub link
+    expect(store.getByTelegram(90)).toBeUndefined(); // no stale id left pointing at the dead link
     expect(store.getByTelegram(51)?.telegramMessageId).toBe(50);
     // The key is in the eviction order once: one more link does not evict the current one early.
     store.add({ maxChatId: 1, maxMessageId: 6n, telegramMessageId: 60 });
     expect(store.getByMax(1, 5n)?.telegramMessageId).toBe(50);
     expect(store.getByMax(1, 6n)?.telegramMessageId).toBe(60);
-  });
-
-  it('remembers REMOVED messages (bounded, kept across clear and removeByChat)', () => {
-    const store = new MessageLinkStore(2);
-    expect(store.wasRemoved(1, 5n)).toBe(false);
-    store.noteRemoved(1, 5n);
-    store.clear();
-    store.removeByChat(1);
-    expect(store.wasRemoved('1', '5')).toBe(true);
-    store.noteRemoved(1, 6n);
-    store.noteRemoved(1, 7n);
-    expect(store.wasRemoved(1, 5n)).toBe(false); // FIFO past capacity
-    expect(store.wasRemoved(1, 7n)).toBe(true);
-  });
-
-  it('never evicts a pinned link until its chat is unpinned (catchup-r3.2#0)', () => {
-    const store = new MessageLinkStore(2);
-    store.pin(1, 5n);
-    store.add({ maxChatId: 1, maxMessageId: 5n, telegramMessageId: 50 });
-    store.add({ maxChatId: 2, maxMessageId: 1n, telegramMessageId: 60 });
-    store.add({ maxChatId: 2, maxMessageId: 2n, telegramMessageId: 61 });
-    expect(store.getByMax(1, 5n)?.telegramMessageId).toBe(50); // the unpinned oldest went instead
-    expect(store.getByMax(2, 1n)).toBeUndefined();
-    store.unpinChat(1);
-    store.add({ maxChatId: 2, maxMessageId: 3n, telegramMessageId: 62 });
-    expect(store.getByMax(1, 5n)).toBeUndefined();
-    expect(store.getByMax(2, 2n)?.telegramMessageId).toBe(61);
   });
 });
 

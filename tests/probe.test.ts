@@ -80,20 +80,16 @@ describe('probeLinkGuard', () => {
   const mapping = { telegramTopicId: 42 };
 
   it('probes a link whose chat and topic are unchanged', () => {
-    expect(probeLinkGuard({ telegramTopicId: 42 }, mapping, false)).toBe('probe');
-    expect(probeLinkGuard({}, mapping, false)).toBe('probe'); // untagged link: topic check happens later
+    expect(probeLinkGuard({ telegramTopicId: 42 }, mapping)).toBe('probe');
+    expect(probeLinkGuard({}, mapping)).toBe('probe'); // untagged link: topic check happens later
   });
 
   it('drops links of an unmapped (closed/rebooted) or banned chat', () => {
-    expect(probeLinkGuard({ telegramTopicId: 42 }, undefined, false)).toBe('drop');
-    expect(probeLinkGuard({ telegramTopicId: 42 }, { telegramTopicId: 42, banned: true }, false)).toBe('drop');
-  });
-
-  it('skips while the chat topic is being restored', () => {
-    expect(probeLinkGuard({ telegramTopicId: 42 }, mapping, true)).toBe('skip');
+    expect(probeLinkGuard({ telegramTopicId: 42 }, undefined)).toBe('drop');
+    expect(probeLinkGuard({ telegramTopicId: 42 }, { telegramTopicId: 42, banned: true })).toBe('drop');
   });
 
   it('drops a link written in a topic that has since been recreated', () => {
-    expect(probeLinkGuard({ telegramTopicId: 41 }, mapping, false)).toBe('drop');
+    expect(probeLinkGuard({ telegramTopicId: 41 }, mapping)).toBe('drop');
   });
 });

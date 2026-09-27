@@ -7,8 +7,8 @@ import { DIR, OPCODES } from '../max/opcodes.js';
 import { dialogParticipantIds, extractMyAccountId, resolveChatName, type ContactProfile } from '../max/names.js';
 import { SessionStore, type MaxSession } from '../store/sessionStore.js';
 import { ChatMapStore } from '../store/chatMapStore.js';
-import { wireBridge, syncAllChatsToTelegram, MessageLinkStore } from '../bridge/sync.js';
-import { RetryBackoff, type CatchUpTracker } from '../bridge/catchUp.js';
+import { wireBridge, syncAllChatsToTelegram, type ChatCatchUp } from '../bridge/sync.js';
+import { RetryBackoff } from '../bridge/catchUp.js';
 import { isTransientTelegramError } from '../bridge/transient.js';
 import { clearPause, isMaxPaused } from '../bridge/panel.js';
 import { MaxAuthUnavailableError } from '../bridge/maxAuthFlow.js';
@@ -49,8 +49,7 @@ const chatMapStore = new ChatMapStore();
 const max = new MaxClient({ host: config.maxHost, sni: config.maxSni });
 
 let bot: Telegraf | null = null;
-let messageLinks: MessageLinkStore | null = null;
-let catchUp: CatchUpTracker | null = null;
+let chatSync: ChatCatchUp | null = null;
 let tgActive = false;
 let maxConnected = false;
 let lastLoginAt: number | null = null; // set on every successful LOGIN (fresh or resumed) — shown in the panel's status
@@ -254,7 +253,7 @@ async function maxAuthCheckPassword(password: string): Promise<void> {
  * (a stacked race here corrupted chat-map.json writes live, 2026-08-08).
  * A call that lands while a run is in flight is not just dropped, though: it
  * queues ONE more run for when the current one ends. A reconnect mid-run resets
- * the bridge's caught-up set (bridge/catchUp.ts), so the chats this run already
+ * the bridge's caught-up set (ChatCatchUp, bridge/sync.ts), so the chats this run already
  * passed need another pass to catch up on the new gap — until then their
  * cursors stay frozen.
  * /reboot and /kill cancel a run (suspendChatSync) instead of collapsing into it:
@@ -271,7 +270,7 @@ let catchUpRetryRequestedDuringRun = false;
 // the release makes up for it (see suspendChatSync).
 let chatSyncDroppedWhileHeld = false;
 function syncChatsIfPossible(): Promise<void> {
-  if (!bot || !messageLinks) return Promise.resolve();
+  if (!bot || !chatSync) return Promise.resolve();
   // /reboot or /kill is wiping the group — it starts its own run afterwards (or none, for /kill).
   if (chatSyncHolds > 0) {
     chatSyncDroppedWhileHeld = true;
@@ -281,21 +280,12 @@ function syncChatsIfPossible(): Promise<void> {
     chatSyncRerun = true;
     return chatSyncInFlight;
   }
-  const bot_ = bot;
-  const messageLinks_ = messageLinks;
   const generation = chatSyncGeneration;
   catchUpRetryRequestedDuringRun = false;
   chatSyncInFlight = syncAllChatsToTelegram(
-    bot_,
-    chatMapStore,
-    config.targetTelegramGroup,
+    chatSync,
     cachedChats,
     (chat) => resolveChatName(chat, myAccountId, contactProfiles),
-    max,
-    messageLinks_,
-    myAccountId,
-    contactProfiles,
-    catchUp ?? undefined,
     () => generation !== chatSyncGeneration,
   )
     .catch((err) => {
@@ -353,7 +343,7 @@ async function suspendChatSync(): Promise<() => void> {
 
 /**
  * Catch-up retries after a transient failure (a live delivery or a backfill that hit a
- * Telegram/proxy outage, a failed topic restore — reported through catchUp.requestRetry). Before,
+ * Telegram/proxy outage, a failed topic restore — reported through chatSync.requestRetry). Before,
  * only a MAX LOGIN ever ran a catch-up, and a Telegram outage doesn't cause one, so the chats it
  * hit stayed behind (review 2026-09-26, RECOVERY5). One timer at a time, backing off
  * (RetryBackoff); each firing first checks that Telegram answers (getMe) and waits again if not,
@@ -730,7 +720,7 @@ async function startServer(): Promise<void> {
           '⚠️ Ошибка при обработке сообщения или команды из Telegram — подробности в логах контейнера (docker compose logs).',
         );
       });
-      ({ messageLinks, catchUp } = wireBridge({
+      ({ chatSync } = wireBridge({
         max,
         bot,
         chatMapStore,
@@ -752,7 +742,7 @@ async function startServer(): Promise<void> {
           checkPassword: maxAuthCheckPassword,
         },
       }));
-      catchUp?.setRetryHandler(scheduleCatchUpRetry);
+      chatSync.setRetryHandler(scheduleCatchUpRetry);
       launchTelegramBotWithRetry(bot);
       // Route throttled operator error notices (MAX down, delivery failures, internal
       // errors) to the target group. Captured in a const so the closure keeps the
