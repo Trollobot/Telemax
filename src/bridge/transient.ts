@@ -53,17 +53,27 @@ export function isTransientNetworkError(err: unknown, depth = 0): boolean {
 }
 
 /**
+ * A 400 that refuses the BOT, not the message: the bot lost the right to post (or was removed)
+ * from the group. Telegram answers most of these as 403, some as 400 with this wording.
+ */
+const RIGHTS_REFUSAL = /not enough rights|CHAT_WRITE_FORBIDDEN|have no rights|bot was kicked/i;
+
+/**
  * Telegram Bot API failure that is worth retrying later: a 5xx / 429 answer (telegraf's
- * TelegramError carries it on `response.error_code`; its 5xx path fills in the HTTP status), or
- * no Telegram answer at all (network/proxy). Every other answered error — 400 bad request, 403
- * bot kicked, 413 too large — is permanent for that message. 429 is normally absorbed by
- * withFloodRetry; one that outlasts it still means "not now", not "never".
+ * TelegramError carries it on `response.error_code`; its 5xx path fills in the HTTP status), no
+ * Telegram answer at all (network/proxy), or a bridge-wide refusal — 403 (bot kicked/blocked) or
+ * a 400 about missing rights: once the admin restores the bot, every message it refused can still
+ * go out, so it must not count as "done". Every other answered error — 400 bad request, 413 too
+ * large — is permanent for that message. 429 is normally absorbed by withFloodRetry; one that
+ * outlasts it still means "not now", not "never".
  */
 export function isTransientTelegramError(err: unknown): boolean {
   const response = (err as { response?: unknown } | null | undefined)?.response;
   if (response && typeof response === 'object' && (response as { error_code?: unknown }).error_code != null) {
-    const code = Number((response as { error_code?: unknown }).error_code);
-    return code === 429 || code >= 500;
+    const { error_code, description } = response as { error_code?: unknown; description?: unknown };
+    const code = Number(error_code);
+    if (code === 429 || code >= 500 || code === 403) return true;
+    return code === 400 && typeof description === 'string' && RIGHTS_REFUSAL.test(description);
   }
   return isTransientNetworkError(err);
 }

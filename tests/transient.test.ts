@@ -25,10 +25,20 @@ describe('isTransientTelegramError', () => {
     expect(isTransientTelegramError(telegramError(429, 'Too Many Requests: retry after 5'))).toBe(true);
   });
 
-  it('treats an answered 4xx as permanent', () => {
+  it('treats an answered 4xx about THIS message as permanent', () => {
     expect(isTransientTelegramError(telegramError(400, 'Bad Request: message thread not found'))).toBe(false);
-    expect(isTransientTelegramError(telegramError(403, 'Forbidden: bot was kicked'))).toBe(false);
+    expect(isTransientTelegramError(telegramError(400, 'Bad Request: message is too long'))).toBe(false);
     expect(isTransientTelegramError(telegramError(413, 'Request Entity Too Large'))).toBe(false);
+  });
+
+  it('treats a bridge-wide refusal (bot kicked, blocked, no rights) as transient', () => {
+    // Once the admin restores the bot, every refused message can still go out — the cursor must not pass them.
+    expect(isTransientTelegramError(telegramError(403, 'Forbidden: bot was kicked from the supergroup chat'))).toBe(true);
+    expect(isTransientTelegramError(telegramError(403, 'Forbidden: bot was blocked by the user'))).toBe(true);
+    expect(isTransientTelegramError(telegramError(400, 'Bad Request: not enough rights to send text messages to the chat'))).toBe(true);
+    expect(isTransientTelegramError(telegramError(400, 'Bad Request: CHAT_WRITE_FORBIDDEN'))).toBe(true);
+    expect(isTransientTelegramError(telegramError(400, 'Bad Request: have no rights to send a message'))).toBe(true);
+    expect(isTransientTelegramError(telegramError(400, 'Bad Request: bot was kicked from the supergroup chat'))).toBe(true);
   });
 
   it('treats a missing answer (network, proxy, timeout) as transient', () => {

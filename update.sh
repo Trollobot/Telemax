@@ -157,9 +157,10 @@ try_source() {
   # Пробуем КАЖДЫЙ тег на коммите, а не только старший по версии: одна лишняя метка рядом с
   # настоящим релизом (например оставленная вручную) выигрывала сортировку, не проходила проверку
   # подписи — и обновления вставали навсегда, хотя валидный подписанный тег был тут же.
+  # Только финальные релизы (vX.Y.Z): предрелиз вроде v1.1.0-beta.1 для стабильной установки не тег.
   local t seen=0
   tag=""
-  for t in $(git tag --points-at "$CANDIDATE" 2>/dev/null | grep -E '^v[0-9]' | sort -rV); do
+  for t in $(git tag --points-at "$CANDIDATE" 2>/dev/null | grep -E '^v[0-9]+(\.[0-9]+)*$' | sort -rV); do
     seen=1
     if git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile="$ALLOWED_SIGNERS" verify-tag "$t" >/dev/null 2>&1; then
       tag="$t"

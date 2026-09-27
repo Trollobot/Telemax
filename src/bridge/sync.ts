@@ -1371,8 +1371,14 @@ export function wireBridge({
     const isCallback = Boolean(ctx.callbackQuery);
     if (!isCommand && !isCallback) return next();
 
+    // An anonymous admin («Remain anonymous») posts as the group itself: from = GroupAnonymousBot,
+    // sender_chat = the group. Only the supergroup's admins can do that — same as the reaction
+    // path's actor_chat check. Callback queries carry the real from.id.
+    const senderChat = (ctx.message as { sender_chat?: { id: number } } | undefined)?.sender_chat;
+    if (senderChat && String(senderChat.id) === targetGroupId) return next();
+
     const userId = ctx.from?.id;
-    if (userId == null) return; // anonymous group post / no sender — fail closed
+    if (userId == null) return; // no sender — fail closed
     try {
       if (await isGroupAdmin(userId)) return next();
     } catch (err) {
@@ -2261,10 +2267,11 @@ export function wireBridge({
   }
 
   /**
-   * A live MAX -> Telegram delivery failed. On a transient failure the message still sits in MAX's
-   * history above the chat's cursor — keep it reachable: take the chat out of `caughtUp`, so later
-   * live messages stop moving its cursor past it, and ask for a catch-up run, which re-delivers it
-   * (see ChatCatchUp). A permanent (4xx) refusal would fail the same way on every retry — logged only.
+   * A live MAX -> Telegram delivery failed. The message still sits in MAX's history above the
+   * chat's cursor — keep it reachable whatever the cause: take the chat out of `caughtUp`, so
+   * later live messages stop moving its cursor past it, and the next catch-up run re-delivers it
+   * (see ChatCatchUp). Only a transient failure asks for that run right away — a permanent (4xx)
+   * refusal would fail the same way on every retry and spin.
    */
   function onLiveDeliveryFailed(chatId: unknown, err: unknown, what: string): void {
     if (err instanceof SyncCancelledError) return; // /reboot or /kill stopped it on purpose
@@ -2273,8 +2280,11 @@ export function wireBridge({
       return;
     }
     logger.error(`${what} failed`, err);
-    if (!isRetriedDeliveryFailure(err) && !isTransientMaxError(err)) return;
     chatSync.markDirty(chatId);
+    if (!isRetriedDeliveryFailure(err) && !isTransientMaxError(err)) {
+      logger.info(`MAX chat ${String(chatId)}: live delivery refused — its cursor stays put until the next catch-up`);
+      return;
+    }
     logger.info(`MAX chat ${String(chatId)}: live delivery failed transiently — its cursor stays put until a catch-up re-delivers the message`);
     chatSync.requestRetry(`live delivery for MAX chat ${String(chatId)} failed`);
   }
@@ -2750,8 +2760,9 @@ export function wireBridge({
   bot.command('poll', async (ctx) => {
     const topicId = ctx.message.message_thread_id;
     if (!topicId) return;
+    // In a forum topic a bare command carries reply_to_message = the topic-root message (id === topicId).
     const replyTo = (ctx.message as { reply_to_message?: { message_id: number } }).reply_to_message;
-    if (!replyTo) {
+    if (!replyTo || replyTo.message_id === topicId) {
       await bot.telegram.sendMessage(targetGroupId, 'Ответьте этой командой на сообщение с опросом.', { message_thread_id: topicId });
       return;
     }
@@ -3082,8 +3093,9 @@ export function wireBridge({
       await bot.telegram.sendMessage(targetGroupId, '/delete работает только внутри темы чата — ответьте им на сообщение, которое нужно удалить.').catch(() => {});
       return;
     }
+    // In a forum topic a bare command carries reply_to_message = the topic-root message (id === topicId).
     const replyTo = (ctx.message as { reply_to_message?: { message_id: number } }).reply_to_message;
-    if (!replyTo) {
+    if (!replyTo || replyTo.message_id === topicId) {
       logger.info(`/delete in topic ${topicId}: no reply target`);
       await bot.telegram.sendMessage(targetGroupId, 'Ответьте этой командой на сообщение, которое нужно удалить. /delete me — удалить только у себя.', {
         message_thread_id: topicId,

@@ -14,8 +14,12 @@
  * config), and any 663-char string in there — a channel post, a description — was
  * taken for a rotated session token, saved, and bricked the session on the next
  * resume. So the walk skips those snapshot branches, and a candidate must use the
- * bearer-token alphabet only.
+ * bearer-token alphabet — or, when no string does, at least not be obvious text.
  */
+
+import { createLogger } from '../logger.js';
+
+const logger = createLogger('max-tokens');
 
 const SESSION_TOKEN_LENGTH = 663;
 
@@ -26,6 +30,30 @@ const SESSION_TOKEN_LENGTH = 663;
  * punctuation) and URLs (`:`, `?`, `&`, `%`) do not.
  */
 const TOKEN_ALPHABET = /^[A-Za-z0-9\-._~+/]+=*$/;
+
+/** Obvious text — whitespace or Cyrillic. Never a token, whatever the real alphabet turns out to be. */
+const OBVIOUS_TEXT = /[\sЀ-ӿ]/;
+
+/**
+ * Length-only fallback for when nothing fits TOKEN_ALPHABET: if that alphabet is a wrong guess,
+ * every login would fail without this. Exact length, no whitespace or Cyrillic.
+ */
+export function couldBeToken(value: string, length = SESSION_TOKEN_LENGTH): boolean {
+  return value.length === length && !OBVIOUS_TEXT.test(value);
+}
+
+/**
+ * A masked, log-safe description of a fallback candidate — length, first/last 4 characters and
+ * the character classes it uses — so the real alphabet can be captured from the logs.
+ */
+export function describeTokenShape(value: string): string {
+  const classes: string[] = [];
+  if (/[a-z]/.test(value)) classes.push('lower');
+  if (/[A-Z]/.test(value)) classes.push('upper');
+  if (/[0-9]/.test(value)) classes.push('digit');
+  const others = [...new Set(value.replace(/[A-Za-z0-9]/g, ''))].sort().join('');
+  return `length=${value.length}, starts "${value.slice(0, 4)}…", ends "…${value.slice(-4)}", classes: ${classes.join(' ') || 'none'}, other chars: "${others}"`;
+}
 
 /**
  * Account-snapshot branches of a LOGIN response (keys seen live: profile, chats, messages,
@@ -47,9 +75,21 @@ export function findAuthToken(payload: unknown): string | undefined {
   return undefined;
 }
 
-export function findLongToken(value: unknown, length = SESSION_TOKEN_LENGTH, seen = new Set<unknown>()): string | undefined {
+/**
+ * The first string of the token length outside the snapshot branches: one in the token alphabet
+ * first; failing that, the length-only fallback, logged masked so the real alphabet gets captured.
+ */
+export function findLongToken(value: unknown, length = SESSION_TOKEN_LENGTH): string | undefined {
+  const strict = walkForToken(value, length, looksLikeToken, new Set());
+  if (strict) return strict;
+  const loose = walkForToken(value, length, couldBeToken, new Set());
+  if (loose) logger.warn(`Token candidate outside the expected alphabet, taken through the length-only fallback: ${describeTokenShape(loose)}`);
+  return loose;
+}
+
+function walkForToken(value: unknown, length: number, accept: (s: string, length: number) => boolean, seen: Set<unknown>): string | undefined {
   if (typeof value === 'string') {
-    return looksLikeToken(value, length) ? value : undefined;
+    return accept(value, length) ? value : undefined;
   }
   if (!value || typeof value !== 'object') return undefined;
   if (seen.has(value)) return undefined; // guard against cyclic structures
@@ -60,7 +100,7 @@ export function findLongToken(value: unknown, length = SESSION_TOKEN_LENGTH, see
 
   for (const [key, child] of entries) {
     if (typeof key === 'string' && SNAPSHOT_KEYS.has(key)) continue;
-    const found = findLongToken(child, length, seen);
+    const found = walkForToken(child, length, accept, seen);
     if (found) return found;
   }
   return undefined;

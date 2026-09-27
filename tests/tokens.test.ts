@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { describeAuthError, findAuthToken, findLongToken, looksLikeToken } from '../src/max/tokens.js';
+import { couldBeToken, describeAuthError, describeTokenShape, findAuthToken, findLongToken, looksLikeToken } from '../src/max/tokens.js';
 
 describe('findAuthToken', () => {
   it('reads a plain token field', () => {
@@ -74,6 +74,49 @@ describe('findLongToken', () => {
   it('skips snapshot keys inside a Map too', () => {
     const map = new Map<unknown, unknown>([['chats', [token663]]]);
     expect(findLongToken(map)).toBeUndefined();
+  });
+
+  // The token alphabet is a guess (never captured live): when nothing fits it, a 663-char
+  // string that is not obvious text is still taken, so /login keeps working if the guess is wrong.
+  const withColons = ('abc:' + 'x'.repeat(60) + '|').repeat(11).slice(0, 663);
+
+  it('falls back to a length-only match when nothing fits the strict alphabet', () => {
+    expect(withColons).toHaveLength(663);
+    expect(looksLikeToken(withColons)).toBe(false);
+    expect(findLongToken({ 87: withColons })).toBe(withColons);
+    expect(findLongToken({ attrs: [{ session: { value: withColons } }] })).toBe(withColons);
+  });
+
+  it('prefers a strict-alphabet candidate over a fallback one', () => {
+    expect(findLongToken({ first: withColons, second: token663 })).toBe(token663);
+  });
+
+  it('never takes text or a snapshot string through the fallback', () => {
+    expect(findLongToken({ description: post })).toBeUndefined();
+    expect(findLongToken({ chats: [{ text: withColons }], profile: { bio: withColons } })).toBeUndefined();
+  });
+});
+
+describe('couldBeToken', () => {
+  it('accepts the exact length unless whitespace or Cyrillic is inside', () => {
+    expect(couldBeToken(('https://i.oneme.ru/i?r=' + 'x'.repeat(700)).slice(0, 663))).toBe(true);
+    expect(couldBeToken('a'.repeat(662))).toBe(false);
+    expect(couldBeToken('a'.repeat(331) + ' ' + 'a'.repeat(331))).toBe(false);
+    expect(couldBeToken('a'.repeat(331) + '\n' + 'a'.repeat(331))).toBe(false);
+    expect(couldBeToken('ж'.repeat(663))).toBe(false);
+  });
+});
+
+describe('describeTokenShape', () => {
+  it('masks the value: length, 4 chars at each end, character classes', () => {
+    const value = 'Ab12' + ':|'.repeat(300) + 'Zz89';
+    const shape = describeTokenShape(value);
+    expect(shape).toBe('length=608, starts "Ab12…", ends "…Zz89", classes: lower upper digit, other chars: ":|"');
+    expect(shape).not.toContain(':|:|:|');
+  });
+
+  it('reports a value with no letters or digits', () => {
+    expect(describeTokenShape('----')).toBe('length=4, starts "----…", ends "…----", classes: none, other chars: "-"');
   });
 });
 

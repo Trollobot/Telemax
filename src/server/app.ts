@@ -256,6 +256,9 @@ async function runCatchUpRetry(): Promise<void> {
     }
     return;
   }
+  // A chat born during the outage (its topic never got created, so no mapping either) is in
+  // neither the LOGIN snapshot nor the mappings — refresh the snapshot so the sync sees it.
+  await refreshChatsAndNames().catch((err) => logger.error('Catch-up retry: refreshing the chat list failed', err));
   void syncChatsIfPossible();
 }
 

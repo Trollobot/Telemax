@@ -523,11 +523,12 @@ fi
 # A fresh clone and an existing checkout are moved only onto a release whose tag verifies against the
 # PINNED key (a clone carries nothing trusted yet; a very old checkout carries no key at all). Prints
 # the newest v* tag in the history of $2 (main's tip) whose signature verifies — a release on a side
-# branch does not count, untagged work after the newest release is skipped (review 2026-09-27,
-# shell-r3.1#2). Non-zero when there is none.
+# branch does not count, untagged work after the newest release is skipped. Only final releases
+# (vX.Y.Z): `sort -rV` ranks v1.1.0-beta.1 above v1.1.0, so a pre-release tag would win a fresh
+# install. Non-zero when there is none.
 newest_signed_release() {
   local t
-  for t in $(git -C "$1" tag -l 'v[0-9]*' 2>/dev/null | sort -rV); do
+  for t in $(git -C "$1" tag -l 'v[0-9]*' 2>/dev/null | grep -E '^v[0-9]+(\.[0-9]+)*$' | sort -rV); do
     git -C "$1" merge-base --is-ancestor "$t" "$2" 2>/dev/null || continue
     if git -C "$1" -c gpg.format=ssh -c gpg.ssh.allowedSignersFile="$SIGNERS" verify-tag "$t" >/dev/null 2>&1; then
       printf '%s' "$t"
@@ -606,6 +607,10 @@ if [ -d "$INSTALL_DIR/.git" ]; then
     explain_update_failure
     CHECKOUT_UNCHANGED=1
   fi
+elif [ -d "$INSTALL_DIR" ] && [ -n "$(ls -A "$INSTALL_DIR" 2>/dev/null)" ]; then
+  # git clone refuses a non-empty directory; without this the failure read as "GitHub недоступен".
+  echo "❌ $INSTALL_DIR не пуст и не является git-репозиторием: удалите мост через меню (пункт 3, с бэкапом) или укажите другой каталог"
+  exit 1
 elif GIT_TERMINAL_PROMPT=0 git clone "$REPO_URL" "$INSTALL_DIR"; then
   FRESH_CLONE=1 # cloned from GitHub
 else
