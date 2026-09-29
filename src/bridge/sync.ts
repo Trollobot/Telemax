@@ -148,6 +148,31 @@ export function probeLinkGuard(link: { telegramTopicId?: number }, mapping: { te
   return 'probe';
 }
 
+/**
+ * Classifies a no-op rename (editForumTopic with the topic's current name) used as an existence
+ * check: a live topic answers TOPIC_NOT_MODIFIED (or ok, when the name did differ), a deleted one
+ * TOPIC_ID_INVALID. sendChatAction and a field-less editForumTopic answer ok for a DELETED topic
+ * (confirmed live 2026-09-29: the probe trusted sendChatAction and mirror-deleted the owner's MAX
+ * messages along with a topic deleted by hand). `null` = the call succeeded. Pure + exported.
+ */
+export function classifyTopicProbe(errText: string | null): 'alive' | 'gone' | 'unknown' {
+  if (errText == null || /TOPIC_NOT_MODIFIED/i.test(errText)) return 'alive';
+  return isThreadNotFound(errText) ? 'gone' : 'unknown';
+}
+
+/** Does the forum topic still exist? 'unknown' on anything inconclusive (429, network, no title to rename to). */
+export async function probeTopic(bot: Pick<Telegraf, 'telegram'>, groupId: string, topicId: number, title: string | undefined): Promise<'alive' | 'gone' | 'unknown'> {
+  const name = clampTopicTitle(title);
+  if (!name) return 'unknown';
+  try {
+    await bot.telegram.editForumTopic(groupId, topicId, { name });
+    return 'alive';
+  } catch (err) {
+    const description = (err as { response?: { description?: string } })?.response?.description;
+    return classifyTopicProbe(String(description ?? (err as Error)?.message ?? err));
+  }
+}
+
 /** Telegram's flood-control 429 carries how long to wait — honor it instead of failing the send.
  * Capped: an endless 429 (the bot got flagged/limited for real) must eventually surface as an
  * error instead of holding a backfill loop hostage forever. */
@@ -393,6 +418,14 @@ export class MessageLinkStore {
     const out: MessageLink[] = [];
     for (const link of this.byMax.values()) if (link.outgoing) out.push(link);
     return out;
+  }
+
+  /** The chat's most recently linked message that came FROM MAX (a bot-written copy in the topic) — the probe's second witness. */
+  newestIncoming(maxChatId: unknown): MessageLink | undefined {
+    const chatKey = String(maxChatId);
+    let newest: MessageLink | undefined;
+    for (const link of this.byMax.values()) if (!link.outgoing && String(link.maxChatId) === chatKey) newest = link;
+    return newest;
   }
 
   /** Drops a single link once the probe confirms its Telegram message is gone, so it isn't pinged again. */
@@ -1564,23 +1597,6 @@ export function wireBridge({
     }
   }
 
-  /**
-   * Is the forum topic still there? Asked only after a message probed 'gone', right before the
-   * irreversible forAll delete on MAX: a message that vanished with its whole topic must not take
-   * the owner's MAX messages with it. Accepted side effect: on a live topic this shows «бот
-   * печатает…» for up to ~5 s, once per owner-side deletion the probe catches. NOTE 2026-09-26:
-   * that sendChatAction on a deleted topic answers "thread not found" still needs live confirmation
-   * — if it answers ok, the check reads 'alive' and merely degrades to the pre-check behaviour.
-   */
-  async function probeTopicState(topicId: number): Promise<'alive' | 'gone' | 'unknown'> {
-    try {
-      await bot.telegram.sendChatAction(targetGroupId, 'typing', { message_thread_id: topicId });
-      return 'alive';
-    } catch (err) {
-      return isThreadNotFound(telegramErrorText(err)) ? 'gone' : 'unknown';
-    }
-  }
-
   async function runProbeTick(): Promise<void> {
     // /reboot or /kill is deleting every topic: messages vanish with them, and nothing here may
     // read that as the owner deleting them (the guard below re-checks per link: a wipe can start mid-tick).
@@ -1604,10 +1620,10 @@ export function wireBridge({
     }
     // Checked BEFORE and again AFTER the probe: a /ban, «Чат закрыт», topic restore, /reboot or
     // /kill can land while the probe call is in flight, and a 'gone' probe deletes on MAX forAll.
-    const guard = async (link: MessageLink): Promise<{ verdict: 'probe' | 'skip' | 'drop'; topicId?: number }> => {
+    const guard = async (link: MessageLink): Promise<{ verdict: 'probe' | 'skip' | 'drop'; topicId?: number; title?: string }> => {
       if (wiping) return { verdict: 'skip' };
       const mapping = await chatMapStore.getByMaxChatId(link.maxChatId);
-      return { verdict: probeLinkGuard(link, mapping), topicId: mapping?.telegramTopicId };
+      return { verdict: probeLinkGuard(link, mapping), topicId: mapping?.telegramTopicId, title: mapping?.title };
     };
     for (const link of due.slice(0, PROBE_MAX_PER_TICK)) {
       const key = `${String(link.maxChatId)}:${String(link.maxMessageId)}`;
@@ -1628,15 +1644,30 @@ export function wireBridge({
         logger.info(`probe: Telegram message ${link.telegramMessageId} gone but chat ${String(link.maxChatId)} changed meanwhile (${after.verdict}) — not deleting on MAX`);
         continue;
       }
-      const topicState = await probeTopicState(after.topicId);
+      // Two independent witnesses that only this ONE message went away, not its whole topic —
+      // the forAll delete below is irreversible. First: the topic itself still exists.
+      const topicState = await probeTopic(bot, targetGroupId, after.topicId, after.title);
       if (topicState === 'gone') {
-        // The whole topic went away, not this one message: none of the chat's links may reach
-        // the forAll delete below. The topic restore brings it back on the next incoming message.
+        // None of the chat's links may reach the delete. The topic comes back with the chat's
+        // next incoming message.
         forgetChatLinks(link.maxChatId);
         logger.info(`probe: Telegram message ${link.telegramMessageId} gone together with topic ${after.topicId} — dropped the chat's links, nothing deleted on MAX`);
         continue;
       }
-      if (topicState === 'unknown') continue; // 429/network — keep the link, retry on the ladder
+      if (topicState === 'unknown') continue; // 429/network/no title — keep the link, retry on the ladder
+      // Second, not relying on how Telegram answers for a topic: the newest copy the bot wrote
+      // into the same topic is still there. Gone as well => treated as the topic vanishing.
+      const witness = messageLinks.newestIncoming(link.maxChatId);
+      if (witness) {
+        const witnessState = await probeMessageState(witness);
+        if (witnessState === 'unknown') continue;
+        if (witnessState === 'gone') {
+          forgetLink(witness.maxChatId, witness.maxMessageId);
+          forgetLink(link.maxChatId, link.maxMessageId);
+          logger.info(`probe: Telegram message ${link.telegramMessageId} gone, and so is the newest MAX copy in its topic — not deleting on MAX (use /delete if it was meant)`);
+          continue;
+        }
+      }
       // Forgotten while the probe was in flight (/delete, 👎, a REMOVED push — each forgets the link
       // BEFORE deleting the copies, which is what the probe saw vanish): that deletion is already
       // handled, and a forAll here would turn a «/delete me» into a delete for everyone.
@@ -3481,7 +3512,8 @@ export function wireBridge({
  * snapshot, mapped chats it did not contain get the same catch-up: the LOGIN snapshot is capped at
  * 50, and a chat born live meanwhile may be missing too — left out, its cursor stayed frozen all
  * session and the next restart re-sent everything. `isCancelled` (/reboot, /kill) is checked
- * before every chat and every message.
+ * before every chat and every message. A topic deleted by hand is NOT looked for here: it comes
+ * back, with its history, when the chat's next message arrives (decided 2026-09-29).
  */
 export async function syncAllChatsToTelegram(
   chatSync: ChatCatchUp,

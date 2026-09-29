@@ -38,7 +38,7 @@ function fakeWorld(history: MaxHistoryMessage[] = [], onSend?: (text: string, to
     }),
     sendLocation: vi.fn(async () => ({ message_id: nextId++ })),
     createForumTopic: vi.fn(async (_group: string, name: string) => ({ message_thread_id: 999, name })),
-    editForumTopic: vi.fn(async () => true),
+    editForumTopic: vi.fn(async (_group: string, _topicId: number, _extra?: { name?: string }) => true),
     deleteForumTopic: vi.fn(async () => true),
     deleteMessage: vi.fn(async (_group: string, _id: number) => true),
   };

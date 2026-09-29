@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { classifyProbeResult, isReactionInvalid, probeIntervalMs, probeLinkGuard } from '../src/bridge/sync.js';
+import { classifyProbeResult, classifyTopicProbe, isReactionInvalid, MessageLinkStore, probeIntervalMs, probeLinkGuard, probeTopic } from '../src/bridge/sync.js';
 import { isThreadNotFound } from '../src/bridge/transient.js';
 
 describe('probeIntervalMs (decay ladder)', () => {
@@ -64,6 +64,54 @@ describe('isThreadNotFound (topic-gone detector, shared by restore and the probe
     expect(isThreadNotFound(new Error('EFATAL: socket hang up'))).toBe(false);
     expect(isThreadNotFound('Bad Request: message to react not found')).toBe(false);
     expect(isThreadNotFound('')).toBe(false);
+  });
+});
+
+describe('classifyTopicProbe / probeTopic (no-op rename as an existence check, live 2026-09-29)', () => {
+  it('a live topic answers TOPIC_NOT_MODIFIED, or ok when the name differed', () => {
+    expect(classifyTopicProbe('Bad Request: TOPIC_NOT_MODIFIED')).toBe('alive');
+    expect(classifyTopicProbe(null)).toBe('alive');
+  });
+
+  it('a deleted topic answers TOPIC_ID_INVALID', () => {
+    expect(classifyTopicProbe('Bad Request: TOPIC_ID_INVALID')).toBe('gone');
+    expect(classifyTopicProbe('Bad Request: message thread not found')).toBe('gone');
+  });
+
+  it('NEVER reads anything else as alive — alive is what allows the forAll delete on MAX', () => {
+    expect(classifyTopicProbe('Too Many Requests: retry after 7')).toBe('unknown');
+    expect(classifyTopicProbe('EFATAL: socket hang up')).toBe('unknown');
+    expect(classifyTopicProbe('Bad Request: not enough rights to manage topics')).toBe('unknown');
+    expect(classifyTopicProbe('')).toBe('unknown');
+  });
+
+  it('renames to the current title, and does not ask at all without one (a field-less call says ok for a deleted topic)', async () => {
+    const calls: unknown[][] = [];
+    const bot = { telegram: { editForumTopic: async (...args: unknown[]) => void calls.push(args) } };
+    expect(await probeTopic(bot as never, 'g', 7, 'Анна')).toBe('alive');
+    expect(calls).toEqual([['g', 7, { name: 'Анна' }]]);
+    expect(await probeTopic(bot as never, 'g', 7, undefined)).toBe('unknown');
+    expect(await probeTopic(bot as never, 'g', 7, '   ')).toBe('unknown');
+    expect(calls).toHaveLength(1);
+  });
+
+  it('reads the description of a Telegram error', async () => {
+    const gone = Object.assign(new Error('400'), { response: { description: 'Bad Request: TOPIC_ID_INVALID' } });
+    const bot = { telegram: { editForumTopic: async () => Promise.reject(gone) } };
+    expect(await probeTopic(bot as never, 'g', 7, 'Анна')).toBe('gone');
+  });
+});
+
+describe('MessageLinkStore.newestIncoming (the probe\'s second witness)', () => {
+  it('returns the chat\'s latest bot-written copy, never an outgoing link or another chat\'s', () => {
+    const links = new MessageLinkStore();
+    links.add({ maxChatId: 1, maxMessageId: 10, telegramMessageId: 100 });
+    links.add({ maxChatId: 1, maxMessageId: 11, telegramMessageId: 101 });
+    links.add({ maxChatId: 1, maxMessageId: 12, telegramMessageId: 102, outgoing: true });
+    links.add({ maxChatId: 2, maxMessageId: 13, telegramMessageId: 103 });
+    expect(links.newestIncoming(1)?.telegramMessageId).toBe(101);
+    expect(links.newestIncoming('2')?.telegramMessageId).toBe(103);
+    expect(links.newestIncoming(3)).toBeUndefined();
   });
 });
 
