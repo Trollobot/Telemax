@@ -62,6 +62,7 @@ function fakeWorld(history: MaxHistoryMessage[] = [], onSend?: (text: string, to
     sendCard,
     forgetChatLinks,
     isWiping: () => wiping,
+    paceMs: 5,
     ...(strikes ? { strikes } : {}),
   });
   const retry = vi.fn();

@@ -658,9 +658,12 @@ async function sendOneAttachment(
 const HISTORY_BATCH_SIZE = 100;
 // Safety valve, not an expected ceiling — just stops a pagination bug from looping forever.
 const HISTORY_MAX_BATCHES = 2000;
-// Telegram's per-chat flood limit is roughly 1 msg/sec — a backfill can dump thousands of
-// messages into one chat, so it paces itself (retrying after every 429 would get flagged as abuse).
-const HISTORY_SEND_DELAY_MS = 1100;
+// A bot may post about 20 messages a minute into one group. At the former 1.1 s a backfill ran
+// into a 30-40 s flood wait in nearly every chat (seen live 2026-09-29) — same total time, but
+// repeated 429s risk being flagged as abuse. 3 s stays under the limit.
+const HISTORY_SEND_DELAY_MS = 3000;
+// Pause between topic deletions of /reboot and /kill.
+const TOPIC_DELETE_DELAY_MS = 1100;
 
 /**
  * Where fetchFullHistory starts paging: a little AHEAD of the local clock. CHAT_HISTORY only
@@ -849,6 +852,8 @@ export interface ChatCatchUpDeps {
   isWiping: () => boolean;
   /** Transient strikes per message before the backfill gives up on it (StrikeCounter) — injectable for tests. */
   strikes?: StrikeCounter;
+  /** Pause after each backfilled message (HISTORY_SEND_DELAY_MS) — injectable for tests. */
+  paceMs?: number;
 }
 
 /**
@@ -1040,6 +1045,7 @@ export class ChatCatchUp {
     const myAccountId = this.deps.getMyAccountId();
     const profiles = this.deps.getContactProfiles();
     const chat = chats.find((c) => c && typeof c === 'object' && String((c as { id?: unknown }).id) === String(chatId));
+    const paceMs = this.deps.paceMs ?? HISTORY_SEND_DELAY_MS;
     for (const msg of messages) {
       // /reboot or /kill wiped the state this run writes into: stop before the next message.
       if (cancelled()) throw new SyncCancelledError();
@@ -1090,7 +1096,7 @@ export class ChatCatchUp {
         let textIds: number[] = [];
         let attachIds: number[] = [];
         if (text) {
-          textIds = await sendTextPieces(bot, groupId, topicId, text, { replyMarkup: memberMarkup, paceMs: HISTORY_SEND_DELAY_MS, sent });
+          textIds = await sendTextPieces(bot, groupId, topicId, text, { replyMarkup: memberMarkup, paceMs, sent });
         }
         if (attaches.length > 0) {
           phase = 'attachments';
@@ -1100,7 +1106,7 @@ export class ChatCatchUp {
             throwOnTransient: !lastTry,
           };
           // withFloodRetry lives INSIDE sendAttachments, around each single send (see the NOTE there).
-          attachIds = await sendAttachments(bot, groupId, topicId, attaches, downloadCtx, undefined, HISTORY_SEND_DELAY_MS, sent, lastTry);
+          attachIds = await sendAttachments(bot, groupId, topicId, attaches, downloadCtx, undefined, paceMs, sent, lastTry);
         }
         const linkIds = buildLinkIds(textIds, attachIds);
         if (linkIds && msg.id != null) messageLinks.add({ maxChatId: chatId, maxMessageId: msg.id, ...linkIds });
@@ -1571,6 +1577,16 @@ export function wireBridge({
   const probeLastAt = new Map<string, number>();
   setInterval(() => void runProbeTick(), PROBE_TICK_MS).unref();
 
+  /** Deletes a forum topic. One already gone (deleted by hand) is the wanted outcome, not an error. Never throws. */
+  async function deleteTopic(topicId: number, what: string): Promise<void> {
+    try {
+      await withFloodRetry(() => bot.telegram.deleteForumTopic(targetGroupId, topicId));
+    } catch (err) {
+      if (isThreadNotFound(err)) logger.info(`Telegram topic ${topicId} was already gone (${what})`);
+      else logger.error(`Failed to delete Telegram topic ${topicId} (${what})`, err);
+    }
+  }
+
   function telegramErrorText(err: unknown): string {
     return String((err as { response?: { description?: string } })?.response?.description ?? (err as Error)?.message ?? '');
   }
@@ -2024,9 +2040,7 @@ export function wireBridge({
       if (banCheck) {
         // Links first — see MessageLinkStore.removeByChat.
         forgetChatLinks(chatId);
-        await bot.telegram
-          .deleteForumTopic(targetGroupId, banCheck.telegramTopicId)
-          .catch((err) => logger.error('Failed to delete Telegram topic on MAX chat deletion', err));
+        await deleteTopic(banCheck.telegramTopicId, 'MAX chat closed');
         await chatMapStore.remove(chatId);
         logger.info(`MAX chat ${String(chatId)} deleted ("Чат закрыт") — removed Telegram topic ${banCheck.telegramTopicId}`);
       }
@@ -2524,7 +2538,7 @@ export function wireBridge({
     // Links first — see MessageLinkStore.removeByChat.
     forgetChatLinks(maxChatId);
     if (mapping) {
-      await bot.telegram.deleteForumTopic(targetGroupId, mapping.telegramTopicId).catch((err) => logger.error('Failed to delete topic on ban', err));
+      await deleteTopic(mapping.telegramTopicId, '/ban');
     }
     await ctx.answerCbQuery('Забанен');
     await ctx.editMessageText(`🚫 Забанен: ${mapping?.title ?? maxChatId}. Сообщения больше не приходят. Вернуть — /unban.`).catch(() => {});
@@ -3033,10 +3047,8 @@ export function wireBridge({
         // Links BEFORE the topics (see MessageLinkStore.removeByChat) — the deletion loop is slow.
         forgetAllLinks();
         for (const mapping of mappings) {
-          await withFloodRetry(() => bot.telegram.deleteForumTopic(targetGroupId, mapping.telegramTopicId)).catch((err) => {
-            logger.error(`Failed to delete Telegram topic ${mapping.telegramTopicId} during ${command}`, err);
-          });
-          await sleep(HISTORY_SEND_DELAY_MS);
+          await deleteTopic(mapping.telegramTopicId, command);
+          await sleep(TOPIC_DELETE_DELAY_MS);
         }
         // Again after the loop: the Telegram -> MAX relay keeps running during the wipe and may have
         // linked a message written into a topic not yet deleted. Before the map goes.
