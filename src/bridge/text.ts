@@ -13,6 +13,11 @@
 export const TELEGRAM_TEXT_LIMIT = 4096;
 /** Bot API limit for a media caption (editMessageCaption). */
 export const TELEGRAM_CAPTION_LIMIT = 1024;
+/**
+ * MAX's limit for a message text, in UTF-16 units: its own client splits at exactly 4000, and a
+ * longer MSG_SEND is answered «Попробуйте уменьшить количество знаков» (seen live 2026-09-29).
+ */
+export const MAX_TEXT_LIMIT = 4000;
 
 function isHighSurrogate(code: number): boolean {
   return code >= 0xd800 && code <= 0xdbff;

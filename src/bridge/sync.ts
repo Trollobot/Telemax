@@ -15,7 +15,7 @@ import {
   type MaxAttachment,
   type DownloadContext,
 } from './attachments.js';
-import { splitTelegramText, truncateCodePoints, truncateUtf16, TELEGRAM_CAPTION_LIMIT, TELEGRAM_TEXT_LIMIT } from './text.js';
+import { splitTelegramText, truncateCodePoints, truncateUtf16, MAX_TEXT_LIMIT, TELEGRAM_CAPTION_LIMIT, TELEGRAM_TEXT_LIMIT } from './text.js';
 import { uploadTelegramAttachmentToMax } from './upload.js';
 import { canRenderAnimatedStickers } from './lottie.js';
 import { reportBridgeError } from './errorReporter.js';
@@ -27,7 +27,7 @@ import { checkVersion, type VersionStatus } from './version.js';
 import { buildStatusText, collectHostStats, maskPhone } from './status.js';
 import { toTelegramReaction } from '../max/reactions.js';
 import { ChatBannedError, StrikeCounter, SyncCancelledError, liveCursorTime } from './catchUp.js';
-import { isThreadNotFound, isTransientMaxError, isTransientTelegramError, TransientDownloadError } from './transient.js';
+import { isThreadNotFound, isTransientMaxError, isTransientTelegramError, TransientDownloadError, withFloodRetry } from './transient.js';
 import { createLogger, jsonStringify, redactSecrets } from '../logger.js';
 
 const logger = createLogger('bridge');
@@ -173,24 +173,14 @@ export async function probeTopic(bot: Pick<Telegraf, 'telegram'>, groupId: strin
   }
 }
 
-/** Telegram's flood-control 429 carries how long to wait — honor it instead of failing the send.
- * Capped: an endless 429 (the bot got flagged/limited for real) must eventually surface as an
- * error instead of holding a backfill loop hostage forever. */
-const FLOOD_RETRY_MAX_ATTEMPTS = 5;
-async function withFloodRetry<T>(fn: () => Promise<T>): Promise<T> {
-  for (let attempt = 1; ; attempt++) {
-    try {
-      return await fn();
-    } catch (err) {
-      const retryAfter = (err as { response?: { parameters?: { retry_after?: number } } })?.response?.parameters?.retry_after;
-      if (!retryAfter || attempt >= FLOOD_RETRY_MAX_ATTEMPTS) throw err;
-      logger.info(`Telegram flood control: waiting ${retryAfter}s (attempt ${attempt}/${FLOOD_RETRY_MAX_ATTEMPTS})`);
-      await sleep((retryAfter + 1) * 1000);
-    }
-  }
+/**
+ * Is this system CONTROL text MAX's «Чат закрыт»? The exact phrase only: the answer deletes the
+ * topic with its history, and any other notice that merely contains «закрыт» must not.
+ * Pure + exported for unit testing.
+ */
+export function isChatClosedNotice(text: unknown): boolean {
+  return typeof text === 'string' && /^чат закрыт\.?$/i.test(text.trim());
 }
-// NOTE: wrap ONE Telegram call, never a function that sends several — a retry re-runs `fn` from
-// the top and posts again everything delivered before the 429 (a wrapped sendAttachments duplicated albums).
 
 /**
  * How a relayed MAX message's Telegram copies are linked: the first text piece (or, with no text,
@@ -345,6 +335,23 @@ interface MessageLink {
   // a reply): deleted with it and resolvable by getByTelegram, but never the target of a 👎 delete,
   // /delete or a relayed reaction (a 👎 on the hint used to delete the owner's poll on both sides).
   noticeTelegramMessageIds?: number[];
+  // Further MAX messages ONE Telegram message produced (a text over MAX_TEXT_LIMIT goes out in
+  // pieces) — deleted together with the anchor. Not indexed in byMax: an edit, a reaction or a
+  // REMOVED push for one of them finds no link.
+  extraMaxMessageIds?: unknown[];
+}
+
+/** Every MAX message a link covers: anchor first, then the further pieces. Pure + exported for unit testing. */
+export function linkMaxIds(link: Pick<MessageLink, 'maxMessageId' | 'extraMaxMessageIds'>): unknown[] {
+  return [link.maxMessageId, ...(link.extraMaxMessageIds ?? [])];
+}
+
+/**
+ * A Telegram text as the pieces MAX accepts: Telegram allows 4096 units, MAX only MAX_TEXT_LIMIT.
+ * A text that fits stays exactly as it is (one piece).
+ */
+function piecesForMax(text: string): string[] {
+  return text.length > MAX_TEXT_LIMIT ? splitTelegramText(text, MAX_TEXT_LIMIT) : [text];
 }
 
 /** Every Telegram message a link covers: anchor, content extras, notices. Pure + exported for unit testing. */
@@ -426,6 +433,17 @@ export class MessageLinkStore {
     let newest: MessageLink | undefined;
     for (const link of this.byMax.values()) if (!link.outgoing && String(link.maxChatId) === chatKey) newest = link;
     return newest;
+  }
+
+  /** Whether the MAX message is already in Telegram: linked itself, or a later piece of a split outgoing text (those are not indexed in byMax). */
+  covers(maxChatId: unknown, maxMessageId: unknown): boolean {
+    if (this.getByMax(maxChatId, maxMessageId)) return true;
+    const chatKey = String(maxChatId);
+    const id = String(maxMessageId);
+    for (const link of this.byMax.values()) {
+      if (link.extraMaxMessageIds && String(link.maxChatId) === chatKey && link.extraMaxMessageIds.some((extra) => String(extra) === id)) return true;
+    }
+    return false;
   }
 
   /** Drops a single link once the probe confirms its Telegram message is gone, so it isn't pinged again. */
@@ -1058,7 +1076,7 @@ export class ChatCatchUp {
         return;
       }
       // Already in Telegram: relayed live (either direction) before this catch-up reached it.
-      if (msg.id != null && messageLinks.getByMax(chatId, msg.id)) {
+      if (msg.id != null && messageLinks.covers(chatId, msg.id)) {
         await chatMapStore.advanceHistoryCursor(chatId, msg.time);
         continue;
       }
@@ -1381,7 +1399,7 @@ export function wireBridge({
   // The target group IS the trust boundary; this enforces it. /reboot and /kill only gate on a
   // confirmation phrase that is public (open-source, echoed in /help), so without this anyone who
   // finds the bot (a DM, an unrelated group) could trigger them. poll_answer updates carry no
-  // `chat` and are authorized by their own poll_id lookup, so they pass through.
+  // `chat`: they pass through, and the poll_answer handler checks poll_id and the voter itself.
   bot.use(async (ctx, next) => {
     if (ctx.chat && String(ctx.chat.id) !== targetGroupId) {
       // A private DM from an outsider is a bug report (or a redirect); only GROUPS get the hard reject.
@@ -1401,9 +1419,9 @@ export function wireBridge({
     return next();
   });
 
-  // Messages/reactions/votes are participation — anyone in the group may. Every BOT COMMAND and
+  // Messages/reactions are participation — anyone in the group may. Every BOT COMMAND and
   // inline button is admin-only: a plain member must not wipe the session or manage MAX groups
-  // just by being in the chat. (The 👎-delete reaction checks isGroupAdmin itself.)
+  // just by being in the chat. (The 👎-delete reaction and a poll vote check isGroupAdmin themselves.)
   bot.use(async (ctx, next) => {
     const text = (ctx.message as { text?: string } | undefined)?.text;
     const isCommand = typeof text === 'string' && text.startsWith('/');
@@ -1689,7 +1707,7 @@ export function wireBridge({
       // handled, and a forAll here would turn a «/delete me» into a delete for everyone.
       if (messageLinks.getByMax(link.maxChatId, link.maxMessageId) !== link) continue;
       try {
-        await max.deleteMessages(link.maxChatId, [link.maxMessageId], false); // forAll — it's ours
+        await max.deleteMessages(link.maxChatId, linkMaxIds(link), false); // forAll — it's ours
         forgetLink(link.maxChatId, link.maxMessageId);
         probeLastAt.delete(key);
         // Its bot notices would otherwise stay as replies to nothing.
@@ -2036,7 +2054,7 @@ export function wireBridge({
     const controlAttach = (attaches as Array<{ _type?: string; event?: string; message?: string; shortMessage?: string }>).find(
       (a) => a?._type === 'CONTROL',
     );
-    if (controlAttach?.event === 'system' && /закрыт/i.test(String(controlAttach.message ?? controlAttach.shortMessage ?? ''))) {
+    if (controlAttach?.event === 'system' && isChatClosedNotice(controlAttach.message ?? controlAttach.shortMessage)) {
       if (banCheck) {
         // Links first — see MessageLinkStore.removeByChat.
         forgetChatLinks(chatId);
@@ -2054,7 +2072,10 @@ export function wireBridge({
       // deletion finds it. No link (relayed before a restart, evicted) — nothing to delete.
       await chatSync.ensureCaughtUp(chatId).catch((err) => onLiveDeliveryFailed(chatId, err, 'Catch-up before a MAX deletion'));
       const link = messageLinks.getByMax(chatId, message.id);
-      if (link) await dropLinkedMessage(link, `MAX deletion of message ${String(message.id)}`);
+      if (link) {
+        await dropLinkedMessage(link, `MAX deletion of message ${String(message.id)}`);
+        logger.info(`MAX -> TG: deletion of message ${String(message.id)} in chat ${String(chatId)} mirrored (${linkTelegramIds(link).length} Telegram message(s) removed)`);
+      }
       return;
     }
     // Everything below writes into the chat's topic: open it and catch the chat up first
@@ -2297,6 +2318,7 @@ export function wireBridge({
           if (linkIds) {
             messageLinks.add({ maxChatId: chatId, maxMessageId: message.id, ...linkIds });
             lastInAt = Date.now();
+            logger.info(`MAX -> TG: message ${String(message.id)} of chat ${String(chatId)} -> topic ${topicId} (${linkTelegramIds(linkIds).length} Telegram message(s))`);
             // Mirror image of rememberOutgoingSend: without it a reconnect's catch-up relays this
             // message a SECOND time. An orphan edit is no new message — it leaves the cursor alone.
             if (!orphanEdit) await chatSync.advanceCursor(chatId, message.time, 'incoming message');
@@ -3164,7 +3186,7 @@ export function wireBridge({
     }
     const forMe = (ctx as unknown as { payload?: string }).payload?.trim().toLowerCase() === 'me';
     try {
-      await max.deleteMessages(link.maxChatId, [link.maxMessageId], forMe);
+      await max.deleteMessages(link.maxChatId, linkMaxIds(link), forMe);
       logger.info(`/delete: removed MAX message ${String(link.maxMessageId)} in chat ${String(link.maxChatId)} (forMe=${forMe})`);
       // Link forgotten BEFORE the copies vanish (dropLinkedMessage) — or the probe would turn a
       // "/delete me" into a delete for everyone.
@@ -3182,6 +3204,26 @@ export function wireBridge({
     if (await bugReports.relayTopicReply(ctx)) return;
     return next();
   });
+
+  /**
+   * The pieces of a long Telegram text after the first one (see piecesForMax), each recorded on
+   * the first piece's link as soon as it is sent — a failure halfway leaves what went out
+   * deletable. No reply link on them. Known limit: an edit in Telegram can't be applied to such a message.
+   */
+  async function sendMorePieces(chatId: unknown, pieces: readonly string[], link: MessageLink): Promise<void> {
+    const total = pieces.length + 1;
+    for (const [i, piece] of pieces.entries()) {
+      let sent;
+      try {
+        sent = await max.sendMessage(chatId, piece);
+      } catch (err) {
+        throw new Error(`${(err as Error).message} (в MAX ушло частей: ${i + 1} из ${total})`, { cause: err });
+      }
+      rememberOutgoingSend(chatId, sent.cid, sent.time);
+      if (sent.messageId != null) (link.extraMaxMessageIds ??= []).push(sent.messageId);
+    }
+    if (total > 1) logger.info(`TG -> MAX: message ${link.telegramMessageId} went to chat ${String(chatId)} as ${total} MAX messages (over ${MAX_TEXT_LIMIT} chars)`);
+  }
 
   bot.on('message', async (ctx) => {
     const topicId = ctx.message.message_thread_id;
@@ -3246,11 +3288,12 @@ export function wireBridge({
           );
           return;
         }
+        const [firstPiece = text, ...morePieces] = piecesForMax(text);
         // Opening the dialog can be rejected by MAX (privacy, an invalid user id): surface the
         // reason IN the topic and keep the pending sentinel intact so the next message retries.
         let opened;
         try {
-          opened = await max.sendToNewDialog(mapping.pendingUserId, text, [], replyLink);
+          opened = await max.sendToNewDialog(mapping.pendingUserId, firstPiece, [], replyLink);
         } catch (err) {
           logger.error(`Failed to open new MAX 1:1 dialog with user ${mapping.pendingUserId}`, err);
           await bot.telegram
@@ -3264,6 +3307,7 @@ export function wireBridge({
         // during the chat-map writes below that echo would find no cid to drop it and open a
         // duplicate topic. rememberOutgoingSend below moves the cursor once the real mapping exists.
         outgoingCids.remember(opened.cid);
+        const link: MessageLink = { maxChatId: opened.chatId, maxMessageId: opened.messageId, telegramMessageId: ctx.message.message_id, telegramTopicId: topicId, outgoing: true };
         // Inside the new chat's queue: a reply from the contact landing between the two writes
         // would otherwise find no mapping and open a second topic.
         await chatSync.runInChat(opened.chatId, async () => {
@@ -3276,18 +3320,13 @@ export function wireBridge({
           });
           // The dialog was born with this very message — no older history to catch up.
           chatSync.markCaughtUp(opened.chatId);
-          messageLinks.add({
-            maxChatId: opened.chatId,
-            maxMessageId: opened.messageId,
-            telegramMessageId: ctx.message.message_id,
-            telegramTopicId: topicId,
-            outgoing: true,
-          });
+          messageLinks.add(link);
         });
         rememberOutgoingSend(opened.chatId, opened.cid, opened.time);
         logger.info(
           `Opened new MAX 1:1 dialog ${String(opened.chatId)} with user ${mapping.pendingUserId} (topic ${topicId})`,
         );
+        await sendMorePieces(opened.chatId, morePieces, link);
         return;
       }
 
@@ -3348,9 +3387,12 @@ export function wireBridge({
       }
 
       if (text) {
-        const { cid, messageId, time } = await max.sendMessage(mapping.maxChatId, text, [], replyLink);
+        const [firstPiece = text, ...morePieces] = piecesForMax(text);
+        const { cid, messageId, time } = await max.sendMessage(mapping.maxChatId, firstPiece, [], replyLink);
         rememberOutgoingSend(mapping.maxChatId, cid, time);
-        messageLinks.add({ maxChatId: mapping.maxChatId, maxMessageId: messageId, telegramMessageId: ctx.message.message_id, telegramTopicId: topicId, outgoing: true });
+        const link: MessageLink = { maxChatId: mapping.maxChatId, maxMessageId: messageId, telegramMessageId: ctx.message.message_id, telegramTopicId: topicId, outgoing: true };
+        messageLinks.add(link);
+        await sendMorePieces(mapping.maxChatId, morePieces, link);
         return;
       }
 
@@ -3468,7 +3510,7 @@ export function wireBridge({
         return;
       }
       try {
-        await max.deleteMessages(link.maxChatId, [link.maxMessageId], false);
+        await max.deleteMessages(link.maxChatId, linkMaxIds(link), false);
         // Forgets the link before the Telegram copies vanish, so the deletion probe never races in.
         await dropLinkedMessage(link, '👎');
         logger.info(`👎-delete: removed MAX message ${String(link.maxMessageId)} in chat ${String(link.maxChatId)} (forAll)`);
@@ -3496,6 +3538,21 @@ export function wireBridge({
     const answer = ctx.pollAnswer;
     const link = pollLinks.getByTelegramPollId(answer.poll_id);
     if (!link) return;
+    // The vote goes to MAX in the owner's name — admins only, like the 👎 delete. An anonymous
+    // admin votes as the group itself (voter_chat); an unverifiable user is ignored — fail closed.
+    const voterChatId = (answer as { voter_chat?: { id: number } }).voter_chat?.id;
+    let allowed = voterChatId != null && String(voterChatId) === targetGroupId;
+    if (!allowed && answer.user) {
+      try {
+        allowed = await isGroupAdmin(answer.user.id);
+      } catch (err) {
+        logger.error('Failed to check admin status for a poll vote', err);
+      }
+    }
+    if (!allowed) {
+      logger.info(`Vote in Telegram poll ${answer.poll_id} by a non-admin (user ${answer.user?.id ?? '?'}) — ignored, not relayed to MAX`);
+      return;
+    }
 
     const answerIds = answer.option_ids.map((i) => link.answerIdByOptionIndex[i]).filter((id): id is number => id != null);
     try {

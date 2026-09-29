@@ -1,9 +1,11 @@
+import { existsSync } from 'node:fs';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { MessageLinkStore } from '../src/bridge/sync.js';
 import { ChatMapStore, cursorToMs, normalizeChatMappings } from '../src/store/chatMapStore.js';
+import { SessionStore } from '../src/store/sessionStore.js';
 
 describe('MessageLinkStore', () => {
   it('resolves links in both directions, including extra Telegram ids', () => {
@@ -166,7 +168,7 @@ describe('ChatMapStore', () => {
     expect((await store.getByMaxChatId(7))?.historyBackfillCursor).toBe('20000');
   });
 
-  it('merges a legacy numeric record and its string twin on load (M7)', async () => {
+  it('merges a legacy numeric record and its string twin on load', async () => {
     // What the old strict-=== upsert left behind: the legacy numeric entry (found first by every
     // lookup) plus a string twin that received the later writes (a newer cursor, a /ban).
     await writeFile(
@@ -206,7 +208,7 @@ describe('ChatMapStore', () => {
     expect(await store.list()).toEqual([]);
   });
 
-  it('setTitle merges only the title into the CURRENT entry (catchup-r1#4)', async () => {
+  it('setTitle merges only the title into the CURRENT entry', async () => {
     const store = new ChatMapStore(filePath);
     await store.upsert({ maxChatId: 1, telegramTopicId: 10, title: 'old', createdAt: 'x', historyBackfillCursor: '5000' });
     // A rename read the entry, then awaited editForumTopic while the backfill advanced the cursor
@@ -224,6 +226,41 @@ describe('ChatMapStore', () => {
     expect((await store.getByMaxChatId(1))?.title).toBe('new topic');
     await store.setTitle(2, 10, 'ghost');
     expect(await store.getByMaxChatId(2)).toBeUndefined();
+  });
+});
+
+describe('SessionStore.clear', () => {
+  let dir: string;
+  let filePath: string;
+  const session = { sessionToken: 't'.repeat(40), phone: '+70000000000', deviceId: 'd', savedAt: 'now' };
+
+  beforeEach(async () => {
+    dir = await mkdtemp(path.join(tmpdir(), 'telemax-session-'));
+    filePath = path.join(dir, 'max.session.json');
+    vi.stubEnv('MAX_SESSION_KEY', 'ab'.repeat(32));
+  });
+
+  afterEach(async () => {
+    vi.unstubAllEnvs();
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  it('lands after a save still in flight, so the file does not come back', async () => {
+    const store = new SessionStore(filePath);
+    await Promise.all([store.save(session), store.save(session), store.clear()]);
+    expect(existsSync(filePath)).toBe(false);
+    expect(await store.load()).toBeNull();
+    // The queue keeps working afterwards.
+    await store.save(session);
+    expect((await store.load())?.phone).toBe(session.phone);
+  });
+
+  it('removes the leftover .tmp and the parked .broken too, and is fine with nothing to remove', async () => {
+    const store = new SessionStore(filePath);
+    for (const file of [filePath, `${filePath}.tmp`, `${filePath}.broken`]) await writeFile(file, 'x', 'utf8');
+    await store.clear();
+    for (const file of [filePath, `${filePath}.tmp`, `${filePath}.broken`]) expect(existsSync(file)).toBe(false);
+    await expect(store.clear()).resolves.toBeUndefined();
   });
 });
 

@@ -22,7 +22,7 @@ class ScriptedClient extends MaxClient {
   }
 }
 
-describe('MaxClient.login failure kinds (review 2026-09-26, RECOVERY4)', () => {
+describe('MaxClient.login failure kinds', () => {
   it('an ERR answer is a MaxServerError carrying the opcode and the server code', async () => {
     const client = new ScriptedClient({ dir: DIR.ERR, payload: { error: 'login.token', localizedMessage: 'Сессия устарела' } });
     const err = await client.login('t').catch((e: unknown) => e);
@@ -54,7 +54,7 @@ describe('MaxClient.login failure kinds (review 2026-09-26, RECOVERY4)', () => {
   });
 });
 
-describe('half-open detection (review 2026-09-26, M1)', () => {
+describe('half-open detection', () => {
   type Internals = { socket: unknown; buffer: Buffer; ping(): void; drainBuffer(): void };
 
   function withFakeSocket(): { client: MaxClient; internals: Internals; destroy: ReturnType<typeof vi.fn>; sent: number[] } {
@@ -92,7 +92,7 @@ describe('half-open detection (review 2026-09-26, M1)', () => {
   });
 });
 
-describe('reconnectAttemptFor (review 2026-09-26, M4)', () => {
+describe('reconnectAttemptFor', () => {
   const now = 1_000_000;
 
   it('keeps counting while connections never pass INIT', () => {
@@ -109,7 +109,7 @@ describe('reconnectAttemptFor (review 2026-09-26, M4)', () => {
   });
 });
 
-describe('TLS handshake deadline (review 2026-09-26, client-r1#1)', () => {
+describe('TLS handshake deadline', () => {
   it('destroys a socket whose handshake stalls, and lifts the deadline once TLS is up', async () => {
     const tls = (await import('node:tls')).default;
     const { EventEmitter } = await import('node:events');

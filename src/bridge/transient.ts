@@ -6,8 +6,12 @@
  * mid-download) must stop the chat's backfill WITHOUT moving its cursor — the cursor is the lower
  * bound of every later catch-up, so everything the outage touched would be lost for good.
  *
- * Pure + exported for unit testing.
+ * Pure + exported for unit testing (withFloodRetry aside — it lives here so that both sync.ts and
+ * telegram/bot.ts can import it without a cycle).
  */
+import { createLogger } from '../logger.js';
+
+const logger = createLogger('bridge');
 
 // Socket/DNS-level failures from node (telegraf's node-fetch, the MAX TLS socket) and undici
 // (maxFetch — undici wraps them as TypeError('fetch failed') with the code on `cause`).
@@ -108,6 +112,25 @@ export class TransientDownloadError extends Error {
     this.name = 'TransientDownloadError';
   }
 }
+
+/** Telegram's flood-control 429 carries how long to wait — honor it instead of failing the send.
+ * Capped: an endless 429 (the bot got flagged/limited for real) must eventually surface as an
+ * error instead of holding a backfill loop hostage forever. */
+const FLOOD_RETRY_MAX_ATTEMPTS = 5;
+export async function withFloodRetry<T>(fn: () => Promise<T>): Promise<T> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      const retryAfter = (err as { response?: { parameters?: { retry_after?: number } } })?.response?.parameters?.retry_after;
+      if (!retryAfter || attempt >= FLOOD_RETRY_MAX_ATTEMPTS) throw err;
+      logger.info(`Telegram flood control: waiting ${retryAfter}s (attempt ${attempt}/${FLOOD_RETRY_MAX_ATTEMPTS})`);
+      await new Promise((resolve) => setTimeout(resolve, (retryAfter + 1) * 1000));
+    }
+  }
+}
+// NOTE: wrap ONE Telegram call, never a function that sends several — a retry re-runs `fn` from
+// the top and posts again everything delivered before the 429 (a wrapped sendAttachments duplicated albums).
 
 /** Telegram's error when you touch a forum topic that's since been deleted. The exact
  * code depends on the method: sendMessage/sendPhoto to a dead thread answer "message

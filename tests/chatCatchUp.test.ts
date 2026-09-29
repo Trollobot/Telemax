@@ -313,7 +313,7 @@ describe('syncAllChatsToTelegram', () => {
     expect(w.sends).toHaveLength(0);
   });
 
-  it('backfills a poll as its text rendering, options included (delivery-r2#3)', async () => {
+  it('backfills a poll as its text rendering, options included', async () => {
     await store.upsert({ maxChatId: '42', telegramTopicId: 100, title: 'Анна', createdAt: 'x', historyBackfillCursor: '50' });
     const poll = {
       id: 1,

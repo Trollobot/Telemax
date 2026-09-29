@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { Telegraf } from 'telegraf';
-import { splitTelegramText, truncateCodePoints, truncateUtf16, TELEGRAM_TEXT_LIMIT } from '../src/bridge/text.js';
+import { splitTelegramText, truncateCodePoints, truncateUtf16, MAX_TEXT_LIMIT, TELEGRAM_TEXT_LIMIT } from '../src/bridge/text.js';
 import { dialogParticipantIds, isFallbackTitle, resolveChatName, resolveContactDisplayName } from '../src/max/names.js';
 import { clampTopicTitle, ensureTopicForMaxChat, withTopicLock } from '../src/telegram/bot.js';
 import { telegramSendKind, TELEGRAM_PHOTO_LIMIT_BYTES, TELEGRAM_UPLOAD_LIMIT_BYTES } from '../src/bridge/attachments.js';
@@ -10,8 +10,10 @@ import {
   discardPartialDelivery,
   HISTORY_FROM_AHEAD_MS,
   historyStartTime,
+  isChatClosedNotice,
   isNoticeOf,
   isPermanentTelegramRefusal,
+  linkMaxIds,
   linkTelegramIds,
   MessageLinkStore,
   renderPollAsText,
@@ -93,6 +95,67 @@ describe('splitTelegramText', () => {
     const text = 'a'.repeat(10) + '\n' + 'b'.repeat(5);
     expect(splitTelegramText(text, 10)).toEqual(['a'.repeat(10), 'b'.repeat(5)]);
   });
+
+  it('cuts a long Telegram text into pieces MAX accepts, on line boundaries', () => {
+    const lines = Array.from({ length: 85 }, (_, i) => `Строка ${String(i + 1).padStart(3, '0')} 🚀 проверка нарезки длинных сообщений моста`);
+    const text = lines.join('\n');
+    expect(text.length).toBeGreaterThan(MAX_TEXT_LIMIT);
+    const pieces = splitTelegramText(text, MAX_TEXT_LIMIT);
+    expect(pieces.length).toBe(2);
+    for (const p of pieces) {
+      expect(p.length).toBeLessThanOrEqual(MAX_TEXT_LIMIT);
+      expect(hasLoneSurrogate(p)).toBe(false);
+      expect(p.startsWith('Строка ')).toBe(true);
+      expect(p.endsWith(' моста')).toBe(true);
+    }
+    expect(pieces.join('\n').split('\n')).toEqual(lines);
+  });
+
+  it('falls back to a word boundary for one long line at the MAX limit', () => {
+    const text = Array.from({ length: 700 }, (_, i) => `слово${i}`).join(' ');
+    expect(text.length).toBeGreaterThan(MAX_TEXT_LIMIT);
+    const pieces = splitTelegramText(text, MAX_TEXT_LIMIT);
+    for (const p of pieces) {
+      expect(p.length).toBeLessThanOrEqual(MAX_TEXT_LIMIT);
+      expect(p).toMatch(/^слово\d+ .* слово\d+$/);
+    }
+    expect(pieces.join(' ')).toBe(text);
+  });
+});
+
+describe('linkMaxIds', () => {
+  it('lists the anchor first, then every further piece', () => {
+    expect(linkMaxIds({ maxMessageId: 100n })).toEqual([100n]);
+    expect(linkMaxIds({ maxMessageId: 100n, extraMaxMessageIds: [101n, 102n] })).toEqual([100n, 101n, 102n]);
+  });
+
+  it('keeps the further pieces out of the by-MAX index', () => {
+    const store = new MessageLinkStore();
+    store.add({ maxChatId: 1, maxMessageId: 100n, extraMaxMessageIds: [101n], telegramMessageId: 7, outgoing: true });
+    expect(linkMaxIds(store.getByTelegram(7) as { maxMessageId: unknown })).toEqual([100n, 101n]);
+    expect(store.getByMax(1, 101n)).toBeUndefined();
+  });
+
+  it('covers() knows every piece, so a catch-up does not post a later piece again', () => {
+    const store = new MessageLinkStore();
+    store.add({ maxChatId: 1, maxMessageId: 100n, extraMaxMessageIds: [101n], telegramMessageId: 7, outgoing: true });
+    expect(store.covers(1, 100n)).toBe(true);
+    expect(store.covers('1', 101n)).toBe(true);
+    expect(store.covers(1, 102n)).toBe(false);
+    expect(store.covers(2, 101n)).toBe(false); // another chat's id
+  });
+});
+
+describe('isChatClosedNotice', () => {
+  it('matches the exact phrase, whatever the case, spaces around and a trailing period', () => {
+    for (const t of ['Чат закрыт', ' чат закрыт. ', 'ЧАТ ЗАКРЫТ']) expect(isChatClosedNotice(t)).toBe(true);
+  });
+
+  it('is false for any other notice with the word in it — the answer deletes a topic', () => {
+    for (const t of ['Доступ к чату закрыт администратором', 'Опрос закрыт', 'Чат закрыт администратором', '', undefined, null, 42]) {
+      expect(isChatClosedNotice(t)).toBe(false);
+    }
+  });
 });
 
 describe('isFallbackTitle', () => {
@@ -156,7 +219,7 @@ function fakeTopicWorld() {
 }
 
 describe('ensureTopicForMaxChat', () => {
-  it('opens ONE topic for concurrent pushes of a new chat (S3)', async () => {
+  it('opens ONE topic for concurrent pushes of a new chat', async () => {
     const w = fakeTopicWorld();
     const results = await Promise.all([
       ensureTopicForMaxChat(w.bot, 'g', 555, w.store, 'Анна'),
@@ -168,7 +231,7 @@ describe('ensureTopicForMaxChat', () => {
     expect(results.filter((r) => r.created)).toHaveLength(1);
   });
 
-  it('never renames an existing topic to a fallback title (C5)', async () => {
+  it('never renames an existing topic to a fallback title', async () => {
     const w = fakeTopicWorld();
     w.mappings.set('9', { maxChatId: '9', telegramTopicId: 1, title: 'Анна' });
     await ensureTopicForMaxChat(w.bot, 'g', 9, w.store, 'MAX ID 9');
@@ -186,6 +249,20 @@ describe('ensureTopicForMaxChat', () => {
     expect(w.mappings.get('9')?.title).toBe('Я'.repeat(128));
     await ensureTopicForMaxChat(w.bot, 'g', 10, w.store, long);
     expect((w.createForumTopic.mock.calls[0] as unknown[])[1]).toBe('Я'.repeat(128));
+  });
+
+  it('waits out a flood-control 429 and creates the topic on the retry', async () => {
+    vi.useFakeTimers();
+    try {
+      const w = fakeTopicWorld();
+      w.createForumTopic.mockRejectedValueOnce(Object.assign(new Error('429: Too Many Requests: retry after 3'), { response: { error_code: 429, parameters: { retry_after: 3 } } }));
+      const run = ensureTopicForMaxChat(w.bot, 'g', 77, w.store, 'Анна');
+      await vi.advanceTimersByTimeAsync(5000);
+      await expect(run).resolves.toMatchObject({ created: true });
+      expect(w.createForumTopic).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('keeps going after a failed run holding the lock', async () => {
@@ -215,7 +292,7 @@ describe('telegramSendKind (Bot API upload limits)', () => {
   });
 });
 
-describe('buildLinkIds (S5)', () => {
+describe('buildLinkIds', () => {
   it('anchors on the first text piece and keeps every other id as extra', () => {
     expect(buildLinkIds([10, 11], [12, 13, 14])).toEqual({ telegramMessageId: 10, extraTelegramMessageIds: [11, 12, 13, 14] });
   });
@@ -255,7 +332,7 @@ describe('isPermanentTelegramRefusal', () => {
   });
 });
 
-describe('renderPollAsText (INBOUND-EDGES4)', () => {
+describe('renderPollAsText', () => {
   it('lists the question, flags and every option', () => {
     const text = renderPollAsText('Куда едем?', ['Море', 'Горы'], 3);
     expect(text).toContain('📊 Опрос: Куда едем? (анонимный, несколько ответов)');
@@ -268,7 +345,7 @@ describe('renderPollAsText (INBOUND-EDGES4)', () => {
   });
 });
 
-describe('describeUnrelayableTelegramMessage (OUTBOUND6)', () => {
+describe('describeUnrelayableTelegramMessage', () => {
   it('labels content types MAX has no equivalent for', () => {
     expect(describeUnrelayableTelegramMessage({ dice: { emoji: '🎲', value: 4 } })).toBe('кубик 🎲');
     expect(describeUnrelayableTelegramMessage({ story: { id: 1 } })).toBe('история');
@@ -283,7 +360,7 @@ describe('describeUnrelayableTelegramMessage (OUTBOUND6)', () => {
   });
 });
 
-describe('partial delivery (review 2026-09-26, b5-delivery/b2b-errors)', () => {
+describe('partial delivery', () => {
   const answered = (code: number, description = 'Bad Gateway') => Object.assign(new Error(description), { response: { error_code: code, description } });
   const location = { _type: 'LOCATION', latitude: 55.75, longitude: 37.62 };
 
@@ -299,7 +376,7 @@ describe('partial delivery (review 2026-09-26, b5-delivery/b2b-errors)', () => {
     expect(sent).toEqual([100, 101]);
   });
 
-  it('on the last try a transient failure degrades to a placeholder and the rest still go out (delivery-r1#2)', async () => {
+  it('on the last try a transient failure degrades to a placeholder and the rest still go out', async () => {
     let next = 100;
     const sendLocation = vi.fn(async () => {
       if (next === 101) {
@@ -347,7 +424,7 @@ describe('partial delivery (review 2026-09-26, b5-delivery/b2b-errors)', () => {
   });
 });
 
-describe('MessageLinkStore.addNotice (poll tally, b5-delivery / delivery-r2#0)', () => {
+describe('MessageLinkStore.addNotice (poll tally)', () => {
   it('adds a later notice to an existing link so a deletion finds it, apart from the content ids', () => {
     const store = new MessageLinkStore();
     store.add({ maxChatId: 1, maxMessageId: 5n, telegramMessageId: 50, extraTelegramMessageIds: [51] });
@@ -383,7 +460,7 @@ describe('MessageLinkStore.addNotice (poll tally, b5-delivery / delivery-r2#0)',
   });
 });
 
-describe('MessageLinkStore — replacing a link (delivery-r2#4)', () => {
+describe('MessageLinkStore — replacing a link', () => {
   it('replaces an existing link for the same message cleanly', () => {
     const store = new MessageLinkStore(2);
     // A partial delivery linked first, then the whole message linked over it.
@@ -398,14 +475,14 @@ describe('MessageLinkStore — replacing a link (delivery-r2#4)', () => {
   });
 });
 
-describe('historyStartTime (RECOVERY9, slow host clock)', () => {
+describe('historyStartTime (slow host clock)', () => {
   it('starts paging ahead of the local clock', () => {
     expect(historyStartTime(1_000_000)).toBe(1_000_000 + HISTORY_FROM_AHEAD_MS);
     expect(HISTORY_FROM_AHEAD_MS).toBeGreaterThan(0);
   });
 });
 
-describe('dialogParticipantIds (C5)', () => {
+describe('dialogParticipantIds', () => {
   it('collects the other side of 1:1 dialogs only, deduplicated', () => {
     const me = 1;
     const chats = [

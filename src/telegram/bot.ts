@@ -3,6 +3,7 @@ import type { ChatMapStore } from '../store/chatMapStore.js';
 import { createLogger } from '../logger.js';
 import { isFallbackTitle } from '../max/names.js';
 import { truncateUtf16 } from '../bridge/text.js';
+import { withFloodRetry } from '../bridge/transient.js';
 
 const logger = createLogger('telegram');
 
@@ -122,9 +123,13 @@ async function ensureTopicUnlocked(
 
   let topic;
   try {
-    topic = await bot.telegram.createForumTopic(groupId, title ?? `MAX chat ${String(maxChatId)}`, {
-      icon_color: pickTopicIconColor(maxChatId),
-    });
+    // Flood control hits exactly here after /reboot (dozens of topics in a row): without the
+    // retry the chat stayed without a topic until its next event.
+    topic = await withFloodRetry(() =>
+      bot.telegram.createForumTopic(groupId, title ?? `MAX chat ${String(maxChatId)}`, {
+        icon_color: pickTopicIconColor(maxChatId),
+      }),
+    );
     lastWarnedAdvice = null; // it worked — a previous warning (if any) no longer applies
   } catch (err) {
     await warnAboutKnownTelegramError(bot, groupId, err);

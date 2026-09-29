@@ -63,12 +63,13 @@ export class SessionStore {
       ciphertext: ciphertext.toString('base64'),
     };
 
-    await mkdir(path.dirname(this.filePath), { recursive: true });
     // write-then-rename, same as ChatMapStore: save() runs on every reconnect (MAX rotates the token),
     // so a crash or a power cut mid-write is a real possibility — and a truncated file used to make
     // load() throw on every boot, which with `restart: unless-stopped` is an endless restart loop
     // curable only by deleting the file over SSH.
+    // Queued with no await before it, mkdir included: a clear() called after this save must land after it.
     const run = this.writeQueue.then(async () => {
+      await mkdir(path.dirname(this.filePath), { recursive: true });
       const tmpPath = `${this.filePath}.tmp`;
       await writeFile(tmpPath, JSON.stringify(encoded), 'utf8');
       await rename(tmpPath, this.filePath);
@@ -112,11 +113,20 @@ export class SessionStore {
     }
   }
 
+  /**
+   * Removes the session and what save()/load() may have left next to it (`.tmp`, the parked
+   * `.broken`) — /kill promises that everything is erased. Queued behind any save in flight,
+   * which would otherwise bring the file back right after the unlink.
+   */
   async clear(): Promise<void> {
-    try {
-      await unlink(this.filePath);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
-    }
+    const run = this.writeQueue.then(async () => {
+      for (const file of [this.filePath, `${this.filePath}.tmp`, `${this.filePath}.broken`]) {
+        await unlink(file).catch((err) => {
+          if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+        });
+      }
+    });
+    this.writeQueue = run.catch(() => undefined);
+    return run;
   }
 }

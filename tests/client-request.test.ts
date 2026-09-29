@@ -104,13 +104,13 @@ function serverFrame(opcode: number, payload: unknown, flags = 0): Buffer {
 
 const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
 
-describe('MaxClient pending waits (review 2026-09-26)', () => {
+describe('MaxClient pending waits', () => {
   afterEach(() => {
     vi.restoreAllMocks();
     vi.useRealTimers();
   });
 
-  it('M2: without a socket a request rejects at once and leaves no listener or timer behind', async () => {
+  it('without a socket a request rejects at once and leaves no listener or timer behind', async () => {
     vi.useFakeTimers();
     const client = new MaxClient({ reconnect: false });
     const messageListeners = client.listenerCount('message');
@@ -124,7 +124,7 @@ describe('MaxClient pending waits (review 2026-09-26)', () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it('client-r3.1#0: before LOGIN OK only auth requests go out; the rest fail as transient', async () => {
+  it('before LOGIN OK only auth requests go out; the rest fail as transient', async () => {
     const { client, socket } = connectedClient(false);
     const err = await client.getFileDownloadUrl(1, 2, 3).catch((e: unknown) => e);
     expect(isTransientMaxError(err)).toBe(true);
@@ -135,7 +135,7 @@ describe('MaxClient pending waits (review 2026-09-26)', () => {
     client.disconnect();
   });
 
-  it('M10: requests in flight add no listeners — one dispatcher serves them all', async () => {
+  it('requests in flight add no listeners — one dispatcher serves them all', async () => {
     const { client } = connectedClient();
     const before = client.listenerCount('message');
     const waits = [client.sendMessage(1, 'a'), client.getFileDownloadUrl(1, 2, 3), client.getVideoPlayUrls(1, 2, 3)];
@@ -147,7 +147,7 @@ describe('MaxClient pending waits (review 2026-09-26)', () => {
     client.disconnect();
   });
 
-  it('M3: an undecodable frame is only reported — the request in flight still gets its answer', async () => {
+  it('an undecodable frame is only reported — the request in flight still gets its answer', async () => {
     const { client, socket } = connectedClient();
     const decodeErrors: Error[] = [];
     client.on('decode-error', (err: Error) => decodeErrors.push(err));
@@ -169,7 +169,7 @@ describe('MaxClient pending waits (review 2026-09-26)', () => {
     client.disconnect();
   });
 
-  it('M3: a socket close fails every request in flight at once, as a transient connection loss', async () => {
+  it('a socket close fails every request in flight at once, as a transient connection loss', async () => {
     const { client, socket } = connectedClient();
     const disconnected = vi.fn();
     client.on('disconnected', disconnected);
@@ -190,7 +190,7 @@ describe('MaxClient pending waits (review 2026-09-26)', () => {
     await expect(client.sendMessage(1, 'c')).rejects.toThrow('not connected');
   });
 
-  it('M3: a socket error fails the requests in flight and is still reported', async () => {
+  it('a socket error fails the requests in flight and is still reported', async () => {
     const { client, socket } = connectedClient();
     const errors: Error[] = [];
     client.on('error', (err: Error) => errors.push(err));
@@ -214,7 +214,7 @@ describe('MaxClient pending waits (review 2026-09-26)', () => {
     expect(client.stoppedByUser).toBe(true);
   });
 
-  it('C18 + M11: a desynced frame header emits disconnected, fails the waits and tears the socket down safely', async () => {
+  it('a desynced frame header emits disconnected, fails the waits and tears the socket down safely', async () => {
     const { client, socket } = connectedClient();
     const disconnected = vi.fn();
     client.on('disconnected', disconnected);
@@ -232,7 +232,7 @@ describe('MaxClient pending waits (review 2026-09-26)', () => {
     expect(() => socket.emit('error', new Error('late'))).not.toThrow();
   });
 
-  it('OUTBOUND9: an upload-ready wait resolves only on the push for its own id', async () => {
+  it('an upload-ready wait resolves only on the push for its own id', async () => {
     const { client } = connectedClient();
     const done: string[] = [];
     const first = client.waitForVideoReady('111').then(() => done.push('first'));
@@ -256,7 +256,7 @@ describe('MaxClient pending waits (review 2026-09-26)', () => {
     client.disconnect();
   });
 
-  it('M13: an upload-ready wait fails at once when the connection drops, and without a socket', async () => {
+  it('an upload-ready wait fails at once when the connection drops, and without a socket', async () => {
     const { client, socket } = connectedClient();
     const wait = client.waitForVideoReady('111').catch((e: unknown) => e);
     socket.emit('close');
@@ -268,7 +268,7 @@ describe('MaxClient pending waits (review 2026-09-26)', () => {
   });
 });
 
-describe('isUploadReadyPush (review 2026-09-26, OUTBOUND9)', () => {
+describe('isUploadReadyPush', () => {
   it('matches the id across number, BigInt and string', () => {
     expect(isUploadReadyPush({ videoId: 5n }, 'videoId', '5')).toBe(true);
     expect(isUploadReadyPush({ audioId: '5' }, 'audioId', 5)).toBe(true);
