@@ -233,6 +233,44 @@ if [ "$CANDIDATE" = "$PREV_HEAD" ]; then
   if [ -n "$DEPLOYED" ] && git cat-file -e "${DEPLOYED}^{commit}" 2>/dev/null; then PREV_HEAD="$DEPLOYED"; fi
 fi
 
+# Free megabytes where Docker keeps images and build cache (the smaller of its data root and, under
+# the containerd image store, /var/lib/containerd). Empty when it cannot be measured.
+free_mb() {
+  local dir mb min=""
+  for dir in "$(docker info -f '{{.DockerRootDir}}' 2>/dev/null || true)" /var/lib/containerd; do
+    [ -n "$dir" ] && [ -d "$dir" ] || continue
+    mb=$(df -Pm "$dir" 2>/dev/null | awk 'NR==2 {print $4}') || mb=""
+    case "$mb" in ''|*[!0-9]*) continue ;; esac
+    if [ -z "$min" ] || [ "$mb" -lt "$min" ]; then min=$mb; fi
+  done
+  printf '%s' "$min"
+}
+
+# A build that runs out of disk fails at the very end, after minutes of work, with a message only
+# the server log explains (reported 2026-10-03). Check BEFORE the tree moves. A release that changes
+# the Dockerfile rebuilds the chromium+ffmpeg layer and needs far more room; the cache of the old
+# one is useless then, so it is the first thing to go.
+STEP="проверка свободного места"
+NEED_MB="${UPDATE_MIN_FREE_MB:-1500}"
+HEAVY_REBUILD=0
+if ! git diff --quiet "$PREV_HEAD" "$CANDIDATE" -- Dockerfile 2>/dev/null; then
+  HEAVY_REBUILD=1
+  NEED_MB="${UPDATE_MIN_FREE_MB:-3000}"
+fi
+FREE_MB=$(free_mb)
+if [ -n "$FREE_MB" ] && [ "$FREE_MB" -lt "$NEED_MB" ]; then
+  echo "[update] свободно ${FREE_MB} МБ, нужно ${NEED_MB} МБ — убираю остатки прошлых сборок..."
+  docker image prune -f >/dev/null 2>&1 || true
+  [ "$HEAVY_REBUILD" = "1" ] && { docker builder prune -af >/dev/null 2>&1 || true; }
+  FREE_MB=$(free_mb)
+fi
+if [ -n "$FREE_MB" ] && [ "$FREE_MB" -lt "$NEED_MB" ]; then
+  echo "[update] мало места: свободно ${FREE_MB} МБ, нужно ${NEED_MB} МБ"
+  notify "❌ Обновление отложено: на диске свободно ${FREE_MB} МБ, для сборки нужно не меньше ${NEED_MB} МБ. Освободите место на сервере (docker builder prune -af удалит кэш прошлых сборок) и нажмите «Обновить» ещё раз. Рабочая версия НЕ тронута."
+  exit 1
+fi
+echo "[update] свободно на диске: ${FREE_MB:-?} МБ"
+
 # Only now is the working tree allowed to move.
 STEP="применение обновления"
 # Refused up front: a merge that touches none of the edited files succeeds (and on the rebuild path
@@ -275,6 +313,8 @@ rollback() {
   git merge-base --is-ancestor "$PREV_HEAD" "$CANDIDATE" 2>/dev/null || git reset --hard "$CANDIDATE" >/dev/null 2>&1 || true
   if [ "$rc" -eq 0 ]; then
     echo "[update] откат выполнен: вернул прежнюю версию и поднял контейнер"
+    # What the failed attempt left behind — otherwise every failure eats more of the disk.
+    docker image prune -f >/dev/null 2>&1 || true
     return 0
   fi
   echo "[update] ОТКАТ НЕ УДАЛСЯ — мост может быть остановлен"
@@ -303,13 +343,23 @@ fi
 
 STEP="сборка образа"
 echo "[update] building (GIT_COMMIT=$(git rev-parse --short HEAD))..."
-if ! GIT_COMMIT=$(git rev-parse HEAD) docker compose build; then
+# The build output is kept so the failure notice can say WHY: «cat update.log» is beyond most users.
+BUILD_LOG=$(mktemp)
+if ! GIT_COMMIT=$(git rev-parse HEAD) docker compose build 2>&1 | tee "$BUILD_LOG"; then
   ROLLBACK_ON_ERROR=0
+  if grep -qi 'no space left on device' "$BUILD_LOG"; then
+    WHY="на диске кончилось место (свободно $(free_mb) МБ). Освободите его: docker builder prune -af — и нажмите «Обновить» ещё раз"
+  else
+    WHY=$(grep -E 'ERROR|failed to solve' "$BUILD_LOG" | tail -1 | cut -c1-300) || WHY=""
+    [ -n "$WHY" ] || WHY="причина в логе"
+  fi
+  rm -f "$BUILD_LOG"
   if rollback; then
-    notify "❌ Обновление не удалось на шаге «${STEP}» — вернул прежнюю версию, мост продолжает работать. Подробности: cat $(pwd)/data/update.log"
+    notify "❌ Обновление не удалось на шаге «${STEP}»: ${WHY}. Вернул прежнюю версию, мост продолжает работать. Полный лог: cat $(pwd)/data/update.log"
   fi
   exit 1
 fi
+rm -f "$BUILD_LOG"
 
 # Written between a SUCCESSFUL build and the restart: the new container reads it on boot
 # (app.ts's reportIfJustUpdated) and reports "✅ Обновлено". Writing it before the build — as this
@@ -374,5 +424,9 @@ ROLLBACK_ON_ERROR=0
 # Deliberately AFTER the liveness window: until then the old image is the only way back.
 echo "[update] cleaning up dangling images..."
 docker image prune -f >/dev/null 2>&1 || true
+# Build cache this build did not touch — layers of earlier releases — only ever grew (3.5 GB on the
+# test server, 2026-10-04). Everything the build above used counts as recent and stays, the
+# chromium layer included, so the next rebuild is still fast.
+docker builder prune -f --filter until=1h >/dev/null 2>&1 || true
 
 echo "[update] done."

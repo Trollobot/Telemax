@@ -1,11 +1,17 @@
-FROM node:22-slim AS build
+# The base image is pinned by digest (the same one in both stages). A floating `node:22-slim` moves
+# on Docker Hub every week or two, and each move invalidated EVERY layer for every install on its
+# next update — including the ~1 GB chromium+ffmpeg one below: a multi-minute rebuild that needs
+# 2-3 GB of free disk and failed with "no space left on device" on small servers (reported
+# 2026-10-03). Bump the digest deliberately, with a release whose notes warn about the heavy rebuild:
+#   docker buildx imagetools inspect node:22-slim
+FROM node:22-slim@sha256:43ac6c60b8f89723f746e8a92ce91abd5017e627ce1ddfe4238355d3a30b772c AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
 COPY . .
 RUN npm run build
 
-FROM node:22-slim AS runtime
+FROM node:22-slim@sha256:43ac6c60b8f89723f746e8a92ce91abd5017e627ce1ddfe4238355d3a30b772c AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
 # Baked in from the host's git checkout at build time (docker-compose.yml passes
