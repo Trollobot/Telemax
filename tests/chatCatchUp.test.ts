@@ -191,6 +191,20 @@ describe('ChatCatchUp — catch-up on first touch', () => {
     expect(w.retry).toHaveBeenCalledTimes(1);
   });
 
+  it('a MAX-side catch-up failure (its rate limit) does not hold the live message back: relayed now, cursor put, catch-up retried without a duplicate', async () => {
+    await store.upsert({ maxChatId: '42', telegramTopicId: 100, title: 'MAX', createdAt: 'x', historyBackfillCursor: '50' });
+    const w = fakeWorld([msg(1, 100, 'old'), msg(2, 200, 'live')]);
+    w.getChatHistory.mockRejectedValueOnce(new Error('Слишком много запросов'));
+    await w.livePush(42, msg(2, 200, 'live'));
+    expect(w.sends.map((s) => s.text)).toEqual(['live']); // not kept back for the retry
+    expect(w.retry).toHaveBeenCalledTimes(1);
+    expect(w.sync.isCaughtUp('42')).toBe(false);
+    expect((await store.getByMaxChatId('42'))?.historyBackfillCursor).toBe('50');
+    await w.sync.runInChat(42, async () => void (await w.sync.ensureCaughtUp(42))); // the retry
+    expect(w.sends.map((s) => s.text)).toEqual(['live', 'old']); // 'live' is linked — not sent twice
+    expect(w.sync.isCaughtUp('42')).toBe(true);
+  });
+
   it('a MAX reconnect during a catch-up keeps the chat out of caughtUp: its snapshot could not see the new gap', async () => {
     await store.upsert({ maxChatId: '42', telegramTopicId: 100, title: 'Анна', createdAt: 'x', historyBackfillCursor: '50' });
     const w = fakeWorld([msg(1, 100, 'one'), msg(2, 200, 'two')], (text) => {

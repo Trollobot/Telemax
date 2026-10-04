@@ -1066,9 +1066,12 @@ export class ChatCatchUp {
   /**
    * Inside the chat's queue, before a live event is written into the chat: its topic (created on
    * first contact, with its info card) and its catch-up. Null when nothing may be written (banned,
-   * or a wipe cancelled it). `deferred` when the catch-up failed transiently: a retry is requested
-   * and a message arrives with it; an event not part of the history (a call notice) goes out
-   * anyway. Any other catch-up failure is logged and the event relayed; the cursor stays put.
+   * or a wipe cancelled it). `deferred` ONLY when Telegram itself is failing: the event could not
+   * be written anyway, so a message arrives with the retried catch-up (a call notice, not part of
+   * the history, is still attempted). Any failure on the MAX side — its rate limit on history, a
+   * timeout, a download — must not hold the event hostage: it is relayed now, the cursor stays put
+   * and the catch-up is retried in the background (a rate-limited chat kept a system message back
+   * for hours, live 2026-10-04). Cost: a restart before that catch-up succeeds replays it once more.
    */
   async openTopic(chatId: unknown, title?: string, sender?: unknown): Promise<{ topicId: number; deferred: boolean } | null> {
     const { bot, groupId, chatMapStore } = this.deps;
@@ -1079,12 +1082,14 @@ export class ChatCatchUp {
       return topicId == null ? null : { topicId, deferred: false };
     } catch (err) {
       if (err instanceof ChatBannedError || err instanceof SyncCancelledError) return null;
-      const deferred = isRetriedDeliveryFailure(err) || isTransientMaxError(err);
+      const deferred = isTransientTelegramError(err);
       if (deferred) {
-        logger.error(`Catch-up of MAX chat ${String(chatId)} before a live event failed transiently — a message arrives with the retried catch-up`, err);
-        this.requestRetry(`catch-up of MAX chat ${String(chatId)} hit a transient failure`);
+        logger.error(`Catch-up of MAX chat ${String(chatId)} before a live event failed on the Telegram side — a message arrives with the retried catch-up`, err);
       } else {
         logger.error(`Catch-up of MAX chat ${String(chatId)} failed — relaying the live event anyway, its cursor stays put`, err);
+      }
+      if (deferred || isRetriedDeliveryFailure(err) || isTransientMaxError(err)) {
+        this.requestRetry(`catch-up of MAX chat ${String(chatId)} hit a transient failure`);
       }
       return { topicId: first.topicId, deferred };
     }
