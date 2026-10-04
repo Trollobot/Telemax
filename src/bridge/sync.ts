@@ -12,6 +12,8 @@ import {
   downloadMaxAttachment,
   describeAttachment,
   telegramSendKind,
+  takeKeyboard,
+  KEYBOARD_NA,
   type MaxAttachment,
   type DownloadContext,
 } from './attachments.js';
@@ -208,6 +210,20 @@ export function isPermanentTelegramRefusal(err: unknown): boolean {
   return !(err instanceof TransientDownloadError) && !isThreadNotFound(err) && !isTransientTelegramError(err);
 }
 
+function telegramErrorText(err: unknown): string {
+  return String((err as { response?: { description?: string } })?.response?.description ?? (err as Error)?.message ?? '');
+}
+
+/** Telegram refused the message because of its inline keyboard (BUTTON_URL_INVALID, BUTTON_COPY_TEXT_INVALID, …). */
+export function isMarkupRefusal(err: unknown): boolean {
+  return /BUTTON_|reply markup/i.test(telegramErrorText(err));
+}
+
+/** Two inline keyboards as one, `a`'s rows first; undefined when neither exists. */
+function joinMarkups(a: InlineMarkup | undefined, b: InlineMarkup | undefined): InlineMarkup | undefined {
+  return a && b ? { inline_keyboard: [...a.inline_keyboard, ...b.inline_keyboard] } : (a ?? b);
+}
+
 /**
  * Sends a text that may exceed Telegram's 4096-unit limit as consecutive messages
  * (splitTelegramText), each through withFloodRetry; the reply goes on the first piece, the inline
@@ -224,24 +240,48 @@ export async function sendTextPieces(
     replyMarkup?: InlineMarkup;
     paceMs?: number;
     sent?: number[];
+    /** Only names the message in the log when Telegram refuses its keyboard. */
+    maxMessageId?: unknown;
   } = {},
 ): Promise<number[]> {
   const pieces = splitTelegramText(text);
   const ids: number[] = [];
   for (let i = 0; i < pieces.length; i++) {
     const piece = pieces[i] as string;
-    const sent = await withFloodRetry(() =>
-      bot.telegram.sendMessage(groupId, piece, {
-        message_thread_id: topicId,
-        ...(i === 0 && extra.replyParameters ? { reply_parameters: extra.replyParameters } : {}),
-        ...(i === pieces.length - 1 && extra.replyMarkup ? { reply_markup: extra.replyMarkup } : {}),
-      }),
-    );
+    const send = (markup?: InlineMarkup) =>
+      withFloodRetry(() =>
+        bot.telegram.sendMessage(groupId, piece, {
+          message_thread_id: topicId,
+          ...(i === 0 && extra.replyParameters ? { reply_parameters: extra.replyParameters } : {}),
+          ...(markup ? { reply_markup: markup } : {}),
+        }),
+      );
+    const markup = i === pieces.length - 1 ? extra.replyMarkup : undefined;
+    // A button Telegram refuses must not cost the message: it goes out again without the keyboard.
+    const sent = await send(markup).catch((err) => {
+      if (!markup || !isMarkupRefusal(err)) throw err;
+      logger.info(`Telegram refused the keyboard of MAX message ${String(extra.maxMessageId)} (${telegramErrorText(err)}) — sent without it`);
+      return send();
+    });
     ids.push(sent.message_id);
     extra.sent?.push(sent.message_id);
     if (extra.paceMs) await sleep(extra.paceMs);
   }
   return ids;
+}
+
+/**
+ * A MAX keyboard that had no text piece to ride on (an attachment-only or keyboard-only message)
+ * goes out on a short message of its own, after the attachments. Returns its id(s) for the link.
+ */
+function sendKeyboardAlone(
+  bot: Telegraf,
+  groupId: string,
+  topicId: number,
+  keyboard: InlineMarkup,
+  extra: Omit<NonNullable<Parameters<typeof sendTextPieces>[4]>, 'replyMarkup'>,
+): Promise<number[]> {
+  return sendTextPieces(bot, groupId, topicId, '⌨️', { ...extra, replyMarkup: keyboard });
 }
 
 /** Deletes the bot's own Telegram messages one by one, so one failure doesn't keep the rest. Never throws; `why` names the cause in the error log. */
@@ -542,7 +582,9 @@ class RecentCids {
  * whose ONLY content is such an event doesn't post a bare author prefix ("👤 Имя:" with nothing) —
  * reported live 2026-08-23 for a group service event attributed to a member.
  */
-function isRenderableAttach(att: MaxAttachment): boolean {
+export function isRenderableAttach(att: MaxAttachment): boolean {
+  // A keyboard is no message of its own: it rides on the message's text as reply_markup (takeKeyboard).
+  if (att._type === 'INLINE_KEYBOARD') return false;
   return !(att._type === 'CONTROL' && !['new', 'join', 'leave', 'title'].includes(String((att as { event?: unknown }).event)));
 }
 
@@ -1082,7 +1124,9 @@ export class ChatCatchUp {
       }
       const forwarded = await resolveForwardContent(max, chats, msg.link, chatId, msg.id, profiles);
       let text = forwarded ? forwarded.text : msg.text;
-      let attaches = forwarded ? forwarded.attaches : Array.isArray(msg.attaches) ? (msg.attaches as MaxAttachment[]) : [];
+      const taken = takeKeyboard(forwarded ? forwarded.attaches : Array.isArray(msg.attaches) ? (msg.attaches as MaxAttachment[]) : []);
+      let attaches = taken.attaches;
+      const keyboard = taken.keyboard;
       // A poll goes out as its text rendering, options included — sendAttachments only knows a
       // «[опрос: …]» placeholder for it.
       const pollAttach = attaches.find((a) => a._type === 'POLL');
@@ -1091,7 +1135,7 @@ export class ChatCatchUp {
         text = text ? `${text}\n${pollText}` : pollText;
         attaches = attaches.filter((a) => a !== pollAttach);
       }
-      if (!text && !attaches.some((a) => isRenderableAttach(a))) {
+      if (!text && !keyboard && !attaches.some((a) => isRenderableAttach(a))) {
         await chatMapStore.advanceHistoryCursor(chatId, msg.time);
         continue;
       }
@@ -1114,7 +1158,7 @@ export class ChatCatchUp {
         let textIds: number[] = [];
         let attachIds: number[] = [];
         if (text) {
-          textIds = await sendTextPieces(bot, groupId, topicId, text, { replyMarkup: memberMarkup, paceMs, sent });
+          textIds = await sendTextPieces(bot, groupId, topicId, text, { replyMarkup: joinMarkups(memberMarkup, keyboard), paceMs, sent, maxMessageId: msg.id });
         }
         if (attaches.length > 0) {
           phase = 'attachments';
@@ -1125,6 +1169,10 @@ export class ChatCatchUp {
           };
           // withFloodRetry lives INSIDE sendAttachments, around each single send (see the NOTE there).
           attachIds = await sendAttachments(bot, groupId, topicId, attaches, downloadCtx, undefined, paceMs, sent, lastTry);
+        }
+        if (keyboard && textIds.length === 0) {
+          phase = 'text';
+          attachIds.push(...(await sendKeyboardAlone(bot, groupId, topicId, keyboard, { paceMs, sent, maxMessageId: msg.id })));
         }
         const linkIds = buildLinkIds(textIds, attachIds);
         if (linkIds && msg.id != null) messageLinks.add({ maxChatId: chatId, maxMessageId: msg.id, ...linkIds });
@@ -1603,10 +1651,6 @@ export function wireBridge({
       if (isThreadNotFound(err)) logger.info(`Telegram topic ${topicId} was already gone (${what})`);
       else logger.error(`Failed to delete Telegram topic ${topicId} (${what})`, err);
     }
-  }
-
-  function telegramErrorText(err: unknown): string {
-    return String((err as { response?: { description?: string } })?.response?.description ?? (err as Error)?.message ?? '');
   }
 
   async function probeMessageState(link: MessageLink): Promise<'alive' | 'gone' | 'unknown'> {
@@ -2097,6 +2141,10 @@ export function wireBridge({
       text = forwarded.text;
       attaches = forwarded.attaches;
     }
+    // The keyboard leaves the attaches here: it is no message of its own (see sendKeyboardAlone).
+    const taken = takeKeyboard(attaches);
+    attaches = taken.attaches;
+    const keyboard = taken.keyboard;
     // Text of its own, before any forward/reply prefix — an orphan edit without it has nothing to post.
     const hasOwnText = Boolean(forwarded ? message.link?.message?.text : message.text);
 
@@ -2144,8 +2192,15 @@ export function wireBridge({
           logger.info(`MAX edit of message ${String(message.id)} is ${marked.length} chars — only its first ${TELEGRAM_TEXT_LIMIT} fit into the edited Telegram message`);
           marked = `${truncateUtf16(marked, TELEGRAM_TEXT_LIMIT - 1)}…`;
         }
+        // The edit carries the message's current keyboard; an empty one removes buttons MAX dropped.
+        const edit = (markup?: InlineMarkup) =>
+          bot.telegram.editMessageText(targetGroupId, existingLink.telegramMessageId, undefined, marked, markup ? { reply_markup: markup } : {});
         try {
-          await bot.telegram.editMessageText(targetGroupId, existingLink.telegramMessageId, undefined, marked);
+          await edit(keyboard ?? { inline_keyboard: [] }).catch((err) => {
+            if (!isMarkupRefusal(err)) throw err;
+            logger.info(`Telegram refused the keyboard of edited MAX message ${String(message.id)} (${telegramErrorText(err)}) — edited without it`);
+            return edit();
+          });
         } catch (err) {
           await relayEditFallback(chatId, message.id, existingLink, marked, err);
         }
@@ -2181,7 +2236,7 @@ export function wireBridge({
     // its topic is the ONLY way it appears live (CHAT_UPDATE never creates one) — openTopic above
     // already did that (regression "добавили в группу, а она не появляется" reported live
     // 2026-08-24). The attach types (never the content) are logged so a recurrence is self-diagnosing.
-    if (!text && !attaches.some((a) => isRenderableAttach(a as MaxAttachment))) {
+    if (!text && !keyboard && !attaches.some((a) => isRenderableAttach(a as MaxAttachment))) {
       if (attaches.length > 0) {
         const kinds = attaches
           .map((a) => `${(a as MaxAttachment)._type}${(a as { event?: unknown }).event ? `/${String((a as { event?: unknown }).event)}` : ''}${Array.isArray((a as MaxAttachment).userIds) ? '+userIds' : ''}`)
@@ -2304,7 +2359,9 @@ export function wireBridge({
         // `sent` tracks every part for discardPartialDelivery.
         const sent: number[] = [];
         try {
-          const textIds = text ? await sendTextPieces(bot, targetGroupId, topicId, text, { replyParameters, replyMarkup: memberMarkup, sent }) : [];
+          const textIds = text
+            ? await sendTextPieces(bot, targetGroupId, topicId, text, { replyParameters, replyMarkup: joinMarkups(memberMarkup, keyboard), sent, maxMessageId: message.id })
+            : [];
           let attachIds: number[] = [];
           if (attaches.length > 0) {
             // Always CALL sendAttachments, never behind a `??=` on the text id: a forward always
@@ -2313,6 +2370,10 @@ export function wireBridge({
             const downloadCtx: DownloadContext = { max, ...(forwarded ? forwarded.download : { chatId, messageId: message.id }) };
             // The reply goes on the text when there is one; only a media-only reply threads it into the first attachment.
             attachIds = await sendAttachments(bot, targetGroupId, topicId, attaches, downloadCtx, textIds.length > 0 ? undefined : replyParameters, undefined, sent);
+          }
+          if (keyboard && textIds.length === 0) {
+            const reply = attachIds.length === 0 ? replyParameters : undefined;
+            attachIds.push(...(await sendKeyboardAlone(bot, targetGroupId, topicId, keyboard, { replyParameters: reply, sent, maxMessageId: message.id })));
           }
           const linkIds = buildLinkIds(textIds, attachIds);
           if (linkIds) {
@@ -2530,6 +2591,11 @@ export function wireBridge({
       logger.error('Failed to write update-requested marker', err);
       await ctx.editMessageText('❌ Не удалось запросить обновление — смотрите логи контейнера.');
     }
+  });
+
+  // A MAX button with no Telegram counterpart (see maxKeyboardToTelegram): presses are not relayed yet.
+  bot.action(KEYBOARD_NA, async (ctx) => {
+    await ctx.answerCbQuery('Эта кнопка работает только в приложении MAX').catch(() => {});
   });
 
   bot.action('tlmx_dismiss', async (ctx) => {

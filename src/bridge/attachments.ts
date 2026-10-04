@@ -9,9 +9,11 @@
  * guarantee which `MP4_*` qualities exist for a given video.
  */
 import { gzipSync } from 'node:zlib';
+import type { InlineKeyboardButton, InlineKeyboardMarkup } from 'telegraf/types';
 import type { MaxClient } from '../max/client.js';
 import { maxFetch } from '../max/ca.js';
-import { createLogger } from '../logger.js';
+import { createLogger, jsonStringify, redactSecrets } from '../logger.js';
+import { truncateUtf16 } from './text.js';
 import { isTransientHttpStatus, isTransientMaxError, isTransientNetworkError, TransientDownloadError } from './transient.js';
 
 const logger = createLogger('attachments');
@@ -72,6 +74,8 @@ export interface MaxAttachment {
   lastName?: string;
   phone?: unknown;
   vcfBody?: string;
+  // INLINE_KEYBOARD — a bot message's buttons: rows of {type, text, url|payload|…} (see maxKeyboardToTelegram).
+  keyboard?: unknown;
 }
 
 export interface DownloadedAttachment {
@@ -302,6 +306,64 @@ export function describeAttachment(att: MaxAttachment): string {
           return `[системное событие${att.event ? ': ' + att.event : ''}]`;
       }
     default:
+      logUnknownAttachment(att);
       return `[вложение${att._type ? ': ' + att._type : ''}]`;
   }
+}
+
+// One line per unknown `_type` per process — enough to learn its shape without flooding the log.
+const loggedUnknownTypes = new Set<string>();
+
+function logUnknownAttachment(att: MaxAttachment): void {
+  const type = String(att._type);
+  if (loggedUnknownTypes.has(type) || loggedUnknownTypes.size >= 50) return;
+  loggedUnknownTypes.add(type);
+  logger.info(`Unknown MAX attachment type ${type}: ${jsonStringify(redactSecrets(att)).slice(0, 1500)}`);
+}
+
+/** callback_data of a MAX button with no Telegram counterpart (yet): pressing it only shows a hint. */
+export const KEYBOARD_NA = 'tlmx_kb_na';
+
+/**
+ * A MAX INLINE_KEYBOARD attach as a Telegram inline keyboard, layout kept: LINK and CLIPBOARD map
+ * to their Telegram twins, every other button (or one Telegram would refuse) becomes a
+ * KEYBOARD_NA callback button. Clamped to Telegram's limits — 8 per row, 100 in total, 64 UTF-16
+ * units of text. Undefined when nothing usable is left; never throws on a malformed attach.
+ */
+export function maxKeyboardToTelegram(att: unknown): InlineKeyboardMarkup | undefined {
+  const rows = (att as { keyboard?: { buttons?: unknown } } | null | undefined)?.keyboard?.buttons;
+  if (!Array.isArray(rows)) return undefined;
+  const str = (v: unknown): string => (typeof v === 'string' ? v : '');
+  const out: InlineKeyboardButton[][] = [];
+  let left = 100;
+  for (const row of rows) {
+    if (!Array.isArray(row)) continue;
+    const buttons: InlineKeyboardButton[] = [];
+    for (const b of row as Array<Record<string, unknown> | null | undefined>) {
+      if (buttons.length >= 8 || left <= 0) break;
+      const text = truncateUtf16(str(b?.text), 64);
+      if (!text.trim()) continue;
+      const url = str(b?.url);
+      const payload = str(b?.payload);
+      if (b?.type === 'LINK' && /^(https?|tg):\/\/./i.test(url) && url.length <= 2048) {
+        buttons.push({ text, url });
+      } else if (b?.type === 'CLIPBOARD' && payload && payload.length <= 256) {
+        // CopyTextButton (Bot API 7.11) is newer than telegraf's typings.
+        buttons.push({ text, copy_text: { text: payload } } as unknown as InlineKeyboardButton);
+      } else {
+        buttons.push({ text, callback_data: KEYBOARD_NA });
+      }
+      left--;
+    }
+    if (buttons.length > 0) out.push(buttons);
+  }
+  return out.length > 0 ? { inline_keyboard: out } : undefined;
+}
+
+/** Splits a message's attaches into its keyboard (the first usable one) and everything else. */
+export function takeKeyboard<T>(attaches: readonly T[]): { attaches: T[]; keyboard: InlineKeyboardMarkup | undefined } {
+  const isKeyboard = (a: T): boolean => (a as { _type?: unknown } | null)?._type === 'INLINE_KEYBOARD';
+  let keyboard: InlineKeyboardMarkup | undefined;
+  for (const a of attaches) if (isKeyboard(a)) keyboard ??= maxKeyboardToTelegram(a);
+  return { attaches: attaches.filter((a) => !isKeyboard(a)), keyboard };
 }
