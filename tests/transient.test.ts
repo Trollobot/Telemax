@@ -78,6 +78,11 @@ describe('isTransientMaxError', () => {
     expect(isTransientMaxError(new MaxConnectionLostError('0x0040 [MSG_SEND]', new Error('socket closed')))).toBe(true);
   });
 
+  it('flags MAX rate limiting — it left two topics empty after /reboot (live 2026-10-04)', () => {
+    expect(isTransientMaxError(new Error('Слишком много запросов'))).toBe(true);
+    expect(isTransientMaxError(new Error('too.many.requests'))).toBe(true);
+  });
+
   it('keeps a real MAX refusal permanent', () => {
     expect(isTransientMaxError(new Error('FILE_DOWNLOAD did not return a url: file not found'))).toBe(false);
     expect(isTransientMaxError(new Error('VIDEO_PLAY did not return any playback urls: access denied'))).toBe(false);

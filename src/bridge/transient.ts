@@ -92,6 +92,9 @@ export function isTransientTelegramError(err: unknown): boolean {
 export function isTransientMaxError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : typeof err === 'string' ? err : '';
   if (/MaxClient\.send called while not connected|MaxClient connection lost|Timed out waiting for /.test(msg)) return true;
+  // MAX's own rate limit (CHAT_HISTORY after several resyncs in a day, seen live 2026-10-04). Read
+  // as permanent, it left two topics empty after /reboot with no retry scheduled.
+  if (/Слишком много запросов|too[ ._]?many[ ._]?requests/i.test(msg)) return true;
   return isTransientNetworkError(err);
 }
 
