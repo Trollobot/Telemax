@@ -32,6 +32,37 @@ export interface MaxContactInfo {
   photoId?: unknown;
   description?: string;
   gender?: number;
+  /** Public profile link `https://max.ru/<nick>` — bots have one; ordinary people (live 2026-10-05) don't. */
+  link?: string;
+}
+
+/** A public channel found by PUBLIC_SEARCH. */
+export interface MaxPublicChannel {
+  id: unknown;
+  title: string;
+  /** `https://max.ru/<slug>`; absent → the channel can't be offered as a link. */
+  link?: string;
+}
+
+/**
+ * Splits a PUBLIC_SEARCH answer (live shape 2026-10-05) into contacts and channels. Each item is
+ * either `{chat: {id, type:'CHANNEL', title, link}}` or `{contact: {contact: {...profile}, summary:
+ * '@nick'}}` — the profile is nested TWICE; a single nesting is still accepted in case MAX flattens it.
+ */
+export function parsePublicSearch(payload: unknown): { contacts: MaxContactInfo[]; channels: MaxPublicChannel[] } {
+  const contacts: MaxContactInfo[] = [];
+  const channels: MaxPublicChannel[] = [];
+  const p = payload as { result?: unknown[]; contacts?: MaxContactInfo[] } | null;
+  if (p && Array.isArray(p.contacts)) contacts.push(...p.contacts);
+  for (const item of Array.isArray(p?.result) ? p.result : []) {
+    const r = item as { contact?: MaxContactInfo & { contact?: MaxContactInfo }; chat?: { id?: unknown; title?: unknown; link?: unknown } };
+    const c = r.contact?.contact ?? r.contact;
+    if (c?.id != null) contacts.push(c);
+    if (r.chat?.id != null && typeof r.chat.title === 'string') {
+      channels.push({ id: r.chat.id, title: r.chat.title, link: typeof r.chat.link === 'string' ? r.chat.link : undefined });
+    }
+  }
+  return { contacts, channels };
 }
 
 /** A single CHAT_HISTORY message — same shape as a PUSH_MESSAGE payload's `message` field. */
@@ -767,17 +798,14 @@ export class MaxClient extends EventEmitter {
   }
 
   /**
-   * Global directory search by name/nickname (PUBLIC_SEARCH, 0x003C) — unlike CONTACT_SEARCH
-   * (local address book only), this hits the whole MAX catalog. Request/response shape
-   * UNCONFIRMED — assumed to mirror CONTACT_SEARCH (`{result: [{contact}], total}`); verify live.
+   * Global catalog search (PUBLIC_SEARCH, 0x003C). Probed live 2026-10-05: it finds public BOTS and
+   * CHANNELS by title or by the nick in their link; ordinary people are not returned, and a query
+   * with a leading «@» finds nothing (strip it before calling). Shape: see parsePublicSearch.
    */
-  async publicSearch(query: string, count = 10): Promise<MaxContactInfo[]> {
+  async publicSearch(query: string, count = 10): Promise<{ contacts: MaxContactInfo[]; channels: MaxPublicChannel[] }> {
     const { dir, payload } = await this.request(OPCODES.PUBLIC_SEARCH, { query, count });
     if (dir === DIR.ERR) throw new Error(describeAuthError(payload, 'PUBLIC_SEARCH failed'));
-    const p = payload as { result?: Array<{ contact?: MaxContactInfo }>; contacts?: MaxContactInfo[] } | null;
-    if (p && Array.isArray(p.result)) return p.result.map((r) => r.contact).filter((c): c is MaxContactInfo => c != null);
-    if (p && Array.isArray(p.contacts)) return p.contacts;
-    return [];
+    return parsePublicSearch(payload);
   }
 
 

@@ -65,7 +65,7 @@ type SearchMode = 'phone' | 'nick' | 'id';
 const pendingSearch = new Map<number, { mode: SearchMode; requesterId: number }>();
 // Contacts shown with a "Начать чат" button, so the tap knows the display name / MAX
 // membership without re-fetching. Keyed by userId (string).
-const shownContacts = new Map<string, { name: string; onMax: boolean }>();
+const shownContacts = new Map<string, { name: string; onMax: boolean; bot?: boolean }>();
 
 // Both maps live for the whole process and only ever grew (an abandoned search prompt,
 // every contact ever shown) — bound them FIFO so months of uptime can't leak memory.
@@ -87,6 +87,31 @@ function contactName(c: MaxContactInfo): string {
 }
 function isOnMax(c: MaxContactInfo): boolean {
   return Array.isArray(c.options) && c.options.includes('ONEME');
+}
+function isBot(c: MaxContactInfo): boolean {
+  return Array.isArray(c.options) && c.options.includes('BOT');
+}
+/** `maxbot` from `https://max.ru/maxbot`; undefined for a profile without a public link. */
+function linkSlug(link: string | undefined): string | undefined {
+  const m = link ? /max\.ru\/([^/?#]+)\/?$/i.exec(link) : null;
+  return m?.[1];
+}
+
+/**
+ * What the user typed into the nick search → the PUBLIC_SEARCH query. Accepts `@nick`, `nick` and a
+ * pasted `max.ru/nick` link (MAX finds nothing for a query with «@»). A link with a deeper path
+ * (`max.ru/u/…`, `max.ru/join/…`) is a personal or invite link, which the catalog can't resolve.
+ */
+export function normalizeNickQuery(raw: string): { query: string } | { personalLink: true } | null {
+  let q = raw.trim();
+  const link = /^(?:https?:\/\/)?(?:www\.)?max\.ru\/(.*)$/i.exec(q);
+  if (link) {
+    const path = link[1]!.split(/[?#]/)[0]!.replace(/\/+$/, '');
+    if (path.includes('/')) return { personalLink: true };
+    q = path;
+  }
+  q = q.replace(/^@+/, '').trim();
+  return q ? { query: q } : null;
 }
 
 type View = { text: string; markup: ReturnType<typeof Markup.inlineKeyboard>['reply_markup'] };
@@ -318,9 +343,16 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
 
   // --- Contact search -----------------------------------------------------------------
   async function promptSearch(ctx: Context, mode: SearchMode): Promise<void> {
-    const label = mode === 'phone' ? 'номер телефона (с + или без)' : mode === 'id' ? 'MAX ID (число — например, из карточки группы или из сообщения о выходе участника)' : 'имя или ник';
-    const sent = await bot.telegram.sendMessage(chatIdOf(ctx), `🔎 Отправьте ${label} в ответ на это сообщение:`, {
-      reply_markup: { force_reply: true, input_field_placeholder: mode === 'phone' ? '+79991234567' : mode === 'id' ? '123456789' : 'Имя' },
+    // The MAX catalog holds public bots and channels only (probed live 2026-10-05) — say so up front,
+    // or a person's nick (or a Telegram @username) just ends in «Ничего не найдено».
+    const text =
+      mode === 'phone'
+        ? '🔎 Отправьте номер телефона (с + или без) в ответ на это сообщение:'
+        : mode === 'id'
+          ? '🔎 Отправьте MAX ID (число — например, из карточки группы или из сообщения о выходе участника) в ответ на это сообщение:'
+          : '🔎 Отправьте в ответ на это сообщение ник бота или канала MAX, ссылку max.ru/… или их название.\nЛюдей по нику не найти — их ищите по номеру или MAX ID. Ник из Telegram тоже не подойдёт.';
+    const sent = await bot.telegram.sendMessage(chatIdOf(ctx), text, {
+      reply_markup: { force_reply: true, input_field_placeholder: mode === 'phone' ? '+79991234567' : mode === 'id' ? '123456789' : '@nick или max.ru/nick' },
     });
     boundedSet(pendingSearch, sent.message_id, { mode, requesterId: ctx.from?.id ?? 0 });
   }
@@ -341,10 +373,12 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
     const uid = String(c.id);
     const name = contactName(c);
     const onMax = isOnMax(c);
-    boundedSet(shownContacts, uid, { name, onMax });
+    boundedSet(shownContacts, uid, { name, onMax, bot: isBot(c) });
     const phone = c.phone != null ? ` · ${String(c.phone)}` : '';
     const country = c.country ? ` · ${c.country}` : '';
-    const text = `👤 ${name}\nID ${uid}${phone}${country}${onMax ? '' : '\n⚠️ Контакт не в MAX — начать чат нельзя.'}`;
+    const slug = linkSlug(c.link);
+    const nick = slug ? ` · @${slug}` : '';
+    const text = `${isBot(c) ? '🤖' : '👤'} ${name}\nID ${uid}${nick}${phone}${country}${onMax ? '' : '\n⚠️ Контакт не в MAX — начать чат нельзя.'}`;
     const buttons = onMax
       ? [Markup.button.callback('💬 Начать чат', `tlmx_panel:startchat:${uid}`), Markup.button.callback('◀️ Готово', 'tlmx_panel:dismiss')]
       : [Markup.button.callback('◀️ Готово', 'tlmx_panel:dismiss')];
@@ -377,20 +411,38 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
         await sendCard(chatId, contact);
         return;
       }
-      const list = await max.publicSearch(query, 8);
-      if (list.length === 0) {
-        await bot.telegram.sendMessage(chatId, '❌ Ничего не найдено.');
+      const parsed = normalizeNickQuery(query);
+      if (parsed == null) {
+        await bot.telegram.sendMessage(chatId, 'Пусто — отмена.');
         return;
       }
-      if (list.length === 1) {
-        await sendCard(chatId, list[0]!);
+      if ('personalLink' in parsed) {
+        await bot.telegram.sendMessage(chatId, '❌ Это личная ссылка или приглашение — поиск MAX их не открывает. Откройте её в приложении MAX или найдите человека по номеру либо MAX ID.');
         return;
       }
-      for (const c of list) boundedSet(shownContacts, String(c.id), { name: contactName(c), onMax: isOnMax(c) });
-      const buttons = list
-        .slice(0, 8)
-        .map((c) => Markup.button.callback(`${contactName(c)}${isOnMax(c) ? '' : ' (не в MAX)'}`, `tlmx_panel:pick:${String(c.id)}`));
-      await bot.telegram.sendMessage(chatId, `Нашёл ${list.length}. Выберите:`, {
+      const { contacts, channels: allChannels } = await max.publicSearch(parsed.query, 8);
+      const channels = allChannels.filter((ch) => ch.link);
+      logger.info(`Nick search "${parsed.query}": ${contacts.length} contact(s), ${channels.length} channel(s)`);
+      // An exact nick wins over everything the catalog matched by title.
+      const exact = contacts.filter((c) => linkSlug(c.link)?.toLowerCase() === parsed.query.toLowerCase());
+      if (exact.length === 1 || (contacts.length === 1 && channels.length === 0)) {
+        await sendCard(chatId, exact[0] ?? contacts[0]!);
+        return;
+      }
+      if (contacts.length === 0 && channels.length === 0) {
+        await bot.telegram.sendMessage(chatId, '❌ Ничего не найдено. По нику находятся только боты и каналы MAX; людей ищите по номеру или MAX ID.');
+        return;
+      }
+      for (const c of contacts) boundedSet(shownContacts, String(c.id), { name: contactName(c), onMax: isOnMax(c), bot: isBot(c) });
+      // Channels can't be opened as a bridge topic — a link into MAX is all we can offer.
+      const buttons = [
+        ...contacts.map((c) =>
+          Markup.button.callback(`${isBot(c) ? '🤖 ' : ''}${contactName(c)}${isOnMax(c) ? '' : ' (не в MAX)'}`, `tlmx_panel:pick:${String(c.id)}`),
+        ),
+        ...channels.map((ch) => Markup.button.url(`📢 ${truncateUtf16(ch.title, 120)}`, ch.link!)),
+      ].slice(0, 8);
+      const hint = channels.length ? '\n📢 — каналы: они откроются в MAX, в мост их не добавить.' : '';
+      await bot.telegram.sendMessage(chatId, `Нашёл ${buttons.length}. Выберите:${hint}`, {
         reply_markup: Markup.inlineKeyboard(buttons, { columns: 1 }).reply_markup,
       });
     } catch (err) {
@@ -408,7 +460,7 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
       await ctx.editMessageText('Список устарел — повторите поиск.').catch(() => {});
       return;
     }
-    const text = `👤 ${info.name}\nID ${uid}${info.onMax ? '' : '\n⚠️ Не в MAX — начать чат нельзя.'}`;
+    const text = `${info.bot ? '🤖' : '👤'} ${info.name}\nID ${uid}${info.onMax ? '' : '\n⚠️ Не в MAX — начать чат нельзя.'}`;
     const buttons = info.onMax
       ? [Markup.button.callback('💬 Начать чат', `tlmx_panel:startchat:${uid}`), Markup.button.callback('◀️ Готово', 'tlmx_panel:dismiss')]
       : [Markup.button.callback('◀️ Готово', 'tlmx_panel:dismiss')];
