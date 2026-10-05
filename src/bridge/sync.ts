@@ -1998,6 +1998,10 @@ export function wireBridge({
     }
     const id = typeof senderId === 'number' ? senderId : Number(senderId);
     if (Number.isNaN(id)) return;
+    // The owner wrote first (to a bot, from the MAX app) and the chat is not cached yet: the sender
+    // is the owner, not the contact — the topic got the owner's own name and card (live 2026-10-04).
+    // The title follows with the chat's next update; no card is better than a wrong one.
+    if (String(id) === String(getMyAccountId())) return;
     const senderProfile = await resolveProfile(max, id, 'new contact', getContactProfiles());
     await renameFallbackTopic(chatId, id, senderProfile);
     const messageId = await sendContactInfoCard(bot, targetGroupId, topicId, `MAX ID ${id}`, 'DIALOG', undefined, id, senderProfile);
@@ -2206,6 +2210,7 @@ export function wireBridge({
             logger.info(`Telegram refused the keyboard of edited MAX message ${String(message.id)} (${telegramErrorText(err)}) — edited without it`);
             return edit();
           });
+          logger.info(`MAX -> TG: edit of message ${String(message.id)} in chat ${String(chatId)} applied${keyboard ? ' (with keyboard)' : ''}`);
         } catch (err) {
           await relayEditFallback(chatId, message.id, existingLink, marked, err);
         }

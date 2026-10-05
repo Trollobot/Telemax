@@ -321,6 +321,15 @@ function logUnknownAttachment(att: MaxAttachment): void {
   logger.info(`Unknown MAX attachment type ${type}: ${jsonStringify(redactSecrets(att)).slice(0, 1500)}`);
 }
 
+// Same idea for a keyboard: the whole attach, once per button type the bridge does not relay yet —
+// CALLBACK, MESSAGE & co. are known from the Bot API docs only, never seen in this protocol.
+function logUnknownButton(type: unknown, att: unknown): void {
+  const key = `button:${String(type)}`;
+  if (loggedUnknownTypes.has(key) || loggedUnknownTypes.size >= 50) return;
+  loggedUnknownTypes.add(key);
+  logger.info(`MAX keyboard with an unrelayed button type ${String(type)}: ${jsonStringify(redactSecrets(att)).slice(0, 3000)}`);
+}
+
 /** callback_data of a MAX button with no Telegram counterpart (yet): pressing it only shows a hint. */
 export const KEYBOARD_NA = 'tlmx_kb_na';
 
@@ -352,6 +361,7 @@ export function maxKeyboardToTelegram(att: unknown): InlineKeyboardMarkup | unde
         buttons.push({ text, copy_text: { text: payload } } as unknown as InlineKeyboardButton);
       } else {
         buttons.push({ text, callback_data: KEYBOARD_NA });
+        logUnknownButton(b?.type, att);
       }
       left--;
     }
