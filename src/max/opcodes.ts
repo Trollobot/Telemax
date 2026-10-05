@@ -38,6 +38,10 @@ export const OPCODES = {
   // `{chatId, messageIds: [...], forMe: bool}` — supplied by the user 2026-08-10.
   MSG_DELETE: 0x0042,
   MSG_EDIT: 0x0043,
+  // A press of a bot keyboard's CALLBACK button: {callbackId, chatId, payload?} -> {success, unread,
+  // mark}. Opcode and the first two fields confirmed live 2026-10-04; `payload` (the pressed
+  // button's own) is the third parameter of libcore's SendCallback.
+  MSG_CALLBACK: 0x0076,
   // Not in max-protocol-full.md — supplied by the user from their own reverse-engineering
   // (2026-08-07). {count} request; PHOTO/FILE return an upload slot {url, ...ids},
   // FILE_DOWNLOAD exchanges {chatId, messageId, fileId} for a signed {url}.

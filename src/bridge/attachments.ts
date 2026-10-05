@@ -9,6 +9,7 @@
  * guarantee which `MP4_*` qualities exist for a given video.
  */
 import { gzipSync } from 'node:zlib';
+import { randomBytes } from 'node:crypto';
 import type { InlineKeyboardButton, InlineKeyboardMarkup } from 'telegraf/types';
 import type { MaxClient } from '../max/client.js';
 import { maxFetch } from '../max/ca.js';
@@ -330,6 +331,36 @@ function logUnknownButton(type: unknown, att: unknown): void {
   logger.info(`MAX keyboard with an unrelayed button type ${String(type)}: ${jsonStringify(redactSecrets(att)).slice(0, 3000)}`);
 }
 
+/**
+ * A CALLBACK button of a MAX bot shown in Telegram. Telegram's callback_data holds 64 bytes, a MAX
+ * callbackId alone is ~110 chars, so the button carries a random key into this bounded in-memory
+ * map. Random, not a counter: after a restart the keys of buttons already sitting in Telegram must
+ * not land on a DIFFERENT new button. A key that is gone answers «кнопка устарела».
+ * Shape seen live 2026-10-05 (GigaChat): {type:'CALLBACK', text, payload:'<json string>', intent},
+ * one callbackId per keyboard — `payload` is what tells the bot which button was pressed.
+ */
+export interface PressableButton {
+  chatId: unknown;
+  callbackId: string;
+  payload?: string;
+  text: string;
+}
+export const KEYBOARD_PRESS = 'tlmx_kb:';
+const PRESSABLE_CAP = 2000;
+const pressable = new Map<string, PressableButton>();
+
+function registerButton(button: PressableButton): string {
+  const key = randomBytes(9).toString('base64url');
+  pressable.set(key, button);
+  if (pressable.size > PRESSABLE_CAP) pressable.delete(pressable.keys().next().value as string);
+  return KEYBOARD_PRESS + key;
+}
+
+/** The button behind a `tlmx_kb:<key>` press, or undefined when the bridge restarted since (or it was evicted). */
+export function pressableButton(key: string): PressableButton | undefined {
+  return pressable.get(key);
+}
+
 /** callback_data of a MAX button with no Telegram counterpart (yet): pressing it only shows a hint. */
 export const KEYBOARD_NA = 'tlmx_kb_na';
 
@@ -339,10 +370,11 @@ export const KEYBOARD_NA = 'tlmx_kb_na';
  * KEYBOARD_NA callback button. Clamped to Telegram's limits — 8 per row, 100 in total, 64 UTF-16
  * units of text. Undefined when nothing usable is left; never throws on a malformed attach.
  */
-export function maxKeyboardToTelegram(att: unknown): InlineKeyboardMarkup | undefined {
+export function maxKeyboardToTelegram(att: unknown, chatId?: unknown): InlineKeyboardMarkup | undefined {
   const rows = (att as { keyboard?: { buttons?: unknown } } | null | undefined)?.keyboard?.buttons;
   if (!Array.isArray(rows)) return undefined;
   const str = (v: unknown): string => (typeof v === 'string' ? v : '');
+  const callbackId = str((att as { callbackId?: unknown }).callbackId);
   const out: InlineKeyboardButton[][] = [];
   let left = 100;
   for (const row of rows) {
@@ -359,6 +391,8 @@ export function maxKeyboardToTelegram(att: unknown): InlineKeyboardMarkup | unde
       } else if (b?.type === 'CLIPBOARD' && payload && payload.length <= 256) {
         // CopyTextButton (Bot API 7.11) is newer than telegraf's typings.
         buttons.push({ text, copy_text: { text: payload } } as unknown as InlineKeyboardButton);
+      } else if (chatId != null && b?.type === 'CALLBACK' && callbackId) {
+        buttons.push({ text, callback_data: registerButton({ chatId, callbackId, payload: payload || undefined, text }) });
       } else {
         buttons.push({ text, callback_data: KEYBOARD_NA });
         logUnknownButton(b?.type, att);
@@ -371,9 +405,9 @@ export function maxKeyboardToTelegram(att: unknown): InlineKeyboardMarkup | unde
 }
 
 /** Splits a message's attaches into its keyboard (the first usable one) and everything else. */
-export function takeKeyboard<T>(attaches: readonly T[]): { attaches: T[]; keyboard: InlineKeyboardMarkup | undefined } {
+export function takeKeyboard<T>(attaches: readonly T[], chatId?: unknown): { attaches: T[]; keyboard: InlineKeyboardMarkup | undefined } {
   const isKeyboard = (a: T): boolean => (a as { _type?: unknown } | null)?._type === 'INLINE_KEYBOARD';
   let keyboard: InlineKeyboardMarkup | undefined;
-  for (const a of attaches) if (isKeyboard(a)) keyboard ??= maxKeyboardToTelegram(a);
+  for (const a of attaches) if (isKeyboard(a)) keyboard ??= maxKeyboardToTelegram(a, chatId);
   return { attaches: attaches.filter((a) => !isKeyboard(a)), keyboard };
 }

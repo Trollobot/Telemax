@@ -861,6 +861,16 @@ export class MaxClient extends EventEmitter {
   }
 
   /** `forMe: true` deletes only from our own view; `false` deletes for everyone. */
+  /** Presses a CALLBACK button of a bot message's keyboard; `payload` is the pressed button's own (see OPCODES.MSG_CALLBACK). */
+  async sendCallback(chatId: unknown, callbackId: string, payload?: string): Promise<void> {
+    const { dir, payload: answer } = await this.request(OPCODES.MSG_CALLBACK, {
+      callbackId,
+      chatId: toChatId(chatId),
+      ...(payload != null ? { payload } : {}),
+    });
+    if (dir === DIR.ERR) throw new Error(describeAuthError(answer, 'MSG_CALLBACK failed'));
+  }
+
   async deleteMessages(chatId: unknown, messageIds: unknown[], forMe: boolean): Promise<void> {
     const { dir, payload } = await this.request(OPCODES.MSG_DELETE, { chatId: toChatId(chatId), messageIds, forMe });
     if (dir === DIR.ERR) throw new Error(describeAuthError(payload, 'MSG_DELETE failed'));

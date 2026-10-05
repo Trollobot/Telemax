@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { Telegraf } from 'telegraf';
-import { KEYBOARD_NA, maxKeyboardToTelegram, takeKeyboard } from '../src/bridge/attachments.js';
+import { KEYBOARD_NA, KEYBOARD_PRESS, maxKeyboardToTelegram, pressableButton, takeKeyboard } from '../src/bridge/attachments.js';
 import { isMarkupRefusal, isRenderableAttach, sendAttachments, sendTextPieces } from '../src/bridge/sync.js';
 
 const kb = (buttons: unknown) => ({ _type: 'INLINE_KEYBOARD', keyboard: { buttons }, callbackId: 'x' });
@@ -106,5 +106,45 @@ describe('a keyboard attach in the relay', () => {
     // Any other refusal still propagates.
     const broken = { telegram: { sendMessage: vi.fn(async () => { throw new Error('400: Bad Request: chat not found'); }) } } as unknown as Telegraf;
     await expect(sendTextPieces(broken, 'g', 7, 'текст', { replyMarkup })).rejects.toThrow('chat not found');
+  });
+});
+
+describe('CALLBACK buttons — presses relayed to MAX', () => {
+  // Verbatim from GigaChat, live 2026-10-05 (payloads shortened).
+  const giga = {
+    _type: 'INLINE_KEYBOARD',
+    callbackId: 'f9LHodD0cOJugVuIGDqvXNFedEn6vqee',
+    keyboard: {
+      buttons: [
+        [
+          { type: 'CALLBACK', text: '🔄 Новый ответ', payload: '{"command":"regenerate"}', intent: 'DEFAULT' },
+          { type: 'CALLBACK', text: '💡 Подсказки', payload: '{"command":"request_suggests"}', intent: 'DEFAULT' },
+        ],
+        [{ type: 'CALLBACK', text: 'Веб-версия и приложение', payload: '{"command":"web_and_app"}', intent: 'DEFAULT' }],
+      ],
+    },
+  };
+
+  it('each button gets its own key, and the key leads back to the chat, callbackId and ITS payload', () => {
+    const markup = maxKeyboardToTelegram(giga, 361838255);
+    const data = (markup?.inline_keyboard ?? []).flat().map((b) => (b as { callback_data: string }).callback_data);
+    expect(data).toHaveLength(3);
+    expect(new Set(data).size).toBe(3);
+    for (const d of data) {
+      expect(d.startsWith(KEYBOARD_PRESS)).toBe(true);
+      expect(Buffer.byteLength(d)).toBeLessThanOrEqual(64); // Telegram's callback_data limit
+    }
+    expect(pressableButton(data[1]!.slice(KEYBOARD_PRESS.length))).toEqual({
+      chatId: 361838255,
+      callbackId: giga.callbackId,
+      payload: '{"command":"request_suggests"}',
+      text: '💡 Подсказки',
+    });
+  });
+
+  it('without a chat (or without a callbackId) the button stays inert, and an unknown key finds nothing', () => {
+    expect(maxKeyboardToTelegram(giga)?.inline_keyboard[1]).toEqual([na('Веб-версия и приложение')]);
+    expect(maxKeyboardToTelegram({ ...giga, callbackId: undefined }, 1)?.inline_keyboard[1]).toEqual([na('Веб-версия и приложение')]);
+    expect(pressableButton('no-such-key')).toBeUndefined();
   });
 });

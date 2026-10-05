@@ -14,6 +14,8 @@ import {
   telegramSendKind,
   takeKeyboard,
   KEYBOARD_NA,
+  KEYBOARD_PRESS,
+  pressableButton,
   type MaxAttachment,
   type DownloadContext,
 } from './attachments.js';
@@ -1129,7 +1131,7 @@ export class ChatCatchUp {
       }
       const forwarded = await resolveForwardContent(max, chats, msg.link, chatId, msg.id, profiles);
       let text = forwarded ? forwarded.text : msg.text;
-      const taken = takeKeyboard(forwarded ? forwarded.attaches : Array.isArray(msg.attaches) ? (msg.attaches as MaxAttachment[]) : []);
+      const taken = takeKeyboard(forwarded ? forwarded.attaches : Array.isArray(msg.attaches) ? (msg.attaches as MaxAttachment[]) : [], chatId);
       let attaches = taken.attaches;
       const keyboard = taken.keyboard;
       // A poll goes out as its text rendering, options included — sendAttachments only knows a
@@ -2151,7 +2153,7 @@ export function wireBridge({
       attaches = forwarded.attaches;
     }
     // The keyboard leaves the attaches here: it is no message of its own (see sendKeyboardAlone).
-    const taken = takeKeyboard(attaches);
+    const taken = takeKeyboard(attaches, chatId);
     attaches = taken.attaches;
     const keyboard = taken.keyboard;
     // Text of its own, before any forward/reply prefix — an orphan edit without it has nothing to post.
@@ -2603,7 +2605,25 @@ export function wireBridge({
     }
   });
 
-  // A MAX button with no Telegram counterpart (see maxKeyboardToTelegram): presses are not relayed yet.
+  // A CALLBACK button of a MAX bot: the press goes to MAX in the owner's name — admins only (the
+  // gate above). The bot's reaction comes back as an ordinary push (a new or edited message).
+  bot.action(new RegExp(`^${KEYBOARD_PRESS}(.+)$`), async (ctx) => {
+    const button = pressableButton(ctx.match[1] ?? '');
+    if (!button) {
+      await ctx.answerCbQuery('Кнопка устарела: мост перезапускался. Нажмите её в приложении MAX.').catch(() => {});
+      return;
+    }
+    try {
+      await max.sendCallback(button.chatId, button.callbackId, button.payload);
+      logger.info(`TG -> MAX: button «${button.text}» pressed in chat ${String(button.chatId)}`);
+      await ctx.answerCbQuery().catch(() => {});
+    } catch (err) {
+      logger.error(`Failed to relay a press of «${button.text}» to MAX chat ${String(button.chatId)}`, err);
+      await ctx.answerCbQuery(`Не удалось нажать в MAX: ${(err as Error).message}`.slice(0, 190)).catch(() => {});
+    }
+  });
+
+  // A MAX button with no Telegram counterpart (see maxKeyboardToTelegram): presses are not relayed.
   bot.action(KEYBOARD_NA, async (ctx) => {
     await ctx.answerCbQuery('Эта кнопка работает только в приложении MAX').catch(() => {});
   });
