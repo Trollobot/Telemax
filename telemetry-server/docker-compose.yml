@@ -1,6 +1,11 @@
 # Maintainer-only install counter — NOT part of a normal Telemax deployment.
 # Deploy on the monitoring host (the DDNS points here):
 #   cd telemetry-server && echo "STATS_KEY=<random>" > .env && docker compose up -d --build
+# .env variables:
+#   STATS_KEY=<random>          required to read /stats and /reports
+#   REPORT_BOT_TOKEN=<token>    optional: Telegram bot that announces NEW error signatures
+#   REPORT_CHAT_ID=<chat id>    optional: where it posts (both unset => no notifications)
+#   REPORT_THREAD_ID=<topic id> optional: forum topic; unset => the server creates one itself
 services:
   telemetry:
     build: .

@@ -344,8 +344,15 @@ export interface PressableButton {
   callbackId: string;
   payload?: string;
   text: string;
+  /** A MESSAGE button: the press sends `text` to the bot instead of a callback. */
+  sendsText?: boolean;
 }
 export const KEYBOARD_PRESS = 'tlmx_kb:';
+// A Telegram inline button in a group cannot ask for a location or a contact, but the bridge
+// already relays both when they are sent into the topic — so these two only say how.
+// Type names per the MAX Bot API docs (LINK, CLIPBOARD and CALLBACK matched them live).
+export const KEYBOARD_GEO = 'tlmx_kb_geo';
+export const KEYBOARD_CONTACT = 'tlmx_kb_contact';
 const PRESSABLE_CAP = 2000;
 const pressable = new Map<string, PressableButton>();
 
@@ -393,6 +400,13 @@ export function maxKeyboardToTelegram(att: unknown, chatId?: unknown): InlineKey
         buttons.push({ text, copy_text: { text: payload } } as unknown as InlineKeyboardButton);
       } else if (chatId != null && b?.type === 'CALLBACK' && callbackId) {
         buttons.push({ text, callback_data: registerButton({ chatId, callbackId, payload: payload || undefined, text }) });
+      } else if (chatId != null && b?.type === 'MESSAGE') {
+        // Pressing it in MAX sends the button's text to the bot as the user's own message.
+        buttons.push({ text, callback_data: registerButton({ chatId, callbackId: '', text, sendsText: true }) });
+      } else if (b?.type === 'REQUEST_GEO_LOCATION') {
+        buttons.push({ text, callback_data: KEYBOARD_GEO });
+      } else if (b?.type === 'REQUEST_CONTACT') {
+        buttons.push({ text, callback_data: KEYBOARD_CONTACT });
       } else {
         buttons.push({ text, callback_data: KEYBOARD_NA });
         logUnknownButton(b?.type, att);

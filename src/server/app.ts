@@ -12,6 +12,7 @@ import { RetryBackoff } from '../bridge/catchUp.js';
 import { isTransientTelegramError } from '../bridge/transient.js';
 import { configureErrorReporter, reportBridgeError } from '../bridge/errorReporter.js';
 import { getAppVersion } from '../bridge/version.js';
+import { noteBoot, reportError } from '../bridge/telemetry.js';
 import { createLogger } from '../logger.js';
 import { config } from './config.js';
 import { MaxSessionController } from './maxSession.js';
@@ -32,14 +33,16 @@ dns.setDefaultResultOrder('ipv4first');
 // "crash the process" behavior undo all the reconnect/retry work elsewhere. The
 // operator also gets a throttled heads-up in Telegram — deliberately generic (no raw
 // error text) so a token/URL in the message can't leak into the group; details stay
-// in the container logs.
+// in the container logs. The maintainer gets the scrubbed first line as an anonymous report.
 process.on('unhandledRejection', (reason) => {
   logger.error('Unhandled rejection:', reason);
   reportBridgeError('unhandled-rejection', '⚠️ Внутренняя ошибка моста — подробности в логах контейнера (docker compose logs).');
+  void reportError({ kind: 'internal', step: 'unhandledRejection', error: reason });
 });
 process.on('uncaughtException', (err) => {
   logger.error('Uncaught exception:', err);
   reportBridgeError('uncaught-exception', '⚠️ Внутренняя ошибка моста — подробности в логах контейнера (docker compose logs).');
+  void reportError({ kind: 'internal', step: 'uncaughtException', error: err });
 });
 
 const sessionStore = new SessionStore();
@@ -70,6 +73,7 @@ const maxSession = new MaxSessionController({
     void syncChatsIfPossible();
   },
   postReauthNotice: (text) => (bot ? bot.telegram.sendMessage(config.targetTelegramGroup, text, maxLoginKeyboard()) : Promise.resolve()),
+  reportError,
 });
 
 function extractChats(loginPayload: unknown): unknown[] {
@@ -298,6 +302,8 @@ function maxLoginKeyboard(): { reply_markup: { inline_keyboard: { text: string; 
 }
 
 async function startServer(): Promise<void> {
+  // Production only: `npm run dev` restarts on every save and would look like a restart loop.
+  if (process.env.NODE_ENV === 'production') void noteBoot();
   // --- MAX client wiring: the lifecycle events go to the controller, the rest is cache upkeep ---
   max.on('error', (err: Error) => logger.error('MAX client error:', err.message));
   // An undecodable frame on a live socket: diagnostic only, nothing waiting on the socket fails.
@@ -344,6 +350,7 @@ async function startServer(): Promise<void> {
           'telegram-handler-error',
           '⚠️ Ошибка при обработке сообщения или команды из Telegram — подробности в логах контейнера (docker compose logs).',
         );
+        void reportError({ kind: 'internal', step: 'telegram-handler', error: err });
       });
       ({ chatSync } = wireBridge({
         max,
@@ -589,12 +596,14 @@ function createBotSafely(token: string): Telegraf | null {
 // setting exitCode left it running whenever max.connect() had already opened its socket — e.g. a
 // bad TELEGRAM_PROXY: MAX connected, no Telegram bot, a live but useless container (review
 // 2026-09-26, A13). The short delay lets the log line reach stdout first.
-startServer().catch((err) => {
+startServer().catch(async (err) => {
   logger.error('Fatal startup error:', err);
   try {
     maxSession.shutdown();
   } catch {
     // exiting anyway
   }
+  // Bounded: an unreachable report endpoint must not hold the restart back.
+  await Promise.race([reportError({ kind: 'fatal', error: err }), new Promise((resolve) => setTimeout(resolve, 3_000))]);
   setTimeout(() => process.exit(1), 500);
 });

@@ -78,6 +78,53 @@ notify() {
   return 0
 }
 
+# Free megabytes where Docker keeps images and build cache (the smaller of its data root and, under
+# the containerd image store, /var/lib/containerd). Empty when it cannot be measured.
+free_mb() {
+  local dir mb min=""
+  for dir in "$(docker info -f '{{.DockerRootDir}}' 2>/dev/null || true)" /var/lib/containerd; do
+    [ -n "$dir" ] && [ -d "$dir" ] || continue
+    mb=$(df -Pm "$dir" 2>/dev/null | awk 'NR==2 {print $4}') || mb=""
+    case "$mb" in ''|*[!0-9]*) continue ;; esac
+    if [ -z "$min" ] || [ "$mb" -lt "$min" ]; then min=$mb; fi
+  done
+  printf '%s' "$min"
+}
+
+# Anonymous failure report to the maintainer: «cat update.log» is beyond most users, and without it
+# nobody learns why updates fail. Same endpoint family, same install id and same opt-out as the
+# bridge's daily ping (src/bridge/telemetry.ts): TELEMETRY=off/0/false/no or NO_TELEMETRY=1/true/yes/on
+# in .env. Carries the step, a short reason and the host's versions/free space — nothing from .env.
+REPORT_URL="https://zergont-gate.duckdns.org/report"
+# Appended to the user's notice once a report was actually attempted.
+REPORT_NOTE=""
+env_flag() { env_get "$1" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]' || true; }
+# A JSON string body: control characters dropped, cut to $2 bytes, then backslash and quote escaped.
+json_str() { printf '%s' "$1" | tr -d '\000-\037\177' | cut -c1-"$2" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' || true; }
+json_num() { case "$2" in ''|*[!0-9]*) ;; *) printf ',"%s":%s' "$1" "$2" ;; esac; }
+report_failure() {
+  local id ver os_name mem body
+  [ -f data/install-id ] || return 0
+  case "$(env_flag TELEMETRY)" in 0|false|off|no) return 0 ;; esac
+  case "$(env_flag NO_TELEMETRY)" in 1|true|yes|on) return 0 ;; esac
+  id=$(head -c 64 data/install-id 2>/dev/null | tr -d '[:space:]') || id=""
+  [ -n "$id" ] || return 0
+  # The version that was running, not the one a failed merge may have left in the tree.
+  ver=$(git show "${PREV_HEAD:-HEAD}:package.json" 2>/dev/null | sed -n 's/^ *"version": *"\([^"]*\)".*/\1/p' | head -1) || ver=""
+  [ -n "$ver" ] || ver=$(sed -n 's/^ *"version": *"\([^"]*\)".*/\1/p' package.json 2>/dev/null | head -1) || ver=""
+  os_name=$(sed -n 's/^PRETTY_NAME="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' /etc/os-release 2>/dev/null | head -1) || os_name=""
+  mem=$(free -m 2>/dev/null | awk '/^Mem:/ {print $7}') || mem=""
+  body=$(printf '{"installId":"%s","version":"%s","kind":"update","step":"%s","error":"%s","toVersion":"%s","os":"%s","docker":"%s","git":"%s"' \
+    "$(json_str "$id" 64)" "$(json_str "$ver" 60)" "$(json_str "$1" 60)" "$(json_str "$2" 300)" "$(json_str "${SIGNED_TAG:-}" 60)" \
+    "$(json_str "$os_name" 60)" "$(json_str "$(docker --version 2>/dev/null | awk '{print $3}' | tr -d ,)" 60)" \
+    "$(json_str "$(git --version 2>/dev/null | awk '{print $3}')" 60)") || return 0
+  body="${body}$(json_num freeMb "$(free_mb)")$(json_num memMb "$mem")}"
+  # --noproxy: TELEGRAM_PROXY is for Telegram only, and an ambient *_proxy must not see the report.
+  printf '%s' "$body" | curl -s -m 8 --noproxy '*' -H 'Content-Type: application/json' --data-binary @- "$REPORT_URL" >/dev/null 2>&1 || true
+  REPORT_NOTE=" Анонимный отчёт отправлен разработчику."
+  return 0
+}
+
 STEP="старт"
 # Set to 1 once the working tree has moved (right after the merge) and back to 0 once the new
 # version has passed the liveness check. While it is 1, ANY unexpected failure must roll back —
@@ -91,20 +138,22 @@ on_error() {
   # writing it (build ok, restart failed) it must not survive, or the bot cheerfully announces a
   # version that never started.
   rm -f data/update-completed
+  # $1 is the command that failed, as written in this script (unexpanded — no values from .env).
+  report_failure "$STEP" "unexpected: ${1:-?}"
   if [ "$ROLLBACK_ON_ERROR" = "1" ]; then
     ROLLBACK_ON_ERROR=0
     # A failed rollback has already sent its own «откат не удался» warning — nothing may follow it
     # claiming the old version is back (review 2026-09-26, shell-r1#2).
     if rollback; then
-      notify "❌ Обновление не удалось на шаге «${STEP}» — вернул прежнюю версию. Подробности на сервере: cat $(pwd)/data/update.log"
+      notify "❌ Обновление не удалось на шаге «${STEP}» — вернул прежнюю версию. Подробности на сервере: cat $(pwd)/data/update.log${REPORT_NOTE}"
     fi
     return 0
   fi
   # Before the merge (fetch/verify) the tree hasn't moved, so there is nothing to roll back — and
   # don't promise anything about the running bridge beyond what we know.
-  notify "❌ Обновление не удалось на шаге «${STEP}». Подробности на сервере: cat $(pwd)/data/update.log"
+  notify "❌ Обновление не удалось на шаге «${STEP}». Подробности на сервере: cat $(pwd)/data/update.log${REPORT_NOTE}"
 }
-trap on_error ERR
+trap 'on_error "$BASH_COMMAND"' ERR
 
 notify "🔄 Начинаю обновление..."
 
@@ -122,12 +171,14 @@ PREV_HEAD=$(git rev-parse HEAD)
 # signature scheme opt-out by deleting one file.
 if [ ! -f "$ALLOWED_SIGNERS" ]; then
   STEP="проверка подписи релиза"
-  notify "❌ Обновление отклонено: в установке нет файла allowed_signers (ключ для проверки подписи релизов). Переустановите мост — возможна повреждённая или подменённая копия."
+  report_failure "$STEP" "allowed_signers missing"
+  notify "❌ Обновление отклонено: в установке нет файла allowed_signers (ключ для проверки подписи релизов). Переустановите мост — возможна повреждённая или подменённая копия.${REPORT_NOTE}"
   exit 1
 fi
 if ! command -v ssh-keygen >/dev/null 2>&1; then
   STEP="проверка подписи релиза"
-  notify "❌ Обновление отклонено: нет ssh-keygen для проверки подписи (apt-get install -y openssh-client)."
+  report_failure "$STEP" "ssh-keygen missing"
+  notify "❌ Обновление отклонено: нет ssh-keygen для проверки подписи (apt-get install -y openssh-client).${REPORT_NOTE}"
   exit 1
 fi
 # git reads SSH signatures only since 2.34 (Debian 11, Ubuntu 20.04 ship older): every tag failed
@@ -135,7 +186,8 @@ fi
 GIT_V=$(git --version | awk '{print $3}')
 if ! printf '2.34\n%s\n' "$GIT_V" | sort -C -V; then
   STEP="проверка подписи релиза"
-  notify "❌ Обновление невозможно: git ${GIT_V} не умеет проверять подписи релизов (нужен 2.34+). Установите git новее (на Debian 11 — из bullseye-backports) или обновите ОС до Ubuntu 22.04+ / Debian 12+. Рабочая версия НЕ тронута."
+  report_failure "$STEP" "git too old for ssh signatures"
+  notify "❌ Обновление невозможно: git ${GIT_V} не умеет проверять подписи релизов (нужен 2.34+). Установите git новее (на Debian 11 — из bullseye-backports) или обновите ОС до Ubuntu 22.04+ / Debian 12+. Рабочая версия НЕ тронута.${REPORT_NOTE}"
   exit 1
 fi
 
@@ -198,7 +250,8 @@ if ! try_source origin "GitHub"; then
   echo "[update] пробую резервное зеркало: ${MIRROR_GIT_URL}"
   if ! try_source "$MIRROR_GIT_URL" "зеркало"; then
     STEP="проверка подписи релиза"
-    notify "❌ Обновление отклонено: ни на GitHub, ни на зеркале нет корректно подписанного релиза. Рабочая версия НЕ тронута."
+    report_failure "$STEP" "no signed release on GitHub or the mirror"
+    notify "❌ Обновление отклонено: ни на GitHub, ни на зеркале нет корректно подписанного релиза. Рабочая версия НЕ тронута.${REPORT_NOTE}"
     exit 1
   fi
 fi
@@ -233,19 +286,6 @@ if [ "$CANDIDATE" = "$PREV_HEAD" ]; then
   if [ -n "$DEPLOYED" ] && git cat-file -e "${DEPLOYED}^{commit}" 2>/dev/null; then PREV_HEAD="$DEPLOYED"; fi
 fi
 
-# Free megabytes where Docker keeps images and build cache (the smaller of its data root and, under
-# the containerd image store, /var/lib/containerd). Empty when it cannot be measured.
-free_mb() {
-  local dir mb min=""
-  for dir in "$(docker info -f '{{.DockerRootDir}}' 2>/dev/null || true)" /var/lib/containerd; do
-    [ -n "$dir" ] && [ -d "$dir" ] || continue
-    mb=$(df -Pm "$dir" 2>/dev/null | awk 'NR==2 {print $4}') || mb=""
-    case "$mb" in ''|*[!0-9]*) continue ;; esac
-    if [ -z "$min" ] || [ "$mb" -lt "$min" ]; then min=$mb; fi
-  done
-  printf '%s' "$min"
-}
-
 # A build that runs out of disk fails at the very end, after minutes of work, with a message only
 # the server log explains (reported 2026-10-03). Check BEFORE the tree moves. A release that changes
 # the Dockerfile rebuilds the chromium+ffmpeg layer and needs far more room; the cache of the old
@@ -266,7 +306,8 @@ if [ -n "$FREE_MB" ] && [ "$FREE_MB" -lt "$NEED_MB" ]; then
 fi
 if [ -n "$FREE_MB" ] && [ "$FREE_MB" -lt "$NEED_MB" ]; then
   echo "[update] мало места: свободно ${FREE_MB} МБ, нужно ${NEED_MB} МБ"
-  notify "❌ Обновление отложено: на диске свободно ${FREE_MB} МБ, для сборки нужно не меньше ${NEED_MB} МБ. Освободите место на сервере (docker builder prune -af удалит кэш прошлых сборок) и нажмите «Обновить» ещё раз. Рабочая версия НЕ тронута."
+  report_failure "$STEP" "low disk: ${FREE_MB} MB free, ${NEED_MB} MB needed"
+  notify "❌ Обновление отложено: на диске свободно ${FREE_MB} МБ, для сборки нужно не меньше ${NEED_MB} МБ. Освободите место на сервере (docker builder prune -af удалит кэш прошлых сборок) и нажмите «Обновить» ещё раз. Рабочая версия НЕ тронута.${REPORT_NOTE}"
   exit 1
 fi
 echo "[update] свободно на диске: ${FREE_MB:-?} МБ"
@@ -277,11 +318,13 @@ STEP="применение обновления"
 # it is a no-op), and a failed build/start then wiped the edits with rollback's reset --hard
 # (review 2026-09-27, shell-r3.3#1). fileMode off: a lost exec bit is no edit.
 if ! git -c core.fileMode=false diff --quiet HEAD --; then
-  notify "❌ Обновление отклонено: в исходниках есть локальные правки (git status покажет, какие). Рабочая версия НЕ тронута."
+  report_failure "$STEP" "local edits in the working tree"
+  notify "❌ Обновление отклонено: в исходниках есть локальные правки (git status покажет, какие). Рабочая версия НЕ тронута.${REPORT_NOTE}"
   exit 1
 fi
 if ! git merge --ff-only "$CANDIDATE" >/dev/null 2>&1; then
-  notify "❌ Обновление отклонено: локальные изменения мешают обновиться (нужен fast-forward). Рабочая версия НЕ тронута."
+  report_failure "$STEP" "fast-forward merge failed"
+  notify "❌ Обновление отклонено: локальные изменения мешают обновиться (нужен fast-forward). Рабочая версия НЕ тронута.${REPORT_NOTE}"
   exit 1
 fi
 echo "[update] обновлено до ${SIGNED_TAG} ($(git rev-parse --short HEAD))"
@@ -299,7 +342,8 @@ echo "[update] обновлено до ${SIGNED_TAG} ($(git rev-parse --short HE
 rollback() {
   if [ "$PREV_HEAD" = "$CANDIDATE" ]; then
     echo "[update] откатываться не на что: прежняя версия неизвестна"
-    notify "⚠️ Откатиться не на что: неизвестно, какая версия работала до обновления, — мост может быть остановлен. Проверьте на сервере: cd $(pwd) && docker compose logs"
+    report_failure "откат" "nothing to roll back to: previous version unknown"
+    notify "⚠️ Откатиться не на что: неизвестно, какая версия работала до обновления, — мост может быть остановлен. Проверьте на сервере: cd $(pwd) && docker compose logs${REPORT_NOTE}"
     return 1
   fi
   git merge --abort >/dev/null 2>&1 || true
@@ -318,7 +362,8 @@ rollback() {
     return 0
   fi
   echo "[update] ОТКАТ НЕ УДАЛСЯ — мост может быть остановлен"
-  notify "⚠️ Откат на прежнюю версию не удался — мост может быть остановлен. Нужен ручной запуск на сервере: cd $(pwd) && docker compose up -d --build"
+  report_failure "откат" "rollback failed: the previous version did not come back up"
+  notify "⚠️ Откат на прежнюю версию не удался — мост может быть остановлен. Нужен ручной запуск на сервере: cd $(pwd) && docker compose up -d --build${REPORT_NOTE}"
   return 1
 }
 # From here until the liveness check passes, the ERR trap rolls back too (see on_error).
@@ -349,13 +394,15 @@ if ! GIT_COMMIT=$(git rev-parse HEAD) docker compose build 2>&1 | tee "$BUILD_LO
   ROLLBACK_ON_ERROR=0
   if grep -qi 'no space left on device' "$BUILD_LOG"; then
     WHY="на диске кончилось место (свободно $(free_mb) МБ). Освободите его: docker builder prune -af — и нажмите «Обновить» ещё раз"
+    report_failure "$STEP" "no space left on device"
   else
     WHY=$(grep -E 'ERROR|failed to solve' "$BUILD_LOG" | tail -1 | cut -c1-300) || WHY=""
+    report_failure "$STEP" "${WHY:-build failed, no ERROR line in the output}"
     [ -n "$WHY" ] || WHY="причина в логе"
   fi
   rm -f "$BUILD_LOG"
   if rollback; then
-    notify "❌ Обновление не удалось на шаге «${STEP}»: ${WHY}. Вернул прежнюю версию, мост продолжает работать. Полный лог: cat $(pwd)/data/update.log"
+    notify "❌ Обновление не удалось на шаге «${STEP}»: ${WHY}. Вернул прежнюю версию, мост продолжает работать. Полный лог: cat $(pwd)/data/update.log${REPORT_NOTE}"
   fi
   exit 1
 fi
@@ -381,8 +428,9 @@ chown -R 1000:1000 data 2>/dev/null || true
 if ! docker compose up -d; then
   ROLLBACK_ON_ERROR=0
   rm -f data/update-completed
+  report_failure "$STEP" "docker compose up -d failed"
   if rollback; then
-    notify "❌ Не удалось запустить контейнер новой версии — вернул прежнюю. Проверьте: docker compose logs"
+    notify "❌ Не удалось запустить контейнер новой версии — вернул прежнюю. Проверьте: docker compose logs${REPORT_NOTE}"
   fi
   exit 1
 fi
@@ -407,8 +455,9 @@ alive() {
 if ! alive; then
   ROLLBACK_ON_ERROR=0
   rm -f data/update-completed
+  report_failure "$STEP" "container not running or restarting after the update"
   if rollback; then
-    notify "❌ Контейнер не поднялся (или перезапускается по кругу) после обновления — вернул прежнюю версию исходников. Проверьте: docker compose logs"
+    notify "❌ Контейнер не поднялся (или перезапускается по кругу) после обновления — вернул прежнюю версию исходников. Проверьте: docker compose logs${REPORT_NOTE}"
   fi
   exit 1
 fi

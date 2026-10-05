@@ -15,6 +15,8 @@ import {
   takeKeyboard,
   KEYBOARD_NA,
   KEYBOARD_PRESS,
+  KEYBOARD_GEO,
+  KEYBOARD_CONTACT,
   pressableButton,
   type MaxAttachment,
   type DownloadContext,
@@ -2614,13 +2616,33 @@ export function wireBridge({
       return;
     }
     try {
-      await max.sendCallback(button.chatId, button.callbackId, button.payload);
+      if (button.sendsText) {
+        const { cid, messageId, time } = await max.sendMessage(button.chatId, button.text, []);
+        rememberOutgoingSend(button.chatId, cid, time);
+        // The topic shows what went out in the owner's name, the way the history renders own messages.
+        const threadId = (ctx.callbackQuery.message as { message_thread_id?: number } | undefined)?.message_thread_id;
+        const shown = await bot.telegram.sendMessage(targetGroupId, `🧑 Вы: ${button.text}`, threadId ? { message_thread_id: threadId } : {}).catch(() => undefined);
+        if (shown) messageLinks.add({ maxChatId: button.chatId, maxMessageId: messageId, telegramMessageId: shown.message_id });
+      } else {
+        await max.sendCallback(button.chatId, button.callbackId, button.payload);
+      }
       logger.info(`TG -> MAX: button «${button.text}» pressed in chat ${String(button.chatId)}`);
       await ctx.answerCbQuery().catch(() => {});
     } catch (err) {
       logger.error(`Failed to relay a press of «${button.text}» to MAX chat ${String(button.chatId)}`, err);
       await ctx.answerCbQuery(`Не удалось нажать в MAX: ${(err as Error).message}`.slice(0, 190)).catch(() => {});
     }
+  });
+
+  // The bot asks for a location or a contact: sent into the topic, either one reaches it through
+  // the ordinary relay. A contact goes without MAX's own signature — a bot that checks it may refuse.
+  bot.action(KEYBOARD_GEO, async (ctx) => {
+    await ctx.answerCbQuery('Отправьте геопозицию в эту тему (скрепка → Геопозиция) — мост передаст её боту.', { show_alert: true }).catch(() => {});
+  });
+  bot.action(KEYBOARD_CONTACT, async (ctx) => {
+    await ctx
+      .answerCbQuery('Отправьте контакт в эту тему (скрепка → Контакт) — мост передаст его боту. Подписи MAX у такого контакта нет: бот, который её проверяет, может его не принять.', { show_alert: true })
+      .catch(() => {});
   });
 
   // A MAX button with no Telegram counterpart (see maxKeyboardToTelegram): presses are not relayed.

@@ -55,6 +55,8 @@ export interface MaxSessionDeps {
   onLogin: (payload: unknown) => Promise<void>;
   /** Posts the «session rejected» notice (with the login button) to the group. */
   postReauthNotice: (text: string) => Promise<unknown>;
+  /** Anonymous error report (bridge/telemetry.ts) — gets the server's refusal text, nothing else. */
+  reportError?: (report: { kind: 'session-rejected'; error: string }) => unknown;
 }
 
 // The saved session is not wiped on the first resume miss: a fresh socket is reconnected and
@@ -242,6 +244,7 @@ export class MaxSessionController {
     this.setState('ready');
     this.noteUp();
     this.notifyReauthNeeded();
+    void this.deps.reportError?.({ kind: 'session-rejected', error: msg });
     await this.deps.store.clear().catch((clearErr) => logger.error('Failed to delete the rejected session file', clearErr));
   }
 

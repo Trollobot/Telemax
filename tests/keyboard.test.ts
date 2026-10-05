@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { Telegraf } from 'telegraf';
-import { KEYBOARD_NA, KEYBOARD_PRESS, maxKeyboardToTelegram, pressableButton, takeKeyboard } from '../src/bridge/attachments.js';
+import { KEYBOARD_CONTACT, KEYBOARD_GEO, KEYBOARD_NA, KEYBOARD_PRESS, maxKeyboardToTelegram, pressableButton, takeKeyboard } from '../src/bridge/attachments.js';
 import { isMarkupRefusal, isRenderableAttach, sendAttachments, sendTextPieces } from '../src/bridge/sync.js';
 
 const kb = (buttons: unknown) => ({ _type: 'INLINE_KEYBOARD', keyboard: { buttons }, callbackId: 'x' });
@@ -29,7 +29,7 @@ describe('maxKeyboardToTelegram', () => {
       [{ type: 'LINK', text: 'Сайт', url: 'tg://resolve?domain=x' }],
     ]);
     expect(maxKeyboardToTelegram(attach)).toEqual({
-      inline_keyboard: [[na('Да'), na('Нет')], [na('Открыть')], [na('Контакт'), na('Гео'), na('?'), na('без типа')], [{ text: 'Сайт', url: 'tg://resolve?domain=x' }]],
+      inline_keyboard: [[na('Да'), na('Нет')], [na('Открыть')], [{ text: 'Контакт', callback_data: KEYBOARD_CONTACT }, { text: 'Гео', callback_data: KEYBOARD_GEO }, na('?'), na('без типа')], [{ text: 'Сайт', url: 'tg://resolve?domain=x' }]],
     });
   });
 
@@ -140,6 +140,12 @@ describe('CALLBACK buttons — presses relayed to MAX', () => {
       payload: '{"command":"request_suggests"}',
       text: '💡 Подсказки',
     });
+  });
+
+  it('a MESSAGE button is pressable too: its press sends the text, no callback', () => {
+    const markup = maxKeyboardToTelegram(kb([[{ type: 'MESSAGE', text: 'Позвать оператора' }]]), 7);
+    const data = (markup?.inline_keyboard[0]?.[0] as { callback_data: string }).callback_data;
+    expect(pressableButton(data.slice(KEYBOARD_PRESS.length))).toEqual({ chatId: 7, callbackId: '', text: 'Позвать оператора', sendsText: true });
   });
 
   it('without a chat (or without a callbackId) the button stays inert, and an unknown key finds nothing', () => {

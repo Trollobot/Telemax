@@ -34,9 +34,10 @@ function setup(session: MaxSession | null = SESSION) {
   const store = { save: vi.fn(async () => {}), clear: vi.fn(async () => {}) };
   const onLogin = vi.fn(async () => {});
   const postReauthNotice = vi.fn(async () => {});
-  const ctl = new MaxSessionController({ client, store, onLogin, postReauthNotice });
+  const reportError = vi.fn();
+  const ctl = new MaxSessionController({ client, store, onLogin, postReauthNotice, reportError });
   ctl.start(session);
-  return { ctl, client, store, onLogin, postReauthNotice };
+  return { ctl, client, store, onLogin, postReauthNotice, reportError };
 }
 
 /** Lets awaited LOGIN promises settle without moving the clock. */
@@ -80,14 +81,16 @@ describe('MaxSessionController — resume retries', () => {
   });
 
   it('the third server rejection wipes the session and asks the group to re-auth', async () => {
-    const { ctl, client, store, postReauthNotice } = setup();
+    const { ctl, client, store, postReauthNotice, reportError } = setup();
     for (let n = 1; n <= 2; n += 1) {
       await failedResume(client, REJECTED());
       expect(store.clear).not.toHaveBeenCalled();
       await vi.advanceTimersByTimeAsync(5_000);
       expect(client.connect).toHaveBeenCalledTimes(n + 1);
     }
+    expect(reportError).not.toHaveBeenCalled();
     await failedResume(client, REJECTED());
+    expect(reportError).toHaveBeenCalledExactlyOnceWith({ kind: 'session-rejected', error: 'Сессия устарела' });
     expect(store.clear).toHaveBeenCalledTimes(1);
     expect(ctl.state).toBe('ready');
     expect(ctl.activePhone).toBe('');
