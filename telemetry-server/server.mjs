@@ -200,8 +200,9 @@ const server = createServer(async (req, res) => {
       const now = Date.now();
       if (report && !ipRateLimited(ip, reportsByIp, REPORT_LIMIT_PER_IP) && acceptReport(report, db, reportsByInstall, now)) {
         const { sig, isNew } = recordReport(reports.signatures, report, now);
-        void save(REPORTS_FILE, reports);
+        // Queue first, save second: a notice waiting out the hourly limit must survive a restart.
         if (isNew) void notifyMaintainer(sig);
+        void save(REPORTS_FILE, reports);
       }
     } catch {
       // ignore malformed reports — never error back
