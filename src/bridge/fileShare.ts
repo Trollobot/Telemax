@@ -289,12 +289,15 @@ export class FileShare {
     const id = newToken();
     const safe = safeFileName(name);
     const dir = path.join(this.dir, 'items', id);
+    // Registered BEFORE the directory exists: sweep() deletes item directories the index doesn't
+    // know, and a file being saved isn't in the index yet (a 2.7 GB ISO was deleted mid-download
+    // that way, live 2026-10-09).
+    const progress = { name: safe, size, written: 0 };
+    this.saving.set(id, progress);
     await mkdir(dir, { recursive: true });
     const part = path.join(dir, `${safe}.part`);
     let written = 0;
     const limit = Math.max(size, 0) + 1024 * 1024; // the declared size, a little slack
-    const progress = { name: safe, size, written: 0 };
-    this.saving.set(id, progress);
     const guard = new Transform({
       transform(chunk: Buffer, _enc, cb) {
         written += chunk.length;
@@ -420,7 +423,7 @@ export class FileShare {
         if (!liveTokens.has(name.replace(/\.json(\.tmp)?$/, ''))) await unlink(path.join(this.dir, 'tokens', name)).catch(() => {});
       }
       for (const name of await readdir(path.join(this.dir, 'items')).catch(() => [] as string[])) {
-        if (!liveItems.has(name)) await rm(path.join(this.dir, 'items', name), { recursive: true, force: true });
+        if (!liveItems.has(name) && !this.saving.has(name)) await rm(path.join(this.dir, 'items', name), { recursive: true, force: true });
       }
       for (const name of await readdir(path.join(this.dir, 'incoming')).catch(() => [] as string[])) {
         if (!liveTokens.has(name)) await rm(path.join(this.dir, 'incoming', name), { recursive: true, force: true });

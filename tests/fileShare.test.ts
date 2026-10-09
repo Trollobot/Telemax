@@ -169,3 +169,21 @@ describe('FileShare.ensureService', () => {
     expect((await (await fresh({ ...opts, enabled: false })).ensureService(10)).ok).toBe(false);
   });
 });
+
+describe('FileShare sweep vs a file being saved', () => {
+  it('leaves a file that is still being written alone (live 2026-10-09: a 2.7 GB ISO was deleted mid-download)', async () => {
+    const share = new FileShare(dataDir, opts);
+    await share.init();
+    const body = new Readable({ read() {} });
+    const saving = share.storeStream(body, 'big.iso', 6);
+    body.push(Buffer.from('abc'));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(share.inProgress()).toEqual([{ name: 'big.iso', size: 6, written: 3 }]);
+    await share.sweep();
+    body.push(Buffer.from('def'));
+    body.push(null);
+    const f = await saving;
+    expect(await readFile(path.join(share.dir, 'items', f.id, 'big.iso'), 'utf8')).toBe('abcdef');
+    expect(share.inProgress()).toEqual([]);
+  });
+});
