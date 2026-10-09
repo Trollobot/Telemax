@@ -71,6 +71,9 @@ function pauseLabel(until: number | null): string | null {
 // --- Contact-search force-reply correlation ------------------------------------------
 type SearchMode = 'phone' | 'nick' | 'id';
 const pendingSearch = new Map<number, { mode: SearchMode; requesterId: number }>();
+// Who pressed a search button and is expected to type the query next (no reply needed).
+const pendingByUser = new Map<number, { mode: SearchMode; promptId: number; at: number }>();
+const SEARCH_WAIT_MS = 10 * 60_000;
 // Contacts shown with a "Начать чат" button, so the tap knows the display name / MAX
 // membership without re-fetching. Keyed by userId (string).
 const shownContacts = new Map<string, { name: string; onMax: boolean; bot?: boolean }>();
@@ -321,6 +324,26 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
   // unref (as with every maintenance timer): must not hold the process open during shutdown.
   setTimeout(() => void restoreOrPost(), 4000).unref();
 
+  // Search prompts used to be force_reply messages, which Telegram Desktop keeps resurrecting as
+  // «В ответ …» above the input field — even after they're deleted. Only a newer bot message with
+  // remove_keyboard clears that (confirmed live 2026-10-10), so every install gets one, once.
+  const SEARCH_PROMPTS_CLEARED = path.join(process.cwd(), '.data', 'search-prompts-cleared');
+  setTimeout(() => {
+    void (async () => {
+      try {
+        await readFile(SEARCH_PROMPTS_CLEARED, 'utf8');
+        return; // already done
+      } catch {
+        /* not yet */
+      }
+      await bot.telegram.sendMessage(targetGroupId, '🧹 Убрал зависшую подсказку поиска внизу чата, если она мешала. Поиск в пульте теперь просто ждёт следующее сообщение.', {
+        reply_markup: { remove_keyboard: true },
+        disable_notification: true,
+      });
+      await writeFile(SEARCH_PROMPTS_CLEARED, new Date().toISOString(), 'utf8');
+    })().catch((err) => logger.error('Clearing stale search prompts failed', err));
+  }, 6000).unref();
+
   bot.command('panel', async (ctx) => {
     await postAndPin().catch((err) => logger.error('Failed to post control panel (/panel)', err));
     await ctx.deleteMessage().catch(() => {}); // remove the "/panel" command message
@@ -479,21 +502,22 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
     // or a person's nick (or a Telegram @username) just ends in «Ничего не найдено».
     const text =
       mode === 'phone'
-        ? '🔎 Отправьте номер телефона (с + или без) в ответ на это сообщение:'
+        ? '🔎 Напишите номер телефона следующим сообщением (с + или без):'
         : mode === 'id'
-          ? '🔎 Отправьте MAX ID (число — например, из карточки группы или из сообщения о выходе участника) в ответ на это сообщение:'
-          : '🔎 Отправьте в ответ на это сообщение ник бота или канала MAX, ссылку max.ru/… или их название.\nЛюдей по нику не найти — их ищите по номеру или MAX ID. Ник из Telegram тоже не подойдёт.';
-    const sent = await bot.telegram.sendMessage(chatIdOf(ctx), text, {
-      reply_markup: { force_reply: true, input_field_placeholder: mode === 'phone' ? '+79991234567' : mode === 'id' ? '123456789' : '@nick или max.ru/nick' },
-    });
-    boundedSet(pendingSearch, sent.message_id, { mode, requesterId: ctx.from?.id ?? 0 });
-    // A force_reply prompt left in the chat keeps popping up as «В ответ …» in Telegram Desktop
-    // whenever the bot posts or edits something later (seen live 2026-10-09) — so it doesn't stay:
-    // removed once answered (below) or after 10 minutes unanswered.
+          ? '🔎 Напишите MAX ID следующим сообщением (число — например, из карточки группы или из сообщения о выходе участника):'
+          : '🔎 Напишите следующим сообщением ник бота или канала MAX, ссылку max.ru/… или их название.\nЛюдей по нику не найти — их ищите по номеру или MAX ID. Ник из Telegram тоже не подойдёт.';
+    // No force_reply: Telegram Desktop keeps a force_reply prompt as the chat's "keyboard" and keeps
+    // popping «В ответ …» up long after the prompt is gone (seen live 2026-10-09). The next text of
+    // the same admin in General is the answer instead (a reply to the prompt works too).
+    const sent = await bot.telegram.sendMessage(chatIdOf(ctx), text);
+    const requesterId = ctx.from?.id ?? 0;
+    boundedSet(pendingSearch, sent.message_id, { mode, requesterId });
+    pendingByUser.set(requesterId, { mode, promptId: sent.message_id, at: Date.now() });
     setTimeout(() => {
+      if (pendingByUser.get(requesterId)?.promptId === sent.message_id) pendingByUser.delete(requesterId);
       if (!pendingSearch.delete(sent.message_id)) return;
       void bot.telegram.deleteMessage(chatIdOf(ctx), sent.message_id).catch(() => {});
-    }, 10 * 60_000).unref();
+    }, SEARCH_WAIT_MS).unref();
   }
   bot.action('tlmx_panel:find:phone', async (ctx) => {
     await ctx.answerCbQuery();
@@ -669,13 +693,20 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
   // runs before the main relay handler; anything that isn't a reply to one of our
   // prompts is passed straight through with next().
   bot.on('message', async (ctx, next) => {
-    const msg = ctx.message as { reply_to_message?: { message_id: number }; text?: string };
-    const replyTo = msg.reply_to_message?.message_id;
-    if (replyTo == null || !pendingSearch.has(replyTo)) return next();
-    const pending = pendingSearch.get(replyTo)!;
-    if (ctx.from?.id !== pending.requesterId) return next();
-    pendingSearch.delete(replyTo);
-    await ctx.telegram.deleteMessage(chatIdOf(ctx), replyTo).catch(() => {});
+    const msg = ctx.message as { reply_to_message?: { message_id: number }; text?: string; message_thread_id?: number };
+    let promptId = msg.reply_to_message?.message_id;
+    if (promptId == null || !pendingSearch.has(promptId)) {
+      // Not a reply: the next text of the admin who pressed the button, in General, within the wait.
+      const byUser = ctx.from ? pendingByUser.get(ctx.from.id) : undefined;
+      const inGeneral = msg.message_thread_id == null;
+      if (!byUser || !inGeneral || msg.text == null || msg.text.startsWith('/') || Date.now() - byUser.at > SEARCH_WAIT_MS) return next();
+      promptId = byUser.promptId;
+    }
+    const pending = pendingSearch.get(promptId);
+    if (!pending || ctx.from?.id !== pending.requesterId) return next();
+    pendingSearch.delete(promptId);
+    if (ctx.from) pendingByUser.delete(ctx.from.id);
+    await ctx.telegram.deleteMessage(chatIdOf(ctx), promptId).catch(() => {});
     const query = (msg.text ?? '').trim();
     if (!query) {
       await ctx.reply('Пусто — отмена.').catch(() => {});
