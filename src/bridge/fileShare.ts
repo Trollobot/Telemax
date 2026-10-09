@@ -35,8 +35,8 @@ export interface StoredFile {
   id: string;
   name: string;
   size: number;
-  /** max2tg: saved from MAX for the topic; tg2max: uploaded for MAX (over MAX's limit). */
-  direction: 'max2tg' | 'tg2max';
+  /** max2tg: saved from MAX for the topic; tg2max: uploaded for MAX but not sent; stored: put on the server through the panel to share by link. */
+  direction: 'max2tg' | 'tg2max' | 'stored';
   token: string;
   createdAt: number;
   expiresAt: number;
@@ -45,6 +45,8 @@ export interface StoredFile {
 }
 
 export interface UploadTicket {
+  /** 'store': the panel's «📤 Загрузить файл» — kept on the server for a link, not sent anywhere. */
+  purpose?: 'max' | 'store';
   token: string;
   maxChatId: string;
   topicId: number;
@@ -226,11 +228,13 @@ export class FileShare {
       const ticket: UploadTicket = { ...t, token: newToken(), createdAt: now, expiresAt: now + this.opts.ttlMs };
       await this.writeToken(ticket.token, {
         kind: 'upload',
+        purpose: ticket.purpose ?? 'max',
         name: ticket.name,
         expectedSize: ticket.expectedSize,
         expiresAt: ticket.expiresAt,
         reserveBytes: this.opts.reserveBytes,
-        maxFileBytes: MAX_FILE_LIMIT,
+        // The MAX limit only matters for a file going to MAX; the panel's store is bounded by the disk.
+        ...(ticket.purpose === 'store' ? {} : { maxFileBytes: MAX_FILE_LIMIT }),
       });
       this.index.tickets.push(ticket);
       await this.save();
@@ -263,6 +267,7 @@ export class FileShare {
       await mkdir(path.join(this.dir, 'items', id), { recursive: true });
       const target = path.join(this.dir, 'items', id, safeFileName(name));
       await rename(filePath, target);
+      if (ticket.purpose === 'store') return this.addFile(id, safeFileName(name), size, 'stored');
       return this.addFile(id, safeFileName(name), size, 'tg2max', {
         maxChatId: ticket.maxChatId,
         topicId: ticket.topicId,

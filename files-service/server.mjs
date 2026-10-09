@@ -127,9 +127,13 @@ async function showLink(res, t) {
     const free = Math.max(0, (await freeBytes(t.root)) - (body.reserveBytes ?? 0));
     const maxFile = typeof body.maxFileBytes === 'number' ? body.maxFileBytes : Infinity;
     const maxBytes = Math.min(free, maxFile);
-    const wanted = body.name
-      ? `Ждём «${esc(body.name)}» (${esc(formatBytes(body.expectedSize ?? 0))}) — мост отправит его в MAX.`
-      : 'Выберите файл — мост отправит его в MAX.';
+    const store = body.purpose === 'store';
+    const wanted = store
+      ? 'Выберите файл — он сохранится на сервере, а ссылку для скачивания бот пришлёт в Telegram.'
+      : body.name
+        ? `Ждём «${esc(body.name)}» (${esc(formatBytes(body.expectedSize ?? 0))}) — мост отправит его в MAX.`
+        : 'Выберите файл — мост отправит его в MAX.';
+    const doneText = store ? 'Готово! Файл на сервере — ссылку на него бот пришлёт в Telegram. Страницу можно закрыть.' : 'Готово! Мост отправит файл в MAX — страницу можно закрыть.';
     const limits = [
       Number.isFinite(maxFile) ? `MAX принимает файлы до ${esc(formatBytes(maxFile))}.` : '',
       `Свободно на сервере: ${esc(formatBytes(free))}.`,
@@ -155,7 +159,7 @@ f.onchange=()=>{const x=f.files[0];s.textContent='';go.disabled=!x;
 go.onclick=()=>{const x=f.files[0];if(!x)return;go.disabled=true;f.disabled=true;stop.hidden=false;p.style.display='block';bar.style.width='0';
 r=new XMLHttpRequest();r.open('PUT',location.pathname.replace(/\\/$/,'')+'/upload');r.setRequestHeader('X-File-Name',encodeURIComponent(x.name));
 r.upload.onprogress=e=>{if(e.lengthComputable){bar.style.width=(e.loaded/e.total*100).toFixed(1)+'%';s.textContent=fmt(e.loaded)+' из '+fmt(e.total)}};
-r.onload=()=>{if(r.status===200){bar.style.width='100%';s.textContent='Готово! Мост отправит файл в MAX — страницу можно закрыть.';stop.hidden=true;f.disabled=true}else{s.textContent='Не получилось: '+(r.responseText||r.status);idle()}};
+r.onload=()=>{if(r.status===200){bar.style.width='100%';s.textContent=${JSON.stringify(doneText)};stop.hidden=true;f.disabled=true}else{s.textContent='Не получилось: '+(r.responseText||r.status);idle()}};
 r.onerror=()=>{s.textContent='Связь прервалась — попробуйте ещё раз.';idle()};
 r.onabort=()=>{s.textContent='Загрузка отменена. Можно выбрать файл заново.';p.style.display='none';idle()};
 r.send(x)};

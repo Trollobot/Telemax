@@ -41,7 +41,8 @@ export function formatExpiry(ms: number): string {
 }
 
 type SentMessage = { message_id: number };
-type SendOpts = { message_thread_id: number; reply_parameters?: { message_id: number; allow_sending_without_reply: boolean } };
+/** No message_thread_id = the group's General topic (where the panel lives). */
+type SendOpts = { message_thread_id?: number; reply_parameters?: { message_id: number; allow_sending_without_reply: boolean } };
 
 export interface BigFilesDeps {
   bot: Telegraf;
@@ -61,6 +62,8 @@ export interface BigFiles {
   offerUpload(p: { maxChatId: string; topicId: number; telegramMessageId: number; caption?: string; name?: string; size?: number }): Promise<void>;
   /** MAX → Telegram: a FILE over the bot upload limit — save it and post a download link. */
   relayFromMax(att: MaxAttachment, ctx: DownloadContext, opts: SendOpts): Promise<SentMessage>;
+  /** The panel's «📤 Загрузить файл»: an upload link into the server's own store, posted in General. */
+  offerStore(): Promise<void>;
   /** The panel's «📤 Отправить в MAX»: a stored file that didn't make it, sent again from disk. */
   resendToMax(id: string): Promise<{ ok: boolean; text: string }>;
 }
@@ -82,7 +85,7 @@ export function createBigFiles({ bot, max, targetGroupId, fileShare, onSentToMax
         logger.error('Editing a big-file notice failed — posting a new one', err);
       }
     }
-    await send(text, { message_thread_id: topicId }, markup).catch((e) => logger.error('Posting a big-file notice failed', e));
+    await send(text, topicId ? { message_thread_id: topicId } : {}, markup).catch((e) => logger.error('Posting a big-file notice failed', e));
   };
   const reserveText = formatBytes(fileShare.opts.reserveBytes);
 
@@ -180,13 +183,70 @@ export function createBigFiles({ bot, max, targetGroupId, fileShare, onSentToMax
   bot.action(new RegExp(`^${CANCEL}(.+)$`), async (ctx) => {
     const ticket = fileShare.getTicket(ctx.match[1] ?? '');
     await ctx.answerCbQuery(ticket ? 'Загрузка отменена' : 'Ссылка уже не действует').catch(() => {});
+    if (ticket) logger.info(`Upload link for «${ticket.name || 'any file'}» cancelled`);
     if (ticket) await fileShare.dropTicket(ticket.token);
     const text = (ctx.callbackQuery.message as { text?: string } | undefined)?.text;
     await ctx.editMessageText(ticket || !text ? '✖️ Загрузка отменена — ссылка больше не работает.' : text).catch(() => {});
   });
 
+  async function offerStore(): Promise<void> {
+    if (!fileShare.enabled) {
+      await send('⚠️ Пересылка больших файлов отключена в настройках (FILES=off).', {});
+      return;
+    }
+    const room = await fileShare.roomFor(1);
+    if (!room.fits) {
+      await send(`⚠️ Загрузить файл не выйдет: на сервере свободно ${formatBytes(room.freeBytes)}, а ${reserveText} нужно оставить для обновлений.`, {});
+      return;
+    }
+    const prompt = await send('⏳ Готовлю ссылку для загрузки файла на сервер…', {});
+    const ticket = await fileShare.createUploadTicket({
+      purpose: 'store',
+      maxChatId: '',
+      topicId: 0,
+      telegramMessageId: prompt.message_id,
+      name: '',
+      expectedSize: 0,
+      promptMessageId: prompt.message_id,
+    });
+    logger.info('Panel: offering an upload link into the server store');
+    const svc = await fileShare.ensureService();
+    if (!svc.ok) {
+      report('service', svc.reason);
+      await fileShare.dropTicket(ticket.token);
+      await edit(prompt.message_id, 0, `⚠️ Ссылку для загрузки подготовить не удалось — ${svc.reason}.`);
+      return;
+    }
+    await edit(
+      prompt.message_id,
+      0,
+      `📤 Загрузите файл по ссылке — он сохранится на вашем сервере, а ссылку для скачивания я пришлю сюда же. Ею можно делиться где угодно.
+Ссылка на загрузку действует до ${formatExpiry(ticket.expiresAt)}.`,
+      uploadKeyboard(`${svc.url}/f/${ticket.token}`, ticket.token),
+    );
+  }
+
   fileShare.onUpload(async (ticket, filePath, size, name) => {
     const label = `«${name}» (${formatBytes(size)})`;
+    if (ticket.purpose === 'store') {
+      const file = await fileShare.adoptUpload(ticket, filePath, size, name);
+      logger.info(`Panel store: ${name} (${size} bytes) uploaded`);
+      const svc = await fileShare.ensureService(30_000);
+      const until = formatExpiry(file.expiresAt);
+      if (!svc.ok) {
+        await edit(ticket.promptMessageId, 0, `✅ Файл ${label} на сервере до ${until}. Ссылку можно взять в пульте → 📁 Файлы.`);
+        return;
+      }
+      await edit(
+        ticket.promptMessageId,
+        0,
+        `✅ Файл ${label} на сервере до ${until}.
+🔗 ${svc.url}/f/${file.token}
+Ссылкой можно делиться — по ней откроется страница со скачиванием. Продлить или удалить — в пульте → 📁 Файлы.`,
+        Markup.inlineKeyboard([Markup.button.url('⬇️ Скачать', `${svc.url}/f/${file.token}`)]),
+      );
+      return;
+    }
     if (size > MAX_FILE_LIMIT) {
       // The page and the service refuse this already — belt and braces.
       await fileShare.dropTicket(ticket.token);
@@ -240,7 +300,7 @@ export function createBigFiles({ bot, max, targetGroupId, fileShare, onSentToMax
       if (Date.now() - lastShown < 20_000) return;
       lastShown = Date.now();
       const pct = size > 0 ? ` (${Math.min(99, Math.floor((written / size) * 100))}%)` : '';
-      void edit(msg.message_id, opts.message_thread_id, `${notice}
+      void edit(msg.message_id, opts.message_thread_id ?? 0, `${notice}
 ⏳ Сохранено ${formatBytes(written)} из ${formatBytes(size)}${pct}…`);
     };
     let file;
@@ -261,10 +321,10 @@ export function createBigFiles({ bot, max, targetGroupId, fileShare, onSentToMax
       }
       logger.error(`Saving the big MAX file ${name} failed`, err);
       report('save from MAX', err);
-      await edit(msg.message_id, opts.message_thread_id, `📎 Файл ${label} — ${WHY_TG_UPLOAD}, а сохранить его для скачивания не удалось: ${humanError(err)}. Откройте его в MAX.`);
+      await edit(msg.message_id, opts.message_thread_id ?? 0, `📎 Файл ${label} — ${WHY_TG_UPLOAD}, а сохранить его для скачивания не удалось: ${humanError(err)}. Откройте его в MAX.`);
       return msg;
     }
-    await edit(msg.message_id, opts.message_thread_id, `${notice}
+    await edit(msg.message_id, opts.message_thread_id ?? 0, `${notice}
 ✅ Сохранён — готовлю ссылку…`);
     // Not awaited: the service may take a minute or two to come up, and this runs inside the
     // chat's queue — the next message must not wait for it.
@@ -272,12 +332,12 @@ export function createBigFiles({ bot, max, targetGroupId, fileShare, onSentToMax
       const svc = await fileShare.ensureService();
       if (!svc.ok) {
       report('service', svc.reason);
-        await edit(msg.message_id, opts.message_thread_id, `📎 Файл ${label} — ${WHY_TG_UPLOAD}. Ссылку подготовить не удалось: ${svc.reason}.\nФайл сохранён до ${formatExpiry(file.expiresAt)} — новую ссылку можно получить в пульте → 📁 Файлы.`);
+        await edit(msg.message_id, opts.message_thread_id ?? 0, `📎 Файл ${label} — ${WHY_TG_UPLOAD}. Ссылку подготовить не удалось: ${svc.reason}.\nФайл сохранён до ${formatExpiry(file.expiresAt)} — новую ссылку можно получить в пульте → 📁 Файлы.`);
         return;
       }
       await edit(
         msg.message_id,
-        opts.message_thread_id,
+        opts.message_thread_id ?? 0,
         `📎 Файл ${label} — ${WHY_TG_UPLOAD}, поэтому он лежит на вашем сервере. Скачайте по ссылке до ${formatExpiry(file.expiresAt)} — потом файл удалится.`,
         Markup.inlineKeyboard([Markup.button.url('⬇️ Скачать', `${svc.url}/f/${file.token}`)]),
       );
@@ -302,5 +362,5 @@ export function createBigFiles({ bot, max, targetGroupId, fileShare, onSentToMax
     }
   }
 
-  return { offerUpload, relayFromMax, resendToMax };
+  return { offerUpload, offerStore, relayFromMax, resendToMax };
 }

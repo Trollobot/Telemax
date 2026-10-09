@@ -205,3 +205,20 @@ describe('big-file errors', () => {
     expect(s).toContain('ENOENT');
   });
 });
+
+describe('the panel store («📤 Загрузить файл»)', () => {
+  it('keeps the upload as a 📦 file with a link, with no MAX limit and nowhere to send it', async () => {
+    const share = new FileShare(dataDir, opts);
+    await share.init();
+    const ticket = await share.createUploadTicket({ purpose: 'store', maxChatId: '', topicId: 0, telegramMessageId: 1, name: '', expectedSize: 0 });
+    const tokenBody = JSON.parse(await readFile(path.join(share.dir, 'tokens', `${ticket.token}.json`), 'utf8'));
+    expect(tokenBody).toMatchObject({ kind: 'upload', purpose: 'store' });
+    expect(tokenBody.maxFileBytes).toBeUndefined();
+    const dir = path.join(share.dir, 'incoming', ticket.token);
+    await mkdir(dir, { recursive: true });
+    await writeFile(path.join(dir, 'photos.zip'), 'zz');
+    const f = await share.adoptUpload(ticket, path.join(dir, 'photos.zip'), 2, 'photos.zip');
+    expect(f.direction).toBe('stored');
+    expect(f.target).toBeUndefined();
+  });
+});

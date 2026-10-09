@@ -42,6 +42,8 @@ export interface ControlPanelDeps {
   pause: PauseControl;
   /** Big files kept for download links — the «📁 Файлы» section. */
   files?: FileShare;
+  /** «📤 Загрузить файл»: an upload link into the server store, posted in General (bigFiles.ts). */
+  offerStore?: () => Promise<void>;
   /** «📤 Отправить в MAX» for a stored file that didn't make it (bigFiles.ts). */
   resendToMax?: (id: string) => Promise<{ ok: boolean; text: string }>;
 }
@@ -169,22 +171,25 @@ function filesView(files: FileShare): View {
   const footer =
     'Здесь хранятся файлы, которые мост держит на сервере для скачивания по ссылке:\n' +
     '• файлы из MAX больше 50 МБ — Telegram не принимает от ботов такие файлы напрямую;\n' +
-    '• загруженные для отправки в MAX, но не ушедшие из-за ошибки — их можно отправить ещё раз.\n\n' +
+    '• загруженные для отправки в MAX, но не ушедшие из-за ошибки — их можно отправить ещё раз;\n' +
+    '• загруженные вами через «📤 Загрузить файл» — чтобы делиться ссылкой.\n\n' +
     'Файлы, которые уже ушли в MAX, на сервере не остаются.\n' +
     `Файлы со ссылкой хранятся ${ttl} от последней выданной ссылки, потом удаляются.`;
   const extra = [...savingLines, pendingLine].filter(Boolean).join('\n');
   if (list.length === 0) {
     return {
       text: `📁 Файлов нет.${extra ? `\n\n${extra}` : ''}\n\n${footer}`,
-      markup: Markup.inlineKeyboard([[Markup.button.callback('🔄 Обновить', 'tlmx_panel:files')], back]).reply_markup,
+      markup: Markup.inlineKeyboard([[Markup.button.callback('📤 Загрузить файл', 'tlmx_panel:fupload')], [Markup.button.callback('🔄 Обновить', 'tlmx_panel:files')], back]).reply_markup,
     };
   }
   const total = list.reduce((s, f) => s + f.size, 0);
-  const lines = list.map((f, i) => `${i + 1}. ${f.direction === 'max2tg' ? '⬇️' : '⬆️'} ${f.name} — ${formatBytes(f.size)}, до ${formatExpiry(f.expiresAt)}`);
+  const icon = (f: StoredFile) => (f.direction === 'max2tg' ? '⬇️' : f.direction === 'stored' ? '📦' : '⬆️');
+  const lines = list.map((f, i) => `${i + 1}. ${icon(f)} ${f.name} — ${formatBytes(f.size)}, до ${formatExpiry(f.expiresAt)}`);
   return {
-    text: `📁 Файлы на сервере: ${list.length}, всего ${formatBytes(total)}.\n⬇️ — из MAX, ⬆️ — не ушли в MAX.\n\n${lines.join('\n')}${extra ? `\n\n${extra}` : ''}\n\n${footer}`,
+    text: `📁 Файлы на сервере: ${list.length}, всего ${formatBytes(total)}.\n⬇️ — из MAX, ⬆️ — не ушли в MAX, 📦 — загружены вами.\n\n${lines.join('\n')}${extra ? `\n\n${extra}` : ''}\n\n${footer}`,
     markup: Markup.inlineKeyboard([
       ...list.slice(0, 20).map((f, i) => [Markup.button.callback(`${i + 1}. ${truncateUtf16(f.name, 48)}`, `tlmx_panel:file:${f.id}`)]),
+      [Markup.button.callback('📤 Загрузить файл', 'tlmx_panel:fupload')],
       [Markup.button.callback('🔄 Обновить', 'tlmx_panel:files')],
       back,
     ]).reply_markup,
@@ -192,7 +197,7 @@ function filesView(files: FileShare): View {
 }
 
 function fileCardView(f: StoredFile, files: FileShare, link?: string, canResend = false): View {
-  const where = f.direction === 'max2tg' ? 'пришёл из MAX' : 'загружен для MAX';
+  const where = f.direction === 'max2tg' ? 'пришёл из MAX' : f.direction === 'stored' ? 'загружен вами для ссылки' : 'загружен для MAX, но не ушёл';
   const linkLine = link ? `\n\n🔗 ${link}\nСсылку можно переслать — по ней откроется страница со скачиванием.` : '';
   return {
     text: `📄 ${f.name}\n${formatBytes(f.size)} · ${where}\nХранится до ${formatExpiry(f.expiresAt)}, потом удалится.${linkLine}`,
@@ -264,7 +269,7 @@ function pauseView(): View {
 }
 
 export function wireControlPanel(deps: ControlPanelDeps): void {
-  const { bot, targetGroupId, max, getActivePhone, triggerFullResync, leaves, startDialog, resolveContactName, getStatus, pause, files, resendToMax } = deps;
+  const { bot, targetGroupId, max, getActivePhone, triggerFullResync, leaves, startDialog, resolveContactName, getStatus, pause, files, resendToMax, offerStore } = deps;
   const card = (f: StoredFile, link?: string): View => fileCardView(f, files!, link, Boolean(resendToMax));
   const root = (): View => rootView(getActivePhone(), pause.until());
   const system = (): View => systemView(pause.until() != null);
@@ -389,8 +394,14 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
     const back = Markup.inlineKeyboard([[Markup.button.callback('◀️ К файлам', 'tlmx_panel:files')]]).reply_markup;
     await ctx.editMessageText(r.text, { reply_markup: back }).catch(() => {});
   });
+  bot.action('tlmx_panel:fupload', async (ctx) => {
+    await ctx.answerCbQuery('Готовлю ссылку для загрузки…').catch(() => {});
+    if (offerStore) void offerStore().catch((err) => logger.error('Panel store upload failed', err));
+  });
   bot.action(/^tlmx_panel:fdel:(.+)$/, async (ctx) => {
+    const name = files?.get(ctx.match[1] ?? '')?.name;
     const removed = files ? await files.remove(ctx.match[1] ?? '') : false;
+    if (removed) logger.info(`Panel: file «${name}» deleted`);
     await ctx.answerCbQuery(removed ? 'Файл удалён' : 'Файла уже нет').catch(() => {});
     if (files) await edit(ctx, filesView(files));
   });
