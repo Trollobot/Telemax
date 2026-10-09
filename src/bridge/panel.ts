@@ -161,21 +161,31 @@ function filesView(files: FileShare): View {
     return { text: '📁 Пересылка больших файлов отключена: FILES=off в .env.', markup: Markup.inlineKeyboard([back]).reply_markup };
   }
   const list = files.list();
+  const saving = files.inProgress();
   const pending = files.pendingUploads();
-  const pendingLine = pending ? `\n\n⏳ Ждут загрузки по ссылке: ${pending}.` : '';
   const ttl = ttlText(files.opts.ttlMs);
+  const savingLines = saving.map((x) => `⏳ Сохраняется: ${x.name} — ${formatBytes(x.written)} из ${formatBytes(x.size)}`);
+  const pendingLine = pending ? `⏳ Ждут загрузки по ссылке: ${pending}` : '';
+  const footer =
+    'Здесь хранятся файлы, которые мост держит на сервере для скачивания по ссылке:\n' +
+    '• файлы из MAX больше 50 МБ — Telegram не принимает от ботов такие файлы напрямую;\n' +
+    '• загруженные для отправки в MAX, но не ушедшие из-за ошибки — их можно отправить ещё раз.\n\n' +
+    'Файлы, которые уже ушли в MAX, на сервере не остаются.\n' +
+    `Файлы со ссылкой хранятся ${ttl} от последней выданной ссылки, потом удаляются.`;
+  const extra = [...savingLines, pendingLine].filter(Boolean).join('\n');
   if (list.length === 0) {
     return {
-      text: `📁 Файлов нет.\n\nСюда попадают большие файлы, которые мост пересылает по ссылке: из MAX — больше 50 МБ, в MAX — больше 4 ГБ. Файл живёт ${ttl} от последней выданной ссылки, потом удаляется.${pendingLine}`,
-      markup: Markup.inlineKeyboard([back]).reply_markup,
+      text: `📁 Файлов нет.${extra ? `\n\n${extra}` : ''}\n\n${footer}`,
+      markup: Markup.inlineKeyboard([[Markup.button.callback('🔄 Обновить', 'tlmx_panel:files')], back]).reply_markup,
     };
   }
   const total = list.reduce((s, f) => s + f.size, 0);
   const lines = list.map((f, i) => `${i + 1}. ${f.direction === 'max2tg' ? '⬇️' : '⬆️'} ${f.name} — ${formatBytes(f.size)}, до ${formatExpiry(f.expiresAt)}`);
   return {
-    text: `📁 Файлы на сервере: ${list.length}, всего ${formatBytes(total)}.\n⬇️ — из MAX, ⬆️ — для MAX. Ссылка живёт ${ttl}, потом файл удаляется.\n\n${lines.join('\n')}${pendingLine}`,
+    text: `📁 Файлы на сервере: ${list.length}, всего ${formatBytes(total)}.\n⬇️ — из MAX, ⬆️ — не ушли в MAX.\n\n${lines.join('\n')}${extra ? `\n\n${extra}` : ''}\n\n${footer}`,
     markup: Markup.inlineKeyboard([
       ...list.slice(0, 20).map((f, i) => [Markup.button.callback(`${i + 1}. ${truncateUtf16(f.name, 48)}`, `tlmx_panel:file:${f.id}`)]),
+      [Markup.button.callback('🔄 Обновить', 'tlmx_panel:files')],
       back,
     ]).reply_markup,
   };

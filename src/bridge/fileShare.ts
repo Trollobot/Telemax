@@ -123,6 +123,8 @@ export class FileShare {
   private chain: Promise<unknown> = Promise.resolve();
   private uploadHandler: ((t: UploadTicket, filePath: string, size: number, name: string) => Promise<void>) | null = null;
   private busyTokens = new Set<string>();
+  /** Files being saved from MAX right now — the panel lists them before they're done. */
+  private saving = new Map<string, { name: string; size: number; written: number }>();
 
   constructor(
     dataDir: string,
@@ -198,6 +200,11 @@ export class FileShare {
 
   getTicket(token: string): UploadTicket | undefined {
     return this.index.tickets.find((t) => t.token === token);
+  }
+
+  /** Files still being saved from MAX: name, declared size, bytes so far. */
+  inProgress(): Array<{ name: string; size: number; written: number }> {
+    return [...this.saving.values()];
   }
 
   pendingUploads(): number {
@@ -286,9 +293,12 @@ export class FileShare {
     const part = path.join(dir, `${safe}.part`);
     let written = 0;
     const limit = Math.max(size, 0) + 1024 * 1024; // the declared size, a little slack
+    const progress = { name: safe, size, written: 0 };
+    this.saving.set(id, progress);
     const guard = new Transform({
       transform(chunk: Buffer, _enc, cb) {
         written += chunk.length;
+        progress.written = written;
         onProgress?.(written);
         if (written > limit) cb(new Error(`file grew past its declared ${size} bytes`));
         else cb(null, chunk);
@@ -300,6 +310,8 @@ export class FileShare {
     } catch (err) {
       await rm(dir, { recursive: true, force: true });
       throw err;
+    } finally {
+      this.saving.delete(id);
     }
     return this.locked(() => this.addFile(id, safe, written, 'max2tg'));
   }
