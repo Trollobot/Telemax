@@ -189,6 +189,10 @@ export class FileShare {
     return this.index.files.find((f) => f.id === id);
   }
 
+  getTicket(token: string): UploadTicket | undefined {
+    return this.index.tickets.find((t) => t.token === token);
+  }
+
   pendingUploads(): number {
     return this.index.tickets.length;
   }
@@ -212,6 +216,7 @@ export class FileShare {
         expectedSize: ticket.expectedSize,
         expiresAt: ticket.expiresAt,
         reserveBytes: this.opts.reserveBytes,
+        maxFileBytes: MAX_FILE_LIMIT,
       });
       this.index.tickets.push(ticket);
       await this.save();

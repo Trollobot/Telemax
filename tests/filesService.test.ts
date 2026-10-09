@@ -24,7 +24,8 @@ beforeAll(async () => {
   await tokenFile('dddddddddddddddddddddd', { kind: 'download', name: 'отчёт.txt', size: 10, path: 'items/id1/отчёт.txt', expiresAt: later });
   await tokenFile('eeeeeeeeeeeeeeeeeeeeee', { kind: 'download', name: 'x', size: 1, path: 'items/id1/отчёт.txt', expiresAt: Date.now() - 1 });
   await tokenFile('tttttttttttttttttttttt', { kind: 'download', name: 'x', size: 1, path: '../../../etc/hosts', expiresAt: later });
-  await tokenFile('uuuuuuuuuuuuuuuuuuuuuu', { kind: 'upload', name: 'big.zip', expectedSize: 5, expiresAt: later, reserveBytes: 0 });
+  await tokenFile('uuuuuuuuuuuuuuuuuuuuuu', { kind: 'upload', name: 'big.zip', expectedSize: 5, expiresAt: later, reserveBytes: 0, maxFileBytes: 4_000_000_000 });
+  await tokenFile('mmmmmmmmmmmmmmmmmmmmmm', { kind: 'upload', name: '', expectedSize: 0, expiresAt: later, reserveBytes: 0, maxFileBytes: 3 });
   await tokenFile('rrrrrrrrrrrrrrrrrrrrrr', { kind: 'upload', name: 'big.zip', expectedSize: 5, expiresAt: later, reserveBytes: Number.MAX_SAFE_INTEGER });
   const port = 18000 + Math.floor(Math.random() * 2000);
   base = `http://127.0.0.1:${port}`;
@@ -70,7 +71,14 @@ describe('files service', () => {
   });
 
   it('takes one upload per link and refuses a second', async () => {
-    expect(await (await fetch(`${base}/f/uuuuuuuuuuuuuuuuuuuuuu`)).text()).toContain('type="file"');
+    const html = await (await fetch(`${base}/f/uuuuuuuuuuuuuuuuuuuuuu`)).text();
+    expect(html).toContain('type="file"');
+    expect(html).toContain('MAX принимает файлы до');
+    expect(html).toContain('Свободно на сервере');
+    // The page script is built inside a template literal — an escaping slip breaks it silently.
+    const script = /<script>([\s\S]*?)<\/script>/.exec(html)![1]!;
+    expect(() => new Function(script)).not.toThrow();
+    expect(script).toContain(String.raw`replace(/\/$/,'')`);
     const put = (body: string) =>
       fetch(`${base}/f/uuuuuuuuuuuuuuuuuuuuuu/upload`, { method: 'PUT', body, headers: { 'X-File-Name': encodeURIComponent('../архив.zip') } });
     const first = await put('hello');
@@ -81,6 +89,12 @@ describe('files service', () => {
     expect(await readFile(path.join(dir, done.file), 'utf8')).toBe('hello');
     expect((await put('again')).status).toBe(410);
     expect(existsSync(path.join(dir, '.lock'))).toBe(false);
+  });
+
+  it('refuses a file over the MAX limit', async () => {
+    const r = await fetch(`${base}/f/mmmmmmmmmmmmmmmmmmmmmm/upload`, { method: 'PUT', body: 'hello' });
+    expect(r.status).toBe(413);
+    expect(await (await fetch(`${base}/f/mmmmmmmmmmmmmmmmmmmmmm`)).text()).toContain('Выберите файл');
   });
 
   it('refuses an upload that would eat the reserve', async () => {

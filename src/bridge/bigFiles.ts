@@ -34,8 +34,12 @@ export interface BigFilesDeps {
 }
 
 export interface BigFiles {
-  /** Telegram → MAX: a file the bot can't download — answer with an upload link. */
-  offerUpload(p: { maxChatId: string; topicId: number; telegramMessageId: number; caption?: string; name: string; size: number }): Promise<void>;
+  /**
+   * Telegram → MAX: an upload link instead of the Bot API. Two ways in: a file the bot can't
+   * download (over 20 MB — `name`/`size` known, the user already waited for Telegram once) or
+   * /file (nothing sent yet — the file goes up once, straight to the server).
+   */
+  offerUpload(p: { maxChatId: string; topicId: number; telegramMessageId: number; caption?: string; name?: string; size?: number }): Promise<void>;
   /** MAX → Telegram: a FILE over the bot upload limit — save it and post a download link. */
   relayFromMax(att: MaxAttachment, ctx: DownloadContext, opts: SendOpts): Promise<SentMessage>;
 }
@@ -59,88 +63,102 @@ export function createBigFiles({ bot, max, targetGroupId, fileShare, onSentToMax
 
   // --- Telegram → MAX -------------------------------------------------------------------------
 
+  const CANCEL = 'tlmx_panel:fcancel:';
+  const uploadKeyboard = (url: string, token: string) =>
+    Markup.inlineKeyboard([[Markup.button.url('📤 Загрузить файл', url)], [Markup.button.callback('✖️ Отменить', CANCEL + token)]]);
+
   async function offerUpload(p: Parameters<BigFiles['offerUpload']>[0]): Promise<void> {
-    const label = `«${p.name}» (${formatBytes(p.size)})`;
+    const fromTelegram = p.name != null && p.size != null;
+    const label = fromTelegram ? `«${p.name}» (${formatBytes(p.size!)})` : '';
     const opts: SendOpts = { message_thread_id: p.topicId, reply_parameters: { message_id: p.telegramMessageId, allow_sending_without_reply: true } };
+    const refuse = (why: string) =>
+      send(fromTelegram ? `⚠️ Файл ${label} не отправлен в MAX: ${WHY_TG_DOWNLOAD}, а ${why}.` : `⚠️ Отправить файл по ссылке не выйдет: ${why}.`, opts);
     if (!fileShare.enabled) {
-      await send(`⚠️ Файл ${label} не отправлен в MAX: ${WHY_TG_DOWNLOAD}. Отправьте его из самого MAX или поделите на части.`, opts);
-      return;
-    }
-    const room = await fileShare.roomFor(p.size);
-    if (!room.fits) {
       await send(
-        `⚠️ Файл ${label} не отправлен в MAX: ${WHY_TG_DOWNLOAD}, а принять его по ссылке не выйдет — на сервере свободно ${formatBytes(room.freeBytes)}, нужно ${formatBytes(p.size)} и ещё ${reserveText} запаса для обновлений.`,
+        fromTelegram
+          ? `⚠️ Файл ${label} не отправлен в MAX: ${WHY_TG_DOWNLOAD}. Отправьте его из самого MAX или поделите на части.`
+          : '⚠️ Пересылка больших файлов отключена в настройках (FILES=off).',
         opts,
       );
       return;
     }
-    const prompt = await send(`⏳ Файл ${label} больше 20 МБ — ${WHY_TG_DOWNLOAD}. Готовлю ссылку, чтобы загрузить его в обход Telegram…`, opts);
+    const room = await fileShare.roomFor(p.size ?? 1);
+    if (!room.fits) {
+      await refuse(`на сервере свободно ${formatBytes(room.freeBytes)}${fromTelegram ? `, нужно ${formatBytes(p.size!)}` : ''} и ещё ${reserveText} запаса для обновлений`);
+      return;
+    }
+    const prompt = await send(
+      fromTelegram
+        ? `⏳ Файл ${label} больше 20 МБ — ${WHY_TG_DOWNLOAD}. Готовлю ссылку, чтобы загрузить его в обход Telegram…`
+        : '⏳ Готовлю ссылку для загрузки файла в этот чат…',
+      opts,
+    );
+    // /file has no Telegram message of its own: the MAX copy is tied to this notice instead, so
+    // deleting it (or 👎) deletes the file in MAX too.
     const ticket = await fileShare.createUploadTicket({
       maxChatId: p.maxChatId,
       topicId: p.topicId,
-      telegramMessageId: p.telegramMessageId,
+      telegramMessageId: fromTelegram ? p.telegramMessageId : prompt.message_id,
       caption: p.caption,
-      name: p.name,
-      expectedSize: p.size,
+      name: p.name ?? '',
+      expectedSize: p.size ?? 0,
       promptMessageId: prompt.message_id,
     });
-    logger.info(`TG -> MAX: ${p.name} is ${p.size} bytes, over the bot download limit — offering an upload link`);
+    logger.info(fromTelegram ? `TG -> MAX: ${p.name} is ${p.size} bytes, over the bot download limit — offering an upload link` : `TG -> MAX: /file — offering an upload link for chat ${p.maxChatId}`);
     const svc = await fileShare.ensureService();
     if (!svc.ok) {
       await fileShare.dropTicket(ticket.token);
-      await edit(prompt.message_id, p.topicId, `⚠️ Файл ${label} не отправлен в MAX: ${WHY_TG_DOWNLOAD}, а ссылку для загрузки подготовить не удалось — ${svc.reason}.`);
+      await edit(prompt.message_id, p.topicId, fromTelegram ? `⚠️ Файл ${label} не отправлен в MAX: ${WHY_TG_DOWNLOAD}, а ссылку для загрузки подготовить не удалось — ${svc.reason}.` : `⚠️ Ссылку для загрузки подготовить не удалось — ${svc.reason}.`);
       return;
     }
+    const until = formatExpiry(ticket.expiresAt);
     await edit(
       prompt.message_id,
       p.topicId,
-      `📤 Файл ${label} больше 20 МБ — ${WHY_TG_DOWNLOAD}.\nЗагрузите его по ссылке, и мост отправит его в MAX. Ссылка действует до ${formatExpiry(ticket.expiresAt)}.`,
-      Markup.inlineKeyboard([Markup.button.url('📤 Загрузить файл', `${svc.url}/f/${ticket.token}`)]),
+      fromTelegram
+        ? `📤 Файл ${label} больше 20 МБ — ${WHY_TG_DOWNLOAD}.
+Загрузите его по ссылке, и мост отправит его в MAX. Ссылка действует до ${until}.
+
+В следующий раз большие файлы отправляйте через /file в теме — загружать придётся один раз, а не два.`
+        : `📤 Загрузите файл по ссылке — мост отправит его в этот чат MAX. До 4 ГБ, ссылка действует до ${until}.`,
+      uploadKeyboard(`${svc.url}/f/${ticket.token}`, ticket.token),
     );
   }
 
+  // «✖️ Отменить» under an upload link: the link stops working (an upload in flight is cut off too).
+  bot.action(new RegExp(`^${CANCEL}(.+)$`), async (ctx) => {
+    const ticket = fileShare.getTicket(ctx.match[1] ?? '');
+    await ctx.answerCbQuery(ticket ? 'Загрузка отменена' : 'Ссылка уже не действует').catch(() => {});
+    if (ticket) await fileShare.dropTicket(ticket.token);
+    const text = (ctx.callbackQuery.message as { text?: string } | undefined)?.text;
+    await ctx.editMessageText(ticket || !text ? '✖️ Загрузка отменена — ссылка больше не работает.' : text).catch(() => {});
+  });
+
   fileShare.onUpload(async (ticket, filePath, size, name) => {
     const label = `«${name}» (${formatBytes(size)})`;
-    if (size <= MAX_FILE_LIMIT) {
-      await edit(ticket.promptMessageId, ticket.topicId, `⏳ Файл ${label} получен — отправляю в MAX…`);
-      try {
-        const attach = await uploadFileFromDiskToMax(max, filePath, size, name);
-        const sent = await max.sendMessage(ticket.maxChatId, ticket.caption ?? null, [attach]);
-        onSentToMax(ticket, sent);
-        await fileShare.dropTicket(ticket.token);
-        await edit(ticket.promptMessageId, ticket.topicId, `✅ Файл ${label} отправлен в MAX.`);
-        logger.info(`TG -> MAX: uploaded ${name} (${size} bytes) sent to chat ${ticket.maxChatId}`);
-      } catch (err) {
-        logger.error(`Sending the uploaded ${name} to MAX failed — keeping it as a link`, err);
-        const file = await fileShare.adoptUpload(ticket, filePath, size, name);
-        await edit(
-          ticket.promptMessageId,
-          ticket.topicId,
-          `⚠️ Файл ${label} получен, но в MAX не ушёл: ${(err as Error).message}.\nОн сохранён до ${formatExpiry(file.expiresAt)} — ссылку на него можно взять в пульте → 📁 Файлы и отправить вручную.`,
-        );
-      }
+    if (size > MAX_FILE_LIMIT) {
+      // The page and the service refuse this already — belt and braces.
+      await fileShare.dropTicket(ticket.token);
+      await edit(ticket.promptMessageId, ticket.topicId, `⚠️ Файл ${label} не отправлен: MAX не принимает файлы больше 4 ГБ.`);
       return;
     }
-    // Over MAX's own limit: the recipient gets a download link instead of the file.
-    const file = await fileShare.adoptUpload(ticket, filePath, size, name);
-    const svc = await fileShare.ensureService(30_000);
-    if (!svc.ok) {
-      await edit(ticket.promptMessageId, ticket.topicId, `⚠️ Файл ${label} получен, но ссылку для MAX подготовить не удалось — ${svc.reason}. Файл сохранён до ${formatExpiry(file.expiresAt)}, ссылка — в пульте → 📁 Файлы.`);
-      return;
-    }
-    const url = `${svc.url}/f/${file.token}`;
-    const text = `📎 ${name} (${formatBytes(size)}) — файл больше 4 ГБ, MAX такие не принимает.\nСкачать до ${formatExpiry(file.expiresAt)}: ${url}${ticket.caption ? `\n\n${ticket.caption}` : ''}`;
+    await edit(ticket.promptMessageId, ticket.topicId, `⏳ Файл ${label} получен — отправляю в MAX…`);
     try {
-      const sent = await max.sendMessage(ticket.maxChatId, text, []);
+      const attach = await uploadFileFromDiskToMax(max, filePath, size, name);
+      const sent = await max.sendMessage(ticket.maxChatId, ticket.caption ?? null, [attach]);
       onSentToMax(ticket, sent);
+      await fileShare.dropTicket(ticket.token);
+      await edit(ticket.promptMessageId, ticket.topicId, `✅ Файл ${label} отправлен в MAX.`);
+      logger.info(`TG -> MAX: uploaded ${name} (${size} bytes) sent to chat ${ticket.maxChatId}`);
+    } catch (err) {
+      logger.error(`Sending the uploaded ${name} to MAX failed — keeping it as a link`, err);
+      const file = await fileShare.adoptUpload(ticket, filePath, size, name);
       await edit(
         ticket.promptMessageId,
         ticket.topicId,
-        `✅ Файл ${label} больше 4 ГБ — MAX такие не принимает, поэтому собеседнику ушла ссылка на скачивание (до ${formatExpiry(file.expiresAt)}). Ссылка ведёт на ваш сервер. Управлять файлом — в пульте → 📁 Файлы.`,
+        `⚠️ Файл ${label} получен, но в MAX не ушёл: ${(err as Error).message}.
+Он сохранён до ${formatExpiry(file.expiresAt)} — ссылку на него можно взять в пульте → 📁 Файлы и отправить вручную.`,
       );
-    } catch (err) {
-      logger.error(`Sending the link for ${name} to MAX failed`, err);
-      await edit(ticket.promptMessageId, ticket.topicId, `⚠️ Ссылку на файл ${label} отправить в MAX не удалось: ${(err as Error).message}. Файл сохранён — ссылка в пульте → 📁 Файлы.`);
     }
   });
 

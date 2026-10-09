@@ -91,7 +91,7 @@ body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.5 system-ui,-appl
 .c{background:var(--card);border-radius:16px;padding:28px;max-width:440px;width:calc(100% - 32px);box-sizing:border-box;box-shadow:0 2px 14px rgba(0,0,0,.08)}
 h1{font-size:20px;margin:0 0 6px}.m{color:var(--mut);font-size:14px;margin:0 0 18px;word-break:break-word}
 .b{display:block;width:100%;box-sizing:border-box;text-align:center;background:var(--acc);color:#fff;border:0;border-radius:10px;padding:13px;font-size:16px;text-decoration:none;cursor:pointer}
-.b[disabled]{opacity:.5;cursor:default}input[type=file]{width:100%;margin:0 0 14px}
+.b[disabled]{opacity:.5;cursor:default}.b2{display:block;width:100%;margin-top:10px;background:none;border:1px solid var(--bar);color:var(--fg);border-radius:10px;padding:11px;font-size:15px;cursor:pointer}.b2[hidden]{display:none}input[type=file]{width:100%;margin:0 0 14px}
 .p{height:8px;background:var(--bar);border-radius:4px;overflow:hidden;margin:14px 0 6px;display:none}.p i{display:block;height:100%;width:0;background:var(--acc)}
 .s{font-size:14px;color:var(--mut);min-height:21px}.f{margin-top:18px;font-size:12px;color:var(--mut)}
 </style></head><body><div class="c">${body}<div class="f">Telemax · ссылка действует ограниченное время, потом файл удаляется</div></div></body></html>`);
@@ -124,24 +124,42 @@ async function showLink(res, t) {
       page(res, 410, 'Файл уже получен', '<h1>Файл уже получен</h1><p class="m">Мост отправит его в MAX. Эту страницу можно закрыть.</p>');
       return;
     }
-    const maxBytes = Math.max(0, (await freeBytes(t.root)) - (body.reserveBytes ?? 0));
+    const free = Math.max(0, (await freeBytes(t.root)) - (body.reserveBytes ?? 0));
+    const maxFile = typeof body.maxFileBytes === 'number' ? body.maxFileBytes : Infinity;
+    const maxBytes = Math.min(free, maxFile);
+    const wanted = body.name
+      ? `Ждём «${esc(body.name)}» (${esc(formatBytes(body.expectedSize ?? 0))}) — мост отправит его в MAX.`
+      : 'Выберите файл — мост отправит его в MAX.';
+    const limits = [
+      Number.isFinite(maxFile) ? `MAX принимает файлы до ${esc(formatBytes(maxFile))}.` : '',
+      `Свободно на сервере: ${esc(formatBytes(free))}.`,
+      `Ссылка действует до ${esc(formatDate(body.expiresAt))}.`,
+    ].filter(Boolean);
     page(
       res,
       200,
       'Загрузка файла',
-      `<h1>Загрузите файл</h1><p class="m">Ждём «${esc(body.name)}» (${esc(formatBytes(body.expectedSize ?? 0))}). Мост отправит его в MAX.<br>Можно выбрать и другой файл — до ${esc(formatBytes(maxBytes))}. Ссылка действует до ${esc(formatDate(body.expiresAt))}.</p>
+      `<h1>Загрузите файл</h1><p class="m">${wanted}<br>${limits.join('<br>')}</p>
 <input type="file" id="f"><button class="b" id="go" disabled>Отправить</button>
 <div class="p" id="p"><i id="bar"></i></div><div class="s" id="s"></div>
+<button class="b2" id="stop" hidden>Отменить</button>
 <script>
-const f=document.getElementById('f'),go=document.getElementById('go'),s=document.getElementById('s'),p=document.getElementById('p'),bar=document.getElementById('bar');
-const MAX=${maxBytes};
+const f=document.getElementById('f'),go=document.getElementById('go'),s=document.getElementById('s'),p=document.getElementById('p'),bar=document.getElementById('bar'),stop=document.getElementById('stop');
+const MAX=${Number.isFinite(maxBytes) ? maxBytes : 'Infinity'},MAXFILE=${Number.isFinite(maxFile) ? maxFile : 'Infinity'};
 const fmt=b=>b>=1073741824?(b/1073741824).toFixed(1)+' ГБ':b>=1048576?Math.round(b/1048576)+' МБ':Math.max(1,Math.round(b/1024))+' КБ';
-f.onchange=()=>{const x=f.files[0];s.textContent='';go.disabled=!x;if(x&&x.size>MAX){s.textContent='Файл '+fmt(x.size)+' не поместится: на сервере свободно '+fmt(MAX)+'.';go.disabled=true}};
-go.onclick=()=>{const x=f.files[0];if(!x)return;go.disabled=true;f.disabled=true;p.style.display='block';
-const r=new XMLHttpRequest();r.open('PUT',location.pathname.replace(/\\/$/,'')+'/upload');r.setRequestHeader('X-File-Name',encodeURIComponent(x.name));
+let r=null;
+const idle=()=>{go.disabled=!f.files[0];f.disabled=false;stop.hidden=true;r=null};
+f.onchange=()=>{const x=f.files[0];s.textContent='';go.disabled=!x;
+ if(x&&x.size>MAXFILE){s.textContent='Файл '+fmt(x.size)+' слишком большой: MAX принимает файлы до '+fmt(MAXFILE)+'.';go.disabled=true}
+ else if(x&&x.size>MAX){s.textContent='Файл '+fmt(x.size)+' не поместится: на сервере свободно '+fmt(MAX)+'.';go.disabled=true}};
+go.onclick=()=>{const x=f.files[0];if(!x)return;go.disabled=true;f.disabled=true;stop.hidden=false;p.style.display='block';bar.style.width='0';
+r=new XMLHttpRequest();r.open('PUT',location.pathname.replace(/\\/$/,'')+'/upload');r.setRequestHeader('X-File-Name',encodeURIComponent(x.name));
 r.upload.onprogress=e=>{if(e.lengthComputable){bar.style.width=(e.loaded/e.total*100).toFixed(1)+'%';s.textContent=fmt(e.loaded)+' из '+fmt(e.total)}};
-r.onload=()=>{if(r.status===200){bar.style.width='100%';s.textContent='Готово! Мост отправит файл в MAX — страницу можно закрыть.'}else{s.textContent='Не получилось: '+(r.responseText||r.status);go.disabled=false;f.disabled=false}};
-r.onerror=()=>{s.textContent='Связь прервалась — попробуйте ещё раз.';go.disabled=false;f.disabled=false};r.send(x)};
+r.onload=()=>{if(r.status===200){bar.style.width='100%';s.textContent='Готово! Мост отправит файл в MAX — страницу можно закрыть.';stop.hidden=true;f.disabled=true}else{s.textContent='Не получилось: '+(r.responseText||r.status);idle()}};
+r.onerror=()=>{s.textContent='Связь прервалась — попробуйте ещё раз.';idle()};
+r.onabort=()=>{s.textContent='Загрузка отменена. Можно выбрать файл заново.';p.style.display='none';idle()};
+r.send(x)};
+stop.onclick=()=>{if(r)r.abort()};
 </script>`,
     );
     return;
@@ -197,6 +215,9 @@ async function receiveUpload(req, res, t) {
   const length = Number(req.headers['content-length']);
   if (!Number.isFinite(length) || length <= 0) return reply(res, 411, 'Не указан размер файла');
   const room = (await freeBytes(root)) - (body.reserveBytes ?? 0);
+  if (typeof body.maxFileBytes === 'number' && length > body.maxFileBytes) {
+    return reply(res, 413, `MAX не принимает файлы больше ${formatBytes(body.maxFileBytes)}`);
+  }
   if (length > room) return reply(res, 507, `Не хватает места на сервере: свободно ${formatBytes(Math.max(0, room))}`);
 
   const dir = path.join(root, 'incoming', token);

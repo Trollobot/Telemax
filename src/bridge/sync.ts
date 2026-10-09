@@ -2504,6 +2504,7 @@ export function wireBridge({
 Сообщения, файлы, голосовые, стикеры и опросы синхронизируются в обе стороны автоматически — команды нужны только для управления. Обычная пересылка сообщений (drag-forward) в тему тоже работает сама — прилетит в привязанный MAX-чат с пометкой «↩️ Переслано от/из...». Звонки — только текстовые уведомления (входящий звонит / завершённый / пропущенный), без передачи аудио — для этого нужен WebRTC, вне рамок Bot API-моста.
 
 /info — карточка контакта или чата (просто в теме)
+/file — отправить в этот чат MAX большой файл (до 4 ГБ) по ссылке: загружается один раз, мимо лимита Telegram в 20 МБ
 
 Ответом на опрос:
 /poll — актуальный счёт (голоса из MAX сами в виджет Telegram не попадают)
@@ -2871,6 +2872,24 @@ export function wireBridge({
   });
 
   /** Contact card for the person/group on the other end of this topic — name, phone, country, registration date, and (best-effort) their avatar. */
+  // /file in a chat's topic: an upload link right away — a big file then goes up ONCE, straight to
+  // the server, instead of into Telegram first and through the link again (bigFiles.ts).
+  bot.command('file', async (ctx) => {
+    const topicId = ctx.message.message_thread_id;
+    const mapping = topicId ? await chatMapStore.getByTopicId(topicId) : undefined;
+    if (!topicId || !mapping) {
+      await ctx.reply('Команда /file работает в теме чата: напишите её в той теме, куда нужно отправить файл.').catch(() => {});
+      return;
+    }
+    if (mapping.pendingUserId) {
+      await ctx.reply('✍️ Сначала отправьте новому контакту текст — так MAX открывает личку. Файл можно будет отправить следующим сообщением.', { message_thread_id: topicId }).catch(() => {});
+      return;
+    }
+    void bigFiles
+      .offerUpload({ maxChatId: mapping.maxChatId, topicId, telegramMessageId: ctx.message.message_id })
+      .catch((err) => logger.error('/file failed', err));
+  });
+
   bot.command('info', async (ctx) => {
     const topicId = ctx.message.message_thread_id;
     if (!topicId) return;

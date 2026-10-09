@@ -430,7 +430,7 @@ const TELEGRAM_RETRY_DELAYS_MS = [2_000, 5_000, 15_000, 30_000, 60_000];
 // (confirmed 2026-08-15). /help and /status inside the group show it only masked (+7999***9999).
 // A constant, so it's set once at Telegram launch. The command list comes from BOT_COMMANDS, so
 // the profile never drifts from the "/" menu (it used to miss /panel, /rename and /setdesc) —
-// mind the 512 limit when adding commands (the text is ~500 chars with today's 19).
+// mind the 512 limit when adding commands (503 chars with today's 20 — /file was the last that fit).
 function buildBotDescription(): string {
   return `Мост MAX ↔ Telegram: сообщения, файлы, голосовые, стикеры, опросы, пересылка. Звонки — только уведомления, без аудио.
 
@@ -451,6 +451,7 @@ const BOT_COMMANDS = [
   { command: 'login', description: 'Войти в MAX (номер + SMS, в личке бота)' },
   { command: 'version', description: 'Версия бота, обновление по кнопке' },
   { command: 'info', description: 'Карточка контакта/чата (просто в теме)' },
+  { command: 'file', description: 'Большой файл в MAX по ссылке (в теме, до 4 ГБ)' },
   { command: 'poll', description: 'Актуальный счёт опроса (ответом на сообщение)' },
   { command: 'delete', description: 'Удалить сообщение с обеих сторон (ответом)' },
   { command: 'newgroup', description: 'Создать группу в MAX: /newgroup <название>' },
