@@ -278,6 +278,13 @@ maybe_remove_updater() {
   if [ -z "$(discover_installs)" ]; then
     systemctl disable --now telemax-updater.timer >/dev/null 2>&1 || true
     rm -f /etc/systemd/system/telemax-updater.timer /etc/systemd/system/telemax-updater.service /usr/local/sbin/telemax-updater
+    # The shared big-file service (files-service/reconcile.sh) and its instant-start trigger.
+    systemctl disable --now telemax-files.path >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/telemax-files.path /etc/systemd/system/telemax-files.service
+    if [ -f /var/lib/telemax-files/compose.yml ]; then
+      docker compose -p telemax-files -f /var/lib/telemax-files/compose.yml down >/dev/null 2>&1 || true
+    fi
+    rm -rf /var/lib/telemax-files
     rm -f /etc/telemax/instances
     rmdir /etc/telemax 2>/dev/null || true
     systemctl daemon-reload >/dev/null 2>&1 || true

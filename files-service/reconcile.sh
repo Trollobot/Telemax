@@ -32,6 +32,9 @@ done < "$REG"
 [ "$LEADER" = "$SELF" ] || exit 0
 
 mkdir -p "$STATE_DIR"
+# The minute dispatcher and the .path trigger below may fire together — one run at a time.
+exec 8>"$STATE_DIR/reconcile.lock"
+flock -w 90 8 || exit 0
 log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >> "$STATE_DIR/reconcile.log"; tail -n 200 "$STATE_DIR/reconcile.log" > "$STATE_DIR/reconcile.log.tmp" 2>/dev/null && mv "$STATE_DIR/reconcile.log.tmp" "$STATE_DIR/reconcile.log"; }
 env_value() { grep -E "^$2=" "$1/.env" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d "\"' \r"; }
 
@@ -43,6 +46,46 @@ while IFS= read -r d; do
   INSTANCES+=("$d")
   [ -f "$d/data/files/active" ] && WANTED=1
 done < "$REG"
+
+# --- instant start: a systemd .path unit on every bridge's `active` marker -----------------------
+# The dispatcher ticks once a minute; with this the service starts within seconds of a bridge
+# creating a link. Stopping stays on the minute tick (no hurry there). Kept in sync with the
+# instance list on every run; installed by this script itself, so an ordinary update brings it.
+if [ -d /run/systemd/system ] && [ "${#INSTANCES[@]}" -gt 0 ]; then
+  {
+    echo "[Unit]"
+    echo "Description=Start the Telemax files service as soon as a bridge has a live link"
+    echo "[Path]"
+    for d in "${INSTANCES[@]}"; do echo "PathChanged=$d/data/files/active"; done
+    echo "Unit=telemax-files.service"
+    echo "[Install]"
+    echo "WantedBy=multi-user.target"
+  } > "$STATE_DIR/telemax-files.path.new"
+  {
+    echo "[Unit]"
+    echo "Description=Telemax files service: start or stop it to match the live links"
+    # A burst of marker writes must not hit systemd's start limit and silence the trigger.
+    echo "StartLimitIntervalSec=0"
+    echo "[Service]"
+    echo "Type=oneshot"
+    echo "ExecStart=/bin/bash $LEADER/files-service/reconcile.sh"
+  } > "$STATE_DIR/telemax-files.service.new"
+  UNITS_CHANGED=0
+  for u in telemax-files.path telemax-files.service; do
+    if ! cmp -s "$STATE_DIR/$u.new" "/etc/systemd/system/$u" 2>/dev/null; then
+      mv -f "$STATE_DIR/$u.new" "/etc/systemd/system/$u"
+      UNITS_CHANGED=1
+    else
+      rm -f "$STATE_DIR/$u.new"
+    fi
+  done
+  if [ "$UNITS_CHANGED" = 1 ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable telemax-files.path >/dev/null 2>&1 || true
+    systemctl restart telemax-files.path >/dev/null 2>&1 || true
+    log "instant-start trigger (telemax-files.path) installed for: ${INSTANCES[*]}"
+  fi
+fi
 
 write_state() { # state url detail
   local now detail

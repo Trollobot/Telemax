@@ -168,10 +168,16 @@ export class FileShare {
   }
 
   /** `active` exists exactly while a link is alive — the host opens ports 80/443 only then. */
-  private async syncActiveMarker(): Promise<void> {
+  /**
+   * The host watches this file (a systemd .path unit, files-service/reconcile.sh) and starts the
+   * service the moment it is written — so it's written only when it appears, or when `poke` asks
+   * the host to look again (ensureService), not on every index change.
+   */
+  private async syncActiveMarker(poke = false): Promise<void> {
     const marker = path.join(this.dir, 'active');
     if (this.index.files.length + this.index.tickets.length > 0) {
-      await writeFile(marker, new Date().toISOString(), 'utf8');
+      const exists = await stat(marker).then(() => true, () => false);
+      if (poke || !exists) await writeFile(marker, new Date().toISOString(), 'utf8');
     } else {
       await unlink(marker).catch(() => {});
     }
@@ -370,7 +376,7 @@ export class FileShare {
    */
   async ensureService(waitMs = SERVICE_WAIT_MS): Promise<ServiceResult> {
     if (!this.opts.enabled) return { ok: false, reason: 'пересылка больших файлов отключена в настройках (FILES=off)' };
-    await this.syncActiveMarker();
+    await this.syncActiveMarker(true);
     const deadline = Date.now() + waitMs;
     let heartbeatChecked = false;
     for (;;) {
@@ -390,7 +396,7 @@ export class FileShare {
         }
       }
       if (Date.now() >= deadline) return { ok: false, reason: 'служба файлов не запустилась за 2,5 минуты — подробности в /var/lib/telemax-files на сервере' };
-      await sleep(3000);
+      await sleep(2000);
     }
   }
 
