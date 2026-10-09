@@ -114,7 +114,7 @@ async function showLink(res, t) {
       200,
       body.name,
       `<h1>${esc(body.name)}</h1><p class="m">${esc(formatBytes(body.size))} · ссылка действует до ${esc(formatDate(body.expiresAt))}</p>
-<a class="b" href="/f/${token}/file">Скачать</a>`,
+<a class="b" href="${token}/file">Скачать</a>`,
     );
     return;
   }
@@ -243,8 +243,14 @@ const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url ?? '/', 'http://x');
     if (url.pathname === '/health') return reply(res, 200, 'ok');
-    const m = /^\/f\/([A-Za-z0-9_-]+)(\/file|\/upload)?\/?$/.exec(url.pathname);
+    const m = /^\/f\/([A-Za-z0-9_-]+)(\/file|\/upload)?(\/?)$/.exec(url.pathname);
     if (!m) return notFound(res);
+    // Links on the pages are relative (the service may sit under a path prefix of another web
+    // server, see FILES_PUBLIC_URL), so a page must be addressed without a trailing slash.
+    if (!m[2] && m[3]) {
+      res.writeHead(301, { ...SECURITY_HEADERS, Location: `../${m[1]}` });
+      return res.end();
+    }
     const t = await findToken(m[1]);
     if (!t) return m[2] === '/upload' ? reply(res, 404, 'Ссылка недействительна или устарела') : notFound(res);
     if (!m[2] && (req.method === 'GET' || req.method === 'HEAD')) return await showLink(res, t);

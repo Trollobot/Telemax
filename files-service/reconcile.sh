@@ -66,7 +66,20 @@ if [ "$WANTED" = 0 ]; then
   exit 0
 fi
 
-# --- where the links point ---------------------------------------------------------------------
+# --- behind a web server the host already runs (FILES_PUBLIC_URL + FILES_LISTEN) ----------------
+# When 80/443 belong to an existing Caddy/nginx, no Caddy of ours: the app listens on a local port
+# only and that server routes a path or a name to it, e.g. for Caddy:
+#   handle_path /tlmx-files/* { reverse_proxy 127.0.0.1:3300 }
+# with FILES_PUBLIC_URL=https://example.org/tlmx-files and FILES_LISTEN=127.0.0.1:3300.
+PUBLIC_URL=$(env_value "$LEADER" FILES_PUBLIC_URL)
+PUBLIC_URL="${PUBLIC_URL%/}"
+LISTEN=$(env_value "$LEADER" FILES_LISTEN)
+EXTERNAL=0
+if [ -n "$PUBLIC_URL" ] && [ -n "$LISTEN" ]; then
+  EXTERNAL=1
+fi
+
+# --- where the links point (own Caddy only) -----------------------------------------------------
 is_public_ipv4() {
   [[ "$1" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
   local a=${BASH_REMATCH[1]} b=${BASH_REMATCH[2]}
@@ -77,35 +90,39 @@ is_public_ipv4() {
   [ "$a" = 169 ] && [ "$b" = 254 ] && return 1
   return 0
 }
-DOMAIN=$(env_value "$LEADER" FILES_DOMAIN)
 IS_IP=0
-if [ -n "$DOMAIN" ]; then
-  HOST="$DOMAIN"
+if [ "$EXTERNAL" = 1 ]; then
+  BASE_URL="$PUBLIC_URL"
 else
-  IS_IP=1
-  HOST=""
-  # Cached for a day: the lookup is the only outside request this script makes.
-  if [ -f "$STATE_DIR/public-ip" ] && [ -n "$(find "$STATE_DIR/public-ip" -mmin -1440 2>/dev/null)" ]; then
-    HOST=$(cat "$STATE_DIR/public-ip")
+  DOMAIN=$(env_value "$LEADER" FILES_DOMAIN)
+  if [ -n "$DOMAIN" ]; then
+    HOST="$DOMAIN"
+  else
+    IS_IP=1
+    HOST=""
+    # Cached for a day: the lookup is the only outside request this script makes.
+    if [ -f "$STATE_DIR/public-ip" ] && [ -n "$(find "$STATE_DIR/public-ip" -mmin -1440 2>/dev/null)" ]; then
+      HOST=$(cat "$STATE_DIR/public-ip")
+    fi
+    if ! is_public_ipv4 "$HOST"; then
+      HOST=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<NF;i++) if ($i=="src") print $(i+1)}' | head -1)
+      is_public_ipv4 "$HOST" || HOST=$(curl -4 -fsS --max-time 6 https://api.ipify.org 2>/dev/null || true)
+      is_public_ipv4 "$HOST" || HOST=$(curl -4 -fsS --max-time 6 https://ifconfig.me/ip 2>/dev/null || true)
+      is_public_ipv4 "$HOST" && printf '%s\n' "$HOST" > "$STATE_DIR/public-ip"
+    fi
+    if ! is_public_ipv4 "$HOST"; then
+      log "no public IPv4 found"
+      write_state no-ip "" ""
+      exit 0
+    fi
   fi
-  if ! is_public_ipv4 "$HOST"; then
-    HOST=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<NF;i++) if ($i=="src") print $(i+1)}' | head -1)
-    is_public_ipv4 "$HOST" || HOST=$(curl -4 -fsS --max-time 6 https://api.ipify.org 2>/dev/null || true)
-    is_public_ipv4 "$HOST" || HOST=$(curl -4 -fsS --max-time 6 https://ifconfig.me/ip 2>/dev/null || true)
-    is_public_ipv4 "$HOST" && printf '%s\n' "$HOST" > "$STATE_DIR/public-ip"
-  fi
-  if ! is_public_ipv4 "$HOST"; then
-    log "no public IPv4 found"
-    write_state no-ip "" ""
+  BASE_URL="https://$HOST"
+  # Someone else's web server must not be fought with (see FILES_PUBLIC_URL above for sharing it).
+  if ! running && ss -ltnH '( sport = :80 or sport = :443 )' 2>/dev/null | grep -q .; then
+    log "ports 80/443 are taken by another service"
+    write_state ports-busy "" ""
     exit 0
   fi
-fi
-
-# --- ports: someone else's web server must not be fought with ---------------------------------
-if ! running && ss -ltnH '( sport = :80 or sport = :443 )' 2>/dev/null | grep -q .; then
-  log "ports 80/443 are taken by another service"
-  write_state ports-busy "" ""
-  exit 0
 fi
 
 # --- config -------------------------------------------------------------------------------------
@@ -113,39 +130,44 @@ NODE_IMAGE=$(sed -n 's/^FROM \(node:[^ ]*\).*/\1/p' "$LEADER/Dockerfile" | head 
 [ -n "$NODE_IMAGE" ] || NODE_IMAGE=node:22-slim
 TZ_VALUE=$(env_value "$LEADER" TZ)
 
-{
-  echo "{"
-  echo "	admin off"
-  if [ "$IS_IP" = 1 ]; then
-    echo "	default_sni $HOST"
-    echo "	cert_issuer acme {"
-    echo "		profile shortlived"
-    echo "	}"
-  fi
-  echo "}"
-  echo "https://$HOST {"
-  echo "	reverse_proxy app:8080"
-  echo "}"
-} > "$STATE_DIR/Caddyfile.new"
+if [ "$EXTERNAL" = 0 ]; then
+  {
+    echo "{"
+    echo "	admin off"
+    if [ "$IS_IP" = 1 ]; then
+      echo "	default_sni $HOST"
+      echo "	cert_issuer acme {"
+      echo "		profile shortlived"
+      echo "	}"
+    fi
+    echo "}"
+    echo "https://$HOST {"
+    echo "	reverse_proxy app:8080"
+    echo "}"
+  } > "$STATE_DIR/Caddyfile.new"
+fi
 
 {
   echo "name: $PROJECT"
   echo "services:"
-  echo "  caddy:"
-  echo "    image: $CADDY_IMAGE"
-  echo "    restart: unless-stopped"
-  echo "    ports: [\"80:80\", \"443:443\"]"
-  echo "    volumes:"
-  echo "      - $STATE_DIR/Caddyfile:/etc/caddy/Caddyfile:ro"
-  echo "      - $STATE_DIR/caddy-data:/data"
-  echo "      - $STATE_DIR/caddy-config:/config"
-  echo "    depends_on: [app]"
-  echo "    logging: {driver: json-file, options: {max-size: \"5m\", max-file: \"2\"}}"
+  if [ "$EXTERNAL" = 0 ]; then
+    echo "  caddy:"
+    echo "    image: $CADDY_IMAGE"
+    echo "    restart: unless-stopped"
+    echo "    ports: [\"80:80\", \"443:443\"]"
+    echo "    volumes:"
+    echo "      - $STATE_DIR/Caddyfile:/etc/caddy/Caddyfile:ro"
+    echo "      - $STATE_DIR/caddy-data:/data"
+    echo "      - $STATE_DIR/caddy-config:/config"
+    echo "    depends_on: [app]"
+    echo "    logging: {driver: json-file, options: {max-size: \"5m\", max-file: \"2\"}}"
+  fi
   echo "  app:"
   echo "    image: $NODE_IMAGE"
   echo "    restart: unless-stopped"
   echo "    user: \"1000:1000\""
   echo "    command: [\"node\", \"/svc/server.mjs\"]"
+  [ "$EXTERNAL" = 1 ] && echo "    ports: [\"$LISTEN:8080\"]"
   echo "    environment:"
   echo "      TZ: \"${TZ_VALUE:-Europe/Moscow}\""
   echo "    volumes:"
@@ -159,8 +181,10 @@ TZ_VALUE=$(env_value "$LEADER" TZ)
 } > "$STATE_DIR/compose.yml.new"
 
 CADDY_CHANGED=0
-cmp -s "$STATE_DIR/Caddyfile.new" "$STATE_DIR/Caddyfile" 2>/dev/null || CADDY_CHANGED=1
-mv -f "$STATE_DIR/Caddyfile.new" "$STATE_DIR/Caddyfile"
+if [ "$EXTERNAL" = 0 ]; then
+  cmp -s "$STATE_DIR/Caddyfile.new" "$STATE_DIR/Caddyfile" 2>/dev/null || CADDY_CHANGED=1
+  mv -f "$STATE_DIR/Caddyfile.new" "$STATE_DIR/Caddyfile"
+fi
 mv -f "$STATE_DIR/compose.yml.new" "$STATE_DIR/compose.yml"
 
 WAS_RUNNING=0
@@ -170,7 +194,10 @@ if ! compose up -d --remove-orphans >"$STATE_DIR/compose-up.log" 2>&1; then
   write_state error "" "$(grep -iE 'error|bind|address already' "$STATE_DIR/compose-up.log" | tail -1)"
   exit 0
 fi
-[ "$WAS_RUNNING" = 0 ] && log "live links — service started for https://$HOST, ports 80/443 open"
+if [ "$WAS_RUNNING" = 0 ]; then
+  if [ "$EXTERNAL" = 1 ]; then log "live links — service started on $LISTEN behind $BASE_URL"
+  else log "live links — service started for $BASE_URL, ports 80/443 open"; fi
+fi
 [ "$WAS_RUNNING" = 1 ] && [ "$CADDY_CHANGED" = 1 ] && compose restart caddy >/dev/null 2>&1
 # server.mjs is mounted, not baked in: after an update brings a new one, restart the app to load it.
 APP_SUM=$(sha256sum "$LEADER/files-service/server.mjs" 2>/dev/null | cut -c1-64)
@@ -182,20 +209,24 @@ fi
 # --- healthy? -----------------------------------------------------------------------------------
 # A fresh start needs a few seconds (and a certificate on the very first run): wait a little here
 # rather than make the waiting bridge sit through another dispatcher minute.
-healthy() { curl -fsS --max-time 8 "https://$HOST/health" >/dev/null 2>&1; }
+healthy() { curl -fsS --max-time 8 "$BASE_URL/health" >/dev/null 2>&1; }
 if [ "$WAS_RUNNING" = 0 ]; then
   for _ in 1 2 3 4 5 6 7 8; do healthy && break; sleep 4; done
 fi
 if healthy; then
   rm -f "$STATE_DIR/starting-since"
-  write_state up "https://$HOST" ""
+  write_state up "$BASE_URL" ""
   exit 0
 fi
 [ -f "$STATE_DIR/starting-since" ] || date +%s > "$STATE_DIR/starting-since"
 SINCE=$(cat "$STATE_DIR/starting-since" 2>/dev/null || date +%s)
 if [ $(( $(date +%s) - SINCE )) -gt 240 ]; then
-  WHY=$(docker logs --tail 50 "$(docker ps -q --filter "label=com.docker.compose.project=$PROJECT" --filter "label=com.docker.compose.service=caddy" | head -1)" 2>&1 \
-    | grep -oE '"(error|msg)":"[^"]*"' | grep -iE 'error|fail|challenge|refused|timeout' | tail -1)
+  if [ "$EXTERNAL" = 1 ]; then
+    WHY="$BASE_URL/health не отвечает — проверьте маршрут на $LISTEN в своём веб-сервере"
+  else
+    WHY=$(docker logs --tail 50 "$(docker ps -q --filter "label=com.docker.compose.project=$PROJECT" --filter "label=com.docker.compose.service=caddy" | head -1)" 2>&1 \
+      | grep -oE '"(error|msg)":"[^"]*"' | grep -iE 'error|fail|challenge|refused|timeout' | tail -1)
+  fi
   log "not healthy after 4 min: $WHY"
   write_state error "" "HTTPS не отвечает: ${WHY:-нет подробностей}"
 else

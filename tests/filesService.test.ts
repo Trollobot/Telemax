@@ -52,7 +52,10 @@ describe('files service', () => {
     const pageRes = await fetch(`${base}/f/dddddddddddddddddddddd`);
     expect(pageRes.status).toBe(200);
     expect(pageRes.headers.get('x-robots-tag')).toMatch(/noindex/);
-    expect(await pageRes.text()).toContain('/f/dddddddddddddddddddddd/file');
+    expect(await pageRes.text()).toContain('href="dddddddddddddddddddddd/file"');
+    const slash = await fetch(`${base}/f/dddddddddddddddddddddd/`, { redirect: 'manual' });
+    expect(slash.status).toBe(301);
+    expect(slash.headers.get('location')).toBe('../dddddddddddddddddddddd');
     const file = await fetch(`${base}/f/dddddddddddddddddddddd/file`);
     expect(await file.text()).toBe('0123456789');
     expect(file.headers.get('content-disposition')).toContain(`filename*=UTF-8''${encodeURIComponent('отчёт.txt')}`);

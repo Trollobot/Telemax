@@ -438,7 +438,7 @@ export class FileShare {
 function describeServiceProblem(st: ServiceState): string {
   switch (st.state) {
     case 'ports-busy':
-      return 'порты 80/443 на сервере заняты другим сервисом';
+      return 'порты 80/443 на сервере заняты другим веб-сервером — файлы можно пустить через него (FILES_PUBLIC_URL и FILES_LISTEN в .env, см. README)';
     case 'no-ip':
       return 'не удалось определить внешний IPv4-адрес сервера (можно указать свой домен: FILES_DOMAIN в .env)';
     default:
