@@ -11,6 +11,25 @@ import { FileShare, MAX_FILE_LIMIT, nodeReadable, type UploadTicket } from './fi
 import { formatBytes } from './status.js';
 import { uploadFileFromDiskToMax } from './upload.js';
 import { isTransientHttpStatus, isTransientNetworkError, TransientDownloadError } from './transient.js';
+import { reportError } from './telemetry.js';
+
+/**
+ * What the topic is told about a failure: MAX's own answers are readable Russian and stay as they
+ * are; a file-system or network error becomes a plain sentence (its details are in the log and,
+ * scrubbed, in the anonymous report).
+ */
+export function humanError(err: unknown): string {
+  const msg = (err as Error)?.message ?? String(err);
+  if (/ENOSPC/.test(msg)) return 'на сервере кончилось место';
+  if (err instanceof TransientDownloadError || isTransientNetworkError(err)) return 'прервалась связь с MAX';
+  if (/\bE[A-Z]{3,}\b/.test(msg) || /^[A-Za-z ]*Error\b/.test(msg)) return 'внутренняя ошибка моста, подробности — в его логе';
+  return msg;
+}
+
+/** Big-file failures reach the maintainer too (anonymous and scrubbed — see telemetry.ts reportError). */
+function report(step: string, error: unknown): void {
+  void reportError({ kind: 'internal', step: `big-file: ${step}`, error });
+}
 
 const logger = createLogger('big-files');
 
@@ -138,6 +157,7 @@ export function createBigFiles({ bot, max, targetGroupId, fileShare, onSentToMax
     logger.info(fromTelegram ? `TG -> MAX: ${p.name} is ${p.size} bytes, over the bot download limit — offering an upload link` : `TG -> MAX: /file — offering an upload link for chat ${p.maxChatId}`);
     const svc = await fileShare.ensureService();
     if (!svc.ok) {
+      report('service', svc.reason);
       await fileShare.dropTicket(ticket.token);
       await edit(prompt.message_id, p.topicId, fromTelegram ? `⚠️ Файл ${label} не отправлен в MAX: ${WHY_TG_DOWNLOAD}, а ссылку для загрузки подготовить не удалось — ${svc.reason}.` : `⚠️ Ссылку для загрузки подготовить не удалось — ${svc.reason}.`);
       return;
@@ -184,11 +204,12 @@ export function createBigFiles({ bot, max, targetGroupId, fileShare, onSentToMax
       logger.info(`TG -> MAX: uploaded ${name} (${size} bytes) sent to chat ${ticket.maxChatId}`);
     } catch (err) {
       logger.error(`Sending the uploaded ${name} to MAX failed — keeping it as a link`, err);
+        report('send to MAX', err);
       const file = await fileShare.adoptUpload(ticket, filePath, size, name);
       await edit(
         ticket.promptMessageId,
         ticket.topicId,
-        `⚠️ Файл ${label} получен, но в MAX не ушёл: ${(err as Error).message}.
+        `⚠️ Файл ${label} получен, но в MAX не ушёл: ${humanError(err)}.
 Он сохранён до ${formatExpiry(file.expiresAt)} — отправить его ещё раз можно из пульта → 📁 Файлы, загружать заново не нужно.`,
       );
     }
@@ -239,7 +260,8 @@ export function createBigFiles({ bot, max, targetGroupId, fileShare, onSentToMax
         throw err instanceof TransientDownloadError ? err : new TransientDownloadError(`big file download: ${(err as Error).message}`, err);
       }
       logger.error(`Saving the big MAX file ${name} failed`, err);
-      await edit(msg.message_id, opts.message_thread_id, `📎 Файл ${label} — ${WHY_TG_UPLOAD}, а сохранить его для скачивания не удалось (${(err as Error).message}). Откройте его в MAX.`);
+      report('save from MAX', err);
+      await edit(msg.message_id, opts.message_thread_id, `📎 Файл ${label} — ${WHY_TG_UPLOAD}, а сохранить его для скачивания не удалось: ${humanError(err)}. Откройте его в MAX.`);
       return msg;
     }
     await edit(msg.message_id, opts.message_thread_id, `${notice}
@@ -249,6 +271,7 @@ export function createBigFiles({ bot, max, targetGroupId, fileShare, onSentToMax
     void (async () => {
       const svc = await fileShare.ensureService();
       if (!svc.ok) {
+      report('service', svc.reason);
         await edit(msg.message_id, opts.message_thread_id, `📎 Файл ${label} — ${WHY_TG_UPLOAD}. Ссылку подготовить не удалось: ${svc.reason}.\nФайл сохранён до ${formatExpiry(file.expiresAt)} — новую ссылку можно получить в пульте → 📁 Файлы.`);
         return;
       }
@@ -274,7 +297,8 @@ export function createBigFiles({ bot, max, targetGroupId, fileShare, onSentToMax
       return { ok: true, text: `✅ Файл ${label} отправлен в MAX и удалён с сервера.` };
     } catch (err) {
       logger.error(`Sending the stored ${file.name} to MAX failed`, err);
-      return { ok: false, text: `⚠️ Файл ${label} в MAX не ушёл: ${(err as Error).message}. Он остаётся на сервере — можно попробовать ещё раз.` };
+      report('resend to MAX', err);
+      return { ok: false, text: `⚠️ Файл ${label} в MAX не ушёл: ${humanError(err)}. Он остаётся на сервере — можно попробовать ещё раз.` };
     }
   }
 

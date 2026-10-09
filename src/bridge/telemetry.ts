@@ -96,6 +96,8 @@ export function scrubError(error: unknown): string {
     .replace(/\d+:[\w-]{30,}/g, '#')
     .replace(/\/\/[^/\s@]+@/g, '//#@')
     .replace(/"[^"]*"/g, '"…"')
+    // A file-system error quotes its path — with the user's file name — in single quotes.
+    .replace(/'[^']*'/g, "'…'")
     .replace(/\d{7,}/g, '#')
     .slice(0, 300);
 }

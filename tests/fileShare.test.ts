@@ -187,3 +187,21 @@ describe('FileShare sweep vs a file being saved', () => {
     expect(share.inProgress()).toEqual([]);
   });
 });
+
+describe('big-file errors', () => {
+  it('turn file-system and network errors into plain words, keep MAX answers as they are', async () => {
+    const { humanError } = await import('../src/bridge/bigFiles.js');
+    expect(humanError(new Error("ENOENT: no such file or directory, rename '/app/.data/files/items/x/a.iso.part' -> '/app/.data/files/items/x/a.iso'"))).toBe(
+      'внутренняя ошибка моста, подробности — в его логе',
+    );
+    expect(humanError(new Error('ENOSPC: no space left on device, write'))).toBe('на сервере кончилось место');
+    expect(humanError(new Error('Вложение в процессе обработки'))).toBe('Вложение в процессе обработки');
+  });
+
+  it('never put a file name into an anonymous report', async () => {
+    const { scrubError } = await import('../src/bridge/telemetry.js');
+    const s = scrubError(new Error("ENOENT: no such file or directory, rename '/app/.data/files/items/x/Паспорт.pdf.part' -> '/app/.data/files/items/x/Паспорт.pdf'"));
+    expect(s).not.toContain('Паспорт');
+    expect(s).toContain('ENOENT');
+  });
+});

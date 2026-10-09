@@ -25,7 +25,7 @@ describe('scrubError', () => {
     const token = '123456789:AAF-abcdefghijklmnopqrstuvwxyz012345';
     expect(scrubError(`request to https://api.telegram.org/bot${token}/sendMessage failed`)).not.toContain('AAF-');
     expect(scrubError('connect ECONNREFUSED socks5://user:hunter2@10.0.0.1:1080')).toBe('connect ECONNREFUSED socks5://#@10.0.0.1:1080');
-    expect(scrubError('Unexpected token \'П\', "Привет, Маша" is not valid JSON')).toBe('Unexpected token \'П\', "…" is not valid JSON');
+    expect(scrubError('Unexpected token \'П\', "Привет, Маша" is not valid JSON')).toBe('Unexpected token \'…\', "…" is not valid JSON');
     expect(scrubError('chat -1001234567890 of +79991234567 not found (code 400)')).toBe('chat -# of +# not found (code 400)');
   });
 });
