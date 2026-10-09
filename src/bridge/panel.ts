@@ -259,7 +259,11 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
   const root = (): View => rootView(getActivePhone(), pause.until());
   const system = (): View => systemView(pause.until() != null);
 
-  const edit = (ctx: Context, view: View) => ctx.editMessageText(view.text, { reply_markup: view.markup }).catch(() => {});
+  const edit = (ctx: Context, view: View) =>
+    ctx.editMessageText(view.text, { reply_markup: view.markup }).catch((err) => {
+      // «not modified» is a no-op; anything else used to vanish here without a trace.
+      if (!/not modified/i.test((err as Error)?.message ?? '')) logger.error('Panel edit failed', err);
+    });
   const chatIdOf = (ctx: Context): number => ctx.chat?.id ?? Number(targetGroupId);
 
   // --- Startup: edit the remembered pinned panel, or post + pin a fresh one -----------
@@ -355,11 +359,13 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
       if (files) await edit(ctx, filesView(files));
       return;
     }
-    await ctx.editMessageText(`⏳ Готовлю ссылку на «${f.name}»… Если служба файлов не запущена, это займёт до пары минут.`).catch(() => {});
+    const logFail = (err: unknown) => logger.error(`Panel: editing the file card of «${f.name}» failed`, err);
+    await ctx.editMessageText(`⏳ Готовлю ссылку на «${f.name}»… Если служба файлов не запущена, это займёт до пары минут.`).catch(logFail);
     const svc = await files.ensureService();
+    logger.info(`Panel: new link for «${f.name}» — service ${svc.ok ? `up at ${svc.url}` : `unavailable: ${svc.reason}`}`);
     if (!svc.ok) {
       const c = card(f);
-      await ctx.editMessageText(`${c.text}\n\n⚠️ Ссылку подготовить не удалось: ${svc.reason}.`, { reply_markup: c.markup }).catch(() => {});
+      await ctx.editMessageText(`${c.text}\n\n⚠️ Ссылку подготовить не удалось: ${svc.reason}.`, { reply_markup: c.markup }).catch(logFail);
       return;
     }
     await edit(ctx, card(f, `${svc.url}/f/${f.token}`));
@@ -460,6 +466,13 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
       reply_markup: { force_reply: true, input_field_placeholder: mode === 'phone' ? '+79991234567' : mode === 'id' ? '123456789' : '@nick или max.ru/nick' },
     });
     boundedSet(pendingSearch, sent.message_id, { mode, requesterId: ctx.from?.id ?? 0 });
+    // A force_reply prompt left in the chat keeps popping up as «В ответ …» in Telegram Desktop
+    // whenever the bot posts or edits something later (seen live 2026-10-09) — so it doesn't stay:
+    // removed once answered (below) or after 10 minutes unanswered.
+    setTimeout(() => {
+      if (!pendingSearch.delete(sent.message_id)) return;
+      void bot.telegram.deleteMessage(chatIdOf(ctx), sent.message_id).catch(() => {});
+    }, 10 * 60_000).unref();
   }
   bot.action('tlmx_panel:find:phone', async (ctx) => {
     await ctx.answerCbQuery();
@@ -641,6 +654,7 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
     const pending = pendingSearch.get(replyTo)!;
     if (ctx.from?.id !== pending.requesterId) return next();
     pendingSearch.delete(replyTo);
+    await ctx.telegram.deleteMessage(chatIdOf(ctx), replyTo).catch(() => {});
     const query = (msg.text ?? '').trim();
     if (!query) {
       await ctx.reply('Пусто — отмена.').catch(() => {});
