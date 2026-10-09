@@ -190,6 +190,17 @@ async function withDownloadFallback<T>(
 }
 
 /**
+ * The CDN URL of a MAX FILE attach (FILE_DOWNLOAD with the forward fallback) — for the big-file
+ * path, which streams it to disk itself. Null when MAX refuses for good; TransientDownloadError
+ * when the socket was down.
+ */
+export async function getMaxFileUrl(att: MaxAttachment, ctx: DownloadContext): Promise<string | null> {
+  if (att._type !== 'FILE' || att.fileId == null) return null;
+  const fileId = att.fileId;
+  return withDownloadFallback(ctx, `FILE_DOWNLOAD fileId ${String(fileId)}`, (chatId, messageId) => ctx.max.getFileDownloadUrl(chatId, messageId, fileId));
+}
+
+/**
  * Downloads a MAX attachment for re-upload to Telegram. Null means "no file to send" — the caller
  * posts describeAttachment()'s placeholder. A transient failure (see TransientDownloadError) is
  * also null unless ctx.throwOnTransient is set, in which case it is thrown so the backfill can stop
@@ -368,6 +379,21 @@ export function pressableButton(key: string): PressableButton | undefined {
   return pressable.get(key);
 }
 
+/**
+ * The public deep link of a MAX mini-app button: `https://max.ru/<bot>?startapp=<payload>` (MAX
+ * docs, dev.max.ru/docs/webapps/introduction). Live shape 2026-10-06: {type:'OPEN_APP', text,
+ * webApp:'maxnotifications_bot', contactId, payload}. MAX drops a payload over 512 chars or with
+ * anything but [A-Za-z0-9_-], so such a payload is left out (the app opens on its start screen).
+ * The payload is per-account — fine, the button only ever reaches the account it was sent to.
+ */
+export function miniAppLink(b: Record<string, unknown> | null | undefined): string | undefined {
+  const app = typeof b?.webApp === 'string' ? b.webApp : '';
+  if (!/^[A-Za-z0-9_]{1,64}$/.test(app)) return undefined;
+  const payload = typeof b?.payload === 'string' ? b.payload : '';
+  const start = /^[A-Za-z0-9_-]{1,512}$/.test(payload) ? `=${payload}` : '';
+  return `https://max.ru/${app}?startapp${start}`;
+}
+
 /** callback_data of a MAX button with no Telegram counterpart (yet): pressing it only shows a hint. */
 export const KEYBOARD_NA = 'tlmx_kb_na';
 
@@ -403,6 +429,9 @@ export function maxKeyboardToTelegram(att: unknown, chatId?: unknown): InlineKey
       } else if (chatId != null && b?.type === 'MESSAGE') {
         // Pressing it in MAX sends the button's text to the bot as the user's own message.
         buttons.push({ text, callback_data: registerButton({ chatId, callbackId: '', text, sendsText: true }) });
+      } else if (b?.type === 'OPEN_APP' && miniAppLink(b)) {
+        // A mini-app can't run inside Telegram, but its public deep link opens it in MAX.
+        buttons.push({ text, url: miniAppLink(b)! });
       } else if (b?.type === 'REQUEST_GEO_LOCATION') {
         buttons.push({ text, callback_data: KEYBOARD_GEO });
       } else if (b?.type === 'REQUEST_CONTACT') {

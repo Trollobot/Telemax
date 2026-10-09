@@ -16,6 +16,12 @@ cd "$(dirname "$0")"
 mkdir -p data
 date -u +%Y-%m-%dT%H:%M:%SZ > data/watcher-heartbeat 2>/dev/null || true
 
+# The shared big-file service (files-service/): started only while some bridge has a live link,
+# stopped when none is left. Never allowed to break or delay-fail the update check below.
+if [ -f files-service/reconcile.sh ]; then
+  timeout 120 bash files-service/reconcile.sh >/dev/null 2>&1 || true
+fi
+
 MARKER="data/update-requested"
 [ -f "$MARKER" ] || exit 0
 

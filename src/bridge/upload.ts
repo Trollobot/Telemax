@@ -6,6 +6,7 @@
  */
 import { gzipSync } from 'node:zlib';
 import https from 'node:https';
+import { createReadStream } from 'node:fs';
 import type { Agent } from 'node:http';
 import type { Telegraf } from 'telegraf';
 // undici's own FormData, not the global one: maxFetch runs on undici's fetch, and
@@ -13,7 +14,7 @@ import type { Telegraf } from 'telegraf';
 // undici-types copy behind the global — same class at runtime either way.
 import { FormData } from 'undici';
 import type { MaxClient } from '../max/client.js';
-import { maxFetch } from '../max/ca.js';
+import { maxFetch, maxFetchBig } from '../max/ca.js';
 import { getTelegramProxyAgent } from '../telegram/proxy.js';
 import { renderTgsToWebm } from './lottie.js';
 
@@ -113,6 +114,34 @@ async function uploadFileToMax(max: MaxClient, buffer: Buffer, filename: string)
   // Empirically observed: MAX needs a moment to finish processing the upload
   // server-side before the resulting fileId is valid to reference in MSG_SEND.
   await new Promise((resolve) => setTimeout(resolve, 3000));
+  return { _type: 'FILE', fileId: slot.fileId };
+}
+
+/**
+ * uploadFileToMax for a file on disk, streamed — a multi-gigabyte upload (fileShare.ts) must not
+ * pass through memory. Same slot, headers and Content-Range shape as the buffered version.
+ */
+export async function uploadFileFromDiskToMax(max: MaxClient, filePath: string, size: number, filename: string): Promise<{ _type: 'FILE'; fileId: unknown }> {
+  const slot = await max.requestFileUpload();
+  const res = await maxFetchBig(slot.url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/octet-stream',
+      'Content-Range': `bytes 0-${size - 1}/${size}`,
+      'Content-Length': String(size),
+      'Content-Disposition': contentDispositionFor(filename),
+    },
+    body: createReadStream(filePath),
+    duplex: 'half',
+  });
+  if (!res.ok) {
+    const bodyText = await res.text().catch(() => '<unreadable>');
+    throw new Error(`File upload POST failed: ${res.status} ${res.statusText} — ${bodyText}`);
+  }
+  await res.body?.cancel().catch(() => {});
+  // The buffered path's 3 s, plus time for MAX to digest a big file before MSG_SEND may use it
+  // (a guess: +1 s per 100 MB, capped at a minute).
+  await new Promise((resolve) => setTimeout(resolve, 3000 + Math.min(60_000, Math.floor(size / (100 * 1024 * 1024)) * 1000)));
   return { _type: 'FILE', fileId: slot.fileId };
 }
 

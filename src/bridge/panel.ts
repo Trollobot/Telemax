@@ -3,9 +3,11 @@ import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { Markup, type Telegraf, type Context } from 'telegraf';
 import type { MaxClient, MaxContactInfo } from '../max/client.js';
 import { getAppVersion } from './version.js';
-import { maskPhone } from './status.js';
+import { formatBytes, maskPhone } from './status.js';
 import { createLogger } from '../logger.js';
 import { truncateUtf16 } from './text.js';
+import { formatExpiry } from './bigFiles.js';
+import type { FileShare, StoredFile } from './fileShare.js';
 
 const logger = createLogger('panel');
 
@@ -38,6 +40,8 @@ export interface ControlPanelDeps {
   getStatus?: (pausedLabel: string | null) => Promise<string>;
   /** The MAX pause (server/maxSession.ts owns it): a deliberate disconnect with no auto-reconnect until resumed or the timer fires. */
   pause: PauseControl;
+  /** Big files kept for download links — the «📁 Файлы» section. */
+  files?: FileShare;
 }
 
 export interface PauseControl {
@@ -135,6 +139,56 @@ function rootView(phone: string, pausedUntil: number | null): View {
     markup: Markup.inlineKeyboard([
       [Markup.button.callback('👤 Найти контакт', 'tlmx_panel:contacts'), Markup.button.callback('🚫 Чаты', 'tlmx_panel:chats')],
       [Markup.button.callback('🔐 Вход в MAX', 'tlmx_panel:web'), Markup.button.callback('⚙️ Система', 'tlmx_panel:system')],
+      [Markup.button.callback('📁 Файлы', 'tlmx_panel:files')],
+    ]).reply_markup,
+  };
+}
+
+/** 72 h → «3 дня», 12 h → «12 ч». */
+function ttlText(ms: number): string {
+  const hours = Math.round(ms / 3600_000);
+  if (hours % 24 !== 0) return `${hours} ч`;
+  const d = hours / 24;
+  const word = d % 10 === 1 && d % 100 !== 11 ? 'день' : [2, 3, 4].includes(d % 10) && ![12, 13, 14].includes(d % 100) ? 'дня' : 'дней';
+  return `${d} ${word}`;
+}
+
+function filesView(files: FileShare): View {
+  const back = [Markup.button.callback('◀️ Назад', 'tlmx_panel:root')];
+  if (!files.enabled) {
+    return { text: '📁 Пересылка больших файлов отключена: FILES=off в .env.', markup: Markup.inlineKeyboard([back]).reply_markup };
+  }
+  const list = files.list();
+  const pending = files.pendingUploads();
+  const pendingLine = pending ? `\n\n⏳ Ждут загрузки по ссылке: ${pending}.` : '';
+  const ttl = ttlText(files.opts.ttlMs);
+  if (list.length === 0) {
+    return {
+      text: `📁 Файлов нет.\n\nСюда попадают большие файлы, которые мост пересылает по ссылке: из MAX — больше 50 МБ, в MAX — больше 4 ГБ. Файл живёт ${ttl} от последней выданной ссылки, потом удаляется.${pendingLine}`,
+      markup: Markup.inlineKeyboard([back]).reply_markup,
+    };
+  }
+  const total = list.reduce((s, f) => s + f.size, 0);
+  const lines = list.map((f, i) => `${i + 1}. ${f.direction === 'max2tg' ? '⬇️' : '⬆️'} ${f.name} — ${formatBytes(f.size)}, до ${formatExpiry(f.expiresAt)}`);
+  return {
+    text: `📁 Файлы на сервере: ${list.length}, всего ${formatBytes(total)}.\n⬇️ — из MAX, ⬆️ — для MAX. Ссылка живёт ${ttl}, потом файл удаляется.\n\n${lines.join('\n')}${pendingLine}`,
+    markup: Markup.inlineKeyboard([
+      ...list.slice(0, 20).map((f, i) => [Markup.button.callback(`${i + 1}. ${truncateUtf16(f.name, 48)}`, `tlmx_panel:file:${f.id}`)]),
+      back,
+    ]).reply_markup,
+  };
+}
+
+function fileCardView(f: StoredFile, files: FileShare, link?: string): View {
+  const where = f.direction === 'max2tg' ? 'пришёл из MAX' : 'загружен для MAX';
+  const linkLine = link ? `\n\n🔗 ${link}\nСсылку можно переслать — по ней откроется страница со скачиванием.` : '';
+  return {
+    text: `📄 ${f.name}\n${formatBytes(f.size)} · ${where}\nХранится до ${formatExpiry(f.expiresAt)}, потом удалится.${linkLine}`,
+    markup: Markup.inlineKeyboard([
+      ...(link ? [[Markup.button.url('⬇️ Открыть ссылку', link)]] : []),
+      [Markup.button.callback(`🔗 Новая ссылка (+${ttlText(files.opts.ttlMs)})`, `tlmx_panel:frenew:${f.id}`)],
+      [Markup.button.callback('🗑 Удалить', `tlmx_panel:fdel:${f.id}`)],
+      [Markup.button.callback('◀️ К файлам', 'tlmx_panel:files')],
     ]).reply_markup,
   };
 }
@@ -197,7 +251,7 @@ function pauseView(): View {
 }
 
 export function wireControlPanel(deps: ControlPanelDeps): void {
-  const { bot, targetGroupId, max, getActivePhone, triggerFullResync, leaves, startDialog, resolveContactName, getStatus, pause } = deps;
+  const { bot, targetGroupId, max, getActivePhone, triggerFullResync, leaves, startDialog, resolveContactName, getStatus, pause, files } = deps;
   const root = (): View => rootView(getActivePhone(), pause.until());
   const system = (): View => systemView(pause.until() != null);
 
@@ -274,6 +328,44 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
     await ctx.answerCbQuery();
     await edit(ctx, pauseView());
   });
+  // --- Big files («📁 Файлы»): list, a fresh link (+TTL), delete ------------------------------
+  bot.action('tlmx_panel:files', async (ctx) => {
+    await ctx.answerCbQuery();
+    if (files) await edit(ctx, filesView(files));
+  });
+  bot.action(/^tlmx_panel:file:(.+)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    const f = files?.get(ctx.match[1] ?? '');
+    if (!files || !f) {
+      if (files) await edit(ctx, filesView(files));
+      return;
+    }
+    await edit(ctx, fileCardView(f, files));
+  });
+  bot.action(/^tlmx_panel:frenew:(.+)$/, async (ctx) => {
+    const id = ctx.match[1] ?? '';
+    // Answered first: the service may take a minute or two to start, far past the callback's life.
+    await ctx.answerCbQuery('Готовлю ссылку…').catch(() => {});
+    const f = files ? await files.renew(id) : undefined;
+    if (!files || !f) {
+      if (files) await edit(ctx, filesView(files));
+      return;
+    }
+    await ctx.editMessageText(`⏳ Готовлю ссылку на «${f.name}»… Если служба файлов не запущена, это займёт до пары минут.`).catch(() => {});
+    const svc = await files.ensureService();
+    if (!svc.ok) {
+      const card = fileCardView(f, files);
+      await ctx.editMessageText(`${card.text}\n\n⚠️ Ссылку подготовить не удалось: ${svc.reason}.`, { reply_markup: card.markup }).catch(() => {});
+      return;
+    }
+    await edit(ctx, fileCardView(f, files, `${svc.url}/f/${f.token}`));
+  });
+  bot.action(/^tlmx_panel:fdel:(.+)$/, async (ctx) => {
+    const removed = files ? await files.remove(ctx.match[1] ?? '') : false;
+    await ctx.answerCbQuery(removed ? 'Файл удалён' : 'Файла уже нет').catch(() => {});
+    if (files) await edit(ctx, filesView(files));
+  });
+
   bot.action('tlmx_panel:dismiss', async (ctx) => {
     await ctx.answerCbQuery();
     await ctx.deleteMessage().catch(() => {});

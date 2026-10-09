@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { Telegraf } from 'telegraf';
-import { KEYBOARD_CONTACT, KEYBOARD_GEO, KEYBOARD_NA, KEYBOARD_PRESS, maxKeyboardToTelegram, pressableButton, takeKeyboard } from '../src/bridge/attachments.js';
+import { KEYBOARD_CONTACT, KEYBOARD_GEO, KEYBOARD_NA, KEYBOARD_PRESS, maxKeyboardToTelegram, miniAppLink, pressableButton, takeKeyboard } from '../src/bridge/attachments.js';
 import { isMarkupRefusal, isRenderableAttach, sendAttachments, sendTextPieces } from '../src/bridge/sync.js';
 
 const kb = (buttons: unknown) => ({ _type: 'INLINE_KEYBOARD', keyboard: { buttons }, callbackId: 'x' });
@@ -29,7 +29,7 @@ describe('maxKeyboardToTelegram', () => {
       [{ type: 'LINK', text: 'Сайт', url: 'tg://resolve?domain=x' }],
     ]);
     expect(maxKeyboardToTelegram(attach)).toEqual({
-      inline_keyboard: [[na('Да'), na('Нет')], [na('Открыть')], [{ text: 'Контакт', callback_data: KEYBOARD_CONTACT }, { text: 'Гео', callback_data: KEYBOARD_GEO }, na('?'), na('без типа')], [{ text: 'Сайт', url: 'tg://resolve?domain=x' }]],
+      inline_keyboard: [[na('Да'), na('Нет')], [{ text: 'Открыть', url: 'https://max.ru/app?startapp' }], [{ text: 'Контакт', callback_data: KEYBOARD_CONTACT }, { text: 'Гео', callback_data: KEYBOARD_GEO }, na('?'), na('без типа')], [{ text: 'Сайт', url: 'tg://resolve?domain=x' }]],
     });
   });
 
@@ -152,5 +152,20 @@ describe('CALLBACK buttons — presses relayed to MAX', () => {
     expect(maxKeyboardToTelegram(giga)?.inline_keyboard[1]).toEqual([na('Веб-версия и приложение')]);
     expect(maxKeyboardToTelegram({ ...giga, callbackId: undefined }, 1)?.inline_keyboard[1]).toEqual([na('Веб-версия и приложение')]);
     expect(pressableButton('no-such-key')).toBeUndefined();
+  });
+});
+
+describe('miniAppLink', () => {
+  it('builds the public deep link of the live «Настройки» sample (2026-10-06)', () => {
+    const b = { type: 'OPEN_APP', text: 'Настройки', webApp: 'maxnotifications_bot', contactId: 18948480, payload: 'v2bdo2qespQHrvVOL0TsKEKUXUk2RsTqvbcEFsHcdRp63ILky2my5' };
+    expect(miniAppLink(b)).toBe('https://max.ru/maxnotifications_bot?startapp=v2bdo2qespQHrvVOL0TsKEKUXUk2RsTqvbcEFsHcdRp63ILky2my5');
+  });
+
+  it('drops a payload MAX would strip anyway, and refuses a bad app name', () => {
+    expect(miniAppLink({ webApp: 'shop_bot', payload: 'a b' })).toBe('https://max.ru/shop_bot?startapp');
+    expect(miniAppLink({ webApp: 'shop_bot', payload: 'x'.repeat(513) })).toBe('https://max.ru/shop_bot?startapp');
+    expect(miniAppLink({ webApp: 'shop_bot' })).toBe('https://max.ru/shop_bot?startapp');
+    expect(miniAppLink({ webApp: '../evil' })).toBeUndefined();
+    expect(miniAppLink({ payload: 'x' })).toBeUndefined();
   });
 });

@@ -58,3 +58,12 @@ const maxDispatcher = new Agent({ connect: { ca: MAX_TLS_CA } });
 export function maxFetch(url: string, init: RequestInit = {}): Promise<Response> {
   return undiciFetch(url, { ...init, dispatcher: maxDispatcher });
 }
+
+// Gigabyte transfers (fileShare.ts): the defaults (5 min to the response headers) are fine for a
+// photo but not for MAX digesting a 4 GB upload; bodyTimeout stays an IDLE limit between chunks.
+const maxBigDispatcher = new Agent({ connect: { ca: MAX_TLS_CA }, headersTimeout: 30 * 60_000, bodyTimeout: 5 * 60_000 });
+
+/** maxFetch for streamed multi-gigabyte up/downloads — same trust set, longer timeouts. */
+export function maxFetchBig(url: string, init: RequestInit = {}): Promise<Response> {
+  return undiciFetch(url, { ...init, dispatcher: maxBigDispatcher });
+}

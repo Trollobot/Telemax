@@ -12,6 +12,7 @@ import {
   downloadMaxAttachment,
   describeAttachment,
   telegramSendKind,
+  TELEGRAM_UPLOAD_LIMIT_BYTES,
   takeKeyboard,
   KEYBOARD_NA,
   KEYBOARD_PRESS,
@@ -23,6 +24,8 @@ import {
 } from './attachments.js';
 import { splitTelegramText, truncateCodePoints, truncateUtf16, MAX_TEXT_LIMIT, TELEGRAM_CAPTION_LIMIT, TELEGRAM_TEXT_LIMIT } from './text.js';
 import { uploadTelegramAttachmentToMax } from './upload.js';
+import { FileShare, fileShareOptionsFromEnv, TELEGRAM_BOT_DOWNLOAD_LIMIT } from './fileShare.js';
+import { createBigFiles } from './bigFiles.js';
 import { canRenderAnimatedStickers } from './lottie.js';
 import { reportBridgeError } from './errorReporter.js';
 import { wireControlPanel, type PauseControl } from './panel.js';
@@ -595,6 +598,9 @@ export function isRenderableAttach(att: MaxAttachment): boolean {
 type SentMessage = { message_id: number };
 type AttachmentSendOpts = { message_thread_id: number; reply_parameters?: { message_id: number; allow_sending_without_reply: boolean } };
 
+/** Set by wireBridge: sends a MAX file over Telegram's bot upload limit as a download link. */
+let bigFileRelay: ((att: MaxAttachment, ctx: DownloadContext, opts: AttachmentSendOpts) => Promise<SentMessage>) | null = null;
+
 /**
  * Sends a MAX message's attachments into a topic, one Telegram message each, and returns EVERY
  * sent message_id in order — the caller links them all (buildLinkIds). Each Telegram call has its
@@ -673,6 +679,10 @@ async function sendOneAttachment(
     return phone != null
       ? withFloodRetry(() => bot.telegram.sendContact(groupId, `+${String(phone)}`, displayName, opts))
       : withFloodRetry(() => bot.telegram.sendMessage(groupId, `👤 Контакт: ${displayName}`, opts));
+  }
+  // A file the bot can't upload to Telegram goes through a download link (bigFiles.ts).
+  if (bigFileRelay && att._type === 'FILE' && Number(att.size ?? 0) > TELEGRAM_UPLOAD_LIMIT_BYTES) {
+    return bigFileRelay(att, downloadCtx, opts);
   }
   const downloaded = await downloadMaxAttachment(att, downloadCtx);
   // Bot API upload limits (50 MB, a photo 10 MB) — see telegramSendKind.
@@ -1547,6 +1557,25 @@ export function wireBridge({
     lastOutAt = Date.now();
     chatSync.runInChat(chatId, () => chatSync.advanceCursor(chatId, serverTime, 'outgoing send')).catch(() => undefined);
   }
+
+  // Big files through links (fileShare.ts / bigFiles.ts): Telegram's bot limits are 20 MB down and
+  // 50 MB up, MAX takes 4 GB.
+  const fileShare = new FileShare(path.join(process.cwd(), '.data'), fileShareOptionsFromEnv());
+  void fileShare
+    .init()
+    .then(() => fileShare.startBackground())
+    .catch((err) => logger.error('Big-file storage failed to start', err));
+  const bigFiles = createBigFiles({
+    bot,
+    max,
+    targetGroupId,
+    fileShare,
+    onSentToMax: (ticket, sent) => {
+      rememberOutgoingSend(ticket.maxChatId, sent.cid, sent.time);
+      messageLinks.add({ maxChatId: ticket.maxChatId, maxMessageId: sent.messageId, telegramMessageId: ticket.telegramMessageId, telegramTopicId: ticket.topicId, outgoing: true });
+    },
+  });
+  bigFileRelay = bigFiles.relayFromMax;
 
   // `${chatId}:${messageId}` -> what we last relayed, so the sticky lastReactedMessageId/lastReaction
   // fields on CHAT_UPDATE (repeated across unrelated pushes) don't re-trigger the same Telegram call.
@@ -2781,6 +2810,7 @@ export function wireBridge({
     triggerFullResync,
     startDialog,
     pause,
+    files: fileShare,
     // Warm-cache name lookup (buildRoster already fetched the profiles); undefined on a miss lets
     // the panel fall back to CONTACT_INFO.
     resolveContactName: (uid) => {
@@ -3511,6 +3541,22 @@ export function wireBridge({
         const link: MessageLink = { maxChatId: mapping.maxChatId, maxMessageId: messageId, telegramMessageId: ctx.message.message_id, telegramTopicId: topicId, outgoing: true };
         messageLinks.add(link);
         await sendMorePieces(mapping.maxChatId, morePieces, link);
+        return;
+      }
+
+      // Over the Bot API download limit getFile answers «file is too big» — offer an upload link
+      // instead (bigFiles.ts). Fire-and-forget: the link can take a minute or two to get ready, and
+      // this handler must not hold up the next update meanwhile.
+      const fileFields = ctx.message as unknown as Record<string, { file_size?: number; file_name?: string } | undefined>;
+      const tooBigKey = ['document', 'video', 'audio', 'animation', 'video_note', 'voice'].find(
+        (k) => (fileFields[k]?.file_size ?? 0) > TELEGRAM_BOT_DOWNLOAD_LIMIT,
+      );
+      if (tooBigKey) {
+        const f = fileFields[tooBigKey]!;
+        const name = f.file_name ?? (tooBigKey === 'video_note' ? 'video_note.mp4' : tooBigKey === 'voice' ? 'voice.ogg' : 'file');
+        void bigFiles
+          .offerUpload({ maxChatId: mapping.maxChatId, topicId, telegramMessageId: ctx.message.message_id, caption: caption || undefined, name, size: f.file_size! })
+          .catch((err) => logger.error('Offering an upload link failed', err));
         return;
       }
 
