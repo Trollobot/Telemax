@@ -42,6 +42,8 @@ export interface ControlPanelDeps {
   pause: PauseControl;
   /** Big files kept for download links — the «📁 Файлы» section. */
   files?: FileShare;
+  /** «📤 Отправить в MAX» for a stored file that didn't make it (bigFiles.ts). */
+  resendToMax?: (id: string) => Promise<{ ok: boolean; text: string }>;
 }
 
 export interface PauseControl {
@@ -179,13 +181,14 @@ function filesView(files: FileShare): View {
   };
 }
 
-function fileCardView(f: StoredFile, files: FileShare, link?: string): View {
+function fileCardView(f: StoredFile, files: FileShare, link?: string, canResend = false): View {
   const where = f.direction === 'max2tg' ? 'пришёл из MAX' : 'загружен для MAX';
   const linkLine = link ? `\n\n🔗 ${link}\nСсылку можно переслать — по ней откроется страница со скачиванием.` : '';
   return {
     text: `📄 ${f.name}\n${formatBytes(f.size)} · ${where}\nХранится до ${formatExpiry(f.expiresAt)}, потом удалится.${linkLine}`,
     markup: Markup.inlineKeyboard([
       ...(link ? [[Markup.button.url('⬇️ Открыть ссылку', link)]] : []),
+      ...(canResend && f.direction === 'tg2max' && f.target ? [[Markup.button.callback('📤 Отправить в MAX', `tlmx_panel:fsend:${f.id}`)]] : []),
       [Markup.button.callback(`🔗 Новая ссылка (+${ttlText(files.opts.ttlMs)})`, `tlmx_panel:frenew:${f.id}`)],
       [Markup.button.callback('🗑 Удалить', `tlmx_panel:fdel:${f.id}`)],
       [Markup.button.callback('◀️ К файлам', 'tlmx_panel:files')],
@@ -251,7 +254,8 @@ function pauseView(): View {
 }
 
 export function wireControlPanel(deps: ControlPanelDeps): void {
-  const { bot, targetGroupId, max, getActivePhone, triggerFullResync, leaves, startDialog, resolveContactName, getStatus, pause, files } = deps;
+  const { bot, targetGroupId, max, getActivePhone, triggerFullResync, leaves, startDialog, resolveContactName, getStatus, pause, files, resendToMax } = deps;
+  const card = (f: StoredFile, link?: string): View => fileCardView(f, files!, link, Boolean(resendToMax));
   const root = (): View => rootView(getActivePhone(), pause.until());
   const system = (): View => systemView(pause.until() != null);
 
@@ -340,7 +344,7 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
       if (files) await edit(ctx, filesView(files));
       return;
     }
-    await edit(ctx, fileCardView(f, files));
+    await edit(ctx, card(f));
   });
   bot.action(/^tlmx_panel:frenew:(.+)$/, async (ctx) => {
     const id = ctx.match[1] ?? '';
@@ -354,11 +358,20 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
     await ctx.editMessageText(`⏳ Готовлю ссылку на «${f.name}»… Если служба файлов не запущена, это займёт до пары минут.`).catch(() => {});
     const svc = await files.ensureService();
     if (!svc.ok) {
-      const card = fileCardView(f, files);
-      await ctx.editMessageText(`${card.text}\n\n⚠️ Ссылку подготовить не удалось: ${svc.reason}.`, { reply_markup: card.markup }).catch(() => {});
+      const c = card(f);
+      await ctx.editMessageText(`${c.text}\n\n⚠️ Ссылку подготовить не удалось: ${svc.reason}.`, { reply_markup: c.markup }).catch(() => {});
       return;
     }
-    await edit(ctx, fileCardView(f, files, `${svc.url}/f/${f.token}`));
+    await edit(ctx, card(f, `${svc.url}/f/${f.token}`));
+  });
+  bot.action(/^tlmx_panel:fsend:(.+)$/, async (ctx) => {
+    const f = files?.get(ctx.match[1] ?? '');
+    await ctx.answerCbQuery(f ? 'Отправляю в MAX…' : 'Файла уже нет').catch(() => {});
+    if (!files || !f || !resendToMax) return;
+    await ctx.editMessageText(`⏳ Отправляю «${f.name}» в MAX… Большой файл MAX обрабатывает несколько минут — сообщение обновится само.`).catch(() => {});
+    const r = await resendToMax(f.id);
+    const back = Markup.inlineKeyboard([[Markup.button.callback('◀️ К файлам', 'tlmx_panel:files')]]).reply_markup;
+    await ctx.editMessageText(r.text, { reply_markup: back }).catch(() => {});
   });
   bot.action(/^tlmx_panel:fdel:(.+)$/, async (ctx) => {
     const removed = files ? await files.remove(ctx.match[1] ?? '') : false;

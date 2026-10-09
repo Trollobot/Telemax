@@ -2812,6 +2812,7 @@ export function wireBridge({
     startDialog,
     pause,
     files: fileShare,
+    resendToMax: (id) => bigFiles.resendToMax(id),
     // Warm-cache name lookup (buildRoster already fetched the profiles); undefined on a miss lets
     // the panel fall back to CONTACT_INFO.
     resolveContactName: (uid) => {

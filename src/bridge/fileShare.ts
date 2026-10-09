@@ -40,6 +40,8 @@ export interface StoredFile {
   token: string;
   createdAt: number;
   expiresAt: number;
+  /** tg2max: where it was going — lets the panel send it to MAX again (a failed send keeps the file). */
+  target?: { maxChatId: string; topicId: number; telegramMessageId: number; caption?: string };
 }
 
 export interface UploadTicket {
@@ -185,6 +187,11 @@ export class FileShare {
     return [...this.index.files].sort((a, b) => b.createdAt - a.createdAt);
   }
 
+  /** Where a stored file lies on disk. */
+  pathOf(file: StoredFile): string {
+    return path.join(this.dir, 'items', file.id, file.name);
+  }
+
   get(id: string): StoredFile | undefined {
     return this.index.files.find((f) => f.id === id);
   }
@@ -249,7 +256,12 @@ export class FileShare {
       await mkdir(path.join(this.dir, 'items', id), { recursive: true });
       const target = path.join(this.dir, 'items', id, safeFileName(name));
       await rename(filePath, target);
-      return this.addFile(id, safeFileName(name), size, 'tg2max');
+      return this.addFile(id, safeFileName(name), size, 'tg2max', {
+        maxChatId: ticket.maxChatId,
+        topicId: ticket.topicId,
+        telegramMessageId: ticket.telegramMessageId,
+        caption: ticket.caption,
+      });
     });
     await this.dropTicket(ticket.token);
     return file;
@@ -266,7 +278,7 @@ export class FileShare {
    * Streams `body` into storage and opens a download link for it. Throws when the stream fails or
    * runs past `size` + the free space (the partial file is removed either way).
    */
-  async storeStream(body: Readable, name: string, size: number): Promise<StoredFile> {
+  async storeStream(body: Readable, name: string, size: number, onProgress?: (written: number) => void): Promise<StoredFile> {
     const id = newToken();
     const safe = safeFileName(name);
     const dir = path.join(this.dir, 'items', id);
@@ -277,6 +289,7 @@ export class FileShare {
     const guard = new Transform({
       transform(chunk: Buffer, _enc, cb) {
         written += chunk.length;
+        onProgress?.(written);
         if (written > limit) cb(new Error(`file grew past its declared ${size} bytes`));
         else cb(null, chunk);
       },
@@ -291,9 +304,9 @@ export class FileShare {
     return this.locked(() => this.addFile(id, safe, written, 'max2tg'));
   }
 
-  private async addFile(id: string, name: string, size: number, direction: StoredFile['direction']): Promise<StoredFile> {
+  private async addFile(id: string, name: string, size: number, direction: StoredFile['direction'], target?: StoredFile['target']): Promise<StoredFile> {
     const now = Date.now();
-    const file: StoredFile = { id, name, size, direction, token: newToken(), createdAt: now, expiresAt: now + this.opts.ttlMs };
+    const file: StoredFile = { id, name, size, direction, token: newToken(), createdAt: now, expiresAt: now + this.opts.ttlMs, ...(target ? { target } : {}) };
     await this.writeToken(file.token, { kind: 'download', name, size, path: `items/${id}/${name}`, expiresAt: file.expiresAt });
     this.index.files.push(file);
     await this.save();

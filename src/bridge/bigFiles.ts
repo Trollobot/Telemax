@@ -42,7 +42,13 @@ export interface BigFiles {
   offerUpload(p: { maxChatId: string; topicId: number; telegramMessageId: number; caption?: string; name?: string; size?: number }): Promise<void>;
   /** MAX → Telegram: a FILE over the bot upload limit — save it and post a download link. */
   relayFromMax(att: MaxAttachment, ctx: DownloadContext, opts: SendOpts): Promise<SentMessage>;
+  /** The panel's «📤 Отправить в MAX»: a stored file that didn't make it, sent again from disk. */
+  resendToMax(id: string): Promise<{ ok: boolean; text: string }>;
 }
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+/** MAX's answer to MSG_SEND while a big upload is still being digested. */
+const STILL_PROCESSING = /в процессе обработки|not[ ._]?ready|processing/i;
 
 export function createBigFiles({ bot, max, targetGroupId, fileShare, onSentToMax }: BigFilesDeps): BigFiles {
   const send = (text: string, opts: SendOpts, markup?: ReturnType<typeof Markup.inlineKeyboard>) =>
@@ -60,6 +66,31 @@ export function createBigFiles({ bot, max, targetGroupId, fileShare, onSentToMax
     await send(text, { message_thread_id: topicId }, markup).catch((e) => logger.error('Posting a big-file notice failed', e));
   };
   const reserveText = formatBytes(fileShare.opts.reserveBytes);
+
+  /**
+   * Uploads a file from disk and sends it. A big file is still «в процессе обработки» for a while
+   * after its upload (a 2.7 GB ISO: well over the 30 s guessed in uploadFileFromDiskToMax — live
+   * 2026-10-09), so the send is retried for up to 15 minutes while MAX says exactly that.
+   */
+  async function uploadAndSend(maxChatId: string, filePath: string, size: number, name: string, caption: string | undefined, onWaiting?: () => void) {
+    const attach = await uploadFileFromDiskToMax(max, filePath, size, name);
+    const deadline = Date.now() + 15 * 60_000;
+    let pause = 5000;
+    let told = false;
+    for (;;) {
+      try {
+        return await max.sendMessage(maxChatId, caption ?? null, [attach]);
+      } catch (err) {
+        if (!STILL_PROCESSING.test((err as Error).message ?? '') || Date.now() > deadline) throw err;
+        if (!told) {
+          told = true;
+          onWaiting?.();
+        }
+        await sleep(pause);
+        pause = Math.min(Math.round(pause * 1.5), 30_000);
+      }
+    }
+  }
 
   // --- Telegram → MAX -------------------------------------------------------------------------
 
@@ -144,8 +175,9 @@ export function createBigFiles({ bot, max, targetGroupId, fileShare, onSentToMax
     }
     await edit(ticket.promptMessageId, ticket.topicId, `⏳ Файл ${label} получен — отправляю в MAX…`);
     try {
-      const attach = await uploadFileFromDiskToMax(max, filePath, size, name);
-      const sent = await max.sendMessage(ticket.maxChatId, ticket.caption ?? null, [attach]);
+      const sent = await uploadAndSend(ticket.maxChatId, filePath, size, name, ticket.caption, () => {
+        void edit(ticket.promptMessageId, ticket.topicId, `⏳ Файл ${label} загружен в MAX — MAX его обрабатывает, это может занять несколько минут…`);
+      });
       onSentToMax(ticket, sent);
       await fileShare.dropTicket(ticket.token);
       await edit(ticket.promptMessageId, ticket.topicId, `✅ Файл ${label} отправлен в MAX.`);
@@ -157,7 +189,7 @@ export function createBigFiles({ bot, max, targetGroupId, fileShare, onSentToMax
         ticket.promptMessageId,
         ticket.topicId,
         `⚠️ Файл ${label} получен, но в MAX не ушёл: ${(err as Error).message}.
-Он сохранён до ${formatExpiry(file.expiresAt)} — ссылку на него можно взять в пульте → 📁 Файлы и отправить вручную.`,
+Он сохранён до ${formatExpiry(file.expiresAt)} — отправить его ещё раз можно из пульта → 📁 Файлы, загружать заново не нужно.`,
       );
     }
   });
@@ -178,6 +210,18 @@ export function createBigFiles({ bot, max, targetGroupId, fileShare, onSentToMax
     }
     const url = await getMaxFileUrl(att, ctx);
     if (!url) return send(describeAttachment(att), opts);
+    // The recipient sees at once that something is coming — saving gigabytes takes minutes.
+    const notice = `📥 Пришёл файл ${label} — ${WHY_TG_UPLOAD}, поэтому мост сохраняет его на ваш сервер и пришлёт сюда ссылку.`;
+    const msg = await send(`${notice}
+⏳ Сохраняю…`, opts);
+    let lastShown = Date.now();
+    const progress = (written: number) => {
+      if (Date.now() - lastShown < 20_000) return;
+      lastShown = Date.now();
+      const pct = size > 0 ? ` (${Math.min(99, Math.floor((written / size) * 100))}%)` : '';
+      void edit(msg.message_id, opts.message_thread_id, `${notice}
+⏳ Сохранено ${formatBytes(written)} из ${formatBytes(size)}${pct}…`);
+    };
     let file;
     try {
       const res = await maxFetchBig(url);
@@ -185,15 +229,21 @@ export function createBigFiles({ bot, max, targetGroupId, fileShare, onSentToMax
         if (isTransientHttpStatus(res.status)) throw new TransientDownloadError(`MAX CDN answered ${res.status}`);
         throw new Error(`MAX отдал ${res.status}`);
       }
-      file = await fileShare.storeStream(nodeReadable(res.body), name, size);
+      file = await fileShare.storeStream(nodeReadable(res.body), name, size, progress);
       logger.info(`MAX -> TG: ${name} (${file.size} bytes) saved for a download link`);
     } catch (err) {
       const transient = err instanceof TransientDownloadError || isTransientNetworkError(err);
-      if (transient && ctx.throwOnTransient) throw err instanceof TransientDownloadError ? err : new TransientDownloadError(`big file download: ${(err as Error).message}`, err);
+      if (transient && ctx.throwOnTransient) {
+        // The catch-up retries this message later and posts a fresh notice — don't leave this one hanging.
+        await bot.telegram.deleteMessage(targetGroupId, msg.message_id).catch(() => {});
+        throw err instanceof TransientDownloadError ? err : new TransientDownloadError(`big file download: ${(err as Error).message}`, err);
+      }
       logger.error(`Saving the big MAX file ${name} failed`, err);
-      return send(`📎 Файл ${label} — ${WHY_TG_UPLOAD}, а сохранить его для скачивания не удалось (${(err as Error).message}). Откройте его в MAX.`, opts);
+      await edit(msg.message_id, opts.message_thread_id, `📎 Файл ${label} — ${WHY_TG_UPLOAD}, а сохранить его для скачивания не удалось (${(err as Error).message}). Откройте его в MAX.`);
+      return msg;
     }
-    const msg = await send(`📎 Файл ${label} — ${WHY_TG_UPLOAD}. Готовлю ссылку для скачивания…`, opts);
+    await edit(msg.message_id, opts.message_thread_id, `${notice}
+✅ Сохранён — готовлю ссылку…`);
     // Not awaited: the service may take a minute or two to come up, and this runs inside the
     // chat's queue — the next message must not wait for it.
     void (async () => {
@@ -212,5 +262,21 @@ export function createBigFiles({ bot, max, targetGroupId, fileShare, onSentToMax
     return msg;
   }
 
-  return { offerUpload, relayFromMax };
+  async function resendToMax(id: string): Promise<{ ok: boolean; text: string }> {
+    const file = fileShare.get(id);
+    if (!file?.target) return { ok: false, text: 'Этот файл не для MAX или его уже нет.' };
+    const label = `«${file.name}» (${formatBytes(file.size)})`;
+    try {
+      const sent = await uploadAndSend(file.target.maxChatId, fileShare.pathOf(file), file.size, file.name, file.target.caption);
+      onSentToMax({ ...file.target, token: '', name: file.name, expectedSize: file.size, createdAt: 0, expiresAt: 0 }, sent);
+      await fileShare.remove(file.id);
+      logger.info(`TG -> MAX: stored ${file.name} sent again to chat ${file.target.maxChatId}`);
+      return { ok: true, text: `✅ Файл ${label} отправлен в MAX и удалён с сервера.` };
+    } catch (err) {
+      logger.error(`Sending the stored ${file.name} to MAX failed`, err);
+      return { ok: false, text: `⚠️ Файл ${label} в MAX не ушёл: ${(err as Error).message}. Он остаётся на сервере — можно попробовать ещё раз.` };
+    }
+  }
+
+  return { offerUpload, relayFromMax, resendToMax };
 }
