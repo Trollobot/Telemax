@@ -59,7 +59,7 @@ compose() { docker compose -p "$PROJECT" -f "$STATE_DIR/compose.yml" "$@"; }
 
 if [ "$WANTED" = 0 ]; then
   if running; then
-    compose down >/dev/null 2>&1 && log "no live links — service stopped, ports 80/443 closed"
+    compose down >/dev/null 2>&1 && log "no live links — service stopped$([ -n "$(env_value "$LEADER" FILES_LISTEN)" ] && echo "" || echo ", ports 80/443 closed")"
   fi
   rm -f "$STATE_DIR/starting-since"
   write_state down "" ""
