@@ -36,7 +36,7 @@ import { checkVersion, type VersionStatus } from './version.js';
 import { buildStatusText, collectHostStats, maskPhone } from './status.js';
 import { toTelegramReaction } from '../max/reactions.js';
 import { ChatBannedError, StrikeCounter, SyncCancelledError, liveCursorTime } from './catchUp.js';
-import { isThreadNotFound, isTransientMaxError, isTransientTelegramError, TransientDownloadError, withFloodRetry } from './transient.js';
+import { isStaleCallbackQuery, isThreadNotFound, isTransientMaxError, isTransientTelegramError, TransientDownloadError, withFloodRetry } from './transient.js';
 import { createLogger, jsonStringify, redactSecrets } from '../logger.js';
 
 const logger = createLogger('bridge');
@@ -1463,6 +1463,22 @@ export function wireBridge({
   // password) — the only login path. In DM so code/password stay private, and admin-gated.
   const maxAuth = createMaxAuthFlow({ targetGroupId, auth });
 
+  // A button press answered after Telegram's ~15 s window (it waited out a restart) used to throw
+  // out of every handler that starts with `await ctx.answerCbQuery()` — the action never ran and the
+  // group got a false «⚠️ Ошибка…». One place for all buttons: such an answer just loses its toast.
+  bot.use(async (ctx, next) => {
+    if (ctx.callbackQuery) {
+      const answer = ctx.answerCbQuery.bind(ctx);
+      ctx.answerCbQuery = (...args: Parameters<typeof answer>) =>
+        answer(...args).catch((err: unknown) => {
+          if (!isStaleCallbackQuery(err)) throw err;
+          logger.info('A button press arrived too late to answer (pressed during a restart?) — running it anyway');
+          return true;
+        });
+    }
+    return next();
+  });
+
   // The target group IS the trust boundary; this enforces it. /reboot and /kill only gate on a
   // confirmation phrase that is public (open-source, echoed in /help), so without this anyone who
   // finds the bot (a DM, an unrelated group) could trigger them. poll_answer updates carry no
@@ -2505,6 +2521,8 @@ export function wireBridge({
 
 /info — карточка контакта или чата (просто в теме)
 /file — отправить в этот чат MAX большой файл (до 4 ГБ) по ссылке: загружается один раз, мимо лимита Telegram в 20 МБ
+
+Файлообменник: /panel → 📁 Файлы → «📤 Загрузить файл». Положите на свой сервер файл любого размера — сколько вместит диск — и получите ссылку на скачивание, которой можно делиться где угодно. Файл хранится 3 дня от последней ссылки.
 
 Ответом на опрос:
 /poll — актуальный счёт (голоса из MAX сами в виджет Telegram не попадают)

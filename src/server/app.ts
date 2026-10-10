@@ -9,7 +9,7 @@ import { SessionStore } from '../store/sessionStore.js';
 import { ChatMapStore } from '../store/chatMapStore.js';
 import { wireBridge, syncAllChatsToTelegram, type ChatCatchUp } from '../bridge/sync.js';
 import { RetryBackoff } from '../bridge/catchUp.js';
-import { isTransientTelegramError } from '../bridge/transient.js';
+import { isStaleCallbackQuery, isTransientTelegramError } from '../bridge/transient.js';
 import { configureErrorReporter, reportBridgeError } from '../bridge/errorReporter.js';
 import { getAppVersion } from '../bridge/version.js';
 import { noteBoot, reportError } from '../bridge/telemetry.js';
@@ -343,6 +343,11 @@ async function startServer(): Promise<void> {
         // chat refresh) keeps running and usually succeeds — no false error notice.
         if ((err as Error)?.name === 'TimeoutError') {
           logger.warn(`Telegram handler still running past telegraf's 90 s limit (update type: ${ctx.updateType})`);
+          return;
+        }
+        // A button press answered too late (it waited out a restart) — not a fault: no notice, no report.
+        if (isStaleCallbackQuery(err)) {
+          logger.info(`A button press arrived too late to answer (update type: ${ctx.updateType})`);
           return;
         }
         logger.error(`Telegram handler failed (update type: ${ctx.updateType}):`, err);

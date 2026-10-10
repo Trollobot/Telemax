@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  isStaleCallbackQuery,
   isTransientHttpStatus,
   isTransientMaxError,
   isTransientNetworkError,
@@ -114,5 +115,12 @@ describe('downloadMaxAttachment transient reporting', () => {
     const denied = new Error('FILE_DOWNLOAD did not return a url: file not found');
     await expect(downloadMaxAttachment(file, ctx(denied, true))).resolves.toBeNull();
     await expect(downloadMaxAttachment(file, ctx(denied))).resolves.toBeNull();
+  });
+});
+
+describe('isStaleCallbackQuery', () => {
+  it('recognizes a press answered after the window (a user report on 1.3.0)', () => {
+    expect(isStaleCallbackQuery(new Error('400: Bad Request: query is too old and response timeout expired or query ID is invalid'))).toBe(true);
+    expect(isStaleCallbackQuery(new Error('400: Bad Request: message is not modified'))).toBe(false);
   });
 });

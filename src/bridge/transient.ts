@@ -144,3 +144,14 @@ export function isThreadNotFound(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
   return /message thread not found|thread not found|TOPIC_DELETED|TOPIC_ID_INVALID/i.test(msg);
 }
+
+/**
+ * Telegram's answer to answerCbQuery after the press's ~15 s window: «query is too old and response
+ * timeout expired or query ID is invalid». A press that waited out a restart (an update) arrives
+ * like that — the action itself can still run, only the toast is lost (seen in a user's anonymous
+ * report on 1.3.0, 2026-10-10). Not a fault.
+ */
+export function isStaleCallbackQuery(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /query is too old|query ID is invalid/i.test(msg);
+}
