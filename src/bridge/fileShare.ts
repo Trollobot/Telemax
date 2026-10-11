@@ -132,8 +132,20 @@ const HEARTBEAT_STALE_MS = 5 * 60_000;
  * outlives its expiry (a 4 GB upload over a slow line takes hours). A lock this old is a crash leftover.
  */
 const UPLOAD_LOCK_STALE_MS = 12 * 3600_000;
-export const SERVICE_TIMEOUT_TEXT =
-  'служба файлов не ответила за 2,5 минуты. Чаще всего так бывает, когда порты 80 и 443 сервера не открываются из интернета (сервер дома за роутером или их закрывает файрвол хостинга). Подробности — в /var/lib/telemax-files/reconcile.log на сервере';
+/**
+ * A files-service problem told the way the user asked for (2026-10-11): what happened, a plain «why»,
+ * what to do. Callers write «… не удалось — <this>.», so it ends without a full stop.
+ */
+const explain = (what: string, why: string, todo: string) => `${what}.\n\nПочему: ${why}.\n\nЧто сделать: ${todo}`;
+const WHY_PAGE = 'большие файлы передаются через страницу на вашем сервере';
+const WHY_CERT = `${WHY_PAGE}, а ей нужен HTTPS-сертификат. Его выдаёт Let's Encrypt — и перед выдачей проверяет, что адрес действительно ведёт на ваш сервер`;
+const NO_FILES = 'а если большие файлы не нужны — выключите их: FILES=off в .env';
+
+export const SERVICE_TIMEOUT_TEXT = explain(
+  'служба файлов не ответила за 2,5 минуты',
+  `${WHY_PAGE}, и порты 80 и 443 сервера должны открываться из интернета. Чаще всего они закрыты: сервер дома за роутером или их закрывает файрвол хостинга`,
+  `пробросьте на сервер порты 80 и 443 на роутере или откройте их в панели хостинга; ${NO_FILES}. Подробности — в /var/lib/telemax-files/reconcile.log на сервере`,
+);
 
 export class FileShare {
   readonly dir: string;
@@ -522,34 +534,44 @@ export class FileShare {
   }
 }
 
-const NO_FILES_HINT = 'Не нужны большие файлы — выключите их: FILES=off в .env.';
-
 /**
- * service.json → a sentence for the user. reconcile.sh passes Caddy's own ACME error through
- * («acme: …», English): the common ones become what to do. Pure + exported for tests.
+ * service.json → what happened, why and what to do (see explain). reconcile.sh passes Caddy's ACME
+ * error through as «acme: urn:ietf:params:acme:error:<type> - …» (English, maybe cut): the type
+ * decides first, the wording second. Pure + exported for tests.
  */
 export function describeServiceProblem(st: { state?: string; detail?: string }): string {
   if (st.state === 'ports-busy') {
-    return 'порты 80/443 на сервере заняты другим веб-сервером — файлы можно пустить через него (FILES_PUBLIC_URL и FILES_LISTEN в .env, см. README)';
+    return explain(
+      'порты 80 и 443 на сервере уже заняты другим веб-сервером',
+      `${WHY_PAGE}, и ей нужны эти порты`,
+      `пустите файлы через ваш веб-сервер — FILES_PUBLIC_URL и FILES_LISTEN в .env (пример в README); ${NO_FILES}`,
+    );
   }
-  if (st.state === 'no-ip') return 'не удалось определить внешний IPv4-адрес сервера (можно указать свой домен: FILES_DOMAIN в .env)';
+  if (st.state === 'no-ip') {
+    return explain('не удалось узнать внешний IPv4-адрес сервера', `${WHY_PAGE}, а ссылка на неё строится по адресу сервера`, 'укажите свой домен — FILES_DOMAIN в .env');
+  }
   const detail = (st.detail ?? '').trim();
   if (/^acme:/i.test(detail)) {
-    // The ACME error type (urn:ietf:params:acme:error:<type>) first, the wording second: the text
-    // may be cut, the type comes first in what reconcile.sh passes.
+    const fail = (because: string, todo: string) => explain("Let's Encrypt не выдал серверу HTTPS-сертификат", `${WHY_CERT}. Проверка не прошла: ${because}`, todo);
     if (/acme:error:(connection|tls)\b|timeout during connect|firewall|connection refused|connection reset|no route to host|network unreachable/i.test(detail)) {
-      return `сервер не виден из интернета на портах 80 и 443, поэтому Let's Encrypt не может выдать ему HTTPS-сертификат. Если сервер дома за роутером — пробросьте на него порты 80 и 443; если их закрывает хостинг — откройте в его панели. ${NO_FILES_HINT}`;
+      return fail(
+        'до сервера не достучаться из интернета на портах 80 и 443',
+        `если сервер дома за роутером — пробросьте на него порты 80 и 443; если их закрывает хостинг — откройте в его панели; ${NO_FILES}`,
+      );
     }
     if (/acme:error:(unauthorized|incorrectresponse)\b|invalid response|status code 404|403 forbidden/i.test(detail)) {
-      return `на портах 80 и 443 по адресу сервера отвечает другое устройство (например, сам роутер), поэтому Let's Encrypt не может выдать сертификат. Пробросьте порты 80 и 443 на этот сервер. ${NO_FILES_HINT}`;
+      return fail('на портах 80 и 443 по адресу сервера отвечает другое устройство — например, сам роутер', `пробросьте порты 80 и 443 на этот сервер; ${NO_FILES}`);
     }
     if (/acme:error:dns\b|nxdomain|no valid a records|no such host|dns problem/i.test(detail)) {
-      return 'домен из FILES_DOMAIN не указывает на этот сервер — проверьте его A-запись (или уберите FILES_DOMAIN, тогда ссылки пойдут по IP)';
+      return fail(
+        'домен из настройки FILES_DOMAIN не указывает на этот сервер',
+        'проверьте A-запись домена или уберите FILES_DOMAIN из .env — тогда ссылки пойдут по IP-адресу сервера',
+      );
     }
     if (/acme:error:ratelimited\b|ratelimit|rate limit|too many/i.test(detail)) {
-      return "Let's Encrypt временно ограничил выдачу сертификатов для этого адреса — попробуйте через час";
+      return fail("было слишком много попыток, и Let's Encrypt временно ограничил выдачу для этого адреса", 'подождите час и попробуйте снова');
     }
-    return `не удалось получить HTTPS-сертификат: ${detail.replace(/^acme:\s*/i, '')}`;
+    return fail(detail.replace(/^acme:\s*/i, ''), `посмотрите /var/lib/telemax-files/reconcile.log на сервере; ${NO_FILES}`);
   }
   return `служба файлов не запустилась${detail ? `: ${detail}` : ''}`;
 }

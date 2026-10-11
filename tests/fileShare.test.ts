@@ -276,7 +276,10 @@ describe('files service problems in plain words', () => {
       state: 'error',
       detail: 'acme: error:HTTP 400 urn:ietf:params:acme:error:connection - 1.2.3.4: Timeout during connect (likely firewall problem)',
     });
-    expect(firewall).toContain('не виден из интернета на портах 80 и 443');
+    expect(firewall).toContain('не достучаться из интернета на портах 80 и 443');
+    expect(firewall).toContain('Почему:');
+    expect(firewall).toContain('Что сделать:');
+    expect(firewall.endsWith('.')).toBe(false); // callers add the full stop
     expect(firewall).toContain('пробросьте');
     expect(firewall).toContain('FILES=off');
     expect(describeServiceProblem({ state: 'error', detail: 'acme: error:403 urn:ietf:params:acme:error:unauthorized - Invalid response from http://1.2.3.4/.well-known' })).toContain(
@@ -284,7 +287,7 @@ describe('files service problems in plain words', () => {
     );
     expect(describeServiceProblem({ state: 'error', detail: 'acme: error:DNS problem: NXDOMAIN looking up A for files.example.org' })).toContain('FILES_DOMAIN');
     expect(describeServiceProblem({ state: 'error', detail: 'acme: error:urn:ietf:params:acme:error:rateLimited' })).toContain('через час');
-    expect(describeServiceProblem({ state: 'error', detail: 'acme: msg:challenge failed oddly' })).toBe('не удалось получить HTTPS-сертификат: msg:challenge failed oddly');
+    expect(describeServiceProblem({ state: 'error', detail: 'acme: msg:challenge failed oddly' })).toContain('Проверка не прошла: msg:challenge failed oddly');
     // What reconcile.sh really passes (live test 2026-10-11): the type first, the wording may be cut.
     expect(describeServiceProblem({ state: 'error', detail: 'acme: urn:ietf:params:acme:error:dns - DNS problem: NXDOMAIN looking up A for x' })).toContain('FILES_DOMAIN');
     expect(describeServiceProblem({ state: 'error', detail: 'acme: urn:ietf:params:acme:error:connection - 1.2.3.4: Ti' })).toContain('пробросьте');
