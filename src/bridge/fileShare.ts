@@ -133,25 +133,31 @@ const HEARTBEAT_STALE_MS = 5 * 60_000;
  */
 const UPLOAD_LOCK_STALE_MS = 12 * 3600_000;
 /**
- * A files-service problem told the way the user asked for (2026-10-11): what happened, a plain «why»,
- * what to do. Callers write «… не удалось — <this>.», so it ends without a full stop.
+ * A files-service problem told the way the user asked for (2026-10-11): the CAUSE first — white IP,
+ * ports or domain, so it's clear at a glance which one — then a plain «why», then what to do.
+ * Callers write «… не удалось — <this>.», so it ends without a full stop.
  */
-const explain = (what: string, why: string, todo: string) => `${what}.\n\nПочему: ${why}.\n\nЧто сделать: ${todo}`;
+const explain = (cause: string, why: string, todo: string) => `${cause}.\n\nПочему это мешает: ${why}.\n\nЧто сделать: ${todo}`;
 const WHY_PAGE = 'большие файлы передаются через страницу на вашем сервере';
-const WHY_CERT = `${WHY_PAGE}, а ей нужен HTTPS-сертификат. Его выдаёт Let's Encrypt — и перед выдачей проверяет, что адрес действительно ведёт на ваш сервер`;
+/** What the page needs from the server — the yardstick every cause below is measured against. */
+const WHY_REACH = `${WHY_PAGE}, и она должна открываться из интернета — по белому IP-адресу сервера, на портах 80 и 443`;
 const NO_FILES = 'а если большие файлы не нужны — выключите их: FILES=off в .env';
 
 /** Behind a router: reconcile.sh saw a private address on the server itself (its «nat» tag). */
-const NO_WHITE_IP = 'у сервера нет своего белого IP-адреса — он стоит за роутером, и из интернета до него не достучаться';
+const NO_WHITE_IP = 'у сервера нет белого IP-адреса';
+const NAT_WHY = `${WHY_REACH}. А этот сервер стоит за роутером, и из интернета до него не достучаться`;
 const NAT_TODO = `если у роутера белый IP — пробросьте на сервер порты 80 и 443 в настройках роутера. Если белого IP нет (провайдер выдаёт серый) — проброс не поможет: подключите белый IP у провайдера или поставьте мост на VPS; ${NO_FILES}`;
+const PORTS_CLOSED = 'закрыты порты 80 и 443';
+const PORTS_WHY = `${WHY_REACH}. Белый IP у сервера есть, но порты 80 и 443 из интернета не открываются — обычно их закрывает файрвол хостинга`;
+const PORTS_TODO = `откройте порты 80 и 443 в панели хостинга; ${NO_FILES}`;
 const LOG_HINT = 'Подробности — в /var/lib/telemax-files/reconcile.log на сервере';
 
 export const SERVICE_TIMEOUT_TEXT = explain(
-  'служба файлов не ответила за 2,5 минуты',
-  `${WHY_PAGE}, и порты 80 и 443 сервера должны открываться из интернета. Чаще всего они закрыты: сервер дома за роутером или их закрывает файрвол хостинга`,
-  `пробросьте на сервер порты 80 и 443 на роутере или откройте их в панели хостинга; ${NO_FILES}. ${LOG_HINT}`,
+  'сервер не стал доступен из интернета за 2,5 минуты',
+  `${WHY_REACH}. Чаще всего мешает одно из двух: у сервера нет белого IP-адреса (он дома за роутером) или закрыты порты 80 и 443 (их закрывает файрвол хостинга)`,
+  `если сервер за роутером — нужен белый IP у роутера и проброс портов 80 и 443 на сервер; если это VPS — откройте порты в панели хостинга; ${NO_FILES}. ${LOG_HINT}`,
 );
-export const SERVICE_TIMEOUT_NAT_TEXT = explain('служба файлов не ответила за 2,5 минуты', `${WHY_PAGE}, и до сервера должен быть доступ из интернета. А ${NO_WHITE_IP}`, `${NAT_TODO}. ${LOG_HINT}`);
+export const SERVICE_TIMEOUT_NAT_TEXT = explain(NO_WHITE_IP, NAT_WHY, `${NAT_TODO}. ${LOG_HINT}`);
 
 export class FileShare {
   readonly dir: string;
@@ -541,48 +547,55 @@ export class FileShare {
 }
 
 /**
- * service.json → what happened, why and what to do (see explain). reconcile.sh passes Caddy's ACME
- * error through as «acme: urn:ietf:params:acme:error:<type> - …» (English, maybe cut): the type
- * decides first, the wording second. Pure + exported for tests.
+ * service.json → the cause, why it matters, what to do (see explain). reconcile.sh passes Caddy's ACME
+ * error through as «acme: [nat: ]urn:ietf:params:acme:error:<type> - …» (English, maybe cut): the
+ * type decides first, the wording second. Pure + exported for tests.
  */
 export function describeServiceProblem(st: { state?: string; detail?: string }): string {
   if (st.state === 'ports-busy') {
     return explain(
-      'порты 80 и 443 на сервере уже заняты другим веб-сервером',
+      'порты 80 и 443 заняты другим веб-сервером',
       `${WHY_PAGE}, и ей нужны эти порты`,
       `пустите файлы через ваш веб-сервер — FILES_PUBLIC_URL и FILES_LISTEN в .env (пример в README); ${NO_FILES}`,
     );
   }
   if (st.state === 'no-ip') {
-    return explain('не удалось узнать внешний IPv4-адрес сервера', `${WHY_PAGE}, а ссылка на неё строится по адресу сервера`, 'укажите свой домен — FILES_DOMAIN в .env');
+    return explain('не удалось узнать белый IP-адрес сервера', `${WHY_PAGE}, а ссылка на неё строится по IP-адресу сервера`, 'укажите свой домен — FILES_DOMAIN в .env');
   }
   const detail = (st.detail ?? '').trim();
   if (/^acme:/i.test(detail)) {
     const behindNat = /^acme:\s*nat:/i.test(detail);
-    const fail = (because: string, todo: string) => explain("Let's Encrypt не выдал серверу HTTPS-сертификат", `${WHY_CERT}. Проверка не прошла: ${because}`, todo);
     const unreachable = /acme:error:(connection|tls)\b|timeout during connect|firewall|connection refused|connection reset|no route to host|network unreachable/i.test(detail);
     const wrongAnswer = /acme:error:(unauthorized|incorrectresponse)\b|invalid response|status code 404|403 forbidden/i.test(detail);
     // A home server: no white IP of its own — the fix depends on the router and the provider.
-    if (behindNat && (unreachable || wrongAnswer)) return fail(NO_WHITE_IP, NAT_TODO);
-    if (unreachable) {
-      return fail('из интернета не открываются порты 80 и 443 сервера — скорее всего, их закрывает файрвол хостинга', `откройте порты 80 и 443 в панели хостинга; ${NO_FILES}`);
-    }
+    if (behindNat && (unreachable || wrongAnswer)) return explain(NO_WHITE_IP, NAT_WHY, NAT_TODO);
+    if (unreachable) return explain(PORTS_CLOSED, PORTS_WHY, PORTS_TODO);
     if (wrongAnswer) {
-      return fail(
-        'на портах 80 и 443 по адресу сервера отвечает другой сервер',
-        `проверьте, что внешний адрес ведёт именно на этот сервер (например, не выходит ли он в интернет через VPN); ${NO_FILES}`,
+      return explain(
+        'по IP-адресу сервера отвечает другой сервер',
+        `${WHY_REACH}. Но на этих портах отвечает не ваш сервер — например, если он выходит в интернет через VPN, его внешний адрес определился не тот`,
+        `проверьте, что внешний IP-адрес ведёт именно на этот сервер; ${NO_FILES}`,
       );
     }
     if (/acme:error:dns\b|nxdomain|no valid a records|no such host|dns problem/i.test(detail)) {
-      return fail(
-        'домен из настройки FILES_DOMAIN не указывает на этот сервер',
+      return explain(
+        'домен из FILES_DOMAIN указывает не на этот сервер',
+        `${WHY_PAGE}, и ссылки на неё строятся на домене из настройки FILES_DOMAIN. Но домен не ведёт на ваш сервер, поэтому Let's Encrypt не выдал для него HTTPS-сертификат`,
         'проверьте A-запись домена или уберите FILES_DOMAIN из .env — тогда ссылки пойдут по IP-адресу сервера',
       );
     }
     if (/acme:error:ratelimited\b|ratelimit|rate limit|too many/i.test(detail)) {
-      return fail("было слишком много попыток, и Let's Encrypt временно ограничил выдачу для этого адреса", 'подождите час и попробуйте снова');
+      return explain(
+        "Let's Encrypt временно не выдаёт сертификат",
+        'страница для больших файлов работает по HTTPS, а сертификат для этого адреса запрашивали слишком часто',
+        'подождите час и попробуйте снова',
+      );
     }
-    return fail(detail.replace(/^acme:\s*/i, ''), `посмотрите /var/lib/telemax-files/reconcile.log на сервере; ${NO_FILES}`);
+    return explain(
+      "Let's Encrypt не выдал HTTPS-сертификат",
+      `страница для больших файлов работает по HTTPS. Ответ Let's Encrypt: ${detail.replace(/^acme:\s*(nat:\s*)?/i, '')}`,
+      `${LOG_HINT.replace('Подробности — в', 'посмотрите')}; ${NO_FILES}`,
+    );
   }
   return `служба файлов не запустилась${detail ? `: ${detail}` : ''}`;
 }
