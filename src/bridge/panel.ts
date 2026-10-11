@@ -68,9 +68,10 @@ function pauseLabel(until: number | null): string | null {
   return until === Number.POSITIVE_INFINITY ? 'до возобновления или перезапуска моста' : `~${Math.max(0, Math.round((until - Date.now()) / 60000))} мин`;
 }
 
-// --- Contact-search force-reply correlation ------------------------------------------
+// --- Contact-search prompt correlation -----------------------------------------------
 type SearchMode = 'phone' | 'nick' | 'id';
-const pendingSearch = new Map<number, { mode: SearchMode; requesterId: number }>();
+// Keyed by the panel message that shows the prompt; `at` tells a re-opened prompt from an old timer.
+const pendingSearch = new Map<number, { mode: SearchMode; requesterId: number; at: number }>();
 // Who pressed a search button and is expected to type the query next (no reply needed).
 const pendingByUser = new Map<number, { mode: SearchMode; promptId: number; at: number }>();
 const SEARCH_WAIT_MS = 10 * 60_000;
@@ -515,34 +516,59 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
     // or a person's nick (or a Telegram @username) just ends in «Ничего не найдено».
     const text =
       mode === 'phone'
-        ? '🔎 Напишите номер телефона следующим сообщением (с + или без):'
+        ? '🔎 Поиск по номеру\nНапишите номер в чат следующим сообщением — с + или без, можно с пробелами, скобками и тире.'
         : mode === 'id'
-          ? '🔎 Напишите MAX ID следующим сообщением (число — например, из карточки группы или из сообщения о выходе участника):'
-          : '🔎 Напишите следующим сообщением ник бота или канала MAX, ссылку max.ru/… или их название.\nЛюдей по нику не найти — их ищите по номеру или MAX ID. Ник из Telegram тоже не подойдёт.';
-    // No force_reply: Telegram Desktop keeps a force_reply prompt as the chat's "keyboard" and keeps
-    // popping «В ответ …» up long after the prompt is gone (seen live 2026-10-09). The next text of
-    // the same admin in General is the answer instead (a reply to the prompt works too).
-    const sent = await bot.telegram.sendMessage(chatIdOf(ctx), text);
+          ? '🔎 Поиск по MAX ID\nНапишите MAX ID в чат следующим сообщением (число — например, из карточки группы или из сообщения о выходе участника).'
+          : '🔎 Поиск по нику\nНапишите в чат следующим сообщением ник бота или канала MAX, ссылку max.ru/… или их название.\nЛюдей по нику не найти — их ищите по номеру или MAX ID. Ник из Telegram тоже не подойдёт.';
+    const toast = mode === 'phone' ? '✍️ Напишите номер в чат' : mode === 'id' ? '✍️ Напишите MAX ID в чат' : '✍️ Напишите ник или название в чат';
+    await ctx.answerCbQuery(toast);
+    // The prompt replaces the panel IN PLACE: the admin is looking at the panel (often scrolled up to
+    // the pin), and a prompt posted at the bottom of the chat went unseen (2026-10-11). Sending the
+    // answer scrolls the chat down, so the result lands in view. No force_reply: Telegram Desktop
+    // keeps such a prompt as the chat's "keyboard" and keeps popping «В ответ …» up long after it's
+    // gone (seen live 2026-10-09). The next text of the same admin in General is the answer (a reply
+    // to the panel works too).
+    const panelId = ctx.callbackQuery?.message?.message_id;
+    if (panelId == null) return;
+    await edit(ctx, { text, markup: Markup.inlineKeyboard([[Markup.button.callback('✖️ Отмена', 'tlmx_panel:findcancel')]]).reply_markup });
     const requesterId = ctx.from?.id ?? 0;
-    boundedSet(pendingSearch, sent.message_id, { mode, requesterId });
-    pendingByUser.set(requesterId, { mode, promptId: sent.message_id, at: Date.now() });
+    const at = Date.now();
+    const chatId = chatIdOf(ctx);
+    boundedSet(pendingSearch, panelId, { mode, requesterId, at });
+    pendingByUser.set(requesterId, { mode, promptId: panelId, at });
     setTimeout(() => {
-      if (pendingByUser.get(requesterId)?.promptId === sent.message_id) pendingByUser.delete(requesterId);
-      if (!pendingSearch.delete(sent.message_id)) return;
-      void bot.telegram.deleteMessage(chatIdOf(ctx), sent.message_id).catch(() => {});
+      if (pendingByUser.get(requesterId)?.at === at) pendingByUser.delete(requesterId);
+      if (pendingSearch.get(panelId)?.at !== at) return; // answered, cancelled or re-opened since
+      pendingSearch.delete(panelId);
+      void restorePanel(chatId, panelId);
     }, SEARCH_WAIT_MS).unref();
   }
-  bot.action('tlmx_panel:find:phone', async (ctx) => {
+  /** Puts the panel back to «Найти контакт» once its search prompt is answered, cancelled or expired. */
+  function restorePanel(chatId: number, panelId: number): Promise<unknown> {
+    const { text, markup } = contactsView();
+    return bot.telegram.editMessageText(chatId, panelId, undefined, text, { reply_markup: markup }).catch((err) => {
+      if (!/not modified/i.test((err as Error)?.message ?? '')) logger.error('Panel restore after a search failed', err);
+    });
+  }
+  /** Ends this admin's open search prompt, if any (a contact card answers it too). */
+  async function endPrompt(chatId: number, userId: number): Promise<void> {
+    const open = pendingByUser.get(userId);
+    if (!open) return;
+    pendingByUser.delete(userId);
+    if (pendingSearch.delete(open.promptId)) await restorePanel(chatId, open.promptId);
+  }
+  bot.action('tlmx_panel:find:phone', (ctx) => promptSearch(ctx, 'phone'));
+  bot.action('tlmx_panel:find:nick', (ctx) => promptSearch(ctx, 'nick'));
+  bot.action('tlmx_panel:find:id', (ctx) => promptSearch(ctx, 'id'));
+  bot.action('tlmx_panel:findcancel', async (ctx) => {
     await ctx.answerCbQuery();
-    await promptSearch(ctx, 'phone');
-  });
-  bot.action('tlmx_panel:find:nick', async (ctx) => {
-    await ctx.answerCbQuery();
-    await promptSearch(ctx, 'nick');
-  });
-  bot.action('tlmx_panel:find:id', async (ctx) => {
-    await ctx.answerCbQuery();
-    await promptSearch(ctx, 'id');
+    const panelId = ctx.callbackQuery.message?.message_id;
+    if (panelId != null) {
+      const open = pendingSearch.get(panelId);
+      pendingSearch.delete(panelId);
+      if (open && pendingByUser.get(open.requesterId)?.at === open.at) pendingByUser.delete(open.requesterId);
+    }
+    await edit(ctx, contactsView());
   });
 
   async function sendCard(chatId: number, c: MaxContactInfo): Promise<void> {
@@ -707,6 +733,7 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
       logger.error('Contact card: could not check admin status', err);
       return;
     }
+    await endPrompt(chatIdOf(ctx), userId);
     const who = [m.contact?.first_name, m.contact?.last_name].filter(Boolean).join(' ').trim();
     await ctx.reply(`📇 Контакт из Telegram${who ? ` «${who}»` : ''} — ищу в MAX по номеру…`).catch(() => {});
     await runSearch(chatIdOf(ctx), 'phone', phone);
@@ -729,7 +756,7 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
     if (!pending || ctx.from?.id !== pending.requesterId) return next();
     pendingSearch.delete(promptId);
     if (ctx.from) pendingByUser.delete(ctx.from.id);
-    await ctx.telegram.deleteMessage(chatIdOf(ctx), promptId).catch(() => {});
+    await restorePanel(chatIdOf(ctx), promptId);
     const query = (msg.text ?? '').trim();
     if (!query) {
       await ctx.reply('Пусто — отмена.').catch(() => {});
