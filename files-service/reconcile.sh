@@ -264,21 +264,30 @@ healthy() { curl -fsS --max-time 8 "$BASE_URL/health" >/dev/null 2>&1; }
 # a home server whose router didn't forward 80/443) without the one thing to fix.
 acme_error() {
   [ "$EXTERNAL" = 0 ] || return 0
-  local c line type detail
+  local c lines line type detail limited=""
   c=$(docker ps -q --filter "label=com.docker.compose.project=$PROJECT" --filter "label=com.docker.compose.service=caddy" | head -1)
   [ -n "$c" ] || return 0
   # Error-level lines that carry an ACME error type. Not any line mentioning «challenge»: «trying to
   # solve challenge» is Caddy at work, and taken for a failure it failed a fresh start 9 s in, before
   # Let's Encrypt even answered (live test, 2026-10-11).
-  line=$(docker logs --tail 80 "$c" 2>&1 | grep -F '"level":"error"' | grep -F 'urn:ietf:params:acme:error:' | tail -1)
-  [ -n "$line" ] || return 0
+  lines=$(docker logs --tail 120 "$c" 2>&1 | grep -F '"level":"error"' | grep -F 'urn:ietf:params:acme:error:' || true)
+  [ -n "$lines" ] || return 0
+  # A rate limit is a consequence: Caddy's quick retry after a real failure hits it within seconds and
+  # used to hide the cause (closed ports read as «подождите час» — live test). Name the cause; flag
+  # the limit next to the type («…:connection+rateLimited»), where a 200-character cut can't drop it.
+  line=$(printf '%s\n' "$lines" | grep -v 'acme:error:rateLimited' | tail -1)
+  if [ -z "$line" ]; then
+    line=$(printf '%s\n' "$lines" | tail -1)
+  elif printf '%s\n' "$lines" | grep -q 'acme:error:rateLimited'; then
+    limited="+rateLimited"
+  fi
   # «urn:…:<type> - <detail>»: the type first (it decides the message), then the human detail. Caddy
   # puts it in a nested «problem» object on «challenge failed» ("type", "detail") and inside the error
   # string elsewhere — and that string holds escaped quotes (\"1.2.3.4\"), so no "[^"]*" matching.
   type=$(printf '%s' "$line" | grep -oE 'urn:ietf:params:acme:error:[A-Za-z]+' | head -1)
   detail=$(printf '%s' "$line" | grep -oE '"detail":"[^"]*"' | head -1 | cut -d'"' -f4)
   [ -n "$detail" ] || detail=$(printf '%s' "$line" | sed -E 's/.*urn:ietf:params:acme:error:[A-Za-z]+ - //; s/\\"//g; s/"[,}].*//' | cut -c1-140)
-  printf '%s - %s' "$type" "$detail"
+  printf '%s%s - %s' "$type" "$limited" "$detail"
 }
 ACME_ERR=""
 if [ "$WAS_RUNNING" = 0 ]; then

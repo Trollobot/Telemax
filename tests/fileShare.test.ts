@@ -302,6 +302,11 @@ describe('files service problems in plain words', () => {
     expect(describeServiceProblem({ state: 'error', detail: 'acme: urn:ietf:params:acme:error:connection - 1.2.3.4: Ti' })).toContain('файрвол хостинга');
     expect(describeServiceProblem({ state: 'error', detail: 'acme: urn:ietf:params:acme:error:tls - 1.2.3.4: rem' })).toContain('файрвол хостинга');
     expect(describeServiceProblem({ state: 'ports-busy' })).toContain('FILES_PUBLIC_URL');
+    // A rate limit right after the real failure (live test): the cause stays, the limit becomes a note.
+    const both = describeServiceProblem({ state: 'error', detail: 'acme: urn:ietf:params:acme:error:connection+rateLimited - 1.2.3.4: Timeout during connect' });
+    expect(both.startsWith('закрыты порты 80 и 443.')).toBe(true);
+    expect(both).toContain('подождите час');
+    expect(describeServiceProblem({ state: 'error', detail: 'acme: nat: urn:ietf:params:acme:error:connection+rateLimited - x' }).startsWith('у сервера нет белого IP-адреса.')).toBe(true);
     expect(describeServiceProblem({ state: 'error', detail: 'bind: address already in use' })).toBe('служба файлов не запустилась: bind: address already in use');
     expect(SERVICE_TIMEOUT_TEXT).toContain('порты 80 и 443');
   });

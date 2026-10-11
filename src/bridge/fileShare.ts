@@ -138,6 +138,7 @@ const UPLOAD_LOCK_STALE_MS = 12 * 3600_000;
  * Callers write «… не удалось — <this>.», so it ends without a full stop.
  */
 const explain = (cause: string, why: string, todo: string) => `${cause}.\n\nПочему это мешает: ${why}.\n\nЧто сделать: ${todo}`;
+const explainBase = explain;
 const WHY_PAGE = 'большие файлы передаются через страницу на вашем сервере';
 /** What the page needs from the server — the yardstick every cause below is measured against. */
 const WHY_REACH = `${WHY_PAGE}, и она должна открываться из интернета — по белому IP-адресу сервера, на портах 80 и 443`;
@@ -565,6 +566,10 @@ export function describeServiceProblem(st: { state?: string; detail?: string }):
   const detail = (st.detail ?? '').trim();
   if (/^acme:/i.test(detail)) {
     const behindNat = /^acme:\s*nat:/i.test(detail);
+    // reconcile.sh flags a rate limit that followed the real failure («…:connection+rateLimited»):
+    // the cause stays the message, the limit becomes a note on when to try again.
+    const limitNote = /\+ratelimited/i.test(detail) ? ". Let's Encrypt к тому же временно ограничил попытки для этого адреса — после того как исправите, подождите час" : '';
+    const explain = (cause: string, why: string, todo: string) => explainBase(cause, why, todo + limitNote);
     const unreachable = /acme:error:(connection|tls)\b|timeout during connect|firewall|connection refused|connection reset|no route to host|network unreachable/i.test(detail);
     const wrongAnswer = /acme:error:(unauthorized|incorrectresponse)\b|invalid response|status code 404|403 forbidden/i.test(detail);
     // A home server: no white IP of its own — the fix depends on the router and the provider.
