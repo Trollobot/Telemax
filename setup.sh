@@ -488,6 +488,48 @@ apply_env_change() {
   echo "✅ Применено."
 }
 
+# Big files go by a link to THIS server, so its ports 80 and 443 must open from the internet. A home
+# server behind a router has no white IP of its own, and ports held by another web server can't be
+# shared without setup — both used to surface only on the first big file, as a failed certificate
+# (a real install, 2026-10-11). Checked here instead. Sets FILES_CHECK to «nat:<address>», «busy» or «ok».
+is_private_ipv4() {
+  case "$1" in
+    10.* | 127.* | 192.168.* | 169.254.* | 172.1[6-9].* | 172.2[0-9].* | 172.3[01].*) return 0 ;;
+    100.6[4-9].* | 100.[7-9][0-9].* | 100.1[01][0-9].* | 100.12[0-7].*) return 0 ;; # carrier-grade NAT
+  esac
+  return 1
+}
+files_check() {
+  local src
+  src=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<NF;i++) if ($i=="src") print $(i+1)}' | head -1) || src=""
+  FILES_CHECK=ok
+  if [ -n "$src" ] && is_private_ipv4 "$src"; then
+    FILES_CHECK="nat:$src"
+    return 0
+  fi
+  # Busy — unless it's our own shared files service (another bridge on this server already runs it).
+  if ss -ltnH '( sport = :80 or sport = :443 )' 2>/dev/null | grep -q . \
+    && ! docker ps -q --filter "label=com.docker.compose.project=telemax-files" 2>/dev/null | grep -q .; then
+    FILES_CHECK=busy
+  fi
+}
+# Explains FILES_CHECK in plain words (nothing to say for «ok»).
+files_explain() {
+  echo "Большие файлы (из Telegram больше 20 МБ, из MAX больше 50 МБ) мост передаёт по ссылке на этот сервер —"
+  echo "для этого его порты 80 и 443 должны открываться из интернета."
+  case "$FILES_CHECK" in
+    nat:*)
+      echo "⚠️  У сервера нет своего белого IP: он стоит за роутером (его адрес ${FILES_CHECK#nat:})."
+      echo "   Ссылки заработают, только если у роутера белый IP и порты 80 и 443 проброшены на этот сервер."
+      echo "   С серым IP от провайдера проброс не поможет — нужен белый IP у провайдера или VPS."
+      ;;
+    busy)
+      echo "⚠️  Порты 80 и 443 уже заняты другим веб-сервером. Файлы можно пустить через него —"
+      echo "   FILES_PUBLIC_URL и FILES_LISTEN в .env, пример в README (раздел «Большие файлы»)."
+      ;;
+  esac
+}
+
 # ---------------------------------------------------------------------------
 # Settings menu — .env already exists, so this is a configured install.
 # ---------------------------------------------------------------------------
@@ -531,7 +573,44 @@ if [ -f .env ]; then
       echo "  Прокси Telegram:  нет (напрямую)"
     fi
     echo "  Стикеры (образ):  ${STICKERS:-full}"
+    if files_off; then
+      echo "  Большие файлы:    выключены (FILES=off)"
+    else
+      echo "  Большие файлы:    включены — по ссылке на этот сервер"
+    fi
     echo "  MAX-авторизация:  через бота — /login в личку (статус виден в /panel)"
+  }
+
+  files_off() {
+    case "$(env_read FILES | tr '[:upper:]' '[:lower:]')" in 0 | false | off | no) return 0 ;; esac
+    return 1
+  }
+
+  toggle_files() {
+    echo
+    if files_off; then
+      echo "Сейчас пересылка больших файлов выключена (FILES=off)."
+      files_check
+      files_explain
+      [ "$FILES_CHECK" = ok ] && echo "✅ Проверка: у сервера свой белый IP, порты 80 и 443 свободны."
+      read -rp "Включить пересылку больших файлов? [y/N] " FA
+      if [ "${FA:-N}" != "y" ] && [ "${FA:-N}" != "Y" ]; then
+        echo "Оставляю выключенной."
+        return 0
+      fi
+      set_env_var FILES on
+      echo "Сохранено: большие файлы включены. Если что-то помешает, бот прямо скажет, что именно."
+    else
+      echo "Сейчас пересылка больших файлов включена."
+      read -rp "Выключить (FILES=off)? Файлы больше лимитов Telegram тогда открывают в MAX. [y/N] " FA
+      if [ "${FA:-N}" != "y" ] && [ "${FA:-N}" != "Y" ]; then
+        echo "Оставляю включённой."
+        return 0
+      fi
+      set_env_var FILES off
+      echo "Сохранено: большие файлы выключены."
+    fi
+    apply_env_change
   }
 
   change_proxy() {
@@ -633,6 +712,7 @@ if [ -f .env ]; then
     echo "  4) Переключить режим стикеров (full/slim, с пересборкой)"
     echo "  5) Проверить связь с MAX и Telegram"
     echo "  6) Пересобрать и перезапустить контейнер"
+    echo "  7) Большие файлы: включить или выключить (с проверкой белого IP и портов)"
     echo "  0) Выход"
     read -rp "Пункт: " MENU_CHOICE
     case "$MENU_CHOICE" in
@@ -641,6 +721,7 @@ if [ -f .env ]; then
       3) change_bot ;;
       4) change_stickers ;;
       5) check_connectivity ;;
+      7) toggle_files ;;
       6)
         if command -v docker >/dev/null 2>&1; then
           compose_up --build
@@ -807,6 +888,25 @@ else
 fi
 echo "  → образ: $STICKERS"
 
+# Big files need this server reachable on 80/443 — when it plainly isn't (no white IP of its own, or
+# the ports belong to another web server), ask before turning the feature on. Defaults to OFF there:
+# otherwise the first big file would only fail with a certificate error. Everything else is unaffected.
+FILES_SETTING=""
+files_check
+if [ "$FILES_CHECK" != ok ]; then
+  echo
+  files_explain
+  if read -t 30 -rp "Включить пересылку больших файлов? Впишите y, если порты уже настроены, или Enter (жду 30с) — выключить: " FILES_CHOICE \
+    && { [ "${FILES_CHOICE:-}" = y ] || [ "${FILES_CHOICE:-}" = Y ]; }; then
+    echo "  → большие файлы: включены"
+  else
+    FILES_SETTING=off
+    echo
+    echo "  → большие файлы: выключены (FILES=off). Всё остальное работает как обычно, а файлы больше"
+    echo "    лимитов Telegram открывают в MAX. Включить позже: ./setup.sh → «Большие файлы»."
+  fi
+fi
+
 # .env carries the session-encryption key and bot token — don't leave it readable to
 # other local users. STICKERS is read by docker-compose.yml as a build arg.
 # Belt and braces: a value that can't be represented must never reach .env, because Compose then
@@ -829,6 +929,7 @@ TARGET_TELEGRAM_GROUP=$(env_quote "$TARGET_TELEGRAM_GROUP")
 TELEGRAM_PROXY=$(env_quote "$TELEGRAM_PROXY")
 STICKERS=$(env_quote "$STICKERS")
 EOF
+[ "$FILES_SETTING" = off ] && printf "FILES='off'\n" >> .env
 
 echo
 bold "Готово: .env создан."
@@ -861,4 +962,4 @@ echo "  Введёте номер MAX и код из SMS прямо в личк�
 echo "  (Альтернатива: в группе /panel → «🔐 Вход в MAX».)"
 echo "════════════════════════════════════════════════════════════════"
 echo
-echo "Изменить настройки позже (прокси, токен, группа, стикеры) — просто запустите ./setup.sh ещё раз."
+echo "Изменить настройки позже (прокси, токен, группа, стикеры, большие файлы) — просто запустите ./setup.sh ещё раз."
