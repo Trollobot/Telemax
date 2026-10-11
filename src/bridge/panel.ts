@@ -8,7 +8,7 @@ import { formatBytes, maskPhone } from './status.js';
 import { createLogger } from '../logger.js';
 import { truncateUtf16 } from './text.js';
 import { formatExpiry } from './bigFiles.js';
-import type { FileShare, ServiceResult, StoredFile, UploadTicket } from './fileShare.js';
+import { MAX_FILE_LIMIT, type FileShare, type ServiceResult, type StoredFile, type UploadTicket } from './fileShare.js';
 
 const logger = createLogger('panel');
 
@@ -246,6 +246,8 @@ function fileCardView(f: StoredFile, files: FileShare, link?: string, canResend 
     markup: Markup.inlineKeyboard([
       ...(link ? [[Markup.button.url('⬇️ Открыть ссылку', link)]] : []),
       ...(canResend && f.direction === 'tg2max' && f.target ? [[Markup.button.callback('📤 Отправить в MAX', `tlmx_panel:fsend:${f.id}`)]] : []),
+      // Any other file MAX would take goes to a chat from that chat's topic: /file lists it there.
+      ...(!(f.direction === 'tg2max' && f.target) && f.size <= MAX_FILE_LIMIT ? [[Markup.button.callback('📤 Отправить в чат MAX', 'tlmx_panel:fhow')]] : []),
       [Markup.button.callback(`🔗 Новая ссылка (+${ttlText(files.opts.ttlMs)})`, `tlmx_panel:frenew:${f.id}`)],
       [Markup.button.callback('🗑 Удалить', `tlmx_panel:fdel:${f.id}`)],
       [Markup.button.callback('◀️ К файлам', 'tlmx_panel:files')],
@@ -426,6 +428,13 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
       return;
     }
     await edit(ctx, card(f));
+  });
+  // «📤 Отправить в чат MAX» on a file card: the chat is picked by where /file is typed — a list of
+  // every chat here would be long and easy to miss on.
+  bot.action('tlmx_panel:fhow', async (ctx) => {
+    await ctx
+      .answerCbQuery('Откройте тему нужного чата и напишите там /file — этот файл будет в списке под ссылкой. Нажмёте — уйдёт в MAX прямо с сервера.', { show_alert: true })
+      .catch(() => {});
   });
   // A waiting upload link («⏳» row): its page and a cancel button. The cancel itself is bigFiles'
   // «✖️» handler — it also updates the message that first offered the link.

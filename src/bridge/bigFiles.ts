@@ -13,6 +13,7 @@ import { uploadFileFromDiskToMax } from './upload.js';
 import { isTransientHttpStatus, isTransientNetworkError, TransientDownloadError } from './transient.js';
 import { reportError } from './telemetry.js';
 import { keepPanelBack } from './panelBack.js';
+import { truncateUtf16 } from './text.js';
 
 /**
  * What the topic is told about a failure: MAX's own answers are readable Russian and stay as they
@@ -118,6 +119,23 @@ export function createBigFiles({ bot, max, targetGroupId, fileShare, onSentToMax
   // --- Telegram → MAX -------------------------------------------------------------------------
 
   const CANCEL = 'tlmx_panel:fcancel:';
+  /** /file's «send a file that is already on the server» buttons (user's request, 2026-10-11). */
+  const PUT = 'tlmx_panel:fput:';
+  /**
+   * /file prompt → the chat it was typed in: where its server-file buttons send. In memory only — after
+   * a restart the button asks for /file again; a pending ticket isn't used, because the server files
+   * are offered even when the upload link itself failed (a home server with no white IP).
+   */
+  const putTargets = new Map<number, { maxChatId: string; topicId: number }>();
+  /** Files on the server MAX would take (≤ 4 GB), newest first: ⬇️ from MAX, 📦 file exchange, ⬆️ didn't make it. */
+  const serverFileRows = () =>
+    fileShare
+      .list()
+      .filter((f) => f.size <= MAX_FILE_LIMIT)
+      .slice(-8)
+      .reverse()
+      .map((f) => [Markup.button.callback(`${f.direction === 'max2tg' ? '⬇️' : f.direction === 'stored' ? '📦' : '⬆️'} ${truncateUtf16(f.name, 40)} · ${formatBytes(f.size)}`, PUT + f.id)]);
+  const SERVER_NOTE = '\n\nИли отправьте сюда файл, который уже лежит на сервере, — загружать его заново не придётся:';
   const uploadRows = (url: string, token: string) => [[Markup.button.url('📤 Загрузить файл', url)], [Markup.button.callback('✖️ Отменить', CANCEL + token)]];
   const uploadKeyboard = (url: string, token: string) => Markup.inlineKeyboard(uploadRows(url, token));
   /** The way back to «📁 Файлы» for everything the file exchange draws in the panel message. */
@@ -161,11 +179,25 @@ export function createBigFiles({ bot, max, targetGroupId, fileShare, onSentToMax
       promptMessageId: prompt.message_id,
     });
     logger.info(fromTelegram ? `TG -> MAX: ${p.name} is ${p.size} bytes, over the bot download limit — offering an upload link` : `TG -> MAX: /file — offering an upload link for chat ${p.maxChatId}`);
+    // /file: the server's own files go to this chat straight from the disk — no link, no service needed.
+    const fromServer = fromTelegram ? [] : serverFileRows();
+    if (fromServer.length) {
+      if (putTargets.size >= 200) putTargets.delete(putTargets.keys().next().value!);
+      putTargets.set(prompt.message_id, { maxChatId: p.maxChatId, topicId: p.topicId });
+    }
+    const serverNote = fromServer.length ? SERVER_NOTE : '';
     const svc = await fileShare.ensureService();
     if (!svc.ok) {
       report('service', svc.reason);
       await fileShare.dropTicket(ticket.token);
-      await edit(prompt.message_id, p.topicId, fromTelegram ? `⚠️ Файл ${label} не отправлен в MAX: ${WHY_TG_DOWNLOAD}, а ссылку для загрузки подготовить не удалось — ${svc.reason}.` : `⚠️ Ссылку для загрузки подготовить не удалось — ${svc.reason}.`);
+      await edit(
+        prompt.message_id,
+        p.topicId,
+        fromTelegram
+          ? `⚠️ Файл ${label} не отправлен в MAX: ${WHY_TG_DOWNLOAD}, а ссылку для загрузки подготовить не удалось — ${svc.reason}.`
+          : `⚠️ Ссылку для загрузки подготовить не удалось — ${svc.reason}.${serverNote}`,
+        fromServer.length ? Markup.inlineKeyboard(fromServer) : undefined,
+      );
       return;
     }
     const until = formatExpiry(ticket.expiresAt);
@@ -177,10 +209,45 @@ export function createBigFiles({ bot, max, targetGroupId, fileShare, onSentToMax
 Загрузите его по ссылке, и мост отправит его в MAX. Ссылка действует до ${until}.
 
 В следующий раз большие файлы отправляйте через /file в теме — загружать придётся один раз, а не два.`
-        : `📤 Загрузите файл по ссылке — мост отправит его в этот чат MAX. До 4 ГБ, ссылка действует до ${until}.`,
-      uploadKeyboard(`${svc.url}/f/${ticket.token}`, ticket.token),
+        : `📤 Загрузите файл по ссылке — мост отправит его в этот чат MAX. До 4 ГБ, ссылка действует до ${until}.${serverNote}`,
+      Markup.inlineKeyboard([...uploadRows(`${svc.url}/f/${ticket.token}`, ticket.token), ...fromServer]),
     );
   }
+
+  // A server file sent from a /file prompt: into that topic's MAX chat, straight from the disk.
+  bot.action(new RegExp(`^${PUT}(.+)$`), async (ctx) => {
+    const promptId = ctx.callbackQuery.message?.message_id;
+    const target = promptId != null ? putTargets.get(promptId) : undefined;
+    const file = fileShare.get(ctx.match[1] ?? '');
+    if (promptId == null || !target) {
+      await ctx.answerCbQuery('Кнопка устарела — напишите /file в теме ещё раз').catch(() => {});
+      return;
+    }
+    if (!file) {
+      await ctx.answerCbQuery('Этого файла на сервере уже нет').catch(() => {});
+      return;
+    }
+    await ctx.answerCbQuery('Отправляю в MAX…').catch(() => {});
+    putTargets.delete(promptId);
+    // The upload link of this /file isn't needed any more — and shouldn't keep the service up.
+    const pending = fileShare.pendingUploads().find((t) => t.promptMessageId === promptId);
+    if (pending) await fileShare.dropTicket(pending.token);
+    const label = `«${file.name}» (${formatBytes(file.size)})`;
+    await edit(promptId, target.topicId, `⏳ Отправляю ${label} в MAX с сервера…`);
+    try {
+      const sent = await uploadAndSend(target.maxChatId, fileShare.pathOf(file), file.size, file.name, undefined, () => {
+        void edit(promptId, target.topicId, `⏳ Файл ${label} загружен в MAX — MAX его обрабатывает, это может занять несколько минут…`);
+      });
+      // Tied to this message like any /file send: deleting it (or 👎) deletes the file in MAX too.
+      onSentToMax({ maxChatId: target.maxChatId, topicId: target.topicId, telegramMessageId: promptId, token: '', name: file.name, expectedSize: file.size, createdAt: 0, expiresAt: 0 }, sent);
+      await edit(promptId, target.topicId, `✅ Файл ${label} отправлен в MAX с сервера. На сервере он остаётся — его можно отправить и в другие чаты.`);
+      logger.info(`TG -> MAX: server file ${file.name} (${file.size} bytes) sent to chat ${target.maxChatId}`);
+    } catch (err) {
+      logger.error(`Sending the server file ${file.name} to MAX failed`, err);
+      report('send server file to MAX', err);
+      await edit(promptId, target.topicId, `⚠️ Файл ${label} в MAX не ушёл: ${humanError(err)}. Он остаётся на сервере — напишите /file, чтобы попробовать ещё раз.`);
+    }
+  });
 
   // «✖️ Отменить» under an upload link: the link stops working (an upload in flight is cut off too).
   bot.action(new RegExp(`^${CANCEL}(.+)$`), async (ctx) => {
