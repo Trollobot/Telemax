@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Статистика посещений — Telemax</title>
+<meta name="description" content="Открытая статистика посещений сайта Telemax: дни, часы, страны и источники переходов. Без cookie и без хранения IP-адресов.">
+<link rel="canonical" href="https://telemax.svnest.ru/stats/">
+<link rel="icon" type="image/png" href="../icon.png">
+<style>
+  :root{
+    --paper:#f5ecd9; --paper-2:#faf4e6; --card:#fffdf8;
+    --ink:#2b2119; --muted:#6f6152; --faint:#948676;
+    --line:#e4d4b6; --line-soft:#eaddc4;
+    --terra:#c2571f; --terra-dark:#9d4315; --terra-tint:#f0dcbb; --terra-soft:#e8b48f;
+    --olive:#7a7433;
+    --serif:Georgia,"Times New Roman","PT Serif",serif;
+    --radius:14px; --shadow:0 1px 2px rgba(70,45,20,.05),0 14px 34px rgba(90,55,20,.09);
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--paper);color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    line-height:1.55;-webkit-font-smoothing:antialiased}
+  a{color:var(--terra-dark);text-decoration:none}
+  a:hover{text-decoration:underline}
+  .wrap{max-width:1000px;margin:0 auto;padding:0 22px}
+  h1,h2{font-family:var(--serif);line-height:1.16;margin:0 0 .4em;font-weight:700}
+  header.nav{position:sticky;top:0;z-index:10;background:rgba(245,236,217,.86);backdrop-filter:blur(8px);border-bottom:1px solid var(--line)}
+  .nav .wrap{display:flex;align-items:center;gap:16px;height:62px}
+  .brand{font-family:var(--serif);font-weight:700;font-size:1.35rem;display:inline-flex;align-items:center;gap:9px;color:var(--ink)}
+  .brand:hover{text-decoration:none}
+  .brand .dot{color:var(--terra)}
+  .nav .spacer{flex:1}
+  .nav a.back{color:var(--muted);font-weight:600;font-size:.94rem}
+  .hero{padding:44px 22px 10px}
+  .hero h1{font-size:clamp(1.9rem,5vw,2.7rem)}
+  .hero p{color:var(--muted);max-width:680px;margin:0}
+  .kicker{color:var(--terra);font-weight:700;text-transform:uppercase;letter-spacing:.09em;font-size:.76rem;margin-bottom:10px}
+  section{padding:26px 0}
+  .cards{display:grid;grid-template-columns:repeat(5,1fr);gap:14px}
+  @media(max-width:860px){.cards{grid-template-columns:repeat(3,1fr)}}
+  @media(max-width:520px){.cards{grid-template-columns:repeat(2,1fr)}}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:16px 18px;box-shadow:var(--shadow)}
+  .card .lbl{font-size:.8rem;font-weight:700;color:var(--faint);text-transform:uppercase;letter-spacing:.06em}
+  .card .big{font-family:var(--serif);font-size:2rem;font-weight:700;line-height:1.1;margin:6px 0 2px}
+  .card .small{font-size:.86rem;color:var(--muted)}
+  .card.accent{background:var(--terra);border-color:var(--terra)}
+  .card.accent .lbl,.card.accent .small{color:#f6e2cf}
+  .card.accent .big{color:#fff8ef}
+  .panel{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:22px 22px 18px;box-shadow:var(--shadow)}
+  .panel h2{font-size:1.35rem}
+  .panel .sub{color:var(--muted);font-size:.9rem;margin:-2px 0 14px}
+  .legend{display:flex;gap:16px;font-size:.84rem;color:var(--muted);margin-bottom:8px;flex-wrap:wrap}
+  .legend i{display:inline-block;width:11px;height:11px;border-radius:3px;margin-right:6px;vertical-align:-1px}
+  svg.chart{width:100%;height:auto;display:block;overflow:visible}
+  svg.chart text{font-size:11px;fill:var(--faint);font-family:inherit}
+  svg.chart .bar{fill:var(--terra)}
+  svg.chart .bar2{fill:var(--terra-tint)}
+  svg.chart .bar:hover,svg.chart g:hover .bar{fill:var(--terra-dark)}
+  svg.chart .grid{stroke:var(--line-soft);stroke-width:1}
+  .two{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+  @media(max-width:760px){.two{grid-template-columns:1fr}}
+  .rows{list-style:none;margin:0;padding:0;display:grid;gap:9px}
+  .rows li{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px 12px;align-items:center}
+  .rows .name{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-weight:600}
+  .rows .num{font-variant-numeric:tabular-nums;color:var(--muted);font-size:.92rem}
+  .rows .track{grid-column:1/-1;height:7px;background:var(--paper-2);border-radius:99px;overflow:hidden;border:1px solid var(--line-soft)}
+  .rows .fill{height:100%;background:linear-gradient(90deg,var(--terra-soft),var(--terra));border-radius:99px}
+  .empty{color:var(--faint);font-size:.92rem;padding:8px 0}
+  .note{font-size:.85rem;color:var(--muted);background:var(--paper-2);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
+  footer{padding:20px 0 56px;color:var(--muted);font-size:.88rem}
+  #state{padding:40px 0;text-align:center;color:var(--muted)}
+</style>
+</head>
+<body>
+
+<header class="nav">
+  <div class="wrap">
+    <a class="brand" href="https://telemax.svnest.ru/">
+      <img src="../icon.png" alt="Telemax" width="30" height="30" style="border-radius:8px;display:block">
+      <span>Tele<span class="dot">max</span></span>
+    </a>
+    <span class="spacer"></span>
+    <a class="back" href="https://telemax.svnest.ru/">← На главную</a>
+  </div>
+</header>
+
+<main class="wrap" style="padding:0">
+  <div class="hero">
+    <div class="kicker">Открытая статистика</div>
+    <h1>Посещения сайта</h1>
+    <p>Сколько людей заходит на сайт Telemax, когда и откуда. Считаем без cookie и сторонних счётчиков, IP-адреса не храним.</p>
+  </div>
+
+  <div id="state" class="wrap">Загружаю статистику…</div>
+
+  <div id="content" hidden>
+    <section class="wrap">
+      <div class="cards" id="cards"></div>
+    </section>
+
+    <section class="wrap">
+      <div class="panel">
+        <h2>За 30 дней</h2>
+        <div class="legend"><span><i style="background:var(--terra)"></i>посетители</span><span><i style="background:var(--terra-tint)"></i>просмотры</span></div>
+        <div id="daysChart"></div>
+      </div>
+    </section>
+
+    <section class="wrap">
+      <div class="panel">
+        <h2>Когда заходят</h2>
+        <p class="sub">Просмотры по часам за 30 дней, время московское</p>
+        <div id="hoursChart"></div>
+      </div>
+    </section>
+
+    <section class="wrap">
+      <div class="two">
+        <div class="panel">
+          <h2>Страны</h2>
+          <p class="sub">Посетители за 30 дней</p>
+          <ul class="rows" id="countries"></ul>
+        </div>
+        <div class="panel">
+          <h2>Откуда приходят</h2>
+          <p class="sub">Посетители за 30 дней</p>
+          <ul class="rows" id="sources"></ul>
+        </div>
+      </div>
+    </section>
+
+    <section class="wrap">
+      <div class="note">
+        <b>Как считаем.</b> Страница сайта при открытии сообщает только адрес страницы, с которой вы пришли.
+        Сервер сразу раскладывает это по счётчикам — день, час, страна, источник — и ничего больше не хранит:
+        ни IP-адресов, ни cookie. Посетитель — это уникальный человек за день: того, кто зашёл и вчера, и сегодня, посчитаем дважды.
+        Страны определяются по базе <a href="https://db-ip.com">IP Geolocation by DB-IP</a> (CC BY 4.0).
+        <span id="sites"></span>
+      </div>
+    </section>
+  </div>
+</main>
+
+<footer>
+  <div class="wrap">
+    <span id="updated"></span>
+    · <a href="https://telemax.svnest.ru/">Telemax — мост MAX ↔ Telegram</a>
+    · <a href="https://github.com/Trollobot/Telemax">GitHub</a>
+  </div>
+</footer>
+
+<script>
+(function () {
+  var API = location.hostname === 'telemax.svnest.ru' || location.hostname === 'localhost' || location.hostname === '127.0.0.1'
+    ? '/api/site/stats'
+    : 'https://telemax.svnest.ru/api/site/stats';
+  var NS = 'http://www.w3.org/2000/svg';
+  var fmt = new Intl.NumberFormat('ru-RU');
+  var regionNames = (function () { try { return new Intl.DisplayNames(['ru'], { type: 'region' }); } catch (e) { return null; } })();
+  var SOURCES = {
+    direct: 'Прямой заход', 'habr.com': 'Хабр', 'vc.ru': 'vc.ru', 'github.com': 'GitHub', telegram: 'Telegram',
+    google: 'Google', yandex: 'Яндекс', bing: 'Bing', duckduckgo: 'DuckDuckGo', other: 'Другие сайты'
+  };
+  var SITES = { 'telemax.svnest.ru': 'telemax.svnest.ru', 'trollobot.github.io': 'копия на GitHub Pages' };
+
+  function plural(n, one, few, many) {
+    var m10 = n % 10, m100 = n % 100;
+    if (m10 === 1 && m100 !== 11) return one;
+    if (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14)) return few;
+    return many;
+  }
+  function el(tag, attrs, text) {
+    var e = document.createElement(tag);
+    for (var k in attrs || {}) e.setAttribute(k, attrs[k]);
+    if (text != null) e.textContent = text;
+    return e;
+  }
+  function svg(tag, attrs) {
+    var e = document.createElementNS(NS, tag);
+    for (var k in attrs || {}) e.setAttribute(k, attrs[k]);
+    return e;
+  }
+  function flag(code) {
+    if (!/^[A-Z]{2}$/.test(code)) return '🌐';
+    return String.fromCodePoint(0x1f1e6 + code.charCodeAt(0) - 65, 0x1f1e6 + code.charCodeAt(1) - 65);
+  }
+  function countryName(code) {
+    if (!/^[A-Z]{2}$/.test(code)) return 'Не определено';
+    try { return (regionNames && regionNames.of(code)) || code; } catch (e) { return code; }
+  }
+  function dayLabel(d) {
+    var p = d.split('-');
+    return Number(p[2]) + '.' + p[1];
+  }
+
+  function card(label, part, accent) {
+    var c = el('div', { class: 'card' + (accent ? ' accent' : '') });
+    c.appendChild(el('div', { class: 'lbl' }, label));
+    c.appendChild(el('div', { class: 'big' }, fmt.format(part.visitors)));
+    c.appendChild(el('div', { class: 'small' }, plural(part.visitors, 'посетитель', 'посетителя', 'посетителей') + ' · ' + fmt.format(part.views) + ' ' + plural(part.views, 'просмотр', 'просмотра', 'просмотров')));
+    return c;
+  }
+
+  /** A top for the axis that splits into four round steps (0, 15, 30, 45, 60 — not 12.5). */
+  function niceMax(v) {
+    var step = Math.max(1, Math.ceil(v / 4));
+    if (step > 10) {
+      var half = Math.pow(10, Math.floor(Math.log10(step))) / 2;
+      step = Math.ceil(step / half) * half;
+    }
+    return step * 4;
+  }
+
+  /** Bars: items [{label, a, b?, title}] — a = main bar, b = the lighter one behind it. */
+  function barChart(items, opts) {
+    var W = 900, H = opts.height || 220, L = 34, B = 26, T = 8;
+    var max = niceMax(Math.max.apply(null, items.map(function (x) { return Math.max(x.a, x.b || 0); }).concat([1])));
+    var s = svg('svg', { class: 'chart', viewBox: '0 0 ' + W + ' ' + H, role: 'img' });
+    var plotW = W - L - 4, plotH = H - B - T;
+    for (var g = 0; g <= 4; g++) {
+      var y = T + plotH - (plotH * g) / 4;
+      s.appendChild(svg('line', { class: 'grid', x1: L, x2: W - 4, y1: y, y2: y }));
+      var t = svg('text', { x: L - 6, y: y + 4, 'text-anchor': 'end' });
+      t.textContent = fmt.format(Math.round((max * g) / 4));
+      s.appendChild(t);
+    }
+    var step = plotW / items.length, bw = Math.max(3, step * 0.62);
+    items.forEach(function (it, i) {
+      var x = L + i * step + (step - bw) / 2;
+      var grp = svg('g');
+      var title = svg('title');
+      title.textContent = it.title;
+      grp.appendChild(title);
+      if (it.b != null) {
+        var hb = (plotH * it.b) / max;
+        grp.appendChild(svg('rect', { class: 'bar2', x: x, y: T + plotH - hb, width: bw, height: hb, rx: 3 }));
+      }
+      var ha = (plotH * it.a) / max;
+      grp.appendChild(svg('rect', { class: 'bar', x: x + (it.b != null ? bw * 0.18 : 0), y: T + plotH - ha, width: it.b != null ? bw * 0.64 : bw, height: ha, rx: 3 }));
+      grp.appendChild(svg('rect', { x: L + i * step, y: T, width: step, height: plotH, fill: 'transparent' }));
+      s.appendChild(grp);
+      if (it.label) {
+        var lt = svg('text', { x: L + i * step + step / 2, y: H - 8, 'text-anchor': 'middle' });
+        lt.textContent = it.label;
+        s.appendChild(lt);
+      }
+    });
+    return s;
+  }
+
+  function rows(ul, list, nameOf, iconOf) {
+    ul.textContent = '';
+    if (!list.length) {
+      ul.appendChild(el('li', { class: 'empty' }, 'Пока пусто'));
+      return;
+    }
+    var max = list[0][1] || 1;
+    list.forEach(function (r) {
+      var li = el('li');
+      li.appendChild(el('span', { class: 'name' }, (iconOf ? iconOf(r[0]) + ' ' : '') + nameOf(r[0])));
+      li.appendChild(el('span', { class: 'num' }, fmt.format(r[1])));
+      var track = el('div', { class: 'track' });
+      var fill = el('div', { class: 'fill' });
+      fill.style.width = Math.max(2, (100 * r[1]) / max) + '%';
+      track.appendChild(fill);
+      li.appendChild(track);
+      ul.appendChild(li);
+    });
+  }
+
+  function render(d) {
+    var cards = document.getElementById('cards');
+    cards.appendChild(card('Сегодня', d.today, true));
+    cards.appendChild(card('Вчера', d.yesterday));
+    cards.appendChild(card('7 дней', d.last7));
+    cards.appendChild(card('30 дней', d.last30));
+    cards.appendChild(card('С ' + dayLabel(d.since) + '.' + d.since.slice(0, 4), d.total));
+
+    var n = d.days.length;
+    document.getElementById('daysChart').appendChild(barChart(d.days.map(function (x, i) {
+      return {
+        label: i % 5 === (n - 1) % 5 ? dayLabel(x.d) : '',
+        a: x.visitors, b: x.views,
+        title: dayLabel(x.d) + ': ' + fmt.format(x.visitors) + ' ' + plural(x.visitors, 'посетитель', 'посетителя', 'посетителей') + ', ' + fmt.format(x.views) + ' ' + plural(x.views, 'просмотр', 'просмотра', 'просмотров')
+      };
+    }), { height: 230 }));
+
+    document.getElementById('hoursChart').appendChild(barChart(d.hours.map(function (v, h) {
+      return { label: h % 3 === 0 ? String(h).padStart(2, '0') : '', a: v, title: String(h).padStart(2, '0') + ':00–' + String(h).padStart(2, '0') + ':59 — ' + fmt.format(v) + ' ' + plural(v, 'просмотр', 'просмотра', 'просмотров') };
+    }), { height: 190 }));
+
+    rows(document.getElementById('countries'), d.countries, countryName, flag);
+    rows(document.getElementById('sources'), d.sources, function (k) { return SOURCES[k] || k; });
+
+    var sites = d.sites.filter(function (s) { return SITES[s[0]]; });
+    if (sites.length > 1) {
+      document.getElementById('sites').textContent = ' Просмотры по адресам за 30 дней: ' + sites.map(function (s) { return SITES[s[0]] + ' — ' + fmt.format(s[1]); }).join(', ') + '.';
+    }
+    document.getElementById('updated').textContent = 'Обновлено ' + new Date(d.updatedAt).toLocaleString('ru-RU', { timeZone: 'Europe/Moscow', day: 'numeric', month: 'long', hour: '2-digit', minute: '2-digit' }) + ' (МСК)';
+    document.getElementById('state').hidden = true;
+    document.getElementById('content').hidden = false;
+  }
+
+  fetch(API, { cache: 'no-store' })
+    .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+    .then(render)
+    .catch(function () { document.getElementById('state').textContent = 'Статистика сейчас недоступна — попробуйте обновить страницу чуть позже.'; });
+})();
+</script>
+</body>
+</html>
