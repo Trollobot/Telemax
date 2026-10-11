@@ -1,4 +1,5 @@
 User-agent: *
 Allow: /
 
+# Краткая справка о проекте для нейросетей: https://telemax.svnest.ru/llms.txt
 Sitemap: https://telemax.svnest.ru/sitemap.xml
