@@ -12,6 +12,7 @@ import { formatBytes } from './status.js';
 import { uploadFileFromDiskToMax } from './upload.js';
 import { isTransientHttpStatus, isTransientNetworkError, TransientDownloadError } from './transient.js';
 import { reportError } from './telemetry.js';
+import { keepPanelBack } from './panelBack.js';
 
 /**
  * What the topic is told about a failure: MAX's own answers are readable Russian and stay as they
@@ -62,8 +63,8 @@ export interface BigFiles {
   offerUpload(p: { maxChatId: string; topicId: number; telegramMessageId: number; caption?: string; name?: string; size?: number }): Promise<void>;
   /** MAX → Telegram: a FILE over the bot upload limit — save it and post a download link. */
   relayFromMax(att: MaxAttachment, ctx: DownloadContext, opts: SendOpts): Promise<SentMessage>;
-  /** The panel's «📤 Загрузить файл»: an upload link into the server's own store, posted in General. */
-  offerStore(): Promise<void>;
+  /** The panel's «📤 Загрузить файл»: an upload link into the server's own store, drawn in the panel message. */
+  offerStore(panelMessageId: number): Promise<void>;
   /** The panel's «📤 Отправить в MAX»: a stored file that didn't make it, sent again from disk. */
   resendToMax(id: string): Promise<{ ok: boolean; text: string }>;
 }
@@ -117,8 +118,10 @@ export function createBigFiles({ bot, max, targetGroupId, fileShare, onSentToMax
   // --- Telegram → MAX -------------------------------------------------------------------------
 
   const CANCEL = 'tlmx_panel:fcancel:';
-  const uploadKeyboard = (url: string, token: string) =>
-    Markup.inlineKeyboard([[Markup.button.url('📤 Загрузить файл', url)], [Markup.button.callback('✖️ Отменить', CANCEL + token)]]);
+  const uploadRows = (url: string, token: string) => [[Markup.button.url('📤 Загрузить файл', url)], [Markup.button.callback('✖️ Отменить', CANCEL + token)]];
+  const uploadKeyboard = (url: string, token: string) => Markup.inlineKeyboard(uploadRows(url, token));
+  /** The way back to «📁 Файлы» for everything the file exchange draws in the panel message. */
+  const TO_FILES = [Markup.button.callback('◀️ К файлам', 'tlmx_panel:files')];
 
   async function offerUpload(p: Parameters<BigFiles['offerUpload']>[0]): Promise<void> {
     const fromTelegram = p.name != null && p.size != null;
@@ -186,43 +189,48 @@ export function createBigFiles({ bot, max, targetGroupId, fileShare, onSentToMax
     if (ticket) logger.info(`Upload link for «${ticket.name || 'any file'}» cancelled`);
     if (ticket) await fileShare.dropTicket(ticket.token);
     const text = (ctx.callbackQuery.message as { text?: string } | undefined)?.text;
-    await ctx.editMessageText(ticket || !text ? '✖️ Загрузка отменена — ссылка больше не работает.' : text).catch(() => {});
+    // In the panel (the file exchange) the cancelled link keeps «◀️ К файлам».
+    await ctx.editMessageText(ticket || !text ? '✖️ Загрузка отменена — ссылка больше не работает.' : text, keepPanelBack(ctx)).catch(() => {});
   });
 
-  async function offerStore(): Promise<void> {
+  /**
+   * The panel's «📤 Загрузить файл», drawn IN the panel message: the admin is looking at the panel,
+   * and a link posted at the bottom of the chat went unseen (2026-10-11). The finished upload lands
+   * in the same message, with «◀️ К файлам».
+   */
+  async function offerStore(panelId: number): Promise<void> {
+    const show = (text: string, rows: ReturnType<typeof uploadRows> = []) => edit(panelId, 0, text, Markup.inlineKeyboard([...rows, TO_FILES]));
     if (!fileShare.enabled) {
-      await send('⚠️ Пересылка больших файлов отключена в настройках (FILES=off).', {});
+      await show('⚠️ Пересылка больших файлов отключена в настройках (FILES=off).');
       return;
     }
     const room = await fileShare.roomFor(1);
     if (!room.fits) {
-      await send(`⚠️ Загрузить файл не выйдет: на сервере свободно ${formatBytes(room.freeBytes)}, а ${reserveText} нужно оставить для обновлений.`, {});
+      await show(`⚠️ Загрузить файл не выйдет: на сервере свободно ${formatBytes(room.freeBytes)}, а ${reserveText} нужно оставить для обновлений.`);
       return;
     }
-    const prompt = await send('⏳ Готовлю ссылку для загрузки файла на сервер…', {});
+    await show('⏳ Готовлю ссылку для загрузки файла на сервер…');
     const ticket = await fileShare.createUploadTicket({
       purpose: 'store',
       maxChatId: '',
       topicId: 0,
-      telegramMessageId: prompt.message_id,
+      telegramMessageId: panelId,
       name: '',
       expectedSize: 0,
-      promptMessageId: prompt.message_id,
+      promptMessageId: panelId,
     });
     logger.info('Panel: offering an upload link into the server store');
     const svc = await fileShare.ensureService();
     if (!svc.ok) {
       report('service', svc.reason);
       await fileShare.dropTicket(ticket.token);
-      await edit(prompt.message_id, 0, `⚠️ Ссылку для загрузки подготовить не удалось — ${svc.reason}.`);
+      await show(`⚠️ Ссылку для загрузки подготовить не удалось — ${svc.reason}.`);
       return;
     }
-    await edit(
-      prompt.message_id,
-      0,
-      `📤 Загрузите файл по ссылке — он сохранится на вашем сервере, а ссылку для скачивания я пришлю сюда же. Ею можно делиться где угодно.
+    await show(
+      `📤 Загрузите файл по ссылке — он сохранится на вашем сервере, а ссылка для скачивания появится здесь же. Ею можно делиться где угодно.
 Ссылка на загрузку действует до ${formatExpiry(ticket.expiresAt)}.`,
-      uploadKeyboard(`${svc.url}/f/${ticket.token}`, ticket.token),
+      uploadRows(`${svc.url}/f/${ticket.token}`, ticket.token),
     );
   }
 
@@ -234,7 +242,7 @@ export function createBigFiles({ bot, max, targetGroupId, fileShare, onSentToMax
       const svc = await fileShare.ensureService(30_000);
       const until = formatExpiry(file.expiresAt);
       if (!svc.ok) {
-        await edit(ticket.promptMessageId, 0, `✅ Файл ${label} на сервере до ${until}. Ссылку можно взять в пульте → 📁 Файлы.`);
+        await edit(ticket.promptMessageId, 0, `✅ Файл ${label} на сервере до ${until}. Ссылку можно взять в пульте → 📁 Файлы.`, Markup.inlineKeyboard([TO_FILES]));
         return;
       }
       await edit(
@@ -243,7 +251,7 @@ export function createBigFiles({ bot, max, targetGroupId, fileShare, onSentToMax
         `✅ Файл ${label} на сервере до ${until}.
 🔗 ${svc.url}/f/${file.token}
 Ссылкой можно делиться — по ней откроется страница со скачиванием. Продлить или удалить — в пульте → 📁 Файлы.`,
-        Markup.inlineKeyboard([Markup.button.url('⬇️ Скачать', `${svc.url}/f/${file.token}`)]),
+        Markup.inlineKeyboard([[Markup.button.url('⬇️ Скачать', `${svc.url}/f/${file.token}`)], TO_FILES]),
       );
       return;
     }

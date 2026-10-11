@@ -29,6 +29,7 @@ import { createBigFiles } from './bigFiles.js';
 import { canRenderAnimatedStickers } from './lottie.js';
 import { reportBridgeError } from './errorReporter.js';
 import { wireControlPanel, type PauseControl } from './panel.js';
+import { keepPanelBack } from './panelBack.js';
 import { createBugReports, isBugReportInboxEnabled, BUGREPORT_BOT_HANDLE, type BugReports } from './bugReports.js';
 import { createMaxAuthFlow, type MaxAuthCallbacks } from './maxAuthFlow.js';
 import { createTelemetry } from './telemetry.js';
@@ -2631,9 +2632,11 @@ export function wireBridge({
     // A fresh /version still shows a live «Обновить» button mid-update (the container isn't
     // rebuilt yet). update-requested = queued for the host watcher; update-in-progress = update.sh
     // is running. flock in update-watcher.sh is the hard backstop; this is the friendly heads-up.
+    // Pressed in the panel, the result keeps its «◀️ Назад» (keepPanelBack).
+    const back = keepPanelBack(ctx);
     if ((await markerActive(UPDATE_REQUESTED_MARKER)) || (await markerActive(UPDATE_IN_PROGRESS_MARKER))) {
       await ctx.answerCbQuery('Обновление уже идёт');
-      await ctx.editMessageText('⏳ Обновление уже запущено — дождитесь сообщения о завершении.').catch(() => {});
+      await ctx.editMessageText('⏳ Обновление уже запущено — дождитесь сообщения о завершении.', back).catch(() => {});
       return;
     }
     // The marker is consumed only by the host dispatcher (absent when setup.sh ran without root):
@@ -2641,17 +2644,17 @@ export function wireBridge({
     if (!(await watcherAlive())) {
       await ctx.answerCbQuery('Автообновление не настроено');
       await ctx
-        .editMessageText('⚠️ Автообновление на этом мосту не настроено — запрос некому выполнить.\nОбновите на сервере:  cd <каталог моста> && ./update.sh\n(автообновление ставится запуском ./setup.sh от root)')
+        .editMessageText('⚠️ Автообновление на этом мосту не настроено — запрос некому выполнить.\nОбновите на сервере:  cd <каталог моста> && ./update.sh\n(автообновление ставится запуском ./setup.sh от root)', back)
         .catch(() => {});
       return;
     }
     await ctx.answerCbQuery('Обновление запрошено');
     try {
       await writeFile(UPDATE_REQUESTED_MARKER, new Date().toISOString(), 'utf8');
-      await ctx.editMessageText('⏳ Обновление запрошено — история переписки не затрагивается.');
+      await ctx.editMessageText('⏳ Обновление запрошено — история переписки не затрагивается.', back);
     } catch (err) {
       logger.error('Failed to write update-requested marker', err);
-      await ctx.editMessageText('❌ Не удалось запросить обновление — смотрите логи контейнера.');
+      await ctx.editMessageText('❌ Не удалось запросить обновление — смотрите логи контейнера.', back);
     }
   });
 
@@ -2700,7 +2703,7 @@ export function wireBridge({
 
   bot.action('tlmx_dismiss', async (ctx) => {
     await ctx.answerCbQuery('Ок');
-    await ctx.editMessageText('⏰ Отложено — напомню при следующей ежедневной проверке.');
+    await ctx.editMessageText('⏰ Отложено — напомню при следующей ежедневной проверке.', keepPanelBack(ctx));
   });
 
   // /ban — mute a MAX chat: its messages stop being mirrored and its topic is deleted. Persistent,
@@ -2729,7 +2732,7 @@ export function wireBridge({
       await deleteTopic(mapping.telegramTopicId, '/ban');
     }
     await ctx.answerCbQuery('Забанен');
-    await ctx.editMessageText(`🚫 Забанен: ${mapping?.title ?? maxChatId}. Сообщения больше не приходят. Вернуть — /unban.`).catch(() => {});
+    await ctx.editMessageText(`🚫 Забанен: ${mapping?.title ?? maxChatId}. Сообщения больше не приходят. Вернуть — /unban.`, keepPanelBack(ctx)).catch(() => {});
   });
 
   // /unban — flips the flag; the topic comes back on the next incoming message from that chat.
@@ -2752,7 +2755,7 @@ export function wireBridge({
     const mapping = await chatMapStore.getByMaxChatId(maxChatId);
     await chatMapStore.setBanned(maxChatId, false);
     await ctx.answerCbQuery('Разбанен');
-    await ctx.editMessageText(`♻️ Разбанен: ${mapping?.title ?? maxChatId}. Тема вернётся при следующем сообщении от него.`).catch(() => {});
+    await ctx.editMessageText(`♻️ Разбанен: ${mapping?.title ?? maxChatId}. Тема вернётся при следующем сообщении от него.`, keepPanelBack(ctx)).catch(() => {});
   });
 
   // --- Control panel (src/bridge/panel.ts): a pinned inline-button menu in General. The leaves
@@ -2831,7 +2834,7 @@ export function wireBridge({
     pause,
     files: fileShare,
     resendToMax: (id) => bigFiles.resendToMax(id),
-    offerStore: () => bigFiles.offerStore(),
+    offerStore: (panelMessageId) => bigFiles.offerStore(panelMessageId),
     // Warm-cache name lookup (buildRoster already fetched the profiles); undefined on a miss lets
     // the panel fall back to CONTACT_INFO.
     resolveContactName: (uid) => {
@@ -2865,28 +2868,23 @@ export function wireBridge({
       });
     },
     leaves: {
-      sendHelp: (chatId) => bot.telegram.sendMessage(chatId, buildHelpText()).then(() => {}),
-      sendVersion: async (chatId) => {
+      help: async () => ({ text: buildHelpText(), rows: [] }),
+      version: async () => {
         const { text, replyMarkup } = formatVersionMessage(await checkVersion());
-        await bot.telegram.sendMessage(chatId, text, { reply_markup: replyMarkup });
+        return { text, rows: replyMarkup?.inline_keyboard ?? [] };
       },
-      sendBanList: async (chatId) => {
+      banList: async () => {
         const active = (await chatMapStore.list()).filter((m) => !m.banned);
-        if (active.length === 0) {
-          await bot.telegram.sendMessage(chatId, 'Нет активных чатов для бана.');
-          return;
-        }
-        const buttons = active.slice(0, 90).map((m) => Markup.button.callback(m.title || `MAX chat ${m.maxChatId}`, `tlmx_ban:${m.maxChatId}`));
-        await bot.telegram.sendMessage(chatId, '🚫 Кого забанить?', { reply_markup: Markup.inlineKeyboard(buttons, { columns: 1 }).reply_markup });
+        if (active.length === 0) return { text: 'Нет активных чатов для бана.', rows: [] };
+        return {
+          text: '🚫 Кого забанить? Сообщения от выбранного чата приходить перестанут, его тема удалится.',
+          rows: active.slice(0, 90).map((m) => [Markup.button.callback(m.title || `MAX chat ${m.maxChatId}`, `tlmx_ban:${m.maxChatId}`)]),
+        };
       },
-      sendUnbanList: async (chatId) => {
+      unbanList: async () => {
         const banned = (await chatMapStore.list()).filter((m) => m.banned);
-        if (banned.length === 0) {
-          await bot.telegram.sendMessage(chatId, 'Забаненных чатов нет.');
-          return;
-        }
-        const buttons = banned.slice(0, 90).map((m) => Markup.button.callback(m.title || `MAX chat ${m.maxChatId}`, `tlmx_unban:${m.maxChatId}`));
-        await bot.telegram.sendMessage(chatId, '♻️ Кого разбанить?', { reply_markup: Markup.inlineKeyboard(buttons, { columns: 1 }).reply_markup });
+        if (banned.length === 0) return { text: 'Забаненных чатов нет.', rows: [] };
+        return { text: '♻️ Кого разбанить?', rows: banned.slice(0, 90).map((m) => [Markup.button.callback(m.title || `MAX chat ${m.maxChatId}`, `tlmx_unban:${m.maxChatId}`)]) };
       },
     },
   });

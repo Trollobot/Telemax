@@ -1,6 +1,7 @@
 import path from 'node:path';
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { Markup, type Telegraf, type Context } from 'telegraf';
+import type { InlineKeyboardButton } from 'telegraf/types';
 import type { MaxClient, MaxContactInfo } from '../max/client.js';
 import { getAppVersion } from './version.js';
 import { formatBytes, maskPhone } from './status.js';
@@ -11,8 +12,9 @@ import type { FileShare, StoredFile } from './fileShare.js';
 
 const logger = createLogger('panel');
 
-/** Sends one of the reused command outputs (help, version, ban/unban list) to a chat. */
-type LeafSender = (chatId: number) => Promise<void>;
+/** One of the reused command outputs (help, version, ban/unban list): text plus its own button rows. The panel draws it in place and adds «◀️ Назад». */
+export type LeafView = { text: string; rows: InlineKeyboardButton[][] };
+type LeafBuilder = () => Promise<LeafView>;
 
 export interface ControlPanelDeps {
   bot: Telegraf;
@@ -20,12 +22,12 @@ export interface ControlPanelDeps {
   max: MaxClient;
   getActivePhone: () => string;
   triggerFullResync: () => Promise<void>;
-  /** Reused slash-command bodies — the panel just triggers the same output. */
+  /** Reused slash-command bodies — the panel shows the same output in its own message. */
   leaves: {
-    sendHelp: LeafSender;
-    sendVersion: LeafSender;
-    sendBanList: LeafSender;
-    sendUnbanList: LeafSender;
+    help: LeafBuilder;
+    version: LeafBuilder;
+    banList: LeafBuilder;
+    unbanList: LeafBuilder;
   };
   /** Reuses or creates a MAX dialog with the contact and its Telegram topic; returns a deep link to open it. */
   startDialog: (
@@ -42,8 +44,8 @@ export interface ControlPanelDeps {
   pause: PauseControl;
   /** Big files kept for download links — the «📁 Файлы» section. */
   files?: FileShare;
-  /** «📤 Загрузить файл»: an upload link into the server store, posted in General (bigFiles.ts). */
-  offerStore?: () => Promise<void>;
+  /** «📤 Загрузить файл»: an upload link into the server store, drawn in the panel message (bigFiles.ts). */
+  offerStore?: (panelMessageId: number) => Promise<void>;
   /** «📤 Отправить в MAX» for a stored file that didn't make it (bigFiles.ts). */
   resendToMax?: (id: string) => Promise<{ ok: boolean; text: string }>;
 }
@@ -433,7 +435,8 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
   });
   bot.action('tlmx_panel:fupload', async (ctx) => {
     await ctx.answerCbQuery('Готовлю ссылку для загрузки…').catch(() => {});
-    if (offerStore) void offerStore().catch((err) => logger.error('Panel store upload failed', err));
+    const panelId = ctx.callbackQuery.message?.message_id;
+    if (offerStore && panelId != null) void offerStore(panelId).catch((err) => logger.error('Panel store upload failed', err));
   });
   bot.action(/^tlmx_panel:fdel:(.+)$/, async (ctx) => {
     const name = files?.get(ctx.match[1] ?? '')?.name;
@@ -448,22 +451,35 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
     await ctx.deleteMessage().catch(() => {});
   });
 
-  // --- Leaves that spawn their own message (reuse the slash-command output) -----------
+  // --- Leaves: the slash-command output, drawn IN the panel ---------------------------
+  // The admin is looking at the panel (often scrolled up to the pin): a list or a button posted at
+  // the bottom of the chat went unseen (2026-10-11). «◀️ Назад» returns to the menu, and a press
+  // inside the leaf keeps it (keepPanelBack in panelBack.ts).
+  async function showLeaf(ctx: Context, build: LeafBuilder, back: string): Promise<void> {
+    let view: LeafView;
+    try {
+      view = await build();
+    } catch (err) {
+      logger.error('Panel leaf failed', err);
+      view = { text: '❌ Не получилось — смотрите логи контейнера.', rows: [] };
+    }
+    await edit(ctx, { text: view.text, markup: Markup.inlineKeyboard([...view.rows, [Markup.button.callback('◀️ Назад', back)]]).reply_markup });
+  }
   bot.action('tlmx_panel:help', async (ctx) => {
     await ctx.answerCbQuery();
-    await leaves.sendHelp(chatIdOf(ctx));
+    await showLeaf(ctx, leaves.help, 'tlmx_panel:system');
   });
   bot.action('tlmx_panel:update', async (ctx) => {
-    await ctx.answerCbQuery();
-    await leaves.sendVersion(chatIdOf(ctx));
+    await ctx.answerCbQuery('Проверяю обновления…');
+    await showLeaf(ctx, leaves.version, 'tlmx_panel:system');
   });
   bot.action('tlmx_panel:ban', async (ctx) => {
     await ctx.answerCbQuery();
-    await leaves.sendBanList(chatIdOf(ctx));
+    await showLeaf(ctx, leaves.banList, 'tlmx_panel:chats');
   });
   bot.action('tlmx_panel:unban', async (ctx) => {
     await ctx.answerCbQuery();
-    await leaves.sendUnbanList(chatIdOf(ctx));
+    await showLeaf(ctx, leaves.unbanList, 'tlmx_panel:chats');
   });
   bot.action('tlmx_panel:resync', async (ctx) => {
     // Without a MAX session CHATS_LIST is rejected ("Недопустимое состояние сессии") and the only
