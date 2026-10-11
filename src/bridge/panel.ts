@@ -614,7 +614,12 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
         const contact = await max.searchContactByPhone(phone);
         logger.info(`Phone search ${maskPhone(phone)}: ${contact ? 'found' : 'not found'}`);
         if (!contact) {
-          await bot.telegram.sendMessage(chatId, `❌ Номер ${phone} в MAX не найден.`);
+          // MAX answers the same «not found» when the person limited search by number in their privacy
+          // settings — then nobody can find them, the MAX app included; only a message from them opens the chat.
+          await bot.telegram.sendMessage(
+            chatId,
+            `❌ Номер ${phone} в MAX не найден. Либо его нет в MAX, либо человек ограничил поиск по номеру в настройках приватности. Тогда попросите его написать вам в MAX первым — чат сам появится здесь отдельной темой.`,
+          );
           return;
         }
         await sendCard(chatId, contact);
