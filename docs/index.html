@@ -3,19 +3,65 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Telemax — мост MAX ↔ Telegram: читать MAX в Telegram без телефона</title>
-<meta name="description" content="Telemax — двусторонний open-source мост MAX ↔ Telegram. Подключается к вашему личному MAX-аккаунту (по номеру, а не через бота) и зеркалит все чаты в Telegram. Свой сервер, приватно, без установки MAX на телефон.">
-<meta name="keywords" content="мост MAX Telegram, MAX Telegram bridge, читать MAX в Telegram, MAX без телефона, перенести чаты MAX в Telegram, self-hosted, мессенджер MAX">
+<title>Telemax — мост MAX ↔ Telegram: переписка из MAX прямо в Telegram</title>
+<meta name="description" content="Telemax — бесплатный мост между MAX и Telegram с открытым кодом. Входит в ваш личный аккаунт MAX по номеру и приносит все чаты в Telegram: каждый чат — отдельная тема. Сообщения, файлы до 4 ГБ, реакции, кнопки ботов. Ставится на свой сервер одной командой.">
+<meta name="keywords" content="MAX в Telegram, мост MAX Telegram, Макс в Телеграм, пересылка сообщений из MAX в Telegram, читать MAX в Telegram, MAX Telegram bridge, Telemax">
 <link rel="canonical" href="https://trollobot.github.io/Telemax/">
 <meta property="og:type" content="website">
-<meta property="og:title" content="Telemax — мост MAX ↔ Telegram">
-<meta property="og:description" content="Читайте MAX в Telegram, не держа его на телефоне. Двусторонний open-source мост через ваш личный аккаунт. Свой сервер, полная приватность.">
+<meta property="og:locale" content="ru_RU">
+<meta property="og:site_name" content="Telemax">
+<meta property="og:title" content="Telemax — переписка из MAX прямо в Telegram">
+<meta property="og:description" content="Бесплатный мост MAX ↔ Telegram с открытым кодом: все чаты MAX — темами в вашей группе Telegram. Свой сервер, одна команда для установки.">
 <meta property="og:url" content="https://trollobot.github.io/Telemax/">
-<!-- TODO: положи картинку docs/img/og.png (1200×630) и раскомментируй: -->
-<!-- <meta property="og:image" content="https://trollobot.github.io/Telemax/img/og.png"> -->
+<meta property="og:image" content="https://trollobot.github.io/Telemax/og.png">
+<meta property="og:image:width" content="780">
+<meta property="og:image:height" content="440">
 <meta name="twitter:card" content="summary_large_image">
 <link rel="icon" type="image/png" href="icon.png">
 <link rel="apple-touch-icon" href="icon.png">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "SoftwareApplication",
+  "name": "Telemax",
+  "description": "Бесплатный мост между мессенджерами MAX и Telegram с открытым кодом. Подключается к личному аккаунту MAX по номеру и приносит все чаты в группу Telegram, каждый чат — отдельной темой.",
+  "applicationCategory": "CommunicationApplication",
+  "operatingSystem": "Linux (Ubuntu 22.04+, Debian 12+)",
+  "url": "https://trollobot.github.io/Telemax/",
+  "downloadUrl": "https://github.com/Trollobot/Telemax",
+  "license": "https://www.gnu.org/licenses/agpl-3.0.html",
+  "image": "https://trollobot.github.io/Telemax/og.png",
+  "offers": { "@type": "Offer", "price": "0", "priceCurrency": "RUB" }
+}
+</script>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "FAQPage",
+  "mainEntity": [
+    { "@type": "Question", "name": "Как читать и отвечать на сообщения MAX в Telegram?",
+      "acceptedAnswer": { "@type": "Answer", "text": "Поставьте Telemax на свой сервер и войдите в свой аккаунт MAX через бота. Все чаты MAX появятся в вашей группе Telegram отдельными темами: отвечаете в теме — ответ уходит в MAX от вашего имени." } },
+    { "@type": "Question", "name": "Нужно ли приложение MAX?",
+      "acceptedAnswer": { "@type": "Answer", "text": "Один раз — да: аккаунт MAX регистрируется в приложении, там же ставится пароль. Дальше переписка идёт через Telegram, и приложение можно не открывать." } },
+    { "@type": "Question", "name": "Это бот в MAX или мой аккаунт?",
+      "acceptedAnswer": { "@type": "Answer", "text": "Ваш личный аккаунт: Telemax входит по номеру телефона, поэтому приходят все ваши чаты, а не только те, куда добавлен бот. Со стороны Telegram работает ваш собственный бот." } },
+    { "@type": "Question", "name": "Можно ли начать новый чат из Telegram?",
+      "acceptedAnswer": { "@type": "Answer", "text": "Да: в пульте «Найти контакт» — по номеру в любом виде, по MAX ID или нику бота. Или отправьте в общую тему группы контакт из телефонной книги. Не найдётся только тот, кто закрыл поиск по номеру в настройках приватности MAX, — тогда пусть напишет первым." } },
+    { "@type": "Question", "name": "Передаются ли файлы, голосовые и кружки?",
+      "acceptedAnswer": { "@type": "Answer", "text": "Да, в обе стороны. Файлы больше 50 МБ из MAX приходят ссылкой на ваш сервер, а в MAX можно отправить файл до 4 ГБ через страницу загрузки." } },
+    { "@type": "Question", "name": "Сколько это стоит?",
+      "acceptedAnswer": { "@type": "Answer", "text": "Telemax бесплатный, весь функционал открыт. Платите только за свой сервер — хватит самого простого VPS." } },
+    { "@type": "Question", "name": "Заработает ли на российском VPS?",
+      "acceptedAnswer": { "@type": "Answer", "text": "Да, если с сервера есть связь с Telegram — напрямую или через прокси, который задаётся при установке." } },
+    { "@type": "Question", "name": "Можно ли подключить два аккаунта MAX?",
+      "acceptedAnswer": { "@type": "Answer", "text": "Да: второй мост ставится той же командой в соседний каталог, со своим ботом и своей группой. Автообновление обслуживает все мосты на сервере." } },
+    { "@type": "Question", "name": "Что будет, если GitHub недоступен?",
+      "acceptedAnswer": { "@type": "Answer", "text": "Установка и обновления сами переключатся на зеркало проекта. Каждый релиз подписан, и мост проверяет подпись перед установкой — неважно, откуда пришёл код." } },
+    { "@type": "Question", "name": "Это безопасно?",
+      "acceptedAnswer": { "@type": "Answer", "text": "Код и данные — на вашем сервере, код открыт. Но это не сквозное шифрование: переписка проходит через сервер, поэтому его стоит защищать. Проект неофициальный — используйте на свой страх и риск." } }
+  ]
+}
+</script>
 <style>
   :root{
     --paper:#f5ecd9; --paper-2:#faf4e6; --card:#fffdf8;
@@ -42,8 +88,6 @@
   .btn-primary:hover{background:var(--terra-dark);text-decoration:none}
   .btn-ghost{background:transparent;border-color:var(--line);color:var(--ink)}
   .btn-ghost:hover{border-color:var(--terra);text-decoration:none}
-  .btn-support{background:#fff;border-color:var(--terra);color:var(--terra-dark)}
-  .btn-support:hover{background:var(--terra-tint);text-decoration:none}
   header.nav{position:sticky;top:0;z-index:10;background:rgba(245,236,217,.86);
     backdrop-filter:blur(8px);border-bottom:1px solid var(--line)}
   .nav .wrap{display:flex;align-items:center;gap:16px;height:62px}
@@ -57,10 +101,10 @@
   .chip{display:inline-flex;align-items:center;gap:7px;background:var(--terra-tint);color:var(--terra-dark);
     border:1px solid var(--line);padding:6px 13px;border-radius:999px;font-size:.82rem;font-weight:700;margin-bottom:20px}
   /* hero */
-  .hero{padding:66px 0 44px;text-align:center}
+  .hero{padding:66px 22px 44px;text-align:center}
   .hero h1{font-size:clamp(2.1rem,5.8vw,3.5rem);letter-spacing:-.01em;margin-bottom:.35em}
   .hero h1 .hl{color:var(--terra)}
-  .hero p.lead{font-size:clamp(1.05rem,2.3vw,1.32rem);color:var(--muted);max-width:700px;margin:0 auto 28px}
+  .hero p.lead{font-size:clamp(1.05rem,2.3vw,1.32rem);color:var(--muted);max-width:720px;margin:0 auto 28px}
   .cta{display:flex;gap:12px;justify-content:center;flex-wrap:wrap;margin-bottom:38px}
   .diagram{margin:0 auto;max-width:660px;background:var(--card);border:1px solid var(--line);
     border-radius:var(--radius);box-shadow:var(--shadow);padding:24px}
@@ -72,7 +116,7 @@
   .callout{background:var(--card);border:1px solid var(--line);border-left:5px solid var(--terra);
     border-radius:0 var(--radius) var(--radius) 0;padding:28px 32px;box-shadow:var(--shadow)}
   .callout .vs{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:22px}
-  @media(max-width:560px){.callout .vs{grid-template-columns:1fr}}
+  @media(max-width:560px){.callout .vs{grid-template-columns:1fr}.callout{padding:22px 20px}}
   .vs .c{background:var(--paper-2);border:1px solid var(--line);border-radius:12px;padding:16px 18px;font-size:.95rem;color:var(--muted)}
   .vs .c.good{background:#f2f6e9;border-color:#d3e0bd}
   .vs .tag{font-weight:700;font-size:.85rem;margin-bottom:6px;font-family:var(--serif)}
@@ -87,7 +131,7 @@
   .feat p{color:var(--muted);font-size:.94rem;margin:0}
   /* steps */
   .steps{display:grid;grid-template-columns:repeat(3,1fr);gap:20px;counter-reset:s}
-  @media(max-width:720px){.steps{grid-template-columns:1fr}}
+  @media(max-width:720px){.steps{grid-template-columns:1fr;gap:28px}}
   .step{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:24px 22px 22px;position:relative}
   .step::before{counter-increment:s;content:counter(s);position:absolute;top:-15px;left:22px;
     width:34px;height:34px;border-radius:50%;background:var(--terra);color:#fff8ef;font-weight:800;font-family:var(--serif);
@@ -96,13 +140,20 @@
   .step p{color:var(--muted);margin:0;font-size:.94rem}
   code{background:var(--terra-tint);color:var(--terra-dark);padding:2px 7px;border-radius:6px;
     font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.88em}
-  /* screenshots — mobile (portrait) + web panel (wide) */
-  .phones{display:grid;grid-template-columns:repeat(4,1fr);gap:18px}
-  @media(max-width:760px){.phones{grid-template-columns:repeat(2,1fr);max-width:520px;margin-left:auto;margin-right:auto}}
-  @media(max-width:400px){.phones{grid-template-columns:1fr;max-width:280px}}
-  .phone{margin:0}
-  .phone img{width:100%;display:block;border-radius:16px;border:1px solid var(--line);box-shadow:var(--shadow);background:#0d1117}
-  .phone figcaption{text-align:center;font-size:.86rem;color:var(--muted);margin-top:10px}
+  .cmd{margin:26px 0 0}
+  .cmd .label{font-size:.88rem;color:var(--muted);margin:14px 0 6px}
+  .cmd pre{margin:0;background:#2b2119;color:#f6e6d2;border-radius:12px;padding:14px 16px;overflow-x:auto;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.9rem;line-height:1.5}
+  /* screenshots */
+  .shots{display:grid;grid-template-columns:repeat(2,1fr);gap:22px;align-items:start}
+  @media(max-width:700px){.shots{grid-template-columns:1fr}}
+  .shot{margin:0}
+  .shot.wide{grid-column:1/-1;justify-self:center;width:100%;max-width:640px}
+  .shot img{width:100%;height:auto;display:block;border-radius:14px;border:1px solid var(--line);box-shadow:var(--shadow);background:#0e1621}
+  .shot figcaption{text-align:center;font-size:.88rem;color:var(--muted);margin-top:10px}
+  /* limits */
+  .limits{margin:22px 0 0;padding:0;list-style:none;display:grid;gap:10px}
+  .limits li{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 16px;color:var(--muted)}
   /* support */
   .support-box{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);
     padding:34px;text-align:center;box-shadow:var(--shadow)}
@@ -118,7 +169,7 @@
   details[open] summary::before{content:"－"}
   details p{color:var(--muted);margin:0 0 15px;padding-left:24px}
   footer{padding:44px 0 64px;color:var(--muted);border-top:1px solid var(--line)}
-  footer .links{display:flex;gap:20px;flex-wrap:wrap;margin-bottom:18px}
+  footer .links{display:flex;gap:12px 20px;flex-wrap:wrap;margin-bottom:18px}
   .disc{font-size:.85rem;background:var(--paper-2);border:1px solid var(--line);border-radius:12px;padding:15px 18px}
   .center{text-align:center}
 </style>
@@ -134,7 +185,7 @@
     <span class="spacer"></span>
     <a class="navlink" href="#features">Возможности</a>
     <a class="navlink" href="#how">Установка</a>
-    <a class="navlink" href="#faq">FAQ</a>
+    <a class="navlink" href="#faq">Вопросы</a>
     <a class="navlink" href="https://github.com/Trollobot/Telemax">GitHub</a>
     <a class="navlink support" href="#support">♥ Поддержать</a>
   </div>
@@ -142,17 +193,18 @@
 
 <main>
   <div class="hero wrap">
-    <div class="eye">твоё личное, а не сервис</div>
-    <span class="chip">🔑 личный аккаунт, а не бот</span>
-    <h1>Твой MAX — на твоём сервере,<br>а ты — в <span class="hl">Telegram</span></h1>
+    <div class="eye">бесплатно · открытый код · свой сервер</div>
+    <span class="chip">🔑 ваш личный аккаунт MAX, а не бот</span>
+    <h1>Переписка из MAX —<br>прямо в <span class="hl">Telegram</span></h1>
     <p class="lead">
-      <b>Telemax</b> — двусторонний open-source мост между мессенджером <b>MAX</b> и <b>Telegram</b>.
-      Подключается к вашему <b>личному MAX-аккаунту по номеру</b> (не через бота) и зеркалит все чаты
-      Макса в Telegram. Всё живёт на вашем сервере — по-человечески и приватно.
+      <b>Telemax</b> — бесплатный мост между <b>MAX</b> и <b>Telegram</b> с открытым кодом.
+      Он входит в ваш <b>личный аккаунт MAX по номеру</b> и приносит все чаты в Telegram:
+      каждый чат — отдельная тема в вашей группе. Читаете и отвечаете из привычного Телеграма,
+      а мост работает на вашем сервере.
     </p>
     <div class="cta">
-      <a class="btn btn-primary" href="https://github.com/Trollobot/Telemax">Открыть на GitHub</a>
-      <a class="btn btn-ghost" href="#how">Как установить</a>
+      <a class="btn btn-primary" href="#how">Как установить</a>
+      <a class="btn btn-ghost" href="https://github.com/Trollobot/Telemax">Открыть на GitHub</a>
     </div>
 
     <div class="diagram" aria-label="Схема: MAX ↔ Telemax ↔ Telegram">
@@ -171,14 +223,14 @@
     </div>
   </div>
 
-  <section id="pain" class="alt">
+  <section id="why" class="alt">
     <div class="wrap">
-      <div class="kicker">Знакомо?</div>
-      <h2>MAX ставить не хочется — но приходится</h2>
+      <div class="kicker">Зачем это</div>
+      <h2>Все переписки — в одном мессенджере</h2>
       <p class="sub" style="max-width:760px">
-        Работа, чаты знакомых, школьные группы — и вот на телефоне приложение, которому не доверяешь
-        и которое живёт в фоне, когда захочет. Веб-версия не шлёт пуши, отдельное устройство — лишние деньги.
-        <b>Telemax</b> решает иначе: MAX остаётся на сервере, а ты спокойно читаешь и отвечаешь из привычного Telegram.
+        Работа, школьный чат, родня — в MAX, а всё остальное — в Telegram. Telemax собирает их вместе:
+        сообщения из Макса приходят в Телеграм, а ваши ответы уходят обратно от вашего имени.
+        Не нужно переключаться между приложениями и держать открытыми два мессенджера.
       </p>
     </div>
   </section>
@@ -189,13 +241,13 @@
         <div class="kicker">Главное отличие</div>
         <h2>Личный аккаунт, а не бот</h2>
         <p class="sub" style="margin:0">
-          Telemax заходит вашим <b>личным MAX-аккаунтом по номеру</b> — поэтому в Telegram
-          автоматически приходят <b>все</b> ваши чаты, диалоги и группы. Мостам-ботам это недоступно.
+          Telemax входит вашим <b>личным аккаунтом MAX по номеру</b> — поэтому в Telegram
+          сами приходят <b>все</b> ваши чаты, диалоги и группы. Мостам-ботам это недоступно.
         </p>
         <div class="vs">
           <div class="c good">
             <div class="tag">Telemax — личный аккаунт</div>
-            Все чаты Макса зеркалятся сами. Ничего не надо добавлять в каждый чат. Видишь ровно то же, что видел бы в приложении MAX.
+            Все чаты MAX приходят сами, ничего не нужно добавлять в каждый чат. Видите то же, что видели бы в приложении MAX.
           </div>
           <div class="c bad">
             <div class="tag">Мосты-боты</div>
@@ -211,15 +263,18 @@
       <div class="kicker">Возможности</div>
       <h2>Полноценная переписка в обе стороны</h2>
       <div class="grid" style="margin-top:26px">
-        <div class="feat"><div class="ic">💬</div><h3>Все типы сообщений</h3><p>Текст, фото, файлы, голосовые, видео и кружки, стикеры (в т.ч. анимированные), опросы, гео, контакты — туда и обратно.</p></div>
-        <div class="feat"><div class="ic">🗂️</div><h3>Форум-темы</h3><p>Каждый MAX-чат — отдельная тема в Telegram-группе. Вся переписка в одном окне, аккуратно разложена.</p></div>
-        <div class="feat"><div class="ic">↩️</div><h3>Нативные ответы</h3><p>Reply в обе стороны с переходом к оригиналу. Удаление сообщений — тоже двустороннее.</p></div>
-        <div class="feat"><div class="ic">🎛️</div><h3>Пульт управления</h3><p>Команда <code>/panel</code>: поиск контактов MAX, старт чата в один тап, пауза, бан — всё кнопками.</p></div>
-        <div class="feat"><div class="ic">😀</div><h3>Реакции</h3><p>Эмодзи-реакции синхронизируются между платформами в обе стороны.</p></div>
-        <div class="feat"><div class="ic">🌐</div><h3>Прокси для Telegram</h3><p>SOCKS5/HTTP, если сервер ходит в Telegram только через прокси. MAX при этом идёт напрямую.</p></div>
-        <div class="feat"><div class="ic">🔔</div><h3>Уведомления о сбоях</h3><p>Потеря связи, ошибки доставки — прилетают в группу, с защитой от спама.</p></div>
-        <div class="feat"><div class="ic">⬆️</div><h3>Обновления по кнопке</h3><p>Бот сам сообщает о новом релизе и обновляется по нажатию — история переписки не затрагивается.</p></div>
-        <div class="feat"><div class="ic">🔐</div><h3>Вход в MAX прямо в боте</h3><p>Команда <code>/login</code> в личке: номер, код из SMS и пароль 2FA — в группу они не попадают.</p></div>
+        <div class="feat"><div class="ic">💬</div><h3>Все типы сообщений</h3><p>Текст, фото, видео, файлы, голосовые, кружки, стикеры (и анимированные), опросы, геолокация и контакты — туда и обратно.</p></div>
+        <div class="feat"><div class="ic">🗂️</div><h3>Чат = тема</h3><p>Каждый чат MAX — отдельная тема в группе Telegram. В групповых чатах видно, кто написал, есть список участников и личка в одно нажатие.</p></div>
+        <div class="feat"><div class="ic">↩️</div><h3>Ответы, правки, реакции</h3><p>Ответы с переходом к оригиналу, правки с пометкой, удаление в обе стороны. Реакции тоже синхронизируются.</p></div>
+        <div class="feat"><div class="ic">📁</div><h3>Большие файлы</h3><p>Из MAX больше 50 МБ — кнопкой «⬇️ Скачать» с вашего сервера. В MAX — до 4 ГБ через страницу загрузки, в обход ограничений бота.</p></div>
+        <div class="feat"><div class="ic">📤</div><h3>Свой файлообменник</h3><p>Положите на свой сервер файл любого размера и делитесь ссылкой где угодно. Файл хранится 3 дня от последней ссылки.</p></div>
+        <div class="feat"><div class="ic">🤖</div><h3>Кнопки ботов MAX</h3><p>Ссылки открываются, «Скопировать код» копирует, нажатия уходят боту от вашего имени — как в приложении.</p></div>
+        <div class="feat"><div class="ic">🎛️</div><h3>Пульт управления</h3><p>Команда <code>/panel</code>: поиск по номеру, MAX ID или нику, новый чат в одно нажатие, файлы, статус сервера, пауза и бан чатов.</p></div>
+        <div class="feat"><div class="ic">🔐</div><h3>Вход в MAX в личке бота</h3><p>Номер, код из SMS и пароль вводятся в личных сообщениях бота — в группу они не попадают.</p></div>
+        <div class="feat"><div class="ic">⬆️</div><h3>Обновления по кнопке</h3><p>Бот сам сообщает о новой версии. Релизы подписаны, а если обновление сорвётся — мост вернётся на прежнюю версию.</p></div>
+        <div class="feat"><div class="ic">🔁</div><h3>Ничего не теряется</h3><p>Пропущенное, пока мост был недоступен, догружается само. Сбои связи не сбрасывают вход в MAX.</p></div>
+        <div class="feat"><div class="ic">🌐</div><h3>Прокси для Telegram</h3><p>SOCKS5 или HTTP, если сервер выходит в Telegram только через прокси. MAX при этом идёт напрямую.</p></div>
+        <div class="feat"><div class="ic">🖥️</div><h3>Несколько мостов</h3><p>Второй номер MAX — второй мост на том же сервере, той же командой. Обновляются все сразу.</p></div>
       </div>
     </div>
   </section>
@@ -227,12 +282,16 @@
   <section id="privacy">
     <div class="wrap">
       <div class="kicker">Приватность</div>
-      <h2>Свой сервер. Никакого облака.</h2>
-      <p class="sub" style="max-width:760px">
-        Telemax — <b>self-hosted</b>: код крутится на <b>вашем</b> VPS, с <b>вашим</b> Telegram-ботом.
-        Сообщения идут <b>только через вашу инфраструктуру</b> — никаких сторонних серверов и посредников.
-        В отличие от облачных решений, ваши переписки не проходят через чужие руки. Проект открытый —
-        можно прочитать каждую строчку.
+      <h2>Свой сервер и открытый код</h2>
+      <p class="sub" style="max-width:780px">
+        Telemax работает на <b>вашем</b> сервере с <b>вашим</b> Telegram-ботом: переписка идёт только между MAX,
+        вашим сервером и Telegram. Код открыт под лицензией AGPL-3.0 — можно прочитать каждую строчку.
+        Мост не держит открытых портов: 80 и 443 открываются, только пока живёт ссылка на файл.
+        Установщик предлагает поставить Fail2ban от подбора паролей SSH.
+      </p>
+      <p class="sub" style="max-width:780px;font-size:.94rem">
+        Разработчику уходят только анонимная статистика установок и отчёты об ошибках — без текста переписки,
+        названий чатов и номера телефона. Отключаются одной строкой <code>TELEMETRY=off</code>.
       </p>
     </div>
   </section>
@@ -242,12 +301,17 @@
       <div class="kicker">Установка</div>
       <h2>Три шага — и мост работает</h2>
       <div class="steps" style="margin-top:30px">
-        <div class="step"><h3>Дешёвый VPS</h3><p>Любой сервер на Ubuntu 22.04+ или Debian 12+ — подойдёт самый бюджетный.</p></div>
-        <div class="step"><h3>Свой бот в Telegram</h3><p>Создаёте бота в <code>@BotFather</code> и вставляете токен при установке. Бот ваш.</p></div>
-        <div class="step"><h3>setup.sh и /login</h3><p>Скрипт сам найдёт группу и поднимет мост, а номер и код из SMS вы введёте боту в личке командой <code>/login</code>. Дальше всё в Telegram.</p></div>
+        <div class="step"><h3>Сервер</h3><p>VPS на Ubuntu 22.04+ или Debian 12+. Хватит и меньше 1 ГБ памяти и 3 ГБ свободного места.</p></div>
+        <div class="step"><h3>Бот и группа</h3><p>Бот в <code>@BotFather</code>, группа с включёнными темами, бот в ней — администратор с правом «Управление темами».</p></div>
+        <div class="step"><h3>Одна команда</h3><p>Запустите от root команду ниже, затем <code>/login</code> в личке бота — и чаты MAX начнут появляться в группе.</p></div>
+      </div>
+      <div class="cmd">
+        <pre>curl -fsSL https://raw.githubusercontent.com/Trollobot/Telemax/main/install.sh | bash</pre>
+        <div class="label">Если GitHub с сервера недоступен — та же установка с зеркала:</div>
+        <pre>curl -fsSL https://zergont-gate.duckdns.org/install.sh | bash</pre>
       </div>
       <p class="center" style="margin-top:32px">
-        <a class="btn btn-primary" href="https://github.com/Trollobot/Telemax#быстрый-старт">Инструкция по установке</a>
+        <a class="btn btn-primary" href="https://github.com/Trollobot/Telemax#быстрый-старт">Подробная инструкция</a>
       </p>
     </div>
   </section>
@@ -256,12 +320,46 @@
     <div class="wrap">
       <div class="kicker">Как это выглядит</div>
       <h2>Скриншоты</h2>
-      <p class="sub" style="margin:.2em 0 22px">В Telegram каждый MAX-чат становится темой — вся переписка в одном окне:</p>
-      <div class="phones">
-        <figure class="phone"><img src="topics.png" alt="Telegram-группа с форум-темами: каждый MAX-чат — своя тема" loading="lazy"><figcaption>Форум-темы: чат = тема</figcaption></figure>
-        <figure class="phone"><img src="panel.png" alt="Пульт управления /panel с кнопками в Telegram" loading="lazy"><figcaption>Пульт /panel</figcaption></figure>
-        <figure class="phone"><img src="search.png" alt="Поиск контакта MAX по номеру или нику" loading="lazy"><figcaption>Поиск контакта</figcaption></figure>
-        <figure class="phone"><img src="contact.png" alt="Карточка контакта, закреплённая в теме" loading="lazy"><figcaption>Карточка контакта</figcaption></figure>
+      <div class="shots" style="margin-top:22px">
+        <figure class="shot"><img src="shot-group.png" alt="Группа Telegram сразу после установки Telemax: бот подключился и закрепил пульт" width="1432" height="994" loading="lazy"><figcaption>Сразу после установки: бот подключился и закрепил пульт</figcaption></figure>
+        <figure class="shot"><img src="shot-files.png" alt="Раздел «Файлы» в пульте Telemax: файлы на сервере и кнопка «Загрузить файл»" width="876" height="858" loading="lazy"><figcaption>«📁 Файлы»: большие файлы и свой файлообменник</figcaption></figure>
+        <figure class="shot"><img src="shot-chat.webp" alt="Переписка MAX в теме Telegram: геолокация и видеокружок" width="1344" height="1564" loading="lazy"><figcaption>Геолокация ушла в MAX, в ответ пришёл кружок</figcaption></figure>
+        <figure class="shot"><img src="shot-bot.png" alt="Бот MAX с кнопками в теме Telegram" width="1412" height="1832" loading="lazy"><figcaption>Бот MAX отвечает в теме, его кнопки работают в Telegram</figcaption></figure>
+        <figure class="shot wide"><img src="shot-status.png" alt="Карточка «Статус» в пульте Telemax: связь с MAX и Telegram, диск и память сервера" width="964" height="472" loading="lazy"><figcaption>«Статус»: связь, последние сообщения, диск и память сервера</figcaption></figure>
+      </div>
+    </div>
+  </section>
+
+  <section id="limits" class="alt">
+    <div class="wrap">
+      <div class="kicker">Честно об ограничениях</div>
+      <h2>Что стоит знать заранее</h2>
+      <ul class="limits">
+        <li>Проект неофициальный и работает с вашим аккаунтом MAX на ваш страх и риск.</li>
+        <li>Это не сквозное шифрование: переписка проходит через ваш сервер, и его стоит защищать.</li>
+        <li>Любой участник группы в Telegram видит все ваши чаты MAX — держите группу закрытой.</li>
+        <li>Аккаунт MAX нужен свой: зарегистрироваться и поставить пароль можно только в приложении MAX.</li>
+        <li>Звонки приходят только уведомлениями, мини-приложения ботов открываются в MAX.</li>
+        <li>Разработчик один: баги бывают, зато чинятся быстро.</li>
+      </ul>
+    </div>
+  </section>
+
+  <section id="faq">
+    <div class="wrap">
+      <div class="kicker">Вопросы</div>
+      <h2>Частые вопросы</h2>
+      <div style="margin-top:26px">
+        <details open><summary>Как читать и отвечать на сообщения MAX в Telegram?</summary><p>Поставьте Telemax на свой сервер и войдите в свой аккаунт MAX через бота. Все чаты MAX появятся в вашей группе Telegram отдельными темами: отвечаете в теме — ответ уходит в MAX от вашего имени.</p></details>
+        <details><summary>Нужно ли приложение MAX?</summary><p>Один раз — да: аккаунт MAX регистрируется в приложении, там же ставится пароль. Дальше переписка идёт через Telegram, и приложение можно не открывать.</p></details>
+        <details><summary>Это бот в MAX или мой аккаунт?</summary><p>Ваш личный аккаунт: Telemax входит по номеру телефона, поэтому приходят все ваши чаты, а не только те, куда добавлен бот. Со стороны Telegram работает ваш собственный бот.</p></details>
+        <details><summary>Можно ли начать новый чат из Telegram?</summary><p>Да: в пульте «Найти контакт» — по номеру в любом виде, по MAX ID или нику бота. Или отправьте в общую тему группы контакт из телефонной книги. Не найдётся только тот, кто закрыл поиск по номеру в настройках приватности MAX, — тогда пусть напишет первым.</p></details>
+        <details><summary>Передаются ли файлы, голосовые и кружки?</summary><p>Да, в обе стороны. Файлы больше 50 МБ из MAX приходят ссылкой на ваш сервер, а в MAX можно отправить файл до 4 ГБ через страницу загрузки.</p></details>
+        <details><summary>Сколько это стоит?</summary><p>Telemax бесплатный, весь функционал открыт. Платите только за свой сервер — хватит самого простого VPS.</p></details>
+        <details><summary>Заработает ли на российском VPS?</summary><p>Да, если с сервера есть связь с Telegram — напрямую или через прокси, который задаётся при установке.</p></details>
+        <details><summary>Можно ли подключить два аккаунта MAX?</summary><p>Да: второй мост ставится той же командой в соседний каталог, со своим ботом и своей группой. Автообновление обслуживает все мосты на сервере.</p></details>
+        <details><summary>Что будет, если GitHub недоступен?</summary><p>Установка и обновления сами переключатся на зеркало проекта. Каждый релиз подписан, и мост проверяет подпись перед установкой — неважно, откуда пришёл код.</p></details>
+        <details><summary>Это безопасно?</summary><p>Код и данные — на вашем сервере, код открыт. Но это не сквозное шифрование: переписка проходит через сервер, поэтому его стоит защищать. Проект неофициальный — используйте на свой страх и риск.</p></details>
       </div>
     </div>
   </section>
@@ -273,27 +371,13 @@
         <div class="kicker">Поддержка</div>
         <h2>Поддержать развитие проекта</h2>
         <p>
-          Telemax — бесплатный и открытый, его пилит один человек в свободное время. Если мост экономит
-          тебе нервы — можно закинуть на кофе (и на новые фичи). Спасибо, что ты с нами!
+          Весь функционал бесплатный. Если мост пригодился — можно подогреть мотивацию разработчика:
+          здесь или командой <code>/donate</code> прямо в боте.
         </p>
         <a class="btn btn-primary" href="https://pay.cloudtips.ru/p/3c71b5e8">☕ Поддержать развитие проекта</a>
         <div class="crypto">
           или GRAM (TON): <code>UQALpK2PKI90-XpupOM8sRJGdwrFMsPcwQZPR0k180umXBcA</code>
         </div>
-      </div>
-    </div>
-  </section>
-
-  <section id="faq">
-    <div class="wrap">
-      <div class="kicker">FAQ</div>
-      <h2>Частые вопросы</h2>
-      <div style="margin-top:26px">
-        <details open><summary>Можно ли читать MAX в Telegram без телефона?</summary><p>Да — в этом и смысл. MAX-аккаунт живёт на сервере, а вся переписка зеркалится в вашу Telegram-группу. Приложение MAX на телефоне не нужно.</p></details>
-        <details><summary>Это бот в MAX или личный аккаунт?</summary><p>Личный аккаунт — Telemax подключается по вашему номеру телефона. Поэтому приходят все ваши чаты, а не только те, куда добавлен бот. На стороне Telegram — да, свой бот.</p></details>
-        <details><summary>Это безопасно?</summary><p>Всё self-hosted: код и данные на вашем сервере, ничего в облаке. При этом проект неофициальный и работает поверх вашего аккаунта — используйте на свой страх и риск (см. дисклеймер).</p></details>
-        <details><summary>Сколько стоит?</summary><p>Сам Telemax бесплатный и открытый. Платите только за свой VPS — подойдёт самый дешёвый.</p></details>
-        <details><summary>Чем отличается от других мостов MAX ↔ Telegram?</summary><p>Личный аккаунт вместо бота (все чаты автоматически), полностью self-hosted (приватность), глубокая интеграция: форум-темы, нативные reply, реакции, стикеры, пульт управления, прокси.</p></details>
       </div>
     </div>
   </section>
@@ -303,15 +387,17 @@
   <div class="wrap">
     <div class="links">
       <a href="https://github.com/Trollobot/Telemax">GitHub</a>
-      <a href="https://habr.com/ru/posts/1070812/">Статья на Хабре</a>
-      <a href="#support">Поддержать проект</a>
-      <a href="https://github.com/Trollobot/Telemax/issues">Сообщить о баге</a>
+      <a href="https://habr.com/ru/posts/1070812/">Первый пост на Хабре</a>
+      <a href="https://habr.com/ru/articles/1092754/">Статья на Хабре: бан на GitHub</a>
+      <a href="https://vc.ru/id973711/3179706-telemax-integratsiya-max-i-telegram">Статья на vc.ru</a>
+      <a href="https://t.me/TelemaxSvv_bot">Баг или идея — боту @TelemaxSvv_bot</a>
+      <a href="https://github.com/Trollobot/Telemax/issues">Issues</a>
     </div>
     <div class="disc">
-      ⚠️ Неофициальный open-source-проект. Не связан с MAX и Telegram. Работает поверх вашего собственного
-      номера/аккаунта — на ваш страх и риск.
+      ⚠️ Неофициальный проект с открытым кодом. Не связан с MAX и Telegram. Работает с вашим собственным
+      аккаунтом — на ваш страх и риск.
     </div>
-    <p style="margin-top:16px">© Telemax — двусторонний мост MAX ↔ Telegram · self-hosted</p>
+    <p style="margin-top:16px">© Telemax — бесплатный мост MAX ↔ Telegram · AGPL-3.0</p>
   </div>
 </footer>
 
