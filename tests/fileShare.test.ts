@@ -285,6 +285,10 @@ describe('files service problems in plain words', () => {
     expect(describeServiceProblem({ state: 'error', detail: 'acme: error:DNS problem: NXDOMAIN looking up A for files.example.org' })).toContain('FILES_DOMAIN');
     expect(describeServiceProblem({ state: 'error', detail: 'acme: error:urn:ietf:params:acme:error:rateLimited' })).toContain('через час');
     expect(describeServiceProblem({ state: 'error', detail: 'acme: msg:challenge failed oddly' })).toBe('не удалось получить HTTPS-сертификат: msg:challenge failed oddly');
+    // What reconcile.sh really passes (live test 2026-10-11): the type first, the wording may be cut.
+    expect(describeServiceProblem({ state: 'error', detail: 'acme: urn:ietf:params:acme:error:dns - DNS problem: NXDOMAIN looking up A for x' })).toContain('FILES_DOMAIN');
+    expect(describeServiceProblem({ state: 'error', detail: 'acme: urn:ietf:params:acme:error:connection - 1.2.3.4: Ti' })).toContain('пробросьте');
+    expect(describeServiceProblem({ state: 'error', detail: 'acme: urn:ietf:params:acme:error:tls - 1.2.3.4: rem' })).toContain('пробросьте');
     expect(describeServiceProblem({ state: 'ports-busy' })).toContain('FILES_PUBLIC_URL');
     expect(describeServiceProblem({ state: 'error', detail: 'bind: address already in use' })).toBe('служба файлов не запустилась: bind: address already in use');
     expect(SERVICE_TIMEOUT_TEXT).toContain('порты 80 и 443');

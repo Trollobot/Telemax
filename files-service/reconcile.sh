@@ -261,8 +261,11 @@ acme_error() {
   local c
   c=$(docker ps -q --filter "label=com.docker.compose.project=$PROJECT" --filter "label=com.docker.compose.service=caddy" | head -1)
   [ -n "$c" ] || return 0
+  # From the ACME error type on: the «[name] Obtain: [name] solving challenge…» preamble alone ate
+  # the 200 characters service.json keeps, and the bridge never saw «error:dns - NXDOMAIN» (live test).
   docker logs --tail 80 "$c" 2>&1 | grep -oE '"(error|msg)":"[^"]*"' \
-    | grep -iE 'challenge|timeout during connect|connection refused|firewall|unauthorized|invalid response|no valid a records|nxdomain|no such host|ratelimit|rate limit|too many' | tail -1
+    | grep -iE 'challenge|timeout during connect|connection refused|firewall|unauthorized|invalid response|no valid a records|nxdomain|no such host|ratelimit|rate limit|too many' | tail -1 \
+    | sed -E 's/.*(urn:ietf:params:acme:error:)/\1/'
 }
 ACME_ERR=""
 if [ "$WAS_RUNNING" = 0 ]; then

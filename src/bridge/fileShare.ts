@@ -535,16 +535,18 @@ export function describeServiceProblem(st: { state?: string; detail?: string }):
   if (st.state === 'no-ip') return 'не удалось определить внешний IPv4-адрес сервера (можно указать свой домен: FILES_DOMAIN в .env)';
   const detail = (st.detail ?? '').trim();
   if (/^acme:/i.test(detail)) {
-    if (/timeout during connect|firewall|connection refused|connection reset|no route to host|network unreachable/i.test(detail)) {
+    // The ACME error type (urn:ietf:params:acme:error:<type>) first, the wording second: the text
+    // may be cut, the type comes first in what reconcile.sh passes.
+    if (/acme:error:(connection|tls)\b|timeout during connect|firewall|connection refused|connection reset|no route to host|network unreachable/i.test(detail)) {
       return `сервер не виден из интернета на портах 80 и 443, поэтому Let's Encrypt не может выдать ему HTTPS-сертификат. Если сервер дома за роутером — пробросьте на него порты 80 и 443; если их закрывает хостинг — откройте в его панели. ${NO_FILES_HINT}`;
     }
-    if (/unauthorized|invalid response|status code 404|403 forbidden/i.test(detail)) {
+    if (/acme:error:(unauthorized|incorrectresponse)\b|invalid response|status code 404|403 forbidden/i.test(detail)) {
       return `на портах 80 и 443 по адресу сервера отвечает другое устройство (например, сам роутер), поэтому Let's Encrypt не может выдать сертификат. Пробросьте порты 80 и 443 на этот сервер. ${NO_FILES_HINT}`;
     }
-    if (/nxdomain|no valid a records|no such host|dns problem/i.test(detail)) {
+    if (/acme:error:dns\b|nxdomain|no valid a records|no such host|dns problem/i.test(detail)) {
       return 'домен из FILES_DOMAIN не указывает на этот сервер — проверьте его A-запись (или уберите FILES_DOMAIN, тогда ссылки пойдут по IP)';
     }
-    if (/ratelimit|rate limit|too many/i.test(detail)) {
+    if (/acme:error:ratelimited\b|ratelimit|rate limit|too many/i.test(detail)) {
       return "Let's Encrypt временно ограничил выдачу сертификатов для этого адреса — попробуйте через час";
     }
     return `не удалось получить HTTPS-сертификат: ${detail.replace(/^acme:\s*/i, '')}`;
