@@ -79,17 +79,27 @@ interface ServiceState {
 
 export interface FileShareOptions {
   enabled: boolean;
+  /** How long a file with a download link is kept (from its last link). */
   ttlMs: number;
+  /**
+   * How long an UNUSED upload link lives. Shorter than a file: an abandoned link keeps the service
+   * (and on an own-Caddy install ports 80/443) up for nothing — 3 days of it was seen live 2026-10-11.
+   */
+  uploadTtlMs: number;
   /** Kept free on top of any file: an update needs ~1.5 GB, a full disk would block it. */
   reserveBytes: number;
 }
 
 export function fileShareOptionsFromEnv(env: NodeJS.ProcessEnv = process.env): FileShareOptions {
-  const ttlHours = Number(env.FILES_TTL_HOURS);
+  const hours = (raw: string | undefined, dflt: number) => {
+    const n = Number(raw);
+    return (Number.isFinite(n) && n > 0 ? n : dflt) * 3600_000;
+  };
   const reserveMb = Number(env.FILES_RESERVE_MB);
   return {
     enabled: parseEnvBool(env.FILES) !== false,
-    ttlMs: (Number.isFinite(ttlHours) && ttlHours > 0 ? ttlHours : 72) * 3600_000,
+    ttlMs: hours(env.FILES_TTL_HOURS, 72),
+    uploadTtlMs: hours(env.FILES_UPLOAD_TTL_HOURS, 24),
     reserveBytes: (Number.isFinite(reserveMb) && reserveMb >= 0 ? reserveMb : 1536) * 1024 * 1024,
   };
 }
@@ -117,6 +127,13 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 const SERVICE_STATE_FRESH_MS = 150_000;
 const SERVICE_WAIT_MS = 150_000;
 const HEARTBEAT_STALE_MS = 5 * 60_000;
+/**
+ * The files service holds `incoming/<token>/.lock` while an upload is streaming in: such a ticket
+ * outlives its expiry (a 4 GB upload over a slow line takes hours). A lock this old is a crash leftover.
+ */
+const UPLOAD_LOCK_STALE_MS = 12 * 3600_000;
+export const SERVICE_TIMEOUT_TEXT =
+  'служба файлов не ответила за 2,5 минуты. Чаще всего так бывает, когда порты 80 и 443 сервера не открываются из интернета (сервер дома за роутером или их закрывает файрвол хостинга). Подробности — в /var/lib/telemax-files/reconcile.log на сервере';
 
 export class FileShare {
   readonly dir: string;
@@ -124,6 +141,7 @@ export class FileShare {
   private index: Index = { files: [], tickets: [] };
   private chain: Promise<unknown> = Promise.resolve();
   private uploadHandler: ((t: UploadTicket, filePath: string, size: number, name: string) => Promise<void>) | null = null;
+  private expiredHandler: ((t: UploadTicket) => Promise<void>) | null = null;
   private busyTokens = new Set<string>();
   /** Files being saved from MAX right now — the panel lists them before they're done. */
   private saving = new Map<string, { name: string; size: number; written: number }>();
@@ -215,8 +233,9 @@ export class FileShare {
     return [...this.saving.values()];
   }
 
-  pendingUploads(): number {
-    return this.index.tickets.length;
+  /** Upload links not used yet (or with an upload still streaming in), oldest first. */
+  pendingUploads(): UploadTicket[] {
+    return [...this.index.tickets];
   }
 
   /** Free bytes left for a file of `size` after the reserve; negative when it won't fit. */
@@ -231,7 +250,7 @@ export class FileShare {
   async createUploadTicket(t: Omit<UploadTicket, 'token' | 'createdAt' | 'expiresAt'>): Promise<UploadTicket> {
     return this.locked(async () => {
       const now = Date.now();
-      const ticket: UploadTicket = { ...t, token: newToken(), createdAt: now, expiresAt: now + this.opts.ttlMs };
+      const ticket: UploadTicket = { ...t, token: newToken(), createdAt: now, expiresAt: now + this.opts.uploadTtlMs };
       await this.writeToken(ticket.token, {
         kind: 'upload',
         purpose: ticket.purpose ?? 'max',
@@ -286,6 +305,11 @@ export class FileShare {
   }
 
   /** Called with each finished upload; the bridge sends it to MAX. */
+  /** Told about every upload link the sweep drops unused — so its «загрузите по ссылке» message can say so. */
+  onTicketExpired(handler: (t: UploadTicket) => Promise<void>): void {
+    this.expiredHandler = handler;
+  }
+
   onUpload(handler: (t: UploadTicket, filePath: string, size: number, name: string) => Promise<void>): void {
     this.uploadHandler = handler;
   }
@@ -384,7 +408,7 @@ export class FileShare {
       const fresh = st?.at != null && Date.now() - st.at * 1000 < SERVICE_STATE_FRESH_MS;
       if (fresh && st?.state === 'up' && st.url) return { ok: true, url: st.url.replace(/\/+$/, '') };
       if (fresh && st?.state && st.state !== 'up' && st.state !== 'starting' && st.state !== 'down') {
-        return { ok: false, reason: describeServiceProblem(st) };
+        return { ok: false, reason: describeServiceProblem(st ?? {}) };
       }
       if (!heartbeatChecked) {
         heartbeatChecked = true;
@@ -395,7 +419,7 @@ export class FileShare {
           };
         }
       }
-      if (Date.now() >= deadline) return { ok: false, reason: 'служба файлов не запустилась за 2,5 минуты — подробности в /var/lib/telemax-files на сервере' };
+      if (Date.now() >= deadline) return { ok: false, reason: SERVICE_TIMEOUT_TEXT };
       await sleep(2000);
     }
   }
@@ -421,10 +445,18 @@ export class FileShare {
 
   /** Drops expired links with their files, and anything on disk the index no longer knows. */
   async sweep(): Promise<void> {
+    let dropped: UploadTicket[] = [];
     await this.locked(async () => {
       const now = Date.now();
       const expiredFiles = this.index.files.filter((f) => f.expiresAt <= now);
-      const expiredTickets = this.index.tickets.filter((t) => t.expiresAt <= now && !this.busyTokens.has(t.token));
+      const expiredTickets: UploadTicket[] = [];
+      for (const t of this.index.tickets) {
+        if (t.expiresAt > now || this.busyTokens.has(t.token)) continue;
+        if (await this.uploadStreaming(t.token, now)) continue; // never cut an upload that is still coming in
+        expiredTickets.push(t);
+      }
+      dropped = expiredTickets;
+      for (const t of expiredTickets) logger.info(`Upload link${t.name ? ` for «${t.name}»` : ''} expired unused — dropped`);
       this.index.files = this.index.files.filter((f) => f.expiresAt > now);
       this.index.tickets = this.index.tickets.filter((t) => !expiredTickets.includes(t));
       for (const f of expiredFiles) logger.info(`File «${f.name}» expired — deleted`);
@@ -441,6 +473,17 @@ export class FileShare {
       }
       await this.save();
     });
+    for (const t of dropped) await this.expiredHandler?.(t).catch((err) => logger.error('Expired upload link notice failed', err));
+  }
+
+  /** True while the files service is still receiving this ticket's upload (its fresh `.lock`). */
+  private async uploadStreaming(token: string, now: number): Promise<boolean> {
+    try {
+      const s = await stat(path.join(this.dir, 'incoming', token, '.lock'));
+      return now - s.mtimeMs < UPLOAD_LOCK_STALE_MS;
+    } catch {
+      return false;
+    }
   }
 
   /** Hands every finished upload to the handler, one at a time. */
@@ -479,15 +522,34 @@ export class FileShare {
   }
 }
 
-function describeServiceProblem(st: ServiceState): string {
-  switch (st.state) {
-    case 'ports-busy':
-      return 'порты 80/443 на сервере заняты другим веб-сервером — файлы можно пустить через него (FILES_PUBLIC_URL и FILES_LISTEN в .env, см. README)';
-    case 'no-ip':
-      return 'не удалось определить внешний IPv4-адрес сервера (можно указать свой домен: FILES_DOMAIN в .env)';
-    default:
-      return `служба файлов не запустилась${st.detail ? `: ${st.detail}` : ''}`;
+const NO_FILES_HINT = 'Не нужны большие файлы — выключите их: FILES=off в .env.';
+
+/**
+ * service.json → a sentence for the user. reconcile.sh passes Caddy's own ACME error through
+ * («acme: …», English): the common ones become what to do. Pure + exported for tests.
+ */
+export function describeServiceProblem(st: { state?: string; detail?: string }): string {
+  if (st.state === 'ports-busy') {
+    return 'порты 80/443 на сервере заняты другим веб-сервером — файлы можно пустить через него (FILES_PUBLIC_URL и FILES_LISTEN в .env, см. README)';
   }
+  if (st.state === 'no-ip') return 'не удалось определить внешний IPv4-адрес сервера (можно указать свой домен: FILES_DOMAIN в .env)';
+  const detail = (st.detail ?? '').trim();
+  if (/^acme:/i.test(detail)) {
+    if (/timeout during connect|firewall|connection refused|connection reset|no route to host|network unreachable/i.test(detail)) {
+      return `сервер не виден из интернета на портах 80 и 443, поэтому Let's Encrypt не может выдать ему HTTPS-сертификат. Если сервер дома за роутером — пробросьте на него порты 80 и 443; если их закрывает хостинг — откройте в его панели. ${NO_FILES_HINT}`;
+    }
+    if (/unauthorized|invalid response|status code 404|403 forbidden/i.test(detail)) {
+      return `на портах 80 и 443 по адресу сервера отвечает другое устройство (например, сам роутер), поэтому Let's Encrypt не может выдать сертификат. Пробросьте порты 80 и 443 на этот сервер. ${NO_FILES_HINT}`;
+    }
+    if (/nxdomain|no valid a records|no such host|dns problem/i.test(detail)) {
+      return 'домен из FILES_DOMAIN не указывает на этот сервер — проверьте его A-запись (или уберите FILES_DOMAIN, тогда ссылки пойдут по IP)';
+    }
+    if (/ratelimit|rate limit|too many/i.test(detail)) {
+      return "Let's Encrypt временно ограничил выдачу сертификатов для этого адреса — попробуйте через час";
+    }
+    return `не удалось получить HTTPS-сертификат: ${detail.replace(/^acme:\s*/i, '')}`;
+  }
+  return `служба файлов не запустилась${detail ? `: ${detail}` : ''}`;
 }
 
 /** Readable from a WHATWG stream (undici's Response.body). */

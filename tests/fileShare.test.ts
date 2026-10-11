@@ -7,7 +7,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from 'node:f
 import { FileShare, fileShareOptionsFromEnv, safeFileName } from '../src/bridge/fileShare.js';
 
 let dataDir: string;
-const opts = { enabled: true, ttlMs: 72 * 3600_000, reserveBytes: 0 };
+const opts = { enabled: true, ttlMs: 72 * 3600_000, uploadTtlMs: 24 * 3600_000, reserveBytes: 0 };
 
 beforeEach(async () => {
   dataDir = await mkdtemp(path.join(os.tmpdir(), 'tlmx-files-'));
@@ -40,9 +40,14 @@ describe('safeFileName', () => {
 });
 
 describe('fileShareOptionsFromEnv', () => {
-  it('is on by default with 3 days and a 1.5 GB reserve', () => {
-    expect(fileShareOptionsFromEnv({})).toEqual({ enabled: true, ttlMs: 72 * 3600_000, reserveBytes: 1536 * 1024 * 1024 });
-    expect(fileShareOptionsFromEnv({ FILES: 'off', FILES_TTL_HOURS: '24', FILES_RESERVE_MB: '0' })).toEqual({ enabled: false, ttlMs: 24 * 3600_000, reserveBytes: 0 });
+  it('is on by default: files 3 days, unused upload links 24 hours, a 1.5 GB reserve', () => {
+    expect(fileShareOptionsFromEnv({})).toEqual({ enabled: true, ttlMs: 72 * 3600_000, uploadTtlMs: 24 * 3600_000, reserveBytes: 1536 * 1024 * 1024 });
+    expect(fileShareOptionsFromEnv({ FILES: 'off', FILES_TTL_HOURS: '24', FILES_UPLOAD_TTL_HOURS: '6', FILES_RESERVE_MB: '0' })).toEqual({
+      enabled: false,
+      ttlMs: 24 * 3600_000,
+      uploadTtlMs: 6 * 3600_000,
+      reserveBytes: 0,
+    });
   });
 });
 
@@ -106,7 +111,7 @@ describe('FileShare', () => {
     await share.pollUploads();
     await share.pollUploads();
     expect(seen).toEqual([[ticket.token, 3, 'other.zip']]);
-    expect(share.pendingUploads()).toBe(0);
+    expect(share.pendingUploads()).toHaveLength(0);
     expect(existsSync(dir)).toBe(false);
   });
 
@@ -119,7 +124,7 @@ describe('FileShare', () => {
     const f = await share.adoptUpload(ticket, path.join(dir, 'huge.iso'), 2, 'huge.iso');
     expect(f.direction).toBe('tg2max');
     expect(await readFile(path.join(share.dir, 'items', f.id, 'huge.iso'), 'utf8')).toBe('zz');
-    expect(share.pendingUploads()).toBe(0);
+    expect(share.pendingUploads()).toHaveLength(0);
   });
 
   it('roomFor counts the reserve', async () => {
@@ -220,5 +225,83 @@ describe('the panel store («📤 Загрузить файл»)', () => {
     const f = await share.adoptUpload(ticket, path.join(dir, 'photos.zip'), 2, 'photos.zip');
     expect(f.direction).toBe('stored');
     expect(f.target).toBeUndefined();
+  });
+});
+
+describe('upload links (1.3.3)', () => {
+  it('an unused link lives 24 hours, then the sweep drops it and tells the handler', async () => {
+    const share = await fresh();
+    const t0 = Date.now();
+    const ticket = await share.createUploadTicket({ purpose: 'store', maxChatId: '', topicId: 0, telegramMessageId: 1, name: '', expectedSize: 0, promptMessageId: 77 });
+    expect(ticket.expiresAt - ticket.createdAt).toBe(24 * 3600_000);
+    expect(ticket.createdAt).toBeGreaterThanOrEqual(t0);
+    expect(share.pendingUploads().map((t) => t.token)).toEqual([ticket.token]);
+    const expired: Array<number | undefined> = [];
+    share.onTicketExpired(async (t) => {
+      expired.push(t.promptMessageId);
+    });
+    await share.sweep(); // still valid
+    expect(expired).toEqual([]);
+    ticket.expiresAt = Date.now() - 1;
+    await share.sweep();
+    expect(expired).toEqual([77]);
+    expect(share.pendingUploads()).toHaveLength(0);
+    expect(existsSync(token(share, ticket.token))).toBe(false);
+  });
+
+  it('never drops a link whose upload is still streaming in (the service holds incoming/<token>/.lock)', async () => {
+    const share = await fresh();
+    const ticket = await share.createUploadTicket({ maxChatId: '5', topicId: 7, telegramMessageId: 9, name: 'big.iso', expectedSize: 9 });
+    const dir = path.join(share.dir, 'incoming', ticket.token);
+    await mkdir(dir, { recursive: true });
+    await writeFile(path.join(dir, '.lock'), '');
+    await writeFile(path.join(dir, 'big.iso.part'), 'half');
+    ticket.expiresAt = Date.now() - 1;
+    await share.sweep();
+    expect(share.pendingUploads()).toHaveLength(1);
+    expect(existsSync(path.join(dir, 'big.iso.part'))).toBe(true);
+    // A lock left by a crash half a day ago no longer protects it.
+    const old = new Date(Date.now() - 13 * 3600_000);
+    await utimes(path.join(dir, '.lock'), old, old);
+    await share.sweep();
+    expect(share.pendingUploads()).toHaveLength(0);
+    expect(existsSync(dir)).toBe(false);
+  });
+});
+
+describe('files service problems in plain words', () => {
+  it('turns Caddy ACME failures into what to do', async () => {
+    const { describeServiceProblem, SERVICE_TIMEOUT_TEXT } = await import('../src/bridge/fileShare.js');
+    const firewall = describeServiceProblem({
+      state: 'error',
+      detail: 'acme: error:HTTP 400 urn:ietf:params:acme:error:connection - 1.2.3.4: Timeout during connect (likely firewall problem)',
+    });
+    expect(firewall).toContain('не виден из интернета на портах 80 и 443');
+    expect(firewall).toContain('пробросьте');
+    expect(firewall).toContain('FILES=off');
+    expect(describeServiceProblem({ state: 'error', detail: 'acme: error:403 urn:ietf:params:acme:error:unauthorized - Invalid response from http://1.2.3.4/.well-known' })).toContain(
+      'отвечает другое устройство',
+    );
+    expect(describeServiceProblem({ state: 'error', detail: 'acme: error:DNS problem: NXDOMAIN looking up A for files.example.org' })).toContain('FILES_DOMAIN');
+    expect(describeServiceProblem({ state: 'error', detail: 'acme: error:urn:ietf:params:acme:error:rateLimited' })).toContain('через час');
+    expect(describeServiceProblem({ state: 'error', detail: 'acme: msg:challenge failed oddly' })).toBe('не удалось получить HTTPS-сертификат: msg:challenge failed oddly');
+    expect(describeServiceProblem({ state: 'ports-busy' })).toContain('FILES_PUBLIC_URL');
+    expect(describeServiceProblem({ state: 'error', detail: 'bind: address already in use' })).toBe('служба файлов не запустилась: bind: address already in use');
+    expect(SERVICE_TIMEOUT_TEXT).toContain('порты 80 и 443');
+  });
+});
+
+describe('panel: a waiting upload link', () => {
+  it('has a card with the upload page, a cancel and a way back', async () => {
+    const { ticketCardView, ticketLabel } = await import('../src/bridge/panel.js');
+    const t = { purpose: 'max' as const, token: 'TOK', maxChatId: '5', topicId: 7, telegramMessageId: 9, name: 'big.iso', expectedSize: 1, createdAt: 0, expiresAt: Date.UTC(2026, 9, 12, 10) };
+    expect(ticketLabel(t)).toBe('Загрузка в MAX: big.iso');
+    expect(ticketLabel({ ...t, purpose: 'store', name: '' })).toBe('Загрузка в файлообменник');
+    const up = ticketCardView(t, { ok: true, url: 'https://1.2.3.4' });
+    const buttons = up.markup.inline_keyboard.flat() as Array<{ text: string; url?: string; callback_data?: string }>;
+    expect(buttons.map((b) => b.url ?? b.callback_data)).toEqual(['https://1.2.3.4/f/TOK', 'tlmx_panel:fcancel:TOK', 'tlmx_panel:files']);
+    const down = ticketCardView(t, { ok: false, reason: 'служба файлов не ответила' });
+    expect(down.text).toContain('⚠️ Страница загрузки сейчас недоступна');
+    expect((down.markup.inline_keyboard.flat() as Array<{ url?: string }>).some((b) => b.url)).toBe(false);
   });
 });

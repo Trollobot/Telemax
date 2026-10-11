@@ -253,24 +253,47 @@ fi
 # A fresh start needs a few seconds (and a certificate on the very first run): wait a little here
 # rather than make the waiting bridge sit through another dispatcher minute.
 healthy() { curl -fsS --max-time 8 "$BASE_URL/health" >/dev/null 2>&1; }
+# Caddy's latest ACME failure, if any. A certificate that failed won't come by itself: say why at
+# once — the bridge waits only 2.5 minutes, and a bare «не запустилась» left a real user (2026-10-11,
+# a home server whose router didn't forward 80/443) without the one thing to fix.
+acme_error() {
+  [ "$EXTERNAL" = 0 ] || return 0
+  local c
+  c=$(docker ps -q --filter "label=com.docker.compose.project=$PROJECT" --filter "label=com.docker.compose.service=caddy" | head -1)
+  [ -n "$c" ] || return 0
+  docker logs --tail 80 "$c" 2>&1 | grep -oE '"(error|msg)":"[^"]*"' \
+    | grep -iE 'challenge|timeout during connect|connection refused|firewall|unauthorized|invalid response|no valid a records|nxdomain|no such host|ratelimit|rate limit|too many' | tail -1
+}
+ACME_ERR=""
 if [ "$WAS_RUNNING" = 0 ]; then
-  for _ in 1 2 3 4 5 6 7 8; do healthy && break; sleep 4; done
+  # Up to ~80 s: within the .path unit's run and well inside the bridge's wait.
+  for i in $(seq 1 20); do
+    healthy && break
+    if [ "$i" -ge 3 ]; then ACME_ERR=$(acme_error); [ -n "$ACME_ERR" ] && break; fi
+    sleep 4
+  done
 fi
 if healthy; then
   rm -f "$STATE_DIR/starting-since"
   write_state up "$BASE_URL" ""
   exit 0
 fi
+[ -n "$ACME_ERR" ] || ACME_ERR=$(acme_error)
+if [ -n "$ACME_ERR" ]; then
+  log "no certificate for $BASE_URL: $ACME_ERR"
+  write_state error "" "acme: $ACME_ERR"
+  exit 0
+fi
 [ -f "$STATE_DIR/starting-since" ] || date +%s > "$STATE_DIR/starting-since"
 SINCE=$(cat "$STATE_DIR/starting-since" 2>/dev/null || date +%s)
-if [ $(( $(date +%s) - SINCE )) -gt 240 ]; then
+if [ $(( $(date +%s) - SINCE )) -gt 120 ]; then
   if [ "$EXTERNAL" = 1 ]; then
     WHY="$BASE_URL/health не отвечает — проверьте маршрут на $LISTEN в своём веб-сервере"
   else
     WHY=$(docker logs --tail 50 "$(docker ps -q --filter "label=com.docker.compose.project=$PROJECT" --filter "label=com.docker.compose.service=caddy" | head -1)" 2>&1 \
       | grep -oE '"(error|msg)":"[^"]*"' | grep -iE 'error|fail|challenge|refused|timeout' | tail -1)
   fi
-  log "not healthy after 4 min: $WHY"
+  log "not healthy after 2 min: $WHY"
   write_state error "" "HTTPS не отвечает: ${WHY:-нет подробностей}"
 else
   write_state starting "" ""

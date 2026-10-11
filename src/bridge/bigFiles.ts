@@ -191,6 +191,24 @@ export function createBigFiles({ bot, max, targetGroupId, fileShare, onSentToMax
     const text = (ctx.callbackQuery.message as { text?: string } | undefined)?.text;
     // In the panel (the file exchange) the cancelled link keeps «◀️ К файлам».
     await ctx.editMessageText(ticket || !text ? '✖️ Загрузка отменена — ссылка больше не работает.' : text, keepPanelBack(ctx)).catch(() => {});
+    // Cancelled from the panel's «⏳» card: the message that offered the link stops offering it too.
+    const pressedId = ctx.callbackQuery.message?.message_id;
+    if (ticket?.promptMessageId != null && ticket.promptMessageId !== pressedId) {
+      await bot.telegram.editMessageText(targetGroupId, ticket.promptMessageId, undefined, '✖️ Загрузка отменена — ссылка больше не работает.').catch(() => {});
+    }
+  });
+
+  // An upload link nobody used: its message says so instead of offering a dead button.
+  fileShare.onTicketExpired(async (ticket) => {
+    if (ticket.promptMessageId == null) return;
+    const hours = Math.round(fileShare.opts.uploadTtlMs / 3600_000);
+    const text =
+      ticket.purpose === 'store'
+        ? `⌛ Ссылка на загрузку истекла — она действовала ${hours} ч. Нужна снова — «📤 Загрузить файл».`
+        : `⌛ Ссылка на загрузку${ticket.name ? ` «${ticket.name}»` : ''} истекла — она действовала ${hours} ч, файл в MAX не ушёл. Нужна снова — /file в этой теме.`;
+    // A store link lives in the panel message: it keeps a way back to the files.
+    const markup = ticket.purpose === 'store' ? { reply_markup: Markup.inlineKeyboard([TO_FILES]).reply_markup } : {};
+    await bot.telegram.editMessageText(targetGroupId, ticket.promptMessageId, undefined, text, markup).catch(() => {});
   });
 
   /**

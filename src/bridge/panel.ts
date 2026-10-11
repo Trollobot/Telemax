@@ -8,7 +8,7 @@ import { formatBytes, maskPhone } from './status.js';
 import { createLogger } from '../logger.js';
 import { truncateUtf16 } from './text.js';
 import { formatExpiry } from './bigFiles.js';
-import type { FileShare, StoredFile } from './fileShare.js';
+import type { FileShare, ServiceResult, StoredFile, UploadTicket } from './fileShare.js';
 
 const logger = createLogger('panel');
 
@@ -186,19 +186,22 @@ function filesView(files: FileShare): View {
   const pending = files.pendingUploads();
   const ttl = ttlText(files.opts.ttlMs);
   const savingLines = saving.map((x) => `⏳ Сохраняется: ${x.name} — ${formatBytes(x.written)} из ${formatBytes(x.size)}`);
-  const pendingLine = pending ? `⏳ Ждут загрузки по ссылке: ${pending}` : '';
+  // Each waiting upload link is a row with its own card (open the page or cancel) — a bare count
+  // gave no way to do either (seen live 2026-10-11).
+  const pendingLines = pending.map((t) => `⏳ ${ticketLabel(t)} — ждёт загрузки до ${formatExpiry(t.expiresAt)}`);
+  const pendingButtons = pending.slice(0, 10).map((t) => [Markup.button.callback(`⏳ ${truncateUtf16(ticketLabel(t), 48)}`, `tlmx_panel:tkt:${t.token}`)]);
   const footer =
     'Здесь хранятся файлы, которые мост держит на сервере для скачивания по ссылке:\n' +
     '• файлы из MAX больше 50 МБ — Telegram не принимает от ботов такие файлы напрямую;\n' +
     '• загруженные для отправки в MAX, но не ушедшие из-за ошибки — их можно отправить ещё раз;\n' +
     '• загруженные вами через «📤 Загрузить файл» — чтобы делиться ссылкой.\n\n' +
     'Файлы, которые уже ушли в MAX, на сервере не остаются.\n' +
-    `Файлы со ссылкой хранятся ${ttl} от последней выданной ссылки, потом удаляются.`;
-  const extra = [...savingLines, pendingLine].filter(Boolean).join('\n');
+    `Файлы со ссылкой хранятся ${ttl} от последней выданной ссылки, потом удаляются. Ссылка на загрузку действует ${ttlText(files.opts.uploadTtlMs)}.`;
+  const extra = [...savingLines, ...pendingLines].filter(Boolean).join('\n');
   if (list.length === 0) {
     return {
       text: `📁 Файлов нет.${extra ? `\n\n${extra}` : ''}\n\n${footer}`,
-      markup: Markup.inlineKeyboard([[Markup.button.callback('📤 Загрузить файл', 'tlmx_panel:fupload')], [Markup.button.callback('🔄 Обновить', 'tlmx_panel:files')], back]).reply_markup,
+      markup: Markup.inlineKeyboard([...pendingButtons, [Markup.button.callback('📤 Загрузить файл', 'tlmx_panel:fupload')], [Markup.button.callback('🔄 Обновить', 'tlmx_panel:files')], back]).reply_markup,
     };
   }
   const total = list.reduce((s, f) => s + f.size, 0);
@@ -208,11 +211,31 @@ function filesView(files: FileShare): View {
     text: `📁 Файлы на сервере: ${list.length}, всего ${formatBytes(total)}.\n⬇️ — из MAX, ⬆️ — не ушли в MAX, 📦 — загружены вами.\n\n${lines.join('\n')}${extra ? `\n\n${extra}` : ''}\n\n${footer}`,
     markup: Markup.inlineKeyboard([
       ...list.slice(0, 20).map((f, i) => [Markup.button.callback(`${i + 1}. ${truncateUtf16(f.name, 48)}`, `tlmx_panel:file:${f.id}`)]),
+      ...pendingButtons,
       [Markup.button.callback('📤 Загрузить файл', 'tlmx_panel:fupload')],
       [Markup.button.callback('🔄 Обновить', 'tlmx_panel:files')],
       back,
     ]).reply_markup,
   };
+}
+
+/** «Загрузка в файлообменник» / «Загрузка в MAX: name» — what a waiting upload link is for. */
+export function ticketLabel(t: UploadTicket): string {
+  if (t.purpose === 'store') return 'Загрузка в файлообменник';
+  return t.name ? `Загрузка в MAX: ${t.name}` : 'Загрузка в MAX';
+}
+
+/** A waiting upload link: open its page or cancel it. `svc` decides whether the page button can be offered. */
+export function ticketCardView(t: UploadTicket, svc: ServiceResult): View {
+  const rows = [];
+  if (svc.ok) rows.push([Markup.button.url('📤 Открыть страницу загрузки', `${svc.url}/f/${t.token}`)]);
+  rows.push([Markup.button.callback('✖️ Отменить ссылку', `tlmx_panel:fcancel:${t.token}`)]);
+  rows.push([Markup.button.callback('◀️ К файлам', 'tlmx_panel:files')]);
+  const where = t.purpose === 'store' ? 'в файлообменник на сервере — потом им можно делиться по ссылке' : `в чат MAX${t.name ? `, файл «${t.name}»` : ''}`;
+  const text =
+    `⏳ ${ticketLabel(t)}\n\nКуда: ${where}.\nСсылка действует до ${formatExpiry(t.expiresAt)}.\n\n` +
+    (svc.ok ? 'Откройте страницу и выберите файл — или отмените ссылку, если она больше не нужна.' : `⚠️ Страница загрузки сейчас недоступна: ${svc.reason}.`);
+  return { text, markup: Markup.inlineKeyboard(rows).reply_markup };
 }
 
 function fileCardView(f: StoredFile, files: FileShare, link?: string, canResend = false): View {
@@ -403,6 +426,19 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
       return;
     }
     await edit(ctx, card(f));
+  });
+  // A waiting upload link («⏳» row): its page and a cancel button. The cancel itself is bigFiles'
+  // «✖️» handler — it also updates the message that first offered the link.
+  bot.action(/^tlmx_panel:tkt:(.+)$/, async (ctx) => {
+    const t = files?.getTicket(ctx.match[1] ?? '');
+    await ctx.answerCbQuery(t ? '' : 'Ссылка уже не действует').catch(() => {});
+    if (!files) return;
+    if (!t) {
+      await edit(ctx, filesView(files));
+      return;
+    }
+    // A live link keeps the service wanted, so this is normally instant.
+    await edit(ctx, ticketCardView(t, await files.ensureService(30_000)));
   });
   bot.action(/^tlmx_panel:frenew:(.+)$/, async (ctx) => {
     const id = ctx.match[1] ?? '';
