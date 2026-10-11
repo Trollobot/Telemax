@@ -125,6 +125,19 @@ export function normalizeNickQuery(raw: string): { query: string } | { personalL
   return q ? { query: q } : null;
 }
 
+/**
+ * A typed number or a shared Telegram contact → the number for the MAX lookup. Spaces, dashes and
+ * brackets go (a phone book keeps «8 (916) 123-45-67»), the Russian trunk «8» and a bare 10-digit
+ * «9…» become «+7…». Fewer than 10 or more than 15 digits isn't a phone number → null.
+ */
+export function normalizePhoneQuery(raw: string): string | null {
+  const international = raw.trim().startsWith('+');
+  let digits = raw.replace(/\D/g, '');
+  if (!international && digits.length === 11 && digits.startsWith('8')) digits = `7${digits.slice(1)}`;
+  else if (!international && digits.length === 10 && digits.startsWith('9')) digits = `7${digits}`;
+  return digits.length >= 10 && digits.length <= 15 ? `+${digits}` : null;
+}
+
 type View = { text: string; markup: ReturnType<typeof Markup.inlineKeyboard>['reply_markup'] };
 
 function rootView(phone: string, pausedUntil: number | null): View {
@@ -551,9 +564,15 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
   async function runSearch(chatId: number, mode: SearchMode, query: string): Promise<void> {
     try {
       if (mode === 'phone') {
-        const contact = await max.searchContactByPhone(query);
+        const phone = normalizePhoneQuery(query);
+        if (!phone) {
+          await bot.telegram.sendMessage(chatId, '❌ Это не похоже на номер телефона. Пример: +7 916 123-45-67.');
+          return;
+        }
+        const contact = await max.searchContactByPhone(phone);
+        logger.info(`Phone search ${maskPhone(phone)}: ${contact ? 'found' : 'not found'}`);
         if (!contact) {
-          await bot.telegram.sendMessage(chatId, '❌ Контакт по этому номеру не найден в MAX.');
+          await bot.telegram.sendMessage(chatId, `❌ Номер ${phone} в MAX не найден.`);
           return;
         }
         await sendCard(chatId, contact);
@@ -680,8 +699,12 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
     if (userId == null) return;
     try {
       const member = await ctx.telegram.getChatMember(targetGroupId, userId);
-      if (member.status !== 'creator' && member.status !== 'administrator') return; // not an admin — ignore
-    } catch {
+      if (member.status !== 'creator' && member.status !== 'administrator') {
+        logger.info(`Contact card in General from a non-admin (user ${userId}, ${member.status}) — ignored`);
+        return;
+      }
+    } catch (err) {
+      logger.error('Contact card: could not check admin status', err);
       return;
     }
     const who = [m.contact?.first_name, m.contact?.last_name].filter(Boolean).join(' ').trim();

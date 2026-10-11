@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { parsePublicSearch } from '../src/max/client.js';
-import { normalizeNickQuery } from '../src/bridge/panel.js';
+import { normalizeNickQuery, normalizePhoneQuery } from '../src/bridge/panel.js';
 
 describe('parsePublicSearch', () => {
   it('reads the live 2026-10-05 shape: double-nested bot contacts and channels', () => {
@@ -57,5 +57,29 @@ describe('normalizeNickQuery', () => {
     expect(normalizeNickQuery('АЗС Радар')).toEqual({ query: 'АЗС Радар' });
     expect(normalizeNickQuery('@')).toBeNull();
     expect(normalizeNickQuery('https://max.ru/')).toBeNull();
+  });
+});
+
+describe('normalizePhoneQuery', () => {
+  it('drops spaces, dashes and brackets', () => {
+    expect(normalizePhoneQuery('+7 (916) 123-45-67')).toBe('+79161234567');
+    expect(normalizePhoneQuery('+7-916-123-45-67')).toBe('+79161234567');
+    expect(normalizePhoneQuery(' 7 916 123 45 67 ')).toBe('+79161234567');
+  });
+  it('turns the Russian trunk «8» and a bare 10-digit number into +7', () => {
+    expect(normalizePhoneQuery('8 (916) 123-45-67')).toBe('+79161234567');
+    expect(normalizePhoneQuery('89161234567')).toBe('+79161234567');
+    expect(normalizePhoneQuery('9161234567')).toBe('+79161234567');
+  });
+  it('keeps a Telegram contact number (digits, no plus) and other countries as they are', () => {
+    expect(normalizePhoneQuery('79161234567')).toBe('+79161234567');
+    expect(normalizePhoneQuery('+375 29 123-45-67')).toBe('+375291234567');
+    expect(normalizePhoneQuery('+8 916 123 45 67')).toBe('+89161234567');
+  });
+  it('rejects what is not a phone number', () => {
+    expect(normalizePhoneQuery('')).toBeNull();
+    expect(normalizePhoneQuery('12345')).toBeNull();
+    expect(normalizePhoneQuery('abc')).toBeNull();
+    expect(normalizePhoneQuery('1234567890123456')).toBeNull();
   });
 });

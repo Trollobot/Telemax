@@ -794,7 +794,10 @@ export class MaxClient extends EventEmitter {
       if (err === 'not.found') return null;
       throw new Error(describeAuthError(payload, 'CONTACT_INFO_BY_PHONE failed'));
     }
-    return (payload as { contact?: MaxContactInfo } | null)?.contact ?? null;
+    const contact = (payload as { contact?: MaxContactInfo } | null)?.contact;
+    // A success without `contact` is a shape we don't know — say so instead of a silent «not found».
+    if (!contact) throw new Error(`CONTACT_INFO_BY_PHONE: unexpected answer (keys: ${Object.keys(payload ?? {}).join(', ') || 'none'})`);
+    return contact;
   }
 
   /**
