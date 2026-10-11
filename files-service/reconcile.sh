@@ -160,6 +160,12 @@ else
     fi
   fi
   BASE_URL="https://$HOST"
+  # Behind NAT: the server's own address is private (a home server behind a router) — then it has
+  # no public IP of its own and a failed certificate means «no white IP / no port forwarding», not
+  # a hosting firewall. Passed to the bridge so it can say which (user's question, 2026-10-11).
+  LOCAL_SRC=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<NF;i++) if ($i=="src") print $(i+1)}' | head -1)
+  NAT_TAG=""
+  if [ -n "$LOCAL_SRC" ] && ! is_public_ipv4 "$LOCAL_SRC"; then NAT_TAG="nat: "; fi
   # Someone else's web server must not be fought with (see FILES_PUBLIC_URL above for sharing it).
   if ! running && ss -ltnH '( sport = :80 or sport = :443 )' 2>/dev/null | grep -q .; then
     log "ports 80/443 are taken by another service"
@@ -284,7 +290,7 @@ fi
 [ -n "$ACME_ERR" ] || ACME_ERR=$(acme_error)
 if [ -n "$ACME_ERR" ]; then
   log "no certificate for $BASE_URL: $ACME_ERR"
-  write_state error "" "acme: $ACME_ERR"
+  write_state error "" "acme: ${NAT_TAG:-}$ACME_ERR"
   exit 0
 fi
 [ -f "$STATE_DIR/starting-since" ] || date +%s > "$STATE_DIR/starting-since"
@@ -299,6 +305,6 @@ if [ $(( $(date +%s) - SINCE )) -gt 120 ]; then
   log "not healthy after 2 min: $WHY"
   write_state error "" "HTTPS не отвечает: ${WHY:-нет подробностей}"
 else
-  write_state starting "" ""
+  write_state starting "" "${NAT_TAG:+nat}"
 fi
 exit 0

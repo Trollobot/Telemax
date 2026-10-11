@@ -157,7 +157,7 @@ describe('FileShare.ensureService', () => {
     await service(share, 'ports-busy');
     const r = await share.ensureService(1000);
     expect(r.ok).toBe(false);
-    expect(!r.ok && r.reason).toMatch(/80\/443/);
+    expect(!r.ok && r.reason).toMatch(/порты 80 и 443 на сервере уже заняты/);
   });
 
   it('says so when no host dispatcher serves this install', async () => {
@@ -276,22 +276,30 @@ describe('files service problems in plain words', () => {
       state: 'error',
       detail: 'acme: error:HTTP 400 urn:ietf:params:acme:error:connection - 1.2.3.4: Timeout during connect (likely firewall problem)',
     });
-    expect(firewall).toContain('не достучаться из интернета на портах 80 и 443');
+    expect(firewall).toContain('файрвол хостинга');
     expect(firewall).toContain('Почему:');
     expect(firewall).toContain('Что сделать:');
     expect(firewall.endsWith('.')).toBe(false); // callers add the full stop
-    expect(firewall).toContain('пробросьте');
+    expect(firewall).toContain('откройте порты 80 и 443 в панели хостинга');
     expect(firewall).toContain('FILES=off');
     expect(describeServiceProblem({ state: 'error', detail: 'acme: error:403 urn:ietf:params:acme:error:unauthorized - Invalid response from http://1.2.3.4/.well-known' })).toContain(
-      'отвечает другое устройство',
+      'отвечает другой сервер',
     );
+    // Behind a router (reconcile.sh tags it «nat: »): say it has no white IP and what that means.
+    const nat = describeServiceProblem({ state: 'error', detail: 'acme: nat: urn:ietf:params:acme:error:connection - 5.6.7.8: Timeout during connect' });
+    expect(nat).toContain('нет своего белого IP');
+    expect(nat).toContain('пробросьте');
+    expect(nat).toContain('серый');
+    expect(nat).toContain('FILES=off');
+    expect(describeServiceProblem({ state: 'error', detail: 'acme: nat: urn:ietf:params:acme:error:unauthorized - x' })).toContain('нет своего белого IP');
+    expect(describeServiceProblem({ state: 'error', detail: 'acme: nat: urn:ietf:params:acme:error:dns - NXDOMAIN' })).toContain('FILES_DOMAIN');
     expect(describeServiceProblem({ state: 'error', detail: 'acme: error:DNS problem: NXDOMAIN looking up A for files.example.org' })).toContain('FILES_DOMAIN');
-    expect(describeServiceProblem({ state: 'error', detail: 'acme: error:urn:ietf:params:acme:error:rateLimited' })).toContain('через час');
+    expect(describeServiceProblem({ state: 'error', detail: 'acme: error:urn:ietf:params:acme:error:rateLimited' })).toContain('подождите час');
     expect(describeServiceProblem({ state: 'error', detail: 'acme: msg:challenge failed oddly' })).toContain('Проверка не прошла: msg:challenge failed oddly');
     // What reconcile.sh really passes (live test 2026-10-11): the type first, the wording may be cut.
     expect(describeServiceProblem({ state: 'error', detail: 'acme: urn:ietf:params:acme:error:dns - DNS problem: NXDOMAIN looking up A for x' })).toContain('FILES_DOMAIN');
-    expect(describeServiceProblem({ state: 'error', detail: 'acme: urn:ietf:params:acme:error:connection - 1.2.3.4: Ti' })).toContain('пробросьте');
-    expect(describeServiceProblem({ state: 'error', detail: 'acme: urn:ietf:params:acme:error:tls - 1.2.3.4: rem' })).toContain('пробросьте');
+    expect(describeServiceProblem({ state: 'error', detail: 'acme: urn:ietf:params:acme:error:connection - 1.2.3.4: Ti' })).toContain('файрвол хостинга');
+    expect(describeServiceProblem({ state: 'error', detail: 'acme: urn:ietf:params:acme:error:tls - 1.2.3.4: rem' })).toContain('файрвол хостинга');
     expect(describeServiceProblem({ state: 'ports-busy' })).toContain('FILES_PUBLIC_URL');
     expect(describeServiceProblem({ state: 'error', detail: 'bind: address already in use' })).toBe('служба файлов не запустилась: bind: address already in use');
     expect(SERVICE_TIMEOUT_TEXT).toContain('порты 80 и 443');

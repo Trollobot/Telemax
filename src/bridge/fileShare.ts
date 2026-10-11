@@ -141,11 +141,17 @@ const WHY_PAGE = 'большие файлы передаются через ст
 const WHY_CERT = `${WHY_PAGE}, а ей нужен HTTPS-сертификат. Его выдаёт Let's Encrypt — и перед выдачей проверяет, что адрес действительно ведёт на ваш сервер`;
 const NO_FILES = 'а если большие файлы не нужны — выключите их: FILES=off в .env';
 
+/** Behind a router: reconcile.sh saw a private address on the server itself (its «nat» tag). */
+const NO_WHITE_IP = 'у сервера нет своего белого IP-адреса — он стоит за роутером, и из интернета до него не достучаться';
+const NAT_TODO = `если у роутера белый IP — пробросьте на сервер порты 80 и 443 в настройках роутера. Если белого IP нет (провайдер выдаёт серый) — проброс не поможет: подключите белый IP у провайдера или поставьте мост на VPS; ${NO_FILES}`;
+const LOG_HINT = 'Подробности — в /var/lib/telemax-files/reconcile.log на сервере';
+
 export const SERVICE_TIMEOUT_TEXT = explain(
   'служба файлов не ответила за 2,5 минуты',
   `${WHY_PAGE}, и порты 80 и 443 сервера должны открываться из интернета. Чаще всего они закрыты: сервер дома за роутером или их закрывает файрвол хостинга`,
-  `пробросьте на сервер порты 80 и 443 на роутере или откройте их в панели хостинга; ${NO_FILES}. Подробности — в /var/lib/telemax-files/reconcile.log на сервере`,
+  `пробросьте на сервер порты 80 и 443 на роутере или откройте их в панели хостинга; ${NO_FILES}. ${LOG_HINT}`,
 );
+export const SERVICE_TIMEOUT_NAT_TEXT = explain('служба файлов не ответила за 2,5 минуты', `${WHY_PAGE}, и до сервера должен быть доступ из интернета. А ${NO_WHITE_IP}`, `${NAT_TODO}. ${LOG_HINT}`);
 
 export class FileShare {
   readonly dir: string;
@@ -431,7 +437,7 @@ export class FileShare {
           };
         }
       }
-      if (Date.now() >= deadline) return { ok: false, reason: SERVICE_TIMEOUT_TEXT };
+      if (Date.now() >= deadline) return { ok: false, reason: st?.detail === 'nat' ? SERVICE_TIMEOUT_NAT_TEXT : SERVICE_TIMEOUT_TEXT };
       await sleep(2000);
     }
   }
@@ -552,15 +558,20 @@ export function describeServiceProblem(st: { state?: string; detail?: string }):
   }
   const detail = (st.detail ?? '').trim();
   if (/^acme:/i.test(detail)) {
+    const behindNat = /^acme:\s*nat:/i.test(detail);
     const fail = (because: string, todo: string) => explain("Let's Encrypt не выдал серверу HTTPS-сертификат", `${WHY_CERT}. Проверка не прошла: ${because}`, todo);
-    if (/acme:error:(connection|tls)\b|timeout during connect|firewall|connection refused|connection reset|no route to host|network unreachable/i.test(detail)) {
-      return fail(
-        'до сервера не достучаться из интернета на портах 80 и 443',
-        `если сервер дома за роутером — пробросьте на него порты 80 и 443; если их закрывает хостинг — откройте в его панели; ${NO_FILES}`,
-      );
+    const unreachable = /acme:error:(connection|tls)\b|timeout during connect|firewall|connection refused|connection reset|no route to host|network unreachable/i.test(detail);
+    const wrongAnswer = /acme:error:(unauthorized|incorrectresponse)\b|invalid response|status code 404|403 forbidden/i.test(detail);
+    // A home server: no white IP of its own — the fix depends on the router and the provider.
+    if (behindNat && (unreachable || wrongAnswer)) return fail(NO_WHITE_IP, NAT_TODO);
+    if (unreachable) {
+      return fail('из интернета не открываются порты 80 и 443 сервера — скорее всего, их закрывает файрвол хостинга', `откройте порты 80 и 443 в панели хостинга; ${NO_FILES}`);
     }
-    if (/acme:error:(unauthorized|incorrectresponse)\b|invalid response|status code 404|403 forbidden/i.test(detail)) {
-      return fail('на портах 80 и 443 по адресу сервера отвечает другое устройство — например, сам роутер', `пробросьте порты 80 и 443 на этот сервер; ${NO_FILES}`);
+    if (wrongAnswer) {
+      return fail(
+        'на портах 80 и 443 по адресу сервера отвечает другой сервер',
+        `проверьте, что внешний адрес ведёт именно на этот сервер (например, не выходит ли он в интернет через VPN); ${NO_FILES}`,
+      );
     }
     if (/acme:error:dns\b|nxdomain|no valid a records|no such host|dns problem/i.test(detail)) {
       return fail(
