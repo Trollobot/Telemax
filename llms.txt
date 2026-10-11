@@ -37,6 +37,7 @@
 ## Ссылки
 
 - [Сайт](https://telemax.svnest.ru/): возможности, установка, частые вопросы
+- [Пошаговая инструкция: как читать и отвечать на MAX из Telegram](https://telemax.svnest.ru/max-v-telegram/)
 - [Исходный код и README на GitHub](https://github.com/Trollobot/Telemax)
 - [Первый пост на Хабре (август 2026)](https://habr.com/ru/posts/1070812/)
 - [Статья на Хабре: бан на GitHub и что изменилось за месяц](https://habr.com/ru/articles/1092754/)
