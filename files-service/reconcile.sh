@@ -267,9 +267,11 @@ acme_error() {
   local c
   c=$(docker ps -q --filter "label=com.docker.compose.project=$PROJECT" --filter "label=com.docker.compose.service=caddy" | head -1)
   [ -n "$c" ] || return 0
+  # Error-level lines only: «trying to solve challenge» is Caddy at work, not a failure — taken for
+  # one, it failed a fresh start 9 s in, before Let's Encrypt even answered (live test, 2026-10-11).
   # From the ACME error type on: the «[name] Obtain: [name] solving challenge…» preamble alone ate
   # the 200 characters service.json keeps, and the bridge never saw «error:dns - NXDOMAIN» (live test).
-  docker logs --tail 80 "$c" 2>&1 | grep -oE '"(error|msg)":"[^"]*"' \
+  docker logs --tail 80 "$c" 2>&1 | grep -F '"level":"error"' | grep -oE '"(error|msg)":"[^"]*"' \
     | grep -iE 'challenge|timeout during connect|connection refused|firewall|unauthorized|invalid response|no valid a records|nxdomain|no such host|ratelimit|rate limit|too many' | tail -1 \
     | sed -E 's/.*(urn:ietf:params:acme:error:)/\1/'
 }
@@ -300,7 +302,7 @@ if [ $(( $(date +%s) - SINCE )) -gt 120 ]; then
     WHY="$BASE_URL/health не отвечает — проверьте маршрут на $LISTEN в своём веб-сервере"
   else
     WHY=$(docker logs --tail 50 "$(docker ps -q --filter "label=com.docker.compose.project=$PROJECT" --filter "label=com.docker.compose.service=caddy" | head -1)" 2>&1 \
-      | grep -oE '"(error|msg)":"[^"]*"' | grep -iE 'error|fail|challenge|refused|timeout' | tail -1)
+      | grep -F '"level":"error"' | grep -oE '"(error|msg)":"[^"]*"' | grep -iE 'error|fail|challenge|refused|timeout' | tail -1)
   fi
   log "not healthy after 2 min: $WHY"
   write_state error "" "HTTPS не отвечает: ${WHY:-нет подробностей}"
