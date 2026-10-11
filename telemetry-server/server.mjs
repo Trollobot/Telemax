@@ -6,9 +6,13 @@
 // `GET /reports`. The decisions live in reports.mjs.
 // No frameworks, no deps — Node built-ins only.
 import { createServer } from 'node:http';
-import { readFile, writeFile, mkdir, rename } from 'node:fs/promises';
+import { readFile, writeFile, mkdir, rename, stat } from 'node:fs/promises';
+import { createReadStream } from 'node:fs';
+import { createGunzip } from 'node:zlib';
+import { createInterface } from 'node:readline';
 import path from 'node:path';
 import { sanitizeReport, acceptReport, recordReport, scheduleNotice, dueIn, formatNotice, listReports } from './reports.mjs';
+import { createSiteStats, summarize, createGeoBuilder, cleanIp } from './site.mjs';
 
 const PORT = Number(process.env.PORT || 3100);
 const DATA_FILE = process.env.DATA_FILE || '/data/installs.json';
@@ -26,6 +30,11 @@ const REPORTS_FILE = process.env.REPORTS_FILE || path.join(path.dirname(DATA_FIL
 const REPORT_BOT_TOKEN = process.env.REPORT_BOT_TOKEN || '';
 const REPORT_CHAT_ID = process.env.REPORT_CHAT_ID || '';
 const REPORT_THREAD_ID = Number(process.env.REPORT_THREAD_ID) || 0;
+// Landing visits (site.mjs): aggregates only, plus the GeoIP table it reads countries from.
+const SITE_FILE = process.env.SITE_FILE || path.join(path.dirname(DATA_FILE), 'site.json');
+const GEO_FILE = process.env.GEO_FILE || path.join(path.dirname(DATA_FILE), 'dbip-country-lite.csv.gz');
+const GEO_MAX_AGE_MS = 35 * 86_400_000; // DB-IP publishes monthly
+const HIT_LIMIT_PER_IP = 120; // per rolling hour
 
 /** installId -> { firstSeen, lastSeen, version } */
 let db = {};
@@ -39,6 +48,11 @@ const saveQueues = {};
 /** ip -> recent request timestamps (bounded by the rate limit itself + periodic sweep). */
 const pingsByIp = new Map();
 const reportsByIp = new Map();
+const hitsByIp = new Map();
+
+let site = createSiteStats();
+/** null until the GeoIP table is loaded (countries then read «??»). */
+let geo = null;
 function ipRateLimited(ip, byIp = pingsByIp, limit = PING_LIMIT_PER_IP) {
   const now = Date.now();
   if (byIp.size >= 10_000 && !byIp.has(ip)) {
@@ -64,6 +78,71 @@ async function load() {
   } catch {
     // no reports yet
   }
+  try {
+    site = createSiteStats(JSON.parse(await readFile(SITE_FILE, 'utf8')));
+  } catch {
+    // no visits yet
+  }
+}
+
+/** Downloads this month's (or last month's) DB-IP Lite country table when ours is missing or stale, then loads it. */
+async function refreshGeo() {
+  let age = Infinity;
+  try {
+    age = Date.now() - (await stat(GEO_FILE)).mtimeMs;
+  } catch {
+    // not downloaded yet
+  }
+  if (age > GEO_MAX_AGE_MS) {
+    for (const back of [0, 1]) {
+      const d = new Date();
+      d.setUTCDate(1);
+      d.setUTCMonth(d.getUTCMonth() - back);
+      const month = d.toISOString().slice(0, 7);
+      try {
+        const res = await fetch(`https://download.db-ip.com/free/dbip-country-lite-${month}.csv.gz`, { signal: AbortSignal.timeout(120_000) });
+        if (!res.ok) continue;
+        const gz = Buffer.from(await res.arrayBuffer());
+        await mkdir(path.dirname(GEO_FILE), { recursive: true });
+        await writeFile(`${GEO_FILE}.tmp`, gz);
+        await rename(`${GEO_FILE}.tmp`, GEO_FILE);
+        console.log(`geoip: downloaded DB-IP country lite ${month}`);
+        geo = null; // reload below
+        break;
+      } catch (err) {
+        console.log(`geoip: download ${month} failed: ${err.message}`);
+      }
+    }
+  }
+  if (geo) return;
+  try {
+    // Line by line from the gzip stream: the whole table as one string cost ~150 MB of heap.
+    const builder = createGeoBuilder();
+    const lines = createInterface({ input: createReadStream(GEO_FILE).pipe(createGunzip()), crlfDelay: Infinity });
+    for await (const line of lines) builder.add(line);
+    geo = builder.build();
+    console.log(`geoip: ${geo.size} ranges loaded`);
+  } catch (err) {
+    console.log(`geoip: not loaded (${err.message}) — countries read «??» until it is`);
+  }
+}
+
+/** Visit counters are saved at most every few seconds, not on every beacon. */
+let siteSaveTimer = null;
+function saveSiteSoon() {
+  if (siteSaveTimer) return;
+  siteSaveTimer = setTimeout(() => {
+    siteSaveTimer = null;
+    void save(SITE_FILE, site);
+  }, 5000);
+}
+
+/** The visitor's address: Caddy's X-Forwarded-For when the request came through it (a private hop), else the socket. Used in memory only. */
+function clientIp(req) {
+  const sock = cleanIp(req.socket.remoteAddress);
+  const viaProxy = /^(127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|::1$|f[cd])/i.test(sock);
+  const forwarded = req.headers['x-forwarded-for'];
+  return viaProxy && forwarded ? cleanIp(String(forwarded).split(',')[0]) : sock;
 }
 
 function save(file = DATA_FILE, data = db) {
@@ -211,6 +290,32 @@ const server = createServer(async (req, res) => {
     return;
   }
 
+  // Landing beacon (text/plain, so the browser sends it without a CORS preflight). Never errors back.
+  if (req.method === 'POST' && url.pathname === '/site/hit') {
+    const body = await readBody(req);
+    const ip = clientIp(req);
+    try {
+      const { r, h } = JSON.parse(body);
+      const now = Date.now();
+      if (!ipRateLimited(ip, hitsByIp, HIT_LIMIT_PER_IP)) {
+        const counted = site.hit({ ip, ua: req.headers['user-agent'] ?? '', referrer: r, host: h, country: geo?.lookup(ip) ?? '', now });
+        if (counted) saveSiteSoon();
+      }
+    } catch {
+      // ignore malformed beacons
+    }
+    res.writeHead(204, { 'Access-Control-Allow-Origin': '*' }).end();
+    return;
+  }
+
+  // Public: the /stats/ page reads it. Visits only — installs and reports stay behind STATS_KEY.
+  if (req.method === 'GET' && url.pathname === '/site/stats') {
+    // Any origin may read it: the GitHub Pages copy of the page fetches it cross-site.
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=30', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify(summarize(site.days, Date.now())));
+    return;
+  }
+
   if (req.method === 'GET' && url.pathname === '/reports') {
     if (!allowed(req, res, url)) return;
     const days = Math.max(1, Number(url.searchParams.get('days') || 30));
@@ -240,4 +345,9 @@ const server = createServer(async (req, res) => {
 
 await load();
 void notifyMaintainer(null); // signatures queued before a restart
+void refreshGeo();
+setInterval(() => {
+  void refreshGeo();
+  site.prune(Date.now());
+}, 86_400_000).unref();
 server.listen(PORT, () => console.log(`telemetry listening on :${PORT} (data: ${DATA_FILE})`));

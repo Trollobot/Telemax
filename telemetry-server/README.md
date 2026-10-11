@@ -67,3 +67,21 @@ Without `REPORT_THREAD_ID` the server creates one topic «🤖 Автоотчё�
 message goes to the chat itself. A signature is announced once, when first seen, and at most one
 message is sent per hour — further new signatures are folded into the next one. The message never
 contains an installId.
+
+## Landing visits (`site.mjs`)
+
+The landing (`docs/` → telemax.svnest.ru and its GitHub Pages copy) sends a beacon on every open; the
+public page `/stats/` shows the result. Caddy on the monitoring host routes `https://telemax.svnest.ru/api/site/*`
+here with the `/api` prefix stripped.
+
+- `POST /site/hit` — `{"r": document.referrer, "h": location.hostname}` as `text/plain` (no CORS preflight).
+  Returns 204. Bots (by user agent) are skipped; 120 beacons per IP per hour.
+- `GET /site/stats` — public aggregates for the last 30 days plus totals: views, daily unique visitors,
+  hours (Moscow time), countries, sources (Хабр, vc.ru, GitHub, Telegram, search engines, direct), and
+  which copy of the site was opened. **Visits only** — installs and reports stay behind `STATS_KEY`.
+
+Privacy: nothing about a visitor reaches the disk. The beacon is folded into per-day counters at once;
+unique visitors are a per-day set of salted hashes kept in memory with a salt that is replaced every
+Moscow day, so `data/site.json` holds numbers only. Countries come from the free DB-IP «IP to Country
+Lite» table (CC BY 4.0 — the `/stats/` page credits it), which the server downloads into
+`data/dbip-country-lite.csv.gz` on start and refreshes monthly; until it loads, countries read «??».

@@ -6,14 +6,14 @@
 <title>Telemax — мост MAX ↔ Telegram: переписка из MAX прямо в Telegram</title>
 <meta name="description" content="Telemax — бесплатный мост между MAX и Telegram с открытым кодом. Входит в ваш личный аккаунт MAX по номеру и приносит все чаты в Telegram: каждый чат — отдельная тема. Сообщения, файлы до 4 ГБ, реакции, кнопки ботов. Ставится на свой сервер одной командой.">
 <meta name="keywords" content="MAX в Telegram, мост MAX Telegram, Макс в Телеграм, пересылка сообщений из MAX в Telegram, читать MAX в Telegram, MAX Telegram bridge, Telemax">
-<link rel="canonical" href="https://trollobot.github.io/Telemax/">
+<link rel="canonical" href="https://telemax.svnest.ru/">
 <meta property="og:type" content="website">
 <meta property="og:locale" content="ru_RU">
 <meta property="og:site_name" content="Telemax">
 <meta property="og:title" content="Telemax — переписка из MAX прямо в Telegram">
 <meta property="og:description" content="Бесплатный мост MAX ↔ Telegram с открытым кодом: все чаты MAX — темами в вашей группе Telegram. Свой сервер, одна команда для установки.">
-<meta property="og:url" content="https://trollobot.github.io/Telemax/">
-<meta property="og:image" content="https://trollobot.github.io/Telemax/og.png">
+<meta property="og:url" content="https://telemax.svnest.ru/">
+<meta property="og:image" content="https://telemax.svnest.ru/og.png">
 <meta property="og:image:width" content="780">
 <meta property="og:image:height" content="440">
 <meta name="twitter:card" content="summary_large_image">
@@ -27,10 +27,10 @@
   "description": "Бесплатный мост между мессенджерами MAX и Telegram с открытым кодом. Подключается к личному аккаунту MAX по номеру и приносит все чаты в группу Telegram, каждый чат — отдельной темой.",
   "applicationCategory": "CommunicationApplication",
   "operatingSystem": "Linux (Ubuntu 22.04+, Debian 12+)",
-  "url": "https://trollobot.github.io/Telemax/",
+  "url": "https://telemax.svnest.ru/",
   "downloadUrl": "https://github.com/Trollobot/Telemax",
   "license": "https://www.gnu.org/licenses/agpl-3.0.html",
-  "image": "https://trollobot.github.io/Telemax/og.png",
+  "image": "https://telemax.svnest.ru/og.png",
   "offers": { "@type": "Offer", "price": "0", "priceCurrency": "RUB" }
 }
 </script>
@@ -392,6 +392,7 @@
       <a href="https://vc.ru/id973711/3179706-telemax-integratsiya-max-i-telegram">Статья на vc.ru</a>
       <a href="https://t.me/TelemaxSvv_bot">Баг или идея — боту @TelemaxSvv_bot</a>
       <a href="https://github.com/Trollobot/Telemax/issues">Issues</a>
+      <a href="https://telemax.svnest.ru/stats/">📊 Статистика посещений</a>
     </div>
     <div class="disc">
       ⚠️ Неофициальный проект с открытым кодом. Не связан с MAX и Telegram. Работает с вашим собственным
@@ -400,6 +401,21 @@
     <p style="margin-top:16px">© Telemax — бесплатный мост MAX ↔ Telegram · AGPL-3.0</p>
   </div>
 </footer>
+
+<script>
+  // Счётчик посещений без cookie: сообщает только, откуда пришли и на каком адресе открыт сайт.
+  // Сервер сразу раскладывает это по счётчикам и IP не хранит — см. /stats/.
+  (function () {
+    var h = location.hostname;
+    if (location.protocol !== 'https:' || h === 'localhost' || h === '127.0.0.1') return;
+    try {
+      var body = JSON.stringify({ r: document.referrer || '', h: h });
+      var url = 'https://telemax.svnest.ru/api/site/hit';
+      if (navigator.sendBeacon) navigator.sendBeacon(url, new Blob([body], { type: 'text/plain' }));
+      else fetch(url, { method: 'POST', body: body, keepalive: true, mode: 'no-cors' });
+    } catch (e) {}
+  })();
+</script>
 
 </body>
 </html>
