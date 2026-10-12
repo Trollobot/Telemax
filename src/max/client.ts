@@ -101,16 +101,29 @@ const DEFAULT_HOST = 'api2.oneme.ru';
 const DEFAULT_PORT = 443;
 const DEFAULT_SNI = 'api2.oneme.ru';
 const DEFAULT_PING_INTERVAL_MS = 50_000;
-// What INIT presents: the MAX desktop client's user agent.
-const USER_AGENT = {
-  deviceType: 'DESKTOP',
-  appVersion: '26.24.0',
-  osVersion: 'Ubuntu 24.04.4 LTS',
-  locale: 'ru',
-  screen: '2.0x',
-  timezone: 'Europe/Moscow',
-  buildNumber: 75261,
-} as const;
+// What INIT presents: the MAX desktop client's user agent. MAX refuses logins from a client it
+// considers outdated («Приложение устарело, пожалуйста, обновитесь» on the SMS request — every new
+// /login broke on 2026-10-12, the day after desktop 26.35.x shipped). The current pair is the newest
+// package in MAX's own apt repo: https://download.max.ru/linux/deb/dists/stable/main/binary-amd64/Packages
+// («Version: 26.35.1», «Filename: …/MAX-26.35.1.80662.deb» → build 80662). MAX_APP_VERSION and
+// MAX_BUILD_NUMBER in .env override it, so a user can fix the next such bump without waiting for a release.
+const DEFAULT_APP_VERSION = '26.35.1';
+const DEFAULT_BUILD_NUMBER = 80662;
+function userAgent(env: NodeJS.ProcessEnv = process.env) {
+  const version = (env.MAX_APP_VERSION ?? '').trim();
+  const build = Number((env.MAX_BUILD_NUMBER ?? '').trim());
+  return {
+    deviceType: 'DESKTOP',
+    appVersion: /^\d+\.\d+\.\d+$/.test(version) ? version : DEFAULT_APP_VERSION,
+    osVersion: 'Ubuntu 24.04.4 LTS',
+    locale: 'ru',
+    screen: '2.0x',
+    timezone: 'Europe/Moscow',
+    buildNumber: Number.isInteger(build) && build > 0 ? build : DEFAULT_BUILD_NUMBER,
+  } as const;
+}
+/** Exported for tests: the user agent INIT sends for a given environment. */
+export const maxUserAgent = userAgent;
 const RECONNECT_DELAYS_MS = [1_000, 2_000, 5_000, 10_000, 30_000];
 // A connection counts as healthy — and the reconnect backoff starts over — only once it has
 // passed INIT and then stayed up this long. Resetting on TLS connect made a server that accepts
@@ -460,7 +473,7 @@ export class MaxClient extends EventEmitter {
 
   private sendDeviceInfo(): void {
     this.send(OPCODES.INIT, {
-      userAgent: USER_AGENT,
+      userAgent: userAgent(),
       deviceId: this.deviceId,
       clientSessionId: Math.floor(Math.random() * 1000),
     });
