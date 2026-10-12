@@ -4,7 +4,7 @@ import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import type { Telegraf } from 'telegraf';
 import type { Message } from 'telegraf/types';
-import { broadcastCard, createBroadcasts, isGoneError, readerText, shiftEntities, withQuote } from '../src/bridge/broadcast.js';
+import { addLinks, broadcastCard, createBroadcasts, isGoneError, readerText, shiftEntities, withQuote } from '../src/bridge/broadcast.js';
 import { BroadcastStore, type Broadcast } from '../src/store/broadcastStore.js';
 
 const tempStore = async () => new BroadcastStore(path.join(await mkdtemp(path.join(tmpdir(), 'tlmx-bc-')), 'broadcasts.json'));
@@ -46,19 +46,31 @@ describe('broadcast texts', () => {
     expect(isGoneError(new Error('socket hang up'))).toBe(false);
   });
 
-  it('the card lists the places with a stop button each and offers one more', () => {
-    const empty = broadcastCard('Дача', [], 'https://t.me/bot?start=bc_x');
-    expect(empty.text).toMatch(/Нажмите кнопку/);
-    expect(empty.markup.inline_keyboard.flat().map((b) => b.text)).toEqual(['📡 Выбрать группу или канал', '◀️ Готово']);
-    const two = broadcastCard('Дача', [broadcast(), broadcast({ id: 'b2', targetTitle: 'Новости', targetType: 'channel' })], 'https://t.me/bot?start=bc_y');
+  it("adds the bot through Telegram's own links: a group gets the code, a channel the admin rights", () => {
+    expect(addLinks('tlmx_bot', 'abc')).toEqual({
+      group: 'https://t.me/tlmx_bot?startgroup=bc_abc',
+      channel: 'https://t.me/tlmx_bot?startchannel&admin=post_messages+edit_messages',
+      pick: 'https://t.me/tlmx_bot?start=bc_abc',
+    });
+  });
+
+  it('the card lists the places with a stop button each and offers more', () => {
+    const links = addLinks('tlmx_bot', 'x');
+    const empty = broadcastCard('Дача', [], links);
+    expect(empty.text).toMatch(/сам добавит туда бота/);
+    expect(empty.markup.inline_keyboard.flat().map((b) => b.text)).toEqual(['👥 В группу', '📢 В канал', '🔎 Бот уже там', '◀️ Готово']);
+    const two = broadcastCard('Дача', [broadcast(), broadcast({ id: 'b2', targetTitle: 'Новости', targetType: 'channel' })], links);
     expect(two.text).toMatch(/👥 Читалка/);
     expect(two.text).toMatch(/📢 Новости/);
     expect(two.markup.inline_keyboard.flat().map((b) => ('callback_data' in b ? b.callback_data : b.text))).toEqual([
       'tlmx_bc:stop:b1',
       'tlmx_bc:stop:b2',
-      '➕ Ещё группа или канал',
+      '👥 В группу',
+      '📢 В канал',
+      '🔎 Бот уже там',
       'tlmx_panel:dismiss',
     ]);
+    expect(broadcastCard('Дача', [], undefined).text).toMatch(/не знает своё имя/);
   });
 });
 
@@ -88,6 +100,8 @@ describe('copying into broadcasts', () => {
       copyMessage: vi.fn(async (_chatId: number | string, _from: number | string, _id: number, _extra?: unknown) => ({ message_id: next++ })),
       editMessageText: vi.fn(async (_chatId: number | string, _id: number, _inline: unknown, _text: string) => true),
       deleteMessages: vi.fn(async (_chatId: number | string, _ids: number[]) => true),
+      getChatMember: vi.fn(async (_chatId: number | string, _userId: number): Promise<Record<string, unknown>> => ({ status: 'member' })),
+      getChat: vi.fn(async (chatId: number | string) => ({ id: chatId, title: 'Из getChat' })),
     };
     return { telegram, botInfo: { id: 42, username: 'tlmx_bot' }, command: vi.fn(), action: vi.fn() };
   }
@@ -173,5 +187,73 @@ describe('copying into broadcasts', () => {
     expect(bot.telegram.copyMessage.mock.calls[0]).toEqual([-500, '-1001', 12, { caption: `${prefix}↩️ Переслано от Пети\nдача`, caption_entities: undefined }]);
     expect(bot.telegram.sendMessage.mock.calls[1]![1]).toBe('🧑 Сергей:');
     expect(bot.telegram.copyMessage.mock.calls[1]!.slice(0, 3)).toEqual([-500, '-1001', 14]);
+  });
+});
+
+describe('switching a broadcast on', () => {
+  async function setup() {
+    const store = await tempStore();
+    let next = 1;
+    const telegram = {
+      sendMessage: vi.fn(async (_chatId: number | string, _text: string, _extra?: unknown) => ({ message_id: next++ })),
+      getChatMember: vi.fn(async (_chatId: number | string, _userId: number): Promise<Record<string, unknown>> => ({ status: 'member' })),
+      getChat: vi.fn(async (chatId: number | string) => ({ id: chatId, title: 'Из getChat' })),
+    };
+    const bot = { telegram, botInfo: { id: 42, username: 'tlmx_bot' }, command: vi.fn(), action: vi.fn() };
+    const bc = createBroadcasts({
+      bot: bot as unknown as Telegraf,
+      targetGroupId: '-1001',
+      store,
+      chatTitle: async () => 'Дача',
+      chatOfTopic: async () => '100',
+      topicOf: async () => 77,
+      ownerName: async () => 'Сергей',
+      isGroupAdmin: async () => true,
+    });
+    bc.register();
+    // An admin (id 9) writes /broadcast in the chat's topic: the card's links carry a fresh code.
+    const onBroadcast = bot.command.mock.calls.find((c) => c[0] === 'broadcast')![1] as (ctx: unknown) => Promise<void>;
+    const reply = vi.fn(async () => ({}));
+    await onBroadcast({ message: { message_thread_id: 5 }, from: { id: 9 }, reply });
+    const markup = (reply.mock.calls[0] as unknown as [string, { reply_markup: { inline_keyboard: Array<Array<{ url?: string }>> } }])[1].reply_markup;
+    const groupLink = markup.inline_keyboard.flat().find((b) => b.url?.includes('startgroup'))!.url!;
+    const code = /bc_([\w-]+)/.exec(groupLink)![1]!;
+    return { store, telegram, bc, code };
+  }
+  const groupCtx = (from: number, text: string) => ({ chat: { id: -700, type: 'supergroup', title: 'Читалка' }, from: { id: from }, message: { text }, reply: vi.fn(async () => ({})) });
+
+  it('«👥 В группу»: the /start the group gets switches it on, with a hello there, a notice in the topic and a DM', async () => {
+    const { store, telegram, bc, code } = await setup();
+    expect(await bc.handleChat(groupCtx(9, `/start@tlmx_bot bc_${code}`) as never)).toBe(true);
+    expect((await store.forChat('100')).map((b) => [b.targetChatId, b.targetType, b.targetTitle])).toEqual([[-700, 'group', 'Читалка']]);
+    expect(telegram.sendMessage.mock.calls.map((c) => c[0])).toEqual([-700, '-1001', 9]);
+    expect(telegram.sendMessage.mock.calls[0]![1]).toMatch(/Сюда транслируется чат «Дача»/);
+    expect(telegram.sendMessage.mock.calls[1]![1]).toMatch(/Трансляция в «Читалка» включена/);
+    expect(telegram.sendMessage.mock.calls[2]![1]).toMatch(/^✅ Готово: чат «Дача» транслируется в «Читалка»/);
+  });
+
+  it("someone else's /start with the code switches nothing on", async () => {
+    const { store, bc, code } = await setup();
+    const ctx = groupCtx(10, `/start@tlmx_bot bc_${code}`);
+    expect(await bc.handleChat(ctx as never)).toBe(true);
+    expect(await store.all()).toEqual([]);
+    expect(ctx.reply).toHaveBeenCalledWith(expect.stringMatching(/устарела или открыта не тем/));
+    expect(await bc.handleChat(groupCtx(9, 'просто сообщение') as never)).toBe(false);
+  });
+
+  it('«📢 В канал»: the promotion to admin is matched to the admin who opened the card', async () => {
+    const { store, telegram, bc } = await setup();
+    const promotion = (from: number, rights: Record<string, unknown>) => ({
+      chat: { id: -800, type: 'channel', title: 'Новости' },
+      from: { id: from },
+      myChatMember: { old_chat_member: { status: 'left' }, new_chat_member: { status: 'administrator', ...rights } },
+    });
+    expect(await bc.handleChat(promotion(10, { can_post_messages: true }) as never)).toBe(true);
+    expect(await store.all()).toEqual([]);
+    expect(await bc.handleChat(promotion(9, { can_post_messages: false }) as never)).toBe(true);
+    expect(await store.all()).toEqual([]);
+    expect(telegram.sendMessage).toHaveBeenLastCalledWith(9, expect.stringMatching(/без права публиковать/));
+    expect(await bc.handleChat(promotion(9, { can_post_messages: true }) as never)).toBe(true);
+    expect((await store.forChat('100')).map((b) => [b.targetChatId, b.targetType, b.targetTitle])).toEqual([[-800, 'channel', 'Новости']]);
   });
 });

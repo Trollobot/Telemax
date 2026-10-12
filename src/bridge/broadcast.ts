@@ -56,6 +56,8 @@ export interface Broadcasts {
   isTarget(chatId: number): Promise<boolean>;
   /** The DM part of switching one on (deep link, chat picker); true when the update was ours. */
   handlePrivate(ctx: Context): Promise<boolean>;
+  /** A group or channel outside the bridge: the bot added there by a card's link (true = ours, nothing else may answer it). */
+  handleChat(ctx: Context): Promise<boolean>;
   /** /broadcast and the card's buttons — registered after the bridge's admin gate. */
   register(): void;
 }
@@ -90,7 +92,7 @@ export function isGoneError(err: unknown): boolean {
 export function broadcastCard(
   chatTitle: string,
   list: Broadcast[],
-  addLink: string | undefined,
+  links: AddLinks | undefined,
 ): { text: string; markup: { inline_keyboard: InlineKeyboardButton[][] } } {
   const day = (ms: number) => new Date(ms).toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit', timeZone: process.env.TZ || 'Europe/Moscow' });
   const where = (b: Broadcast) => `${b.targetType === 'channel' ? '📢' : '👥'} ${b.targetTitle}`;
@@ -98,17 +100,37 @@ export function broadcastCard(
   if (list.length === 0) {
     lines.push(
       'Новые сообщения этого чата можно копировать в группы и каналы Telegram — для тех, у кого нет MAX. Мест — сколько угодно. История до включения не переносится, а что пишут там — в MAX не уходит.',
-      '',
-      'Нажмите кнопку — откроется личка с ботом, там выберите группу или канал.',
     );
   } else {
     lines.push('Новые сообщения копируются сюда:', ...list.map((b) => `• ${where(b)} — с ${day(b.since)}`));
   }
-  if (!addLink) lines.push('', '⚠️ Бот ещё не знает своё имя — повторите /broadcast через минуту.');
+  if (links) {
+    lines.push(
+      '',
+      '«👥 В группу» / «📢 В канал» — Telegram покажет ваши группы или каналы и сам добавит туда бота (в канал — администратором с правом публиковать). Бот уже там — «🔎 Бот уже там».',
+    );
+  } else {
+    lines.push('', '⚠️ Бот ещё не знает своё имя — повторите /broadcast через минуту.');
+  }
   const rows: InlineKeyboardButton[][] = list.map((b) => [Markup.button.callback(`⏹ Остановить: ${truncateCodePoints(b.targetTitle, 40, '…')}`, `tlmx_bc:stop:${b.id}`)]);
-  if (addLink) rows.push([Markup.button.url(list.length ? '➕ Ещё группа или канал' : '📡 Выбрать группу или канал', addLink)]);
+  if (links) {
+    rows.push([Markup.button.url('👥 В группу', links.group), Markup.button.url('📢 В канал', links.channel)]);
+    rows.push([Markup.button.url('🔎 Бот уже там', links.pick)]);
+  }
   rows.push([Markup.button.callback('◀️ Готово', 'tlmx_panel:dismiss')]);
   return { text: lines.join('\n'), markup: { inline_keyboard: rows } };
+}
+
+/** The card's three ways to add a place — all carry the same one-time code (see createBroadcasts). */
+export type AddLinks = { group: string; channel: string; pick: string };
+
+/** Telegram's own «add the bot» links: a group gets `/start@bot bc_<code>` (the code says which chat); a channel makes the bot an admin with these rights. */
+export function addLinks(username: string, code: string): AddLinks {
+  return {
+    group: `https://t.me/${username}?startgroup=bc_${code}`,
+    channel: `https://t.me/${username}?startchannel&admin=post_messages+edit_messages`,
+    pick: `https://t.me/${username}?start=bc_${code}`,
+  };
 }
 
 /** What a channel's admin rights must include for the bot (and so for the user who picks it). */
@@ -296,34 +318,74 @@ export function createBroadcasts(deps: BroadcastDeps): Broadcasts {
     copies.delete(key);
   }
 
-  // --- Switching one on: /broadcast card → deep link → the DM's chat picker ----------------------
-  function deepLink(maxChatId: string, requesterId: number): string | undefined {
+  // --- Switching one on --------------------------------------------------------------------------
+  // The /broadcast card carries three links with one code: Telegram's «add the bot to a group»
+  // (the group then gets `/start@bot bc_<code>` — the code names the MAX chat), «add the bot to a
+  // channel as admin» (no code travels: the my_chat_member update of that promotion is matched to
+  // the admin's latest card), and the DM chat picker for a place the bot is already in. Telegram's
+  // picker does NOT add the bot by itself (live 2026-10-13) — hence the add links.
+  /** The newest card's code per admin — a channel promotion carries no code, it takes this one. */
+  const latestCode = new Map<number, string>();
+  function issue(maxChatId: string, requesterId: number): AddLinks | undefined {
     const username = bot.botInfo?.username;
     if (!username) return undefined;
     for (const [code, p] of codes) if (Date.now() - p.at > LINK_TTL_MS) codes.delete(code);
     const code = randomBytes(9).toString('base64url');
     codes.set(code, { maxChatId, requesterId, at: Date.now() });
-    return `https://t.me/${username}?start=bc_${code}`;
+    latestCode.set(requesterId, code);
+    return addLinks(username, code);
+  }
+  /** A live code of this admin: the one named, or (no code given) their newest. */
+  function codeOf(userId: number, code?: string): PickRequest | undefined {
+    const p = codes.get(code ?? latestCode.get(userId) ?? '');
+    return p && p.requesterId === userId && Date.now() - p.at <= LINK_TTL_MS ? p : undefined;
   }
   async function card(maxChatId: string, requesterId: number) {
-    return broadcastCard(await deps.chatTitle(maxChatId), await store.forChat(maxChatId), deepLink(maxChatId, requesterId));
+    return broadcastCard(await deps.chatTitle(maxChatId), await store.forChat(maxChatId), issue(maxChatId, requesterId));
   }
   const removeKeyboard = { reply_markup: { remove_keyboard: true as const } };
+  const botHandle = () => (bot.botInfo?.username ? `@${bot.botInfo.username}` : 'бота');
+
+  /** Can the bot post into `chatId`? A channel needs it as an admin allowed to publish, a group as a member allowed to write. */
+  async function canPost(chatId: number, kind: 'group' | 'channel'): Promise<boolean> {
+    const botId = bot.botInfo?.id;
+    const member = botId != null ? await bot.telegram.getChatMember(chatId, botId).catch(() => undefined) : undefined;
+    if (kind === 'channel') return member?.status === 'administrator' && member.can_post_messages === true;
+    return member?.status === 'member' || member?.status === 'administrator' || (member?.status === 'restricted' && member.can_send_messages);
+  }
+
+  /** Switches the broadcast on (rights checked by the caller): saved, a hello in the place, a notice in the topic. Returns what to tell the admin. */
+  async function bind(p: PickRequest, chatId: number, kind: 'group' | 'channel', knownTitle?: string): Promise<string> {
+    if (String(chatId) === targetGroupId) return 'Это группа самого моста — выберите другую.';
+    if ((await store.forChat(p.maxChatId)).some((b) => b.targetChatId === chatId)) return 'Этот чат уже транслируется туда.';
+    const chat = knownTitle ? undefined : await bot.telegram.getChat(chatId).catch(() => undefined);
+    const targetTitle = knownTitle ?? (chat && 'title' in chat ? chat.title : undefined) ?? String(chatId);
+    const title = await deps.chatTitle(p.maxChatId);
+    const now = Date.now();
+    await store.add({ id: randomBytes(6).toString('base64url'), maxChatId: p.maxChatId, targetChatId: chatId, targetTitle, targetType: kind, since: now, cursor: now });
+    logger.info(`Broadcast on: MAX chat ${p.maxChatId} -> ${kind} ${chatId}`);
+    await bot.telegram
+      .sendMessage(chatId, `📡 Сюда транслируется чат «${title}» из MAX — новые сообщения будут появляться здесь.`)
+      .catch((err) => logger.error('Broadcast hello to the target failed', err));
+    await notifyTopic(p.maxChatId, `📡 Трансляция в «${targetTitle}» включена — новые сообщения этого чата копируются туда. Управление — /broadcast.`);
+    return `✅ Готово: чат «${title}» транслируется в «${targetTitle}». Остановить — /broadcast в теме чата.`;
+  }
 
   async function handlePrivate(ctx: Context): Promise<boolean> {
     const msg = ctx.message;
     const userId = ctx.from?.id;
     if (!msg || userId == null) return false;
 
+    // «🔎 Бот уже там»: the DM chat picker.
     const start = 'text' in msg ? /^\/start bc_([\w-]+)$/.exec(msg.text) : null;
     if (start) {
-      const p = codes.get(start[1]!);
-      if (!p || Date.now() - p.at > LINK_TTL_MS) {
-        await ctx.reply('Ссылка устарела — напишите /broadcast в теме чата ещё раз.');
+      const p = codeOf(userId, start[1]!);
+      if (!p) {
+        await ctx.reply('Ссылка устарела или открыта не тем администратором — напишите /broadcast в теме чата ещё раз.');
         return true;
       }
-      if (p.requesterId !== userId || !(await deps.isGroupAdmin(userId).catch(() => false))) {
-        await ctx.reply('Эта ссылка открывает трансляцию только тому администратору, который её запросил.');
+      if (!(await deps.isGroupAdmin(userId).catch(() => false))) {
+        await ctx.reply('Трансляцию включает только администратор группы моста.');
         return true;
       }
       for (const [id, r] of requests) if (r.requesterId === userId || Date.now() - r.at > LINK_TTL_MS) requests.delete(id);
@@ -333,7 +395,7 @@ export function createBroadcasts(deps: BroadcastDeps): Broadcasts {
       requests.set(channelReq, { ...p, at: Date.now(), kind: 'channel' });
       const title = await deps.chatTitle(p.maxChatId);
       await ctx.reply(
-        `📡 Куда транслировать чат «${title}»?\n\nНажмите кнопку внизу и выберите группу или канал из своих. Бот должен там быть: для канала — администратором с правом публиковать, Telegram предложит добавить его сам.`,
+        `📡 Куда транслировать чат «${title}»?\n\nНажмите кнопку внизу и выберите группу или канал, где бот уже есть (в канале — администратором с правом публиковать). Если его там нет — вернитесь к /broadcast и нажмите «👥 В группу» или «📢 В канал»: так Telegram добавит его сам.`,
         Markup.keyboard([
           [Markup.button.groupRequest('👥 Выбрать группу', groupReq, { bot_is_member: true })],
           [Markup.button.channelRequest('📢 Выбрать канал', channelReq, { bot_administrator_rights: CHANNEL_RIGHTS, user_administrator_rights: CHANNEL_RIGHTS })],
@@ -352,41 +414,17 @@ export function createBroadcasts(deps: BroadcastDeps): Broadcasts {
         return true;
       }
       const chatId = msg.chat_shared.chat_id;
-      const botId = bot.botInfo?.id;
-      const member = botId != null ? await bot.telegram.getChatMember(chatId, botId).catch(() => undefined) : undefined;
-      const canPost =
-        r.kind === 'channel'
-          ? member?.status === 'creator' || (member?.status === 'administrator' && member.can_post_messages === true)
-          : member?.status === 'member' || member?.status === 'administrator' || member?.status === 'creator' || (member?.status === 'restricted' && member.can_send_messages);
-      if (!canPost) {
-        const who = bot.botInfo?.username ? `@${bot.botInfo.username}` : 'бота';
+      if (!(await canPost(chatId, r.kind))) {
         await ctx.reply(
           r.kind === 'channel'
-            ? `Бот не администратор этого канала или ему нельзя публиковать. Добавьте ${who} в администраторы канала с правом «Публикация сообщений» и выберите канал ещё раз.`
-            : `Бота нет в этой группе или ему запрещено писать. Добавьте ${who} в группу и выберите её ещё раз.`,
+            ? `Бот не администратор этого канала или ему нельзя публиковать. Проще всего — /broadcast в теме чата → «📢 В канал»: Telegram сам добавит ${botHandle()} администратором.`
+            : `Бота нет в этой группе или ему запрещено писать. Проще всего — /broadcast в теме чата → «👥 В группу»: Telegram сам добавит ${botHandle()}.`,
         );
         return true;
       }
-      if (String(chatId) === targetGroupId) {
-        await ctx.reply('Это группа самого моста — выберите другую.');
-        return true;
-      }
-      if ((await store.forChat(r.maxChatId)).some((b) => b.targetChatId === chatId)) {
-        await ctx.reply('Этот чат уже транслируется туда.', removeKeyboard);
-        return true;
-      }
-      const chat = await bot.telegram.getChat(chatId).catch(() => undefined);
-      const targetTitle = (chat && 'title' in chat ? chat.title : undefined) ?? String(chatId);
-      const title = await deps.chatTitle(r.maxChatId);
-      const now = Date.now();
-      await store.add({ id: randomBytes(6).toString('base64url'), maxChatId: r.maxChatId, targetChatId: chatId, targetTitle, targetType: r.kind, since: now, cursor: now });
+      const answer = await bind(r, chatId, r.kind);
       for (const [id, x] of requests) if (x.requesterId === userId) requests.delete(id);
-      logger.info(`Broadcast on: MAX chat ${r.maxChatId} -> ${r.kind} ${chatId}`);
-      await bot.telegram
-        .sendMessage(chatId, `📡 Сюда транслируется чат «${title}» из MAX — новые сообщения будут появляться здесь.`)
-        .catch((err) => logger.error('Broadcast hello to the target failed', err));
-      await notifyTopic(r.maxChatId, `📡 Трансляция в «${targetTitle}» включена — новые сообщения этого чата копируются туда. Управление — /broadcast.`);
-      await ctx.reply(`✅ Готово: чат «${title}» транслируется в «${targetTitle}». Остановить — /broadcast в теме чата.`, removeKeyboard);
+      await ctx.reply(answer, removeKeyboard);
       return true;
     }
 
@@ -396,6 +434,50 @@ export function createBroadcasts(deps: BroadcastDeps): Broadcasts {
       return true;
     }
     return false;
+  }
+
+  async function handleChat(ctx: Context): Promise<boolean> {
+    const userId = ctx.from?.id;
+    const chat = ctx.chat;
+    if (!chat || chat.type === 'private') return false;
+
+    // «📢 В канал»: Telegram made the bot an admin there — the promoting admin's newest card says which MAX chat.
+    const change = ctx.myChatMember;
+    if (change) {
+      const now = change.new_chat_member;
+      const before = change.old_chat_member.status;
+      const promoted = chat.type === 'channel' && now.status === 'administrator' && before !== 'administrator';
+      const p = promoted && userId != null ? codeOf(userId) : undefined;
+      if (!p || userId == null) return true; // nothing of ours — and never a reply into someone's channel
+      if (!(now.status === 'administrator' && now.can_post_messages)) {
+        await bot.telegram
+          .sendMessage(userId, `Бота добавили в «${chat.title}» без права публиковать сообщения — трансляции туда не будет. Дайте ему это право и нажмите «📢 В канал» ещё раз.`)
+          .catch(() => {});
+        return true;
+      }
+      const answer = await bind(p, chat.id, 'channel', chat.title);
+      await bot.telegram.sendMessage(userId, answer).catch((err) => logger.error('Broadcast: could not tell the admin in DM', err));
+      return true;
+    }
+
+    // «👥 В группу»: Telegram added the bot and sent `/start@bot bc_<code>` into the group.
+    const text = (ctx.message as { text?: string } | undefined)?.text;
+    const start = text ? /^\/start(?:@\w+)? bc_([\w-]+)$/.exec(text) : null;
+    if (!start) return false;
+    const p = userId != null ? codeOf(userId, start[1]!) : undefined;
+    if (!p) {
+      await ctx.reply('Ссылка устарела или открыта не тем администратором — напишите /broadcast в теме чата ещё раз.').catch(() => {});
+      return true;
+    }
+    if (!(await canPost(chat.id, 'group'))) {
+      await ctx.reply('Боту здесь запрещено писать — разрешите ему отправку сообщений и нажмите «👥 В группу» ещё раз.').catch(() => {});
+      return true;
+    }
+    const answer = await bind(p, chat.id, 'group', 'title' in chat ? chat.title : undefined);
+    // The hello already went into the group; the admin gets the outcome in DM (a refusal stays visible there).
+    if (!answer.startsWith('✅')) await ctx.reply(answer).catch(() => {});
+    await bot.telegram.sendMessage(userId!, answer).catch(() => {});
+    return true;
   }
 
   function register(): void {
@@ -433,6 +515,7 @@ export function createBroadcasts(deps: BroadcastDeps): Broadcasts {
     copyDelete,
     isTarget: (chatId) => store.isTarget(chatId),
     handlePrivate,
+    handleChat,
     register,
   };
 }

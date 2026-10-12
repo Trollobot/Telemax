@@ -1522,6 +1522,13 @@ export function wireBridge({
   // finds the bot (a DM, an unrelated group) could trigger them. poll_answer updates carry no
   // `chat`: they pass through, and the poll_answer handler checks poll_id and the voter itself.
   bot.use(async (ctx, next) => {
+    // The bot added to / removed from a chat: only a broadcast's channel promotion means anything to us.
+    if (ctx.myChatMember) {
+      if (ctx.chat && String(ctx.chat.id) !== targetGroupId) {
+        await broadcasts.handleChat(ctx).catch((err) => logger.error('Broadcast: membership update failed', err));
+      }
+      return;
+    }
     if (ctx.chat && String(ctx.chat.id) !== targetGroupId) {
       // A private DM from an outsider is a bug report (or a redirect); only GROUPS get the hard reject.
       if (ctx.chat.type === 'private') {
@@ -1534,6 +1541,15 @@ export function wireBridge({
       // A broadcast's group or channel: readers' messages there go nowhere. And no reject for the
       // service message of the bot being added — the chat picker does exactly that before it says which chat.
       if (await broadcasts.isTarget(ctx.chat.id).catch(() => false)) return;
+      // «👥 В группу» from a /broadcast card: Telegram added the bot and sent `/start@bot bc_<code>` here.
+      if (
+        await broadcasts.handleChat(ctx).catch((err) => {
+          logger.error('Broadcast: switching on from a group failed', err);
+          return true;
+        })
+      ) {
+        return;
+      }
       const m = ctx.message as { new_chat_members?: unknown; left_chat_member?: unknown; group_chat_created?: unknown; supergroup_chat_created?: unknown; migrate_to_chat_id?: unknown; migrate_from_chat_id?: unknown } | undefined;
       if (m && (m.new_chat_members || m.left_chat_member || m.group_chat_created || m.supergroup_chat_created || m.migrate_to_chat_id || m.migrate_from_chat_id)) return;
       if (ctx.callbackQuery) {

@@ -591,9 +591,11 @@ async function launchTelegramBotWithRetry(bot: Telegraf, attempt = 0): Promise<v
   // leaving it out here silently dropped every inline-keyboard button press (/version's Обновить/Позже)
   // with no error anywhere: Telegram just never delivered the update. /donate's buttons never surfaced
   // this because they're url buttons, which the client opens directly without involving the bot at all.
+  // my_chat_member: «📢 В канал» of a /broadcast card makes the bot a channel admin — that update is
+  // the only sign of which channel it was (bridge/broadcast.ts).
   const launchedAt = Date.now();
   bot
-    .launch({ allowedUpdates: ['message', 'edited_message', 'message_reaction', 'poll_answer', 'callback_query'] })
+    .launch({ allowedUpdates: ['message', 'edited_message', 'message_reaction', 'poll_answer', 'callback_query', 'my_chat_member'] })
     .catch((err) => retryTelegramLaunch(bot, Date.now() - launchedAt >= TELEGRAM_STABLE_POLLING_MS ? 0 : attempt, err));
 }
 
