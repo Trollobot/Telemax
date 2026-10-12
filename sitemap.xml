@@ -2,11 +2,15 @@
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
   <url>
     <loc>https://telemax.svnest.ru/</loc>
-    <lastmod>2026-10-11</lastmod>
+    <lastmod>2026-10-13</lastmod>
   </url>
   <url>
     <loc>https://telemax.svnest.ru/max-v-telegram/</loc>
     <lastmod>2026-10-11</lastmod>
+  </url>
+  <url>
+    <loc>https://telemax.svnest.ru/news/</loc>
+    <lastmod>2026-10-13</lastmod>
   </url>
   <url>
     <loc>https://telemax.svnest.ru/stats/</loc>

@@ -1,0 +1,623 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Новости Telemax — что нового в мосте MAX ↔ Telegram</title>
+<meta name="description" content="Что нового в Telemax: все версии моста MAX ↔ Telegram по-человечески. Последняя — 1.3.5 от 13 октября 2026: Трансляция чатов и контакты MAX.">
+<link rel="canonical" href="https://telemax.svnest.ru/news/">
+<link rel="alternate" type="application/rss+xml" title="Новости Telemax" href="https://telemax.svnest.ru/news/feed.xml">
+<meta property="og:type" content="website">
+<meta property="og:locale" content="ru_RU">
+<meta property="og:site_name" content="Telemax">
+<meta property="og:title" content="Новости Telemax — Трансляция чатов и контакты MAX">
+<meta property="og:description" content="Все версии моста MAX ↔ Telegram: что появилось и что починили.">
+<meta property="og:url" content="https://telemax.svnest.ru/news/">
+<meta property="og:image" content="https://telemax.svnest.ru/og.png">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" type="image/png" href="../icon.png">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "Blog",
+  "name": "Новости Telemax",
+  "url": "https://telemax.svnest.ru/news/",
+  "inLanguage": "ru",
+  "blogPost": [
+    {
+      "@type": "BlogPosting",
+      "headline": "Telemax 1.3.5: Трансляция чатов и контакты MAX",
+      "datePublished": "2026-10-13",
+      "url": "https://telemax.svnest.ru/news/#v1.3.5",
+      "author": {
+        "@type": "Organization",
+        "name": "Telemax"
+      }
+    },
+    {
+      "@type": "BlogPosting",
+      "headline": "Telemax 1.3.4: Вход в MAX снова работает",
+      "datePublished": "2026-10-12",
+      "url": "https://telemax.svnest.ru/news/#v1.3.4",
+      "author": {
+        "@type": "Organization",
+        "name": "Telemax"
+      }
+    },
+    {
+      "@type": "BlogPosting",
+      "headline": "Telemax 1.3.3: Большие файлы: понятные причины сбоев и отправка с сервера",
+      "datePublished": "2026-10-11",
+      "url": "https://telemax.svnest.ru/news/#v1.3.3",
+      "author": {
+        "@type": "Organization",
+        "name": "Telemax"
+      }
+    },
+    {
+      "@type": "BlogPosting",
+      "headline": "Telemax 1.3.2: Поиск по номеру в любом виде, подсказки прямо в пульте",
+      "datePublished": "2026-10-11",
+      "url": "https://telemax.svnest.ru/news/#v1.3.2",
+      "author": {
+        "@type": "Organization",
+        "name": "Telemax"
+      }
+    },
+    {
+      "@type": "BlogPosting",
+      "headline": "Telemax 1.3.1: Свой файлообменник",
+      "datePublished": "2026-10-10",
+      "url": "https://telemax.svnest.ru/news/#v1.3.1",
+      "author": {
+        "@type": "Organization",
+        "name": "Telemax"
+      }
+    },
+    {
+      "@type": "BlogPosting",
+      "headline": "Telemax 1.3.0: Большие файлы — по ссылке, до 4 ГБ",
+      "datePublished": "2026-10-10",
+      "url": "https://telemax.svnest.ru/news/#v1.3.0",
+      "author": {
+        "@type": "Organization",
+        "name": "Telemax"
+      }
+    },
+    {
+      "@type": "BlogPosting",
+      "headline": "Telemax 1.2.1: Боты и каналы MAX снова находятся по нику",
+      "datePublished": "2026-10-05",
+      "url": "https://telemax.svnest.ru/news/#v1.2.1",
+      "author": {
+        "@type": "Organization",
+        "name": "Telemax"
+      }
+    },
+    {
+      "@type": "BlogPosting",
+      "headline": "Telemax 1.2.0: Кнопки ботов MAX заработали в Telegram",
+      "datePublished": "2026-10-05",
+      "url": "https://telemax.svnest.ru/news/#v1.2.0",
+      "author": {
+        "@type": "Organization",
+        "name": "Telemax"
+      }
+    },
+    {
+      "@type": "BlogPosting",
+      "headline": "Telemax 1.1.1: Обновления стали легче",
+      "datePublished": "2026-10-04",
+      "url": "https://telemax.svnest.ru/news/#v1.1.1",
+      "author": {
+        "@type": "Organization",
+        "name": "Telemax"
+      }
+    },
+    {
+      "@type": "BlogPosting",
+      "headline": "Telemax 1.1.0: Большая работа над надёжностью",
+      "datePublished": "2026-10-02",
+      "url": "https://telemax.svnest.ru/news/#v1.1.0",
+      "author": {
+        "@type": "Organization",
+        "name": "Telemax"
+      }
+    },
+    {
+      "@type": "BlogPosting",
+      "headline": "Telemax 1.0.1: Тема нового собеседника — сразу с его именем",
+      "datePublished": "2026-09-22",
+      "url": "https://telemax.svnest.ru/news/#v1.0.1",
+      "author": {
+        "@type": "Organization",
+        "name": "Telemax"
+      }
+    },
+    {
+      "@type": "BlogPosting",
+      "headline": "Telemax 1.0.0: Версия 1.0: несколько мостов на одном сервере",
+      "datePublished": "2026-09-21",
+      "url": "https://telemax.svnest.ru/news/#v1.0.0",
+      "author": {
+        "@type": "Organization",
+        "name": "Telemax"
+      }
+    }
+  ]
+}
+</script>
+<style>
+  :root{
+    --paper:#f5ecd9; --paper-2:#faf4e6; --card:#fffdf8;
+    --ink:#2b2119; --muted:#6f6152; --faint:#948676;
+    --line:#e4d4b6; --line-soft:#eaddc4;
+    --terra:#c2571f; --terra-dark:#9d4315; --terra-tint:#f0dcbb;
+    --olive:#7a7433; --ok:#4d7c2f;
+    --serif:Georgia,"Times New Roman","PT Serif",serif;
+    --radius:14px; --shadow:0 1px 2px rgba(70,45,20,.05),0 14px 34px rgba(90,55,20,.09);
+  }
+  *{box-sizing:border-box}
+  html{scroll-padding-top:80px}
+  body{margin:0;background:var(--paper);color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    line-height:1.62;-webkit-font-smoothing:antialiased}
+  a{color:var(--terra-dark);text-decoration:none}
+  a:hover{text-decoration:underline}
+  .wrap{max-width:860px;margin:0 auto;padding:0 22px}
+  h1,h2,h3{font-family:var(--serif);line-height:1.18;margin:0 0 .4em;font-weight:700}
+  .btn{display:inline-block;padding:11px 18px;border-radius:12px;font-weight:700;border:1.5px solid transparent;font-size:.95rem}
+  .btn-primary{background:var(--terra);color:#fff8ef}
+  .btn-primary:hover{background:var(--terra-dark);text-decoration:none}
+  .btn-ghost{background:transparent;border-color:var(--line);color:var(--ink)}
+  .btn-ghost:hover{border-color:var(--terra);text-decoration:none}
+  header.nav{position:sticky;top:0;z-index:10;background:rgba(245,236,217,.86);
+    backdrop-filter:blur(8px);border-bottom:1px solid var(--line)}
+  .nav .wrap{max-width:1000px;display:flex;align-items:center;gap:16px;height:62px}
+  .brand{font-family:var(--serif);font-weight:700;font-size:1.35rem;letter-spacing:-.01em;color:var(--ink);display:inline-flex;align-items:center;gap:9px}
+  .brand:hover{text-decoration:none}
+  .brand .dot{color:var(--terra)}
+  .nav .spacer{flex:1}
+  .nav a.navlink{color:var(--muted);font-weight:600;font-size:.94rem}
+  .nav a.navlink.on{color:var(--terra-dark)}
+  @media(max-width:680px){.nav a.navlink{display:none}.nav a.navlink.on{display:inline}}
+  code{background:var(--terra-tint);color:var(--terra-dark);padding:1px 6px;border-radius:6px;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.86em}
+  /* top */
+  .top{padding:54px 0 18px}
+  .kicker{color:var(--terra);font-weight:700;text-transform:uppercase;letter-spacing:.09em;font-size:.76rem;margin-bottom:10px}
+  .top h1{font-size:clamp(2rem,5.4vw,3.1rem);letter-spacing:-.01em}
+  .top .lead{color:var(--muted);font-size:clamp(1.02rem,2.2vw,1.18rem);max-width:640px;margin:0 0 22px}
+  .actions{display:flex;gap:10px;flex-wrap:wrap}
+  .facts{display:flex;gap:10px;flex-wrap:wrap;margin-top:26px}
+  .fact{background:var(--card);border:1px solid var(--line);border-radius:999px;padding:6px 14px;font-size:.86rem;color:var(--muted)}
+  .fact b{color:var(--ink)}
+  /* timeline */
+  .feed{position:relative;padding:18px 0 30px}
+  .month{position:relative;padding-left:34px}
+  .month::before{content:"";position:absolute;left:9px;top:0;bottom:0;width:2px;background:var(--line)}
+  .mh{font-size:.8rem;font-family:inherit;text-transform:uppercase;letter-spacing:.1em;color:var(--faint);
+    margin:28px 0 14px;position:relative}
+  .mh::before{content:"";position:absolute;left:-30px;top:3px;width:12px;height:12px;border-radius:50%;
+    background:var(--paper);border:2px solid var(--line)}
+  .rel{position:relative;background:var(--card);border:1px solid var(--line);border-radius:var(--radius);
+    padding:20px 24px 16px;margin-bottom:16px;box-shadow:var(--shadow)}
+  .rel::before{content:"";position:absolute;left:-31px;top:26px;width:14px;height:14px;border-radius:50%;
+    background:var(--card);border:3px solid var(--terra-tint)}
+  .rel.major{border-left:5px solid var(--terra);padding-left:20px}
+  .rel.major::before{background:var(--terra);border-color:var(--terra-tint);width:16px;height:16px;left:-36px;top:24px}
+  .rel:target{outline:3px solid var(--terra-tint);outline-offset:2px}
+  .meta{display:flex;align-items:center;gap:10px;flex-wrap:wrap;font-size:.85rem;color:var(--faint);margin-bottom:6px}
+  .ver{font-weight:800;color:var(--terra-dark);background:var(--terra-tint);border-radius:999px;padding:2px 10px;font-size:.8rem}
+  .ver:hover{text-decoration:none;background:var(--terra);color:#fff8ef}
+  .tag.big{font-weight:700;color:var(--ok);background:#eef3e3;border:1px solid #d3e0bd;border-radius:999px;padding:1px 9px;font-size:.76rem}
+  .rel h3{font-size:clamp(1.12rem,2.6vw,1.32rem);margin:0 0 8px}
+  .rel h3 .em{margin-right:2px}
+  .rel ul{margin:0;padding-left:20px;color:var(--muted);font-size:.95rem}
+  .rel li{margin:0 0 7px}
+  .rel li b{color:var(--ink);font-weight:650}
+  .rel li::marker{color:var(--terra)}
+  /* early versions */
+  details.early{margin-top:22px;background:var(--paper-2);border:1px solid var(--line);border-radius:var(--radius);padding:4px 20px}
+  details.early>summary{cursor:pointer;list-style:none;padding:14px 0;font-family:var(--serif);font-weight:700;font-size:1.05rem}
+  details.early>summary::-webkit-details-marker{display:none}
+  details.early>summary::before{content:"＋";color:var(--terra);font-weight:800;margin-right:10px}
+  details.early[open]>summary::before{content:"－"}
+  details.early .sub{color:var(--muted);font-weight:400;font-family:inherit;font-size:.9rem}
+  details.early .rel{box-shadow:none}
+  @media(max-width:560px){.month{padding-left:24px}.month::before{left:5px}.mh::before{left:-24px}
+    .rel{padding:16px 16px 12px}.rel.major{padding-left:14px}.rel::before{left:-25px}.rel.major::before{left:-29px}
+    details.early{padding:4px 12px}}
+  /* bottom */
+  .howto{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:24px 26px;margin:10px 0 0;box-shadow:var(--shadow)}
+  .howto h2{font-size:1.3rem}
+  .howto p{color:var(--muted);margin:0 0 10px}
+  footer{padding:40px 0 60px;color:var(--muted);border-top:1px solid var(--line);margin-top:46px}
+  footer .links{display:flex;gap:12px 20px;flex-wrap:wrap;margin-bottom:18px}
+  .disc{font-size:.85rem;background:var(--paper-2);border:1px solid var(--line);border-radius:12px;padding:15px 18px}
+</style>
+</head>
+<body>
+
+<header class="nav">
+  <div class="wrap">
+    <a class="brand" href="../">
+      <img src="../icon.png" alt="Telemax" width="30" height="30" style="border-radius:8px;display:block">
+      <span>Tele<span class="dot">max</span></span>
+    </a>
+    <span class="spacer"></span>
+    <a class="navlink" href="../#features">Возможности</a>
+    <a class="navlink" href="../max-v-telegram/">Инструкция</a>
+    <a class="navlink on" href="./">Новости</a>
+    <a class="navlink" href="../#faq">Вопросы</a>
+    <a class="navlink" href="https://github.com/Trollobot/Telemax">GitHub</a>
+  </div>
+</header>
+
+<main class="wrap">
+  <div class="top">
+    <div class="kicker">Новости</div>
+    <h1>Что нового в Telemax</h1>
+    <p class="lead">Каждая версия моста — коротко и по-человечески. О новой версии бот сам скажет в группе, а обновиться можно одной кнопкой «Обновить» в <code>/version</code>.</p>
+    <div class="actions">
+      <a class="btn btn-primary" href="#v1.3.5">📡 Версия 1.3.5</a>
+      <a class="btn btn-ghost" href="feed.xml">📡 RSS-лента</a>
+      <a class="btn btn-ghost" href="../#how">Как установить</a>
+    </div>
+    <div class="facts">
+      <span class="fact">Последняя версия — <b>1.3.5</b>, 13 октября 2026</span>
+      <span class="fact"><b>33</b> версий с 22 августа 2026</span>
+    </div>
+  </div>
+
+  <div class="feed">
+    <div class="month"><h2 class="mh">Октябрь 2026</h2>
+      <article class="rel" id="v1.3.5">
+        <div class="meta"><a class="ver" href="#v1.3.5" title="Ссылка на эту новость">v1.3.5</a><time datetime="2026-10-13">13 октября</time></div>
+        <h3><span class="em" aria-hidden="true">📡</span> Трансляция чатов и контакты MAX</h3>
+        <ul>
+          <li><b>«➕ В контакты MAX»</b> — в карточке найденного человека (поиск по номеру, MAX ID или контакт из Telegram) и в <code>/info</code>: в личке собеседник добавляется сразу, в группе — выбранный участник. Контакт из Telegram сохраняется под тем же именем, что у вас в Telegram</li>
+          <li><b>Трансляция:</b> <code>/broadcast</code> в теме чата копирует новые сообщения этого чата MAX в группы и каналы Telegram — для тех, у кого нет MAX. Мест сколько угодно, бота туда Telegram добавит сам. Остановить — кнопкой в том же <code>/broadcast</code></li>
+        </ul>
+      </article>
+      <article class="rel" id="v1.3.4">
+        <div class="meta"><a class="ver" href="#v1.3.4" title="Ссылка на эту новость">v1.3.4</a><time datetime="2026-10-12">12 октября</time></div>
+        <h3><span class="em" aria-hidden="true">🔑</span> Вход в MAX снова работает</h3>
+        <ul>
+          <li><b>Вход в MAX снова работает.</b> MAX перестал пускать устаревшие версии клиента — при <code>/login</code> приходило «Приложение устарело, пожалуйста, обновитесь».</li>
+          <li><b>Если MAX снова поднимет минимальную версию, вход можно починить самому:</b> <code>MAX_APP_VERSION</code> и <code>MAX_BUILD_NUMBER</code> в <code>.env</code> (как узнать текущие — в README) или вручную проверьте обновление Телемакс - может оно уже готово )))</li>
+        </ul>
+      </article>
+      <article class="rel" id="v1.3.3">
+        <div class="meta"><a class="ver" href="#v1.3.3" title="Ссылка на эту новость">v1.3.3</a><time datetime="2026-10-11">11 октября</time></div>
+        <h3><span class="em" aria-hidden="true">🧭</span> Большие файлы: понятные причины сбоев и отправка с сервера</h3>
+        <ul>
+          <li>Если ссылку на большой файл подготовить не удалось, бот первой строкой называет причину — у сервера нет белого IP, закрыты или заняты порты 80 и 443, домен не тот, временный лимит Let's Encrypt — и объясняет, почему это мешает и что сделать</li>
+          <li>Установщик сам проверяет, есть ли у сервера белый IP и свободны ли порты 80 и 443. Если нет — объясняет и по умолчанию выключает большие файлы, остальное работает как обычно. Включить или выключить позже: <code>./setup.sh</code> → «Большие файлы»</li>
+          <li><b><code>/file</code> в теме чата показывает и файлы, которые уже лежат на сервере:</b> нажали — файл уходит в этот чат MAX прямо с сервера, загружать его заново не нужно</li>
+          <li>Ссылка на загрузку, которой не воспользовались, живёт сутки, а не 3 дня, и сообщение с ней скажет, что она истекла. Ждущие ссылки видны в «📁 Файлы» — их можно открыть или отменить. Загрузка, которая уже идёт, по сроку не обрывается</li>
+        </ul>
+      </article>
+      <article class="rel" id="v1.3.2">
+        <div class="meta"><a class="ver" href="#v1.3.2" title="Ссылка на эту новость">v1.3.2</a><time datetime="2026-10-11">11 октября</time></div>
+        <h3><span class="em" aria-hidden="true">🔎</span> Поиск по номеру в любом виде, подсказки прямо в пульте</h3>
+        <ul>
+          <li><b>Поиск контакта по номеру понимает номер в любом виде:</b> с пробелами, скобками, тире и с 8 в начале. Контакт из Telegram, отправленный в общую тему группы, тоже находит человека в MAX</li>
+          <li>Если номер не найден, бот объясняет почему и что делать</li>
+          <li>Всё, где пульт просит что-то написать, выбрать или нажать, появляется прямо в пульте, а не внизу чата: поиск, бан и разбан, обновление, список команд, загрузка в файлообменник. Вернуться можно кнопкой «◀️ Назад»</li>
+        </ul>
+      </article>
+      <article class="rel" id="v1.3.1">
+        <div class="meta"><a class="ver" href="#v1.3.1" title="Ссылка на эту новость">v1.3.1</a><time datetime="2026-10-10">10 октября</time></div>
+        <h3><span class="em" aria-hidden="true">📤</span> Свой файлообменник</h3>
+        <ul>
+          <li><b>Файлообменник:</b> <code>/panel</code> → 📁 Файлы → «📤 Загрузить файл». Положите на свой сервер файл любого размера — сколько вместит диск — и получите ссылку на скачивание, которой можно делиться где угодно. Файл хранится 3 дня от последней ссылки</li>
+          <li>Кнопка, нажатая, пока мост перезапускался (например, во время обновления), теперь срабатывает, а не молчит — и в группу больше не приходит ложное «⚠️ Ошибка при обработке сообщения или команды»</li>
+        </ul>
+      </article>
+      <article class="rel major" id="v1.3.0">
+        <div class="meta"><a class="ver" href="#v1.3.0" title="Ссылка на эту новость">v1.3.0</a><time datetime="2026-10-10">10 октября</time><span class="tag big">Крупное обновление</span></div>
+        <h3><span class="em" aria-hidden="true">📁</span> Большие файлы — по ссылке, до 4 ГБ</h3>
+        <ul>
+          <li><b>Файлы больше 50 МБ из MAX в Telegram пересылаются по ссылке</b> — напрямую больше бот принять не может. Файл сохраняется на вашем сервере, а в тему приходит кнопка «⬇️ Скачать». Пока файл сохраняется, в теме видно, сколько уже скачано</li>
+          <li><b>Из Telegram в MAX файл больше 20 МБ</b> — больше бот скачать не может — загружается через страницу на вашем сервере и уходит в MAX обычным файлом, до 4 ГБ. Чтобы не загружать файл дважды, напишите в теме чата <code>/file</code>: ссылка на загрузку придёт сразу</li>
+          <li><b>Пульт → «📁 Файлы»:</b> файлы на сервере, новая ссылка, удаление и повторная отправка в MAX, если она не удалась. «📤 Загрузить файл» — свой файлообменник: положить файл на сервер и делиться ссылкой где угодно. Файл хранится 3 дня от последней ссылки, потом удаляется сам</li>
+          <li><b>Для ссылок на сервере открываются порты 80 и 443</b> — только пока есть хотя бы одна действующая ссылка; служба файлов запускается за несколько секунд. HTTPS настраивается сам, домен не нужен. Если на сервере уже есть свой веб-сервер, файлы можно пустить через него (см. README). Перед каждой передачей мост проверяет свободное место и оставляет 1,5 ГБ для обновлений. Отключить: <code>FILES=off</code> в <code>.env</code></li>
+          <li><b>Кнопки мини-приложений ботов MAX стали ссылками:</b> нажатие переправляет в веб к мини-приложению MAX</li>
+          <li><b>Поиск в пульте больше не оставляет «В ответ …» над полем ввода:</b> после кнопки поиска просто напишите номер, ID или ник следующим сообщением</li>
+          <li>Сбои при пересылке больших файлов попадают в анонимные отчёты об ошибках, без имён файлов</li>
+        </ul>
+      </article>
+      <article class="rel" id="v1.2.1">
+        <div class="meta"><a class="ver" href="#v1.2.1" title="Ссылка на эту новость">v1.2.1</a><time datetime="2026-10-05">5 октября</time></div>
+        <h3><span class="em" aria-hidden="true">🔤</span> Боты и каналы MAX снова находятся по нику</h3>
+        <ul>
+          <li><b>Поиск по нику снова находит ботов MAX:</b> ник можно писать с «@» или без, а можно вставить ссылку max.ru/ник. Найденный бот приходит карточкой с кнопкой «Начать чат», дальше с ним можно переписываться и нажимать его кнопки</li>
+          <li><b>В поиске по нику видны и каналы MAX:</b> они приходят кнопками-ссылками и открываются в MAX. Добавить канал в мост пока нельзя</li>
+          <li><b>Людей по нику MAX не находит</b> — таков его поиск. Подсказка теперь говорит об этом прямо: человека ищите по номеру или MAX ID, а ник из Telegram здесь не подойдёт</li>
+        </ul>
+      </article>
+      <article class="rel major" id="v1.2.0">
+        <div class="meta"><a class="ver" href="#v1.2.0" title="Ссылка на эту новость">v1.2.0</a><time datetime="2026-10-05">5 октября</time><span class="tag big">Крупное обновление</span></div>
+        <h3><span class="em" aria-hidden="true">🤖</span> Кнопки ботов MAX заработали в Telegram</h3>
+        <ul>
+          <li><b>Кнопки ботов MAX теперь работают в Telegram.</b> Ссылки открываются, «Скопировать код» копирует текст, а кнопки с действием нажимаются: нажатие уходит боту от вашего имени, его ответ приходит как обычно</li>
+          <li><b>Нажимать кнопки ботов могут только администраторы группы.</b> После перезапуска моста кнопки под старыми сообщениями перестают работать: напишите боту ещё раз, и он пришлёт свежие</li>
+          <li><b>Кнопка с готовым текстом отправляет его боту.</b> На запрос геопозиции или контакта мост подсказывает отправить их в тему, оттуда они уходят боту. Мини-приложения открываются только в приложении MAX</li>
+          <li><b>Анонимные отчёты об ошибках:</b> при неудачном обновлении или сбое моста разработчику уходит отчёт с версией, шагом, текстом ошибки, свободным местом и памятью, версиями ОС, Docker и git. Без текста сообщений, названий чатов и номера телефона. Отключается вместе с телеметрией: <code>TELEMETRY=off</code> в <code>.env</code></li>
+          <li>Если MAX временно ограничил запросы истории («Слишком много запросов»), мост сам дозаливает чат позже. Раньше тема оставалась пустой до следующего сообщения</li>
+          <li>Тема чата с ботом больше не получает ваше имя, когда вы пишете боту первым</li>
+        </ul>
+      </article>
+      <article class="rel" id="v1.1.1">
+        <div class="meta"><a class="ver" href="#v1.1.1" title="Ссылка на эту новость">v1.1.1</a><time datetime="2026-10-04">4 октября</time></div>
+        <h3><span class="em" aria-hidden="true">🪶</span> Обновления стали легче</h3>
+        <ul>
+          <li><b>Если обновление не прошло на шаге «сборка образа»</b> — на сервере не хватило места, мост при этом остался на прежней версии. Нажмите «Обновить» ещё раз: тяжёлая часть уже собрана и повторно не скачивается. Не помогло — выполните на сервере docker builder prune -af и docker image prune -f и повторите</li>
+          <li><b>Обновления стали легче:</b> большая часть образа (браузер для анимированных стикеров, около 1 ГБ) больше не пересобирается при каждом обновлении. Раньше это случалось раз в одну-две недели и требовало 2–3 ГБ свободного места</li>
+          <li>Перед сборкой мост проверяет свободное место, сам убирает остатки прошлых сборок и, если места всё равно мало, сразу говорит, сколько нужно и сколько есть</li>
+          <li>Сообщение о неудачной сборке теперь называет причину, а не только отправляет читать лог на сервере</li>
+          <li><b>После успешного обновления чистится кэш старых сборок:</b> раньше он только рос и со временем занимал несколько гигабайт</li>
+        </ul>
+      </article>
+      <article class="rel major" id="v1.1.0">
+        <div class="meta"><a class="ver" href="#v1.1.0" title="Ссылка на эту новость">v1.1.0</a><time datetime="2026-10-02">2 октября</time><span class="tag big">Крупное обновление</span></div>
+        <h3><span class="em" aria-hidden="true">🛡️</span> Большая работа над надёжностью</h3>
+        <ul>
+          <li>Удаление темы, <code>/ban</code>, <code>/reboot</code> и <code>/kill</code> больше не стирают ваши сообщения у собеседника в MAX. Раньше мост принимал исчезновение темы за удаление сообщений и отзывал в MAX то, что вы написали за последние часы</li>
+          <li>Догрузка пропущенных сообщений больше не теряет их, если во время неё идёт переписка или Telegram временно недоступен</li>
+          <li>Сообщение из Telegram длиной от 4001 до 4096 знаков теперь доходит в MAX: мост режет его на части по границе строки или слова. Раньше MAX такое сообщение отклонял</li>
+          <li><b>Альбомы и сообщения с несколькими вложениями удаляются целиком:</b> раньше при удалении в MAX в Telegram оставались «хвосты»</li>
+          <li><b>Сбои связи при входе больше не сбрасывают сессию:</b> войти по SMS заново мост просит, только если MAX сам трижды отклонил сессию. Зависшее соединение обнаруживается за одну-две минуты, раньше на это уходило 15 минут и больше</li>
+          <li>Правка сообщения, которое мост уже не помнит, приходит с пометкой «✏️ Изменено», вложения повторно не отправляются</li>
+          <li>Музыкальные файлы (mp3 и подобные) из Telegram теперь доходят в MAX как файлы: раньше терялись молча</li>
+          <li>Если тип сообщения передать в MAX нельзя (кубик, история, игра, платное медиа), мост пишет об этом в тему, а не молчит</li>
+          <li><b>Опросы:</b> опрос, который не проходит ограничения Telegram, приходит текстом, а не теряется. У опроса, созданного в Telegram, появилась подсказка о том, куда попадают голоса</li>
+          <li>Удалять сообщения реакцией 👎 и голосовать в опросах от вашего имени могут только администраторы группы</li>
+          <li><b>Одно неудачное вложение больше не мешает доставке остальных.</b> Файл больше 50 МБ приходит текстовой заметкой: Telegram не принимает от ботов файлы крупнее</li>
+          <li>Номер телефона в <code>/help</code> и в логах показывается маской</li>
+          <li><b>Восстановление истории идёт ровнее:</b> сообщения отправляются по одному в три секунды, мост укладывается в ограничения Telegram</li>
+          <li>Установка и обновление через установщик идут только с подписанного релиза</li>
+          <li><b>Требования:</b> Ubuntu 22.04+ или Debian 12+. Для проверки подписи нужен git 2.34 или новее. На Ubuntu 20.04 и Debian 11 установщик откажется работать, а обновление кнопкой сообщит, что подписанного релиза нет: причина в версии git. Рабочая версия при этом остаётся нетронутой. На Debian 11 помогает git из bullseye-backports</li>
+        </ul>
+      </article>
+    </div>
+    <div class="month"><h2 class="mh">Сентябрь 2026</h2>
+      <article class="rel" id="v1.0.1">
+        <div class="meta"><a class="ver" href="#v1.0.1" title="Ссылка на эту новость">v1.0.1</a><time datetime="2026-09-22">22 сентября</time></div>
+        <h3><span class="em" aria-hidden="true">🏷️</span> Тема нового собеседника — сразу с его именем</h3>
+        <ul>
+          <li><b>Тема для нового собеседника называется его именем, а не «MAX chat …»:</b> раньше, если незнакомый контакт писал первым, тема создавалась до того, как мост успевал получить его профиль, и запасное имя оставалось навсегда (хотя закреплённая карточка имя уже знала). Теперь тема переименовывается в момент получения карточки контакта</li>
+        </ul>
+      </article>
+      <article class="rel major" id="v1.0.0">
+        <div class="meta"><a class="ver" href="#v1.0.0" title="Ссылка на эту новость">v1.0.0</a><time datetime="2026-09-21">21 сентября</time><span class="tag big">Версия 1.0</span></div>
+        <h3><span class="em" aria-hidden="true">🎉</span> Версия 1.0: несколько мостов на одном сервере</h3>
+        <ul>
+          <li><b>Установщик стал менеджером мостов:</b> если на сервере уже есть установленный мост (или несколько), та же команда установки открывает меню — обновить или перенастроить существующий, переустановить его начисто (со сбросом настроек и автоматическим бэкапом старых в <code>/root</code>), поставить ещё один мост рядом или удалить ненужный (один или все; перед удалением настройки и данные тоже сохраняются в бэкап). Вместе с последним мостом убирается и общий таймер автообновления</li>
+          <li>Явный каталог (<code>INSTALL_DIR=…</code>) и неинтерактивный запуск работают как раньше, без меню и лишних вопросов</li>
+          <li><b>README:</b> новый раздел «Несколько мостов на одном сервере» — что у мостов общее, что у каждого своё, и как ими управлять</li>
+        </ul>
+      </article>
+    </div>
+
+    <details class="early">
+      <summary>Ранние версии 0.4.1 — 0.6.6 <span class="sub">· 22 августа — 18 сентября 2026</span></summary>
+
+    <div class="month"><h2 class="mh">Сентябрь 2026</h2>
+      <article class="rel" id="v0.6.6">
+        <div class="meta"><a class="ver" href="#v0.6.6" title="Ссылка на эту новость">v0.6.6</a><time datetime="2026-09-18">18 сентября</time></div>
+        <h3><span class="em" aria-hidden="true">🆔</span> Боты находятся по MAX ID</h3>
+        <ul>
+          <li><b>Пульт:</b> поиск по MAX ID теперь находит и ботов — их длинные ID (например, из ника вида @id4725009270_bot) раньше отвергались MAX с «Ошибкой валидации». Починены и «Начать чат» с ботом, и <code>/invite</code> с <code>/kick</code> по таким ID</li>
+        </ul>
+      </article>
+      <article class="rel" id="v0.6.5">
+        <div class="meta"><a class="ver" href="#v0.6.5" title="Ссылка на эту новость">v0.6.5</a><time datetime="2026-09-17">17 сентября</time></div>
+        <h3><span class="em" aria-hidden="true">✅</span> Чек-лист при установке и укреплённая безопасность</h3>
+        <ul>
+          <li><b>Установка:</b> проверка токена и группы показывает полный чек-лист — что уже в порядке, что именно не так и куда нажать, чтобы исправить. Отдельно подсвечено право «Управление темами»: оно не входит в базовый набор прав администратора, и именно на нём спотыкаются чаще всего</li>
+          <li><b>Безопасность:</b> содержимое анимированного стикера больше не может вырваться со страницы рендера и выполнить свой код внутри контейнера</li>
+          <li><b>Надёжность:</b> входящий файл из MAX ограничен по размеру — один огромный файл больше не способен исчерпать память и уронить мост</li>
+          <li><b>Обновление:</b> если на коммите несколько тегов, проверяются все — одна лишняя метка рядом с настоящим релизом больше не блокирует обновления навсегда</li>
+          <li><b>Сессия MAX:</b> одновременные записи выстроены в очередь (как в карте чатов), поэтому гонка при переподключении не может повредить файл сессии</li>
+          <li><b>Пульт:</b> номер телефона показывается маской (карточка закреплена в группе и видна всем участникам); пауза «Навсегда» переименована в «До перезапуска» и честно предупреждает, что перезапуск моста её снимет</li>
+        </ul>
+      </article>
+      <article class="rel" id="v0.6.4">
+        <div class="meta"><a class="ver" href="#v0.6.4" title="Ссылка на эту новость">v0.6.4</a><time datetime="2026-09-17">17 сентября</time></div>
+        <h3><span class="em" aria-hidden="true">🔄</span> Обновления, которые не залипают</h3>
+        <ul>
+          <li><b>Обновления больше не залипают:</b> кнопка «Обновить» переставала работать навсегда, если предыдущая попытка была прервана (перезагрузка, нехватка памяти) — теперь забытый признак распознаётся и не мешает; «✅ Обновлено» приходит только после реально удавшейся сборки и запуска</li>
+          <li><b>Обновление безопаснее и надёжнее:</b> подпись релиза проверяется ДО того, как новые файлы попадут на диск, при любой неудаче версия откатывается на прежнюю; если на GitHub нет подписанного релиза — мост берёт его с зеркала (раньше в этом случае обновления вставали намертво); проверка «контейнер поднялся» больше не принимает контейнер, падающий по кругу</li>
+          <li>Если сервер ходит в Telegram через прокси, сообщения об обновлении наконец доходят — раньше весь процесс, включая отказы, шёл в полной тишине</li>
+          <li><b>Сборка при обновлении:</b> секунды вместо минут и без разрастания диска — тяжёлый слой с Chromium перестал пересобираться на каждом коммите</li>
+          <li><b>Автообновление теперь обслуживает ВСЕ мосты на сервере:</b> один таймер обходит список установок вместо одного выбранного каталога (раньше второй мост молча отбирал автообновление у первого, и то же делал обычный заход в меню настроек). Если автообновления нет вовсе (<code>setup.sh</code> запускали не от root), кнопка «Обновить» прямо говорит об этом, а не обещает несбыточное</li>
+          <li><b>Несколько мостов на одном сервере:</b> второй ставится в свой каталог (<code>INSTALL_DIR=/opt/telemax-2</code>), имя контейнера фиксируется явно, установка второго не предлагает погасить чужой контейнер</li>
+          <li><b>Личная переписка защищена:</b> <code>/deletegroup</code> в теме личного чата теперь прямо предупреждает, что удалит её и у собеседника, называя человека по имени; остальные групповые команды в личном чате отвечают понятным отказом вместо невнятной ошибки MAX</li>
+          <li><b>Мост больше не кирпичится:</b> повреждённый файл сессии MAX не уводит контейнер в вечный перезапуск — мост поднимается и просит <code>/login</code></li>
+          <li>Спецсимволы в пароле прокси ($, пробел, &amp;) больше не ломают установку и обновления: раньше Docker молча искажал такое значение и Telegram просто не подключался</li>
+          <li>«📊 Статус» больше не сообщает «актуальная версия», когда проверить обновления не удалось</li>
+        </ul>
+      </article>
+      <article class="rel" id="v0.6.3">
+        <div class="meta"><a class="ver" href="#v0.6.3" title="Ссылка на эту новость">v0.6.3</a><time datetime="2026-09-11">11 сентября</time></div>
+        <h3><span class="em" aria-hidden="true">🔴</span> Честный статус до входа в MAX</h3>
+        <ul>
+          <li><b>Пульт и «📊 Статус» честно показывают, что вход в MAX ещё не выполнен:</b> 🔴 «не авторизован — <code>/login</code>» вместо зелёного кружка, который на свежей установке читался как «всё в порядке»</li>
+          <li>«🔄 Пересинхронизация» без входа не запускается, а объясняет, что сначала нужен <code>/login</code> — после входа синхронизация идёт сама</li>
+        </ul>
+      </article>
+      <article class="rel" id="v0.6.2">
+        <div class="meta"><a class="ver" href="#v0.6.2" title="Ссылка на эту новость">v0.6.2</a><time datetime="2026-09-11">11 сентября</time></div>
+        <h3><span class="em" aria-hidden="true">🔧</span> Исправлена настройка на серверах без прокси</h3>
+        <ul>
+          <li><b><code>setup.sh</code>:</b> исправлен молчаливый выход первичной настройки сразу после «Сделали? Enter» на серверах без прокси для Telegram (сидел с 0.4.9 — то самое «Enter нажимаю и ничего»); найден сквозным прогоном установки с нуля</li>
+        </ul>
+      </article>
+      <article class="rel" id="v0.6.1">
+        <div class="meta"><a class="ver" href="#v0.6.1" title="Ссылка на эту новость">v0.6.1</a><time datetime="2026-09-11">11 сентября</time></div>
+        <h3><span class="em" aria-hidden="true">🔧</span> Понятные ошибки при поиске группы</h3>
+        <ul>
+          <li><b><code>setup.sh</code>:</b> поиск группы больше не молчит при ошибке Telegram — показывает её текст; при 409 объясняет, что у бота уже запущен другой экземпляр с тем же токеном (старый сервер/контейнер), при 401 — что дело в токене; перед поиском снимает случайно оставленный webhook; подсказка про то, что бот без прав администратора ваших сообщений не видит</li>
+        </ul>
+      </article>
+      <article class="rel major" id="v0.6.0">
+        <div class="meta"><a class="ver" href="#v0.6.0" title="Ссылка на эту новость">v0.6.0</a><time datetime="2026-09-11">11 сентября</time><span class="tag big">Крупное обновление</span></div>
+        <h3><span class="em" aria-hidden="true">📊</span> Статус сервера и поиск по контакту из Telegram</h3>
+        <ul>
+          <li><b>Пульт:</b> кнопка «📊 Статус» — версия, аптайм, состояние MAX и Telegram, когда прошли последние сообщения в каждую сторону, диск/RAM/нагрузка сервера, доступность обновления</li>
+          <li><b>Пульт:</b> поделитесь в общей теме группы контактом из Telegram — бот найдёт его в MAX по номеру и предложит начать чат (автоматически сопоставлять с вашей книгой контактов Telegram бот не может — Bot API не даёт такого доступа)</li>
+          <li><b>Установка (<code>setup.sh</code>):</b> проверка токена с показом имени бота, ручной ввод id группы, проверка группы — темы включены, бот администратор с «Управлением темами» — с понятным списком того, чего не хватает</li>
+          <li><b>Установка (<code>install.sh</code>):</b> лог в /var/log/telemax-install.log, предварительная проверка сервера (ОС, диск, RAM, сеть, время), ожидание фонового обновления apt, запасной путь установки Docker</li>
+          <li><b><code>/kill</code>:</b> честно про сессию — завершить её на стороне MAX снаружи нельзя; после <code>/kill</code> завершите её в приложении MAX (Настройки → Устройства)</li>
+        </ul>
+      </article>
+      <article class="rel" id="v0.5.3">
+        <div class="meta"><a class="ver" href="#v0.5.3" title="Ссылка на эту новость">v0.5.3</a><time datetime="2026-09-10">10 сентября</time></div>
+        <h3><span class="em" aria-hidden="true">📦</span> Установка на свежих VPS без вопросов apt</h3>
+        <ul>
+          <li><b>Установка:</b> apt больше не задаёт вопросов про конфиги — conffile-промпт cloud-init на свежих VPS ломал dpkg, и Docker не ставился. На время установки dpkg глобально оставляет текущие конфиги (это доходит и до установщика Docker), dpkg лечится перед установкой Docker, по завершении настройка убирается</li>
+        </ul>
+      </article>
+      <article class="rel" id="v0.5.2">
+        <div class="meta"><a class="ver" href="#v0.5.2" title="Ссылка на эту новость">v0.5.2</a><time datetime="2026-09-07">7 сентября</time></div>
+        <h3><span class="em" aria-hidden="true">✍️</span> Личка с участником группы в одно нажатие</h3>
+        <ul>
+          <li><b>Группы:</b> сообщение о выходе/добавлении участника теперь называет человека, показывает его MAX ID и даёт кнопку «✍️» — открыть с ним личку в один тап (раньше вышедший исчезал из ростера, и написать ему из Telegram было нельзя)</li>
+          <li><b>Панель:</b> поиск контакта «🆔 По ID» — любой MAX ID из карточки группы или сообщения о выходе можно вставить и начать чат</li>
+        </ul>
+      </article>
+      <article class="rel" id="v0.5.1">
+        <div class="meta"><a class="ver" href="#v0.5.1" title="Ссылка на эту новость">v0.5.1</a><time datetime="2026-09-05">5 сентября</time></div>
+        <h3><span class="em" aria-hidden="true">🧱</span> Fail2ban чинится сам</h3>
+        <ul>
+          <li><b>Fail2ban при установке:</b> исправлена мёртвая тюрьма sshd из 0.5.0 — ставится python3-systemd (без него backend systemd не стартует), успех проверяется по самой тюрьме, а не по службе; если Fail2ban уже стоял без модуля — доставит и перезапустит</li>
+        </ul>
+      </article>
+      <article class="rel major" id="v0.5.0">
+        <div class="meta"><a class="ver" href="#v0.5.0" title="Ссылка на эту новость">v0.5.0</a><time datetime="2026-09-05">5 сентября</time><span class="tag big">Крупное обновление</span></div>
+        <h3><span class="em" aria-hidden="true">📜</span> Открытая лицензия и защита сервера</h3>
+        <ul>
+          <li><b>Лицензия:</b> код открыт под GNU AGPL-3.0 (файл LICENSE, раздел в README). Закрытое коммерческое использование — по отдельной лицензии; правообладатель Zergont</li>
+          <li><b>Защита сервера:</b> <code>install.sh</code> предлагает поставить Fail2ban (по умолчанию — да) — бан подбора пароля по SSH, IP вашей сессии установки в белом списке, работает и на минимальных Ubuntu без auth.log</li>
+        </ul>
+      </article>
+    </div>
+    <div class="month"><h2 class="mh">Август 2026</h2>
+      <article class="rel" id="v0.4.10">
+        <div class="meta"><a class="ver" href="#v0.4.10" title="Ссылка на эту новость">v0.4.10</a><time datetime="2026-08-29">29 августа</time></div>
+        <h3><span class="em" aria-hidden="true">✏️</span> Правки с отметкой времени</h3>
+        <ul>
+          <li><b>Пометка правок из MAX в Telegram:</b> ✏️ с временем (МСК по умолчанию, TZ в <code>.env</code>) — Telegram не показывает «изменено» у бот-правок; заодно правка группового сообщения больше не теряет авторский префикс</li>
+          <li><b>README:</b> команда установки с резервного зеркала (когда GitHub недоступен)</li>
+        </ul>
+      </article>
+      <article class="rel" id="v0.4.9">
+        <div class="meta"><a class="ver" href="#v0.4.9" title="Ссылка на эту новость">v0.4.9</a><time datetime="2026-08-25">25 августа</time></div>
+        <h3><span class="em" aria-hidden="true">🛡️</span> Аудит безопасности и меню настроек</h3>
+        <ul>
+          <li><b>Безопасность и надёжность (полный аудит):</b> зеркало и телеметрия переведены на HTTPS, ключ подписи релизов закреплён в <code>install.sh</code>, контейнер работает без root, авто-реконнект при повреждённом кадре MAX, корректное завершение по SIGTERM, таймауты скачиваний и лимиты памяти</li>
+          <li><b>Настройка после установки:</b> повторный <code>./setup.sh</code> открывает меню — прокси Telegram с живой проверкой до записи, смена токена/группы, режим стикеров, проверка связи; README без веб-панели</li>
+        </ul>
+      </article>
+      <article class="rel" id="v0.4.8">
+        <div class="meta"><a class="ver" href="#v0.4.8" title="Ссылка на эту новость">v0.4.8</a><time datetime="2026-08-24">24 августа</time></div>
+        <h3><span class="em" aria-hidden="true">👥</span> Личка из списка участников работает</h3>
+        <ul>
+          <li>Кнопка «Открыть личку» в карточке группы снова открывает чат с выбранным участником, а ошибки отправки видны прямо в теме</li>
+        </ul>
+      </article>
+      <article class="rel" id="v0.4.7">
+        <div class="meta"><a class="ver" href="#v0.4.7" title="Ссылка на эту новость">v0.4.7</a><time datetime="2026-08-23">23 августа</time></div>
+        <h3><span class="em" aria-hidden="true">➕</span> Новая группа появляется сразу</h3>
+        <ul>
+          <li>Когда вас добавляют в группу MAX, её тема в Telegram появляется сразу, без пустой подписи автора</li>
+        </ul>
+      </article>
+      <article class="rel" id="v0.4.6">
+        <div class="meta"><a class="ver" href="#v0.4.6" title="Ссылка на эту новость">v0.4.6</a><time datetime="2026-08-23">23 августа</time></div>
+        <h3><span class="em" aria-hidden="true">🧹</span> Мелкие исправления</h3>
+        <ul>
+          <li>Служебные события в группах больше не приходят с пустым «Имя:»</li>
+          <li><code>/help</code> стал короче и понятнее, установщик подсказывает написать что-нибудь в группу</li>
+        </ul>
+      </article>
+      <article class="rel" id="v0.4.5">
+        <div class="meta"><a class="ver" href="#v0.4.5" title="Ссылка на эту новость">v0.4.5</a><time datetime="2026-08-22">22 августа</time></div>
+        <h3><span class="em" aria-hidden="true">💬</span> Личка из карточки группы</h3>
+        <ul>
+          <li><b>Ростер группы:</b> кнопка «Открыть личку» → список участников → тап открывает 1:1</li>
+        </ul>
+      </article>
+      <article class="rel" id="v0.4.4">
+        <div class="meta"><a class="ver" href="#v0.4.4" title="Ссылка на эту новость">v0.4.4</a><time datetime="2026-08-22">22 августа</time></div>
+        <h3><span class="em" aria-hidden="true">📋</span> Состав группы в карточке</h3>
+        <ul>
+          <li>Ростер участников группы в карточке + свои сообщения метятся «Вы» при синхронизации</li>
+        </ul>
+      </article>
+      <article class="rel" id="v0.4.3">
+        <div class="meta"><a class="ver" href="#v0.4.3" title="Ссылка на эту новость">v0.4.3</a><time datetime="2026-08-22">22 августа</time></div>
+        <h3><span class="em" aria-hidden="true">👤</span> В групповых чатах видно автора</h3>
+        <ul>
+          <li><b>Автор сообщений в групповых чатах:</b> в теме видно, кто написал</li>
+        </ul>
+      </article>
+      <article class="rel" id="v0.4.2">
+        <div class="meta"><a class="ver" href="#v0.4.2" title="Ссылка на эту новость">v0.4.2</a><time datetime="2026-08-22">22 августа</time></div>
+        <h3><span class="em" aria-hidden="true">🔏</span> Проверка подписи обновлений</h3>
+        <ul>
+          <li><b>Контрольный выпуск без подписи:</b> мост обязан был отказаться его ставить — и отказался. Проверка подписи работает</li>
+        </ul>
+      </article>
+      <article class="rel" id="v0.4.1">
+        <div class="meta"><a class="ver" href="#v0.4.1" title="Ссылка на эту новость">v0.4.1</a><time datetime="2026-08-22">22 августа</time></div>
+        <h3><span class="em" aria-hidden="true">🔏</span> Подписанные обновления</h3>
+        <ul>
+          <li><b>Подпись обновлений включена:</b> релизы подписываются SSH-ключом, <code>update.sh</code> проверяет</li>
+        </ul>
+      </article>
+    </div>
+    </details>
+  </div>
+
+  <div class="howto">
+    <h2>Как обновиться</h2>
+    <p>Бот сам проверяет обновления раз в сутки и пишет в группу, что нового. Обновиться — кнопкой «Обновить» в этом сообщении или в <code>/version</code>: мост пересоберётся за пару минут, переписка не потеряется. Каждый релиз подписан, а если обновление сорвётся, мост вернётся на прежнюю версию.</p>
+    <p style="margin:0">Ещё не поставили? <a href="../max-v-telegram/">Пошаговая инструкция</a> · есть идея или нашли баг — <a href="https://t.me/TelemaxSvv_bot">напишите боту</a>.</p>
+  </div>
+</main>
+
+<footer>
+  <div class="wrap" style="max-width:1000px">
+    <div class="links">
+      <a href="../">Главная</a>
+      <a href="https://github.com/Trollobot/Telemax">GitHub</a>
+      <a href="https://github.com/Trollobot/Telemax/blob/main/CHANGELOG.md">CHANGELOG на GitHub</a>
+      <a href="feed.xml">RSS</a>
+      <a href="https://t.me/TelemaxSvv_bot">Баг или идея — боту @TelemaxSvv_bot</a>
+      <a href="../stats/">📊 Статистика посещений</a>
+    </div>
+    <div class="disc">⚠️ Неофициальный проект с открытым кодом. Не связан с MAX и Telegram. Работает с вашим собственным аккаунтом — на ваш страх и риск.</div>
+    <p style="margin-top:16px">© Telemax — бесплатный мост MAX ↔ Telegram · AGPL-3.0</p>
+  </div>
+</footer>
+
+<script>
+  // Счётчик посещений без cookie: сообщает только, откуда пришли и на каком адресе открыт сайт.
+  // Сервер сразу раскладывает это по счётчикам и IP не хранит — см. /stats/.
+  (function () {
+    var h = location.hostname;
+    if (location.protocol !== 'https:' || h === 'localhost' || h === '127.0.0.1') return;
+    try {
+      var body = JSON.stringify({ r: document.referrer || '', h: h });
+      var url = 'https://telemax.svnest.ru/api/site/hit';
+      if (navigator.sendBeacon) navigator.sendBeacon(url, new Blob([body], { type: 'text/plain' }));
+      else fetch(url, { method: 'POST', body: body, keepalive: true, mode: 'no-cors' });
+    } catch (e) {}
+  })();
+</script>
+
+</body>
+</html>
