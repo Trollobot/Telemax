@@ -13,6 +13,7 @@ import { createInterface } from 'node:readline';
 import path from 'node:path';
 import { sanitizeReport, acceptReport, recordReport, scheduleNotice, dueIn, formatNotice, listReports } from './reports.mjs';
 import { createSiteStats, summarize, createGeoBuilder, cleanIp } from './site.mjs';
+import { MAX_PACKAGES_URL, BRIDGE_CLIENT_URL, parsePackages, newestPackage, parseBridgeDefaults, shouldNotify, formatVersionNotice } from './maxversion.mjs';
 
 const PORT = Number(process.env.PORT || 3100);
 const DATA_FILE = process.env.DATA_FILE || '/data/installs.json';
@@ -35,6 +36,9 @@ const SITE_FILE = process.env.SITE_FILE || path.join(path.dirname(DATA_FILE), 's
 const GEO_FILE = process.env.GEO_FILE || path.join(path.dirname(DATA_FILE), 'dbip-country-lite.csv.gz');
 const GEO_MAX_AGE_MS = 35 * 86_400_000; // DB-IP publishes monthly
 const HIT_LIMIT_PER_IP = 120; // per rolling hour
+// MAX desktop version watch: what was last seen and announced (maxversion.mjs).
+const MAXVERSION_FILE = process.env.MAXVERSION_FILE || path.join(path.dirname(DATA_FILE), 'maxversion.json');
+const MAXVERSION_EVERY_MS = 6 * 3600_000;
 
 /** installId -> { firstSeen, lastSeen, version } */
 let db = {};
@@ -82,6 +86,11 @@ async function load() {
     site = createSiteStats(JSON.parse(await readFile(SITE_FILE, 'utf8')));
   } catch {
     // no visits yet
+  }
+  try {
+    maxVersionState = { ...maxVersionState, ...JSON.parse(await readFile(MAXVERSION_FILE, 'utf8')) };
+  } catch {
+    // never checked yet
   }
 }
 
@@ -183,7 +192,13 @@ async function notifyMaintainer(sig) {
   }
   const entries = due.map((s) => reports.signatures[s]).filter(Boolean);
   if (!entries.length) return;
-  const text = formatNotice(entries);
+  await sendToMaintainer(formatNotice(entries));
+}
+
+/** Posts into the maintainer's «🤖 Автоотчёты об ошибках» topic (created once). False when it couldn't. */
+async function sendToMaintainer(text) {
+  if (!REPORT_BOT_TOKEN || !REPORT_CHAT_ID) return false;
+  let ok = true;
   try {
     let thread = REPORT_THREAD_ID || reports.notify.threadId;
     if (!thread) {
@@ -198,9 +213,36 @@ async function notifyMaintainer(sig) {
       return tg('sendMessage', { text });
     });
   } catch (err) {
-    console.log(`report notice failed: ${err.message}`);
+    ok = false;
+    console.log(`maintainer notice failed: ${err.message}`);
   }
   void save(REPORTS_FILE, reports);
+  return ok;
+}
+
+// --- MAX desktop version watch (maxversion.mjs) -----------------------------------------------
+/** { bridge: {version, build}, maxLatest, lastNotified, checkedAt } — bridge is the last one read from GitHub. */
+let maxVersionState = { bridge: null, maxLatest: null, lastNotified: null, checkedAt: 0 };
+
+async function checkMaxVersion() {
+  try {
+    const res = await fetch(MAX_PACKAGES_URL, { signal: AbortSignal.timeout(30_000) });
+    if (!res.ok) throw new Error(`MAX repo HTTP ${res.status}`);
+    const maxLatest = newestPackage(parsePackages(await res.text()));
+    // GitHub unreachable: keep comparing with what the bridge presented last time.
+    const src = await fetch(BRIDGE_CLIENT_URL, { signal: AbortSignal.timeout(30_000) })
+      .then((r) => (r.ok ? r.text() : null))
+      .catch(() => null);
+    const bridge = (src && parseBridgeDefaults(src)) || maxVersionState.bridge;
+    console.log(`max version: MAX desktop ${maxLatest?.version ?? '?'} (${maxLatest?.build ?? '?'}), bridge presents ${bridge?.version ?? '?'}`);
+    if (shouldNotify(maxLatest, bridge, maxVersionState.lastNotified) && (await sendToMaintainer(formatVersionNotice(maxLatest, bridge)))) {
+      maxVersionState.lastNotified = maxLatest.version;
+    }
+    maxVersionState = { ...maxVersionState, bridge, maxLatest, checkedAt: Date.now() };
+    void save(MAXVERSION_FILE, maxVersionState);
+  } catch (err) {
+    console.log(`max version check failed: ${err.message}`);
+  }
 }
 
 /** /stats and /reports: HTTPS-only + STATS_KEY. Answers 403 itself and returns false when refused. */
@@ -350,4 +392,6 @@ setInterval(() => {
   void refreshGeo();
   site.prune(Date.now());
 }, 86_400_000).unref();
+setTimeout(() => void checkMaxVersion(), 60_000).unref();
+setInterval(() => void checkMaxVersion(), MAXVERSION_EVERY_MS).unref();
 server.listen(PORT, () => console.log(`telemetry listening on :${PORT} (data: ${DATA_FILE})`));

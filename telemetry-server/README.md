@@ -85,3 +85,15 @@ unique visitors are a per-day set of salted hashes kept in memory with a salt th
 Moscow day, so `data/site.json` holds numbers only. Countries come from the free DB-IP «IP to Country
 Lite» table (CC BY 4.0 — the `/stats/` page credits it), which the server downloads into
 `data/dbip-country-lite.csv.gz` on start and refreshes monthly; until it loads, countries read «??».
+
+## MAX desktop version watch (`maxversion.mjs`)
+
+MAX refuses logins from a client it considers outdated («Приложение устарело, пожалуйста, обновитесь»),
+and the bridge presents itself as MAX desktop with `DEFAULT_APP_VERSION` / `DEFAULT_BUILD_NUMBER` from
+`src/max/client.ts`. Every 6 hours (and a minute after start) the server reads MAX's apt repo
+(`download.max.ru/linux/deb/…/Packages`: the newest «Version:» and the build in «MAX-<version>.<build>.deb»)
+and the bridge's numbers from `src/max/client.ts` on GitHub `main`, so it follows every release by itself.
+When MAX is ahead it posts ONE notice per new MAX version to the maintainer's «🤖 Автоотчёты об ошибках»
+topic, with the numbers to release (and the `.env` override users can apply meanwhile). State, including
+the last announced version, is kept in `data/maxversion.json`; if GitHub is unreachable it compares with the
+bridge numbers it read last time.
