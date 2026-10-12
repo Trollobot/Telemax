@@ -223,7 +223,7 @@ function contactError(payload: unknown, opcode: number, fallback: string): MaxSe
 }
 
 /** `flags` bit MAX's web client calls FLAG_IS_ADDED — the person is in this account's address book. */
-const CONTACT_FLAG_ADDED = 512;
+export const CONTACT_FLAG_ADDED = 512;
 export function isAddedContact(c: Pick<MaxContactInfo, 'flags'>): boolean {
   return typeof c.flags === 'number' && (c.flags & CONTACT_FLAG_ADDED) !== 0;
 }

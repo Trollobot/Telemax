@@ -123,6 +123,32 @@ export function cardButtons(uid: string, info: ShownContact): InlineKeyboardButt
     Markup.button.callback('◀️ Готово', 'tlmx_panel:dismiss'),
   ];
 }
+/**
+ * «➕ В контакты MAX» — the search card's and the /info card's: saves the person into the account's
+ * MAX address book (it shows on the phone too). With a phone it is what MAX's own «Добавить контакт»
+ * form sends, under `saveAs` (a shared Telegram card's name or their MAX name); without one (an ID
+ * search may hide it) the person is added by id and MAX keeps their own name. `line` is what the card shows.
+ */
+export async function addToMaxContacts(
+  max: Pick<MaxClient, 'addContactByPhone' | 'addContactById'>,
+  uid: string,
+  opts: { phone?: string; saveAs?: SaveAs },
+): Promise<{ ok: boolean; line: string }> {
+  try {
+    if (opts.phone && opts.saveAs) {
+      const { isNew } = await max.addContactByPhone(opts.phone, opts.saveAs.firstName, opts.saveAs.lastName);
+      const as = [opts.saveAs.firstName, opts.saveAs.lastName].filter(Boolean).join(' ');
+      logger.info(`MAX contact ${uid} added by phone${isNew ? '' : ' (was there already)'}`);
+      return { ok: true, line: isNew ? `✅ Добавлен в контакты MAX как «${as}».` : '📒 Уже был в ваших контактах MAX.' };
+    }
+    await max.addContactById(uid);
+    logger.info(`MAX contact ${uid} added by id`);
+    return { ok: true, line: '✅ Добавлен в контакты MAX.' };
+  } catch (err) {
+    logger.error(`Adding MAX contact ${uid} failed`, err);
+    return { ok: false, line: contactAddFailure(err) };
+  }
+}
 /** What the card says when MAX refused to add the person (CONTACT_ADD / CONTACT_UPDATE error codes). */
 export function contactAddFailure(err: unknown): string {
   const code = isMaxServerError(err) ? err.serverCode : undefined;
@@ -774,10 +800,7 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
     await ctx.editMessageText(text, { reply_markup: Markup.inlineKeyboard(cardButtons(uid, info), { columns: 1 }).reply_markup }).catch(() => {});
   });
 
-  // «➕ В контакты MAX» on a search card: saves the person into the account's MAX address book (it
-  // shows on the phone too). With a phone on the card it is what MAX's own «Добавить контакт» form
-  // sends — under the name from a shared Telegram contact card, else under their MAX name; without
-  // one (an ID search may hide it) the person is added by id and MAX keeps their own name.
+  // «➕ В контакты MAX» on a search card (the /info card has its own button in sync.ts — same addToMaxContacts).
   bot.action(/^tlmx_panel:addcontact:(.+)$/, async (ctx) => {
     const uid = ctx.match?.[1];
     if (!uid) return;
@@ -788,23 +811,8 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
     }
     // Answer first: a MAX round-trip can outlast Telegram's callback window (see startchat below).
     await ctx.answerCbQuery('Добавляю в контакты MAX…').catch(() => {});
-    let line: string;
-    try {
-      if (info.phone && info.saveAs) {
-        const { isNew } = await max.addContactByPhone(info.phone, info.saveAs.firstName, info.saveAs.lastName);
-        const as = [info.saveAs.firstName, info.saveAs.lastName].filter(Boolean).join(' ');
-        line = isNew ? `✅ Добавлен в контакты MAX как «${as}».` : '📒 Уже был в ваших контактах MAX.';
-        logger.info(`MAX contact ${uid} added by phone${isNew ? '' : ' (was there already)'}`);
-      } else {
-        await max.addContactById(uid);
-        line = '✅ Добавлен в контакты MAX.';
-        logger.info(`MAX contact ${uid} added by id`);
-      }
-      info.added = true;
-    } catch (err) {
-      logger.error(`Adding MAX contact ${uid} failed`, err);
-      line = contactAddFailure(err);
-    }
+    const { ok, line } = await addToMaxContacts(max, uid, info);
+    if (ok) info.added = true;
     // The card's first two lines are the name and the ID line; the status line below them is replaced.
     const card = (ctx.callbackQuery.message as { text?: string } | undefined)?.text?.split('\n').slice(0, 2).join('\n') ?? `👤 ${info.name}`;
     await ctx.editMessageText(`${card}\n${line}`, { reply_markup: Markup.inlineKeyboard(cardButtons(uid, info), { columns: 1 }).reply_markup }).catch(() => {});

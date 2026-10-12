@@ -1,9 +1,9 @@
 import path from 'node:path';
 import { rm, stat, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
-import { Markup, type Telegraf } from 'telegraf';
+import { Markup, type Context, type Telegraf } from 'telegraf';
 import type { ChatAction, TelegramEmoji } from 'telegraf/types';
-import type { MaxClient, MaxMessageEvent, MaxHistoryMessage } from '../max/client.js';
+import { CONTACT_FLAG_ADDED, isAddedContact, type MaxClient, type MaxContactInfo, type MaxMessageEvent, type MaxHistoryMessage } from '../max/client.js';
 import { OPCODES, formatOpcode } from '../max/opcodes.js';
 import { resolveContactDisplayName, resolveChatName, isFallbackTitle, type ContactProfile } from '../max/names.js';
 import { cursorToMs, type ChatMapStore } from '../store/chatMapStore.js';
@@ -28,7 +28,7 @@ import { FileShare, fileShareOptionsFromEnv, TELEGRAM_BOT_DOWNLOAD_LIMIT } from 
 import { createBigFiles } from './bigFiles.js';
 import { canRenderAnimatedStickers } from './lottie.js';
 import { reportBridgeError } from './errorReporter.js';
-import { wireControlPanel, type PauseControl } from './panel.js';
+import { addToMaxContacts, profileName, wireControlPanel, type PauseControl } from './panel.js';
 import { keepPanelBack } from './panelBack.js';
 import { createBugReports, isBugReportInboxEnabled, BUGREPORT_BOT_HANDLE, type BugReports } from './bugReports.js';
 import { createMaxAuthFlow, type MaxAuthCallbacks } from './maxAuthFlow.js';
@@ -1232,7 +1232,7 @@ async function buildRoster(
   max: MaxClient,
   myAccountId: number | null,
   profiles: Map<number, ContactProfile>,
-): Promise<Array<{ id: number; name: string; isSelf: boolean }> | undefined> {
+): Promise<Array<{ id: number; name: string; isSelf: boolean; addable: boolean }> | undefined> {
   if (!participants || chatType === 'DIALOG') return undefined;
   const ids = Object.keys(participants).map(Number).filter((id) => !Number.isNaN(id));
   const uncached = ids.filter((id) => !profiles.has(id));
@@ -1246,14 +1246,26 @@ async function buildRoster(
       logger.error('Failed to fetch participant profiles for the roster', err);
     }
   }
-  return ids.slice(0, 80).map((id) => ({
-    id,
-    name: resolveContactDisplayName(id, profiles.get(id)),
-    isSelf: myAccountId != null && id === myAccountId,
-  }));
+  return ids.slice(0, 80).map((id) => {
+    const isSelf = myAccountId != null && id === myAccountId;
+    return { id, name: resolveContactDisplayName(id, profiles.get(id)), isSelf, addable: !isSelf && canAddToContacts(profiles.get(id)) };
+  });
+}
+
+/** «➕ В контакты MAX» makes sense for this profile: not a contact yet, not a bot (an unknown profile — offered, MAX decides). */
+function canAddToContacts(profile: ContactProfile | undefined): boolean {
+  const p = profile as MaxContactInfo | undefined;
+  return !p || (!isAddedContact(p) && !(Array.isArray(p.options) && p.options.includes('BOT')));
 }
 
 type InlineMarkup = ReturnType<typeof Markup.inlineKeyboard>['reply_markup'];
+
+/** A group card's collapsed buttons: «💬 Открыть личку», plus «➕ В контакты MAX» while someone there isn't a contact yet. */
+function rosterKeyboard(canAdd: boolean): InlineMarkup {
+  const rows = [[Markup.button.callback('💬 Открыть личку', 'tlmx_roster:open')]];
+  if (canAdd) rows.push([Markup.button.callback('➕ В контакты MAX', 'tlmx_roster:add')]);
+  return Markup.inlineKeyboard(rows).reply_markup;
+}
 
 /**
  * A group "member event" (CONTROL join/leave) rendered as ONE actionable message: who left / was
@@ -1322,7 +1334,7 @@ async function sendContactInfoCard(
   participantCount: number | undefined,
   otherId: number | undefined,
   profile: ContactProfile | undefined,
-  roster?: Array<{ id: number; name: string; isSelf: boolean }>,
+  roster?: Array<{ id: number; name: string; isSelf: boolean; addable: boolean }>,
 ): Promise<number> {
   if (chatType !== 'DIALOG' || otherId == null) {
     const lines = [`ℹ️ ${fallbackTitle}`];
@@ -1332,11 +1344,9 @@ async function sendContactInfoCard(
       for (const p of roster) lines.push(`• ${p.isSelf ? '🧑 Вы' : `👤 ${p.name}`} — MAX ID ${p.id}`);
       if (participantCount != null && participantCount > roster.length) lines.push(`…и ещё ${participantCount - roster.length}`);
     }
-    // "Open a DM with a participant" — expands into a button per person (tlmx_roster:open).
+    // "Open a DM with a participant" / "add one to MAX contacts" — each expands into a button per person (tlmx_roster:open / :add).
     const hasOthers = !!roster?.some((p) => !p.isSelf);
-    const markup = hasOthers
-      ? Markup.inlineKeyboard([[Markup.button.callback('💬 Открыть личку', 'tlmx_roster:open')]]).reply_markup
-      : undefined;
+    const markup = hasOthers ? rosterKeyboard(!!roster?.some((p) => p.addable)) : undefined;
     const sent = await bot.telegram.sendMessage(targetGroupId, lines.join('\n'), { message_thread_id: topicId, reply_markup: markup });
     return sent.message_id;
   }
@@ -1357,16 +1367,19 @@ async function sendContactInfoCard(
   if (p.description) lines.push(`О себе: ${p.description}`);
   if (p.registrationTime != null) lines.push(`Регистрация: ${new Date(Number(p.registrationTime)).toLocaleDateString('ru-RU')}`);
   lines.push(`ID: ${otherId}`);
+  // «➕ В контакты MAX» for a person not in the address book yet (bots aren't added) — tlmx_info:addcontact.
+  if (isAddedContact(p as MaxContactInfo)) lines.push('📒 В ваших контактах MAX');
   const caption = lines.join('\n');
+  const reply_markup = canAddToContacts(p) ? Markup.inlineKeyboard([Markup.button.callback('➕ В контакты MAX', `tlmx_info:addcontact:${otherId}`)]).reply_markup : undefined;
 
   try {
     const sent = p.baseUrl
-      ? await bot.telegram.sendPhoto(targetGroupId, p.baseUrl, { caption, message_thread_id: topicId })
-      : await bot.telegram.sendMessage(targetGroupId, caption, { message_thread_id: topicId });
+      ? await bot.telegram.sendPhoto(targetGroupId, p.baseUrl, { caption, message_thread_id: topicId, reply_markup })
+      : await bot.telegram.sendMessage(targetGroupId, caption, { message_thread_id: topicId, reply_markup });
     return sent.message_id;
   } catch (err) {
     logger.error('Failed to send contact info card, falling back to text-only', err);
-    const sent = await bot.telegram.sendMessage(targetGroupId, caption, { message_thread_id: topicId });
+    const sent = await bot.telegram.sendMessage(targetGroupId, caption, { message_thread_id: topicId, reply_markup });
     return sent.message_id;
   }
 }
@@ -2520,7 +2533,7 @@ export function wireBridge({
 
 Сообщения, файлы, голосовые, стикеры и опросы синхронизируются в обе стороны автоматически — команды нужны только для управления. Обычная пересылка сообщений (drag-forward) в тему тоже работает сама — прилетит в привязанный MAX-чат с пометкой «↩️ Переслано от/из...». Звонки — только текстовые уведомления (входящий звонит / завершённый / пропущенный), без передачи аудио — для этого нужен WebRTC, вне рамок Bot API-моста.
 
-/info — карточка контакта или чата (просто в теме)
+/info — карточка контакта или чата (просто в теме). Кнопка «➕ В контакты MAX» сохраняет собеседника в контакты вашего MAX, в группе — выбранного участника
 /file — отправить в этот чат MAX большой файл (до 4 ГБ) по ссылке: загружается один раз, мимо лимита Telegram в 20 МБ. Там же — файлы, которые уже лежат на сервере: нажмёте — уйдут в этот чат прямо с сервера
 
 Файлообменник: /panel → 📁 Файлы → «📤 Загрузить файл». Положите на свой сервер файл любого размера — сколько вместит диск — и получите ссылку на скачивание, которой можно делиться где угодно. Файл хранится 3 дня от последней ссылки.
@@ -2920,10 +2933,48 @@ export function wireBridge({
     await sendContactInfoCard(bot, targetGroupId, topicId, chat?.title || mapping.title || 'Чат', chat?.type, count, otherId, profile, roster);
   });
 
-  // "💬 Открыть личку" on a group's roster card → a button per participant (tlmx_panel:startchat:<uid>).
-  // Participants come from the chat of the topic the card lives in — nothing is encoded in the button.
-  bot.action('tlmx_roster:open', async (ctx) => {
-    const topicId = (ctx.callbackQuery.message as { message_thread_id?: number } | undefined)?.message_thread_id;
+  /** «➕ В контакты MAX» from an /info card: the profile from the warm cache (or MAX), then the panel's addToMaxContacts — by phone under their MAX name, else by id. */
+  async function addParticipantToContacts(uid: number): Promise<{ ok: boolean; line: string; name: string }> {
+    const profiles = getContactProfiles();
+    let profile = profiles.get(uid) as MaxContactInfo | undefined;
+    if (!profile) {
+      try {
+        profile = (await max.getContactInfo([uid]))[0];
+        if (profile) profiles.set(uid, profile as ContactProfile);
+      } catch (err) {
+        logger.error(`Failed to fetch profile ${uid} for «В контакты MAX»`, err);
+      }
+    }
+    const digits = profile?.phone != null ? String(profile.phone).replace(/\D/g, '') : '';
+    const res = await addToMaxContacts(max, String(uid), { phone: digits ? `+${digits}` : undefined, saveAs: profile ? profileName(profile) : undefined });
+    if (res.ok && profile) profile.flags = (profile.flags ?? 0) | CONTACT_FLAG_ADDED; // the next /info knows
+    return { ...res, name: resolveContactDisplayName(uid, profile as ContactProfile | undefined) };
+  }
+
+  type CardMessage = { caption?: string; text?: string; photo?: unknown; message_thread_id?: number; reply_markup?: InlineMarkup };
+  /** Appends a result line to an /info card (photo caption or text) with new buttons; if Telegram refuses (a caption at its 1024 limit), the line goes to the topic as a message. */
+  async function appendToCard(ctx: Context, line: string, reply_markup: InlineMarkup | undefined): Promise<void> {
+    const msg = ctx.callbackQuery?.message as CardMessage | undefined;
+    const extra = { reply_markup: reply_markup ?? { inline_keyboard: [] } };
+    const edited = msg?.photo ? ctx.editMessageCaption(`${msg.caption ?? ''}\n${line}`, extra) : ctx.editMessageText(`${msg?.text ?? ''}\n${line}`, extra);
+    await edited.catch(async (err) => {
+      logger.error('Failed to update the /info card after «В контакты MAX»', err);
+      await bot.telegram.sendMessage(targetGroupId, line, { message_thread_id: msg?.message_thread_id }).catch(() => {});
+    });
+  }
+
+  // «➕ В контакты MAX» on a dialog's /info card (and the auto-sent first-contact card) adds at once.
+  bot.action(/^tlmx_info:addcontact:(\d+)$/, async (ctx) => {
+    // Answer first: a MAX round-trip can outlast Telegram's callback window.
+    await ctx.answerCbQuery('Добавляю в контакты MAX…').catch(() => {});
+    const { ok, line } = await addParticipantToContacts(Number(ctx.match[1]));
+    // Done → the button goes; refused → it stays for another try.
+    await appendToCard(ctx, line, ok ? undefined : (ctx.callbackQuery.message as CardMessage | undefined)?.reply_markup);
+  });
+
+  /** The other participants of the chat behind the topic a group card lives in (≤50) — nothing is encoded in the buttons. */
+  async function rosterOthers(ctx: Context): Promise<number[]> {
+    const topicId = (ctx.callbackQuery?.message as { message_thread_id?: number } | undefined)?.message_thread_id;
     const mapping = topicId != null ? await chatMapStore.getByTopicId(topicId) : undefined;
     const chat = mapping
       ? (getChats().find((c) => c && typeof c === 'object' && String((c as { id?: unknown }).id) === mapping.maxChatId) as
@@ -2931,12 +2982,24 @@ export function wireBridge({
           | undefined)
       : undefined;
     const myId = getMyAccountId();
-    const others = chat?.participants
+    return chat?.participants
       ? Object.keys(chat.participants)
           .map(Number)
           .filter((id) => !Number.isNaN(id) && id !== myId)
           .slice(0, 50)
       : [];
+  }
+  /** Of `others`, the ones «➕ В контакты MAX» still makes sense for (per the warm profile cache). */
+  const addableOf = (others: number[]): number[] => others.filter((id) => canAddToContacts(getContactProfiles().get(id)));
+  /** The «➕ В контакты MAX» choice list: one button per participant not in the contacts yet. */
+  const addRows = (ids: number[]) => [
+    ...ids.map((id) => [Markup.button.callback(`➕ ${resolveContactDisplayName(id, getContactProfiles().get(id))}`, `tlmx_roster:addc:${id}`)]),
+    [Markup.button.callback('◀️ Свернуть', 'tlmx_roster:hide')],
+  ];
+
+  // "💬 Открыть личку" on a group's roster card → a button per participant (tlmx_panel:startchat:<uid>).
+  bot.action('tlmx_roster:open', async (ctx) => {
+    const others = await rosterOthers(ctx);
     if (others.length === 0) {
       await ctx.answerCbQuery('Не вижу участников — обновите /info').catch(() => {});
       return;
@@ -2947,11 +3010,35 @@ export function wireBridge({
     await ctx.editMessageReplyMarkup(Markup.inlineKeyboard(rows).reply_markup).catch((err) => logger.error('Failed to expand roster DM list', err));
   });
 
+  // "➕ В контакты MAX" on a group's roster card → a button per participant who isn't a contact yet (tlmx_roster:addc:<uid>).
+  bot.action('tlmx_roster:add', async (ctx) => {
+    const others = await rosterOthers(ctx);
+    if (others.length === 0) {
+      await ctx.answerCbQuery('Не вижу участников — обновите /info').catch(() => {});
+      return;
+    }
+    const addable = addableOf(others);
+    if (addable.length === 0) {
+      await ctx.answerCbQuery('Все участники уже в ваших контактах MAX', { show_alert: true }).catch(() => {});
+      await ctx.editMessageReplyMarkup(rosterKeyboard(false)).catch(() => {});
+      return;
+    }
+    await ctx.answerCbQuery().catch(() => {});
+    await ctx.editMessageReplyMarkup(Markup.inlineKeyboard(addRows(addable)).reply_markup).catch((err) => logger.error('Failed to expand roster add list', err));
+  });
+
+  // A participant picked from that list: added at once, the card gets a result line, the list loses them.
+  bot.action(/^tlmx_roster:addc:(\d+)$/, async (ctx) => {
+    await ctx.answerCbQuery('Добавляю в контакты MAX…').catch(() => {});
+    const { line, name } = await addParticipantToContacts(Number(ctx.match[1]));
+    const left = addableOf(await rosterOthers(ctx));
+    await appendToCard(ctx, `👤 ${name}: ${line}`, left.length ? Markup.inlineKeyboard(addRows(left)).reply_markup : rosterKeyboard(false));
+  });
+
   bot.action('tlmx_roster:hide', async (ctx) => {
     await ctx.answerCbQuery().catch(() => {});
-    await ctx
-      .editMessageReplyMarkup(Markup.inlineKeyboard([[Markup.button.callback('💬 Открыть личку', 'tlmx_roster:open')]]).reply_markup)
-      .catch((err) => logger.error('Failed to collapse roster DM list', err));
+    const canAdd = addableOf(await rosterOthers(ctx)).length > 0;
+    await ctx.editMessageReplyMarkup(rosterKeyboard(canAdd)).catch((err) => logger.error('Failed to collapse roster DM list', err));
   });
 
   /** Formats a poll's current tally — MAX sends no push for votes, so callers always pull it live via CHAT_HISTORY first. */

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { MaxServerError, parsePublicSearch } from '../src/max/client.js';
 import { OPCODES } from '../src/max/opcodes.js';
-import { cardButtons, contactAddFailure, normalizeNickQuery, normalizePhoneQuery, profileName } from '../src/bridge/panel.js';
+import { addToMaxContacts, cardButtons, contactAddFailure, normalizeNickQuery, normalizePhoneQuery, profileName } from '../src/bridge/panel.js';
 
 describe('parsePublicSearch', () => {
   it('reads the live 2026-10-05 shape: double-nested bot contacts and channels', () => {
@@ -108,5 +108,28 @@ describe('«➕ В контакты MAX» on the search card', () => {
     expect(contactAddFailure(refused('error.invalid-phone'))).toMatch(/номер неверным/);
     expect(contactAddFailure(refused('user.not.found'))).toMatch(/не нашёл/);
     expect(contactAddFailure(new Error('timeout'))).toBe('❌ Не удалось добавить в контакты: timeout');
+  });
+  it('adds by phone under the given name, else by id, and says what happened', async () => {
+    const calls: unknown[] = [];
+    const max = {
+      addContactByPhone: async (phone: string, firstName: string, lastName?: string) => {
+        calls.push(['phone', phone, firstName, lastName]);
+        return { contact: { id: 1 }, isNew: true };
+      },
+      addContactById: async (id: unknown) => {
+        calls.push(['id', id]);
+        return null;
+      },
+    };
+    expect(await addToMaxContacts(max, '1', { phone: '+79161234567', saveAs: { firstName: 'Вася', lastName: 'Пупкин' } })).toEqual({ ok: true, line: '✅ Добавлен в контакты MAX как «Вася Пупкин».' });
+    expect(await addToMaxContacts(max, '1', {})).toEqual({ ok: true, line: '✅ Добавлен в контакты MAX.' });
+    expect(calls).toEqual([['phone', '+79161234567', 'Вася', 'Пупкин'], ['id', '1']]);
+    const refusing = {
+      ...max,
+      addContactByPhone: async () => {
+        throw new MaxServerError('x', OPCODES.CONTACT_ADD, 'error.add.self');
+      },
+    };
+    expect(await addToMaxContacts(refusing, '1', { phone: '+79161234567', saveAs: { firstName: 'Я' } })).toMatchObject({ ok: false, line: expect.stringMatching(/собственный номер/) });
   });
 });
