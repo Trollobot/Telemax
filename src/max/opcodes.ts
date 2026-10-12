@@ -18,6 +18,12 @@ export const OPCODES = {
   CHECK_PASSWORD: 0x0073,
   CONTACT_INFO: 0x0020,
   CONTACT_INFO_BY_PHONE: 0x002e,
+  // Address book — read from MAX's web client 2026-10-12 (its «Добавить контакт» form and the
+  // contact menu). CONTACT_ADD `{phone, firstName, lastName?}` -> `{contact, new}`; errors
+  // `user.not.found`, `error.add.self`, `error.invalid-phone`. CONTACT_UPDATE `{contactId, action}`
+  // with action ADD | REMOVE | BLOCK | UNBLOCK | UPDATE (+ firstName/lastName) -> `{contact}`.
+  CONTACT_ADD: 0x0029,
+  CONTACT_UPDATE: 0x0022,
   // Global directory search by name — CONTACT_SEARCH (0x0025) only hits the account's
   // LOCAL address book (empty book => total:0 even for existing users). Supplied by the
   // user 2026-08-16.

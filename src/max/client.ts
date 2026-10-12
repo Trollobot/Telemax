@@ -216,6 +216,18 @@ function toUserId(id: unknown): bigint {
   return typeof id === 'bigint' ? id : BigInt(id as string | number);
 }
 
+/** An ERR answer to an address-book request, keeping MAX's machine code (payload.error) for the caller. */
+function contactError(payload: unknown, opcode: number, fallback: string): MaxServerError {
+  const code = (payload as { error?: unknown } | null)?.error;
+  return new MaxServerError(describeAuthError(payload, fallback), opcode, typeof code === 'string' ? code : undefined);
+}
+
+/** `flags` bit MAX's web client calls FLAG_IS_ADDED — the person is in this account's address book. */
+const CONTACT_FLAG_ADDED = 512;
+export function isAddedContact(c: Pick<MaxContactInfo, 'flags'>): boolean {
+  return typeof c.flags === 'number' && (c.flags & CONTACT_FLAG_ADDED) !== 0;
+}
+
 interface ResolvedOptions {
   host: string;
   sni: string;
@@ -811,6 +823,27 @@ export class MaxClient extends EventEmitter {
     // A success without `contact` is a shape we don't know — say so instead of a silent «not found».
     if (!contact) throw new Error(`CONTACT_INFO_BY_PHONE: unexpected answer (keys: ${Object.keys(payload ?? {}).join(', ') || 'none'})`);
     return contact;
+  }
+
+  /**
+   * Saves a person into the account's MAX address book by phone, under the given name
+   * (CONTACT_ADD, 0x0029) — what MAX's own «Добавить контакт» form sends. `isNew` false = they were
+   * a contact already. An ERR answer is a MaxServerError whose serverCode the panel explains
+   * (user.not.found, error.add.self, error.invalid-phone).
+   */
+  async addContactByPhone(phone: string, firstName: string, lastName?: string): Promise<{ contact: MaxContactInfo; isNew: boolean }> {
+    const { dir, payload } = await this.request(OPCODES.CONTACT_ADD, { phone, firstName, ...(lastName ? { lastName } : {}) });
+    if (dir === DIR.ERR) throw contactError(payload, OPCODES.CONTACT_ADD, 'CONTACT_ADD failed');
+    const p = payload as { contact?: MaxContactInfo; new?: boolean } | null;
+    if (!p?.contact) throw new Error(`CONTACT_ADD: unexpected answer (keys: ${Object.keys(payload ?? {}).join(', ') || 'none'})`);
+    return { contact: p.contact, isNew: !!p.new };
+  }
+
+  /** Adds a MAX user known by id to the address book (CONTACT_UPDATE, action ADD) — no phone needed; MAX keeps their own name. */
+  async addContactById(contactId: unknown): Promise<MaxContactInfo | null> {
+    const { dir, payload } = await this.request(OPCODES.CONTACT_UPDATE, { contactId: toUserId(contactId), action: 'ADD' });
+    if (dir === DIR.ERR) throw contactError(payload, OPCODES.CONTACT_UPDATE, 'CONTACT_UPDATE failed');
+    return (payload as { contact?: MaxContactInfo } | null)?.contact ?? null;
   }
 
   /**

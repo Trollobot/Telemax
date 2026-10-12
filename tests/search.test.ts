@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { parsePublicSearch } from '../src/max/client.js';
-import { normalizeNickQuery, normalizePhoneQuery } from '../src/bridge/panel.js';
+import { MaxServerError, parsePublicSearch } from '../src/max/client.js';
+import { OPCODES } from '../src/max/opcodes.js';
+import { cardButtons, contactAddFailure, normalizeNickQuery, normalizePhoneQuery, profileName } from '../src/bridge/panel.js';
 
 describe('parsePublicSearch', () => {
   it('reads the live 2026-10-05 shape: double-nested bot contacts and channels', () => {
@@ -81,5 +82,31 @@ describe('normalizePhoneQuery', () => {
     expect(normalizePhoneQuery('12345')).toBeNull();
     expect(normalizePhoneQuery('abc')).toBeNull();
     expect(normalizePhoneQuery('1234567890123456')).toBeNull();
+  });
+});
+
+describe('«➕ В контакты MAX» on the search card', () => {
+  const data = (buttons: Array<{ callback_data: string }>) => buttons.map((b) => b.callback_data);
+
+  it('is offered to a person on MAX who is not a contact yet — not to bots, contacts or non-MAX numbers', () => {
+    expect(data(cardButtons('42', { name: 'Вася', onMax: true }))).toEqual(['tlmx_panel:startchat:42', 'tlmx_panel:addcontact:42', 'tlmx_panel:dismiss']);
+    expect(data(cardButtons('42', { name: 'Вася', onMax: true, added: true }))).toEqual(['tlmx_panel:startchat:42', 'tlmx_panel:dismiss']);
+    expect(data(cardButtons('42', { name: 'Бот', onMax: true, bot: true }))).toEqual(['tlmx_panel:startchat:42', 'tlmx_panel:dismiss']);
+    expect(data(cardButtons('42', { name: 'Вася', onMax: false }))).toEqual(['tlmx_panel:dismiss']);
+  });
+
+  it('saves under the MAX profile name, split into first and last', () => {
+    expect(profileName({ id: 1, names: [{ firstName: 'Вася', lastName: 'Пупкин', type: 'ONEME' }] })).toEqual({ firstName: 'Вася', lastName: 'Пупкин' });
+    expect(profileName({ id: 1, names: [{ firstName: 'Вася', lastName: '', type: 'ONEME' }] })).toEqual({ firstName: 'Вася', lastName: undefined });
+    expect(profileName({ id: 1, names: [{ name: 'Вася Пупкин Младший' }] })).toEqual({ firstName: 'Вася', lastName: 'Пупкин Младший' });
+    expect(profileName({ id: 7 })).toEqual({ firstName: 'MAX', lastName: '7' });
+  });
+
+  it('explains what MAX refused', () => {
+    const refused = (code: string) => new MaxServerError('x', OPCODES.CONTACT_ADD, code);
+    expect(contactAddFailure(refused('error.add.self'))).toMatch(/собственный номер/);
+    expect(contactAddFailure(refused('error.invalid-phone'))).toMatch(/номер неверным/);
+    expect(contactAddFailure(refused('user.not.found'))).toMatch(/не нашёл/);
+    expect(contactAddFailure(new Error('timeout'))).toBe('❌ Не удалось добавить в контакты: timeout');
   });
 });

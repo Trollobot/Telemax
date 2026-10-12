@@ -2,7 +2,7 @@ import path from 'node:path';
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { Markup, type Telegraf, type Context } from 'telegraf';
 import type { InlineKeyboardButton } from 'telegraf/types';
-import type { MaxClient, MaxContactInfo } from '../max/client.js';
+import { isAddedContact, isMaxServerError, type MaxClient, type MaxContactInfo } from '../max/client.js';
 import { getAppVersion } from './version.js';
 import { formatBytes, maskPhone } from './status.js';
 import { createLogger } from '../logger.js';
@@ -78,8 +78,12 @@ const pendingSearch = new Map<number, { mode: SearchMode; requesterId: number; a
 const pendingByUser = new Map<number, { mode: SearchMode; promptId: number; at: number }>();
 const SEARCH_WAIT_MS = 10 * 60_000;
 // Contacts shown with a "Начать чат" button, so the tap knows the display name / MAX
-// membership without re-fetching. Keyed by userId (string).
-const shownContacts = new Map<string, { name: string; onMax: boolean; bot?: boolean }>();
+// membership without re-fetching. Keyed by userId (string). `phone` (+digits) and `saveAs` (the
+// name from a shared Telegram contact card) serve «➕ В контакты MAX»; `added` = already in the
+// account's MAX address book, so the card offers no add button.
+export type ShownContact = { name: string; onMax: boolean; bot?: boolean; added?: boolean; phone?: string; saveAs?: SaveAs };
+export type SaveAs = { firstName: string; lastName?: string };
+const shownContacts = new Map<string, ShownContact>();
 
 // Both maps live for the whole process and only ever grew (an abandoned search prompt,
 // every contact ever shown) — bound them FIFO so months of uptime can't leak memory.
@@ -101,6 +105,31 @@ function contactName(c: MaxContactInfo): string {
 }
 function isOnMax(c: MaxContactInfo): boolean {
   return Array.isArray(c.options) && c.options.includes('ONEME');
+}
+/** The person's own MAX name as first/last — what «➕ В контакты MAX» saves when no Telegram card named them. */
+export function profileName(c: MaxContactInfo): SaveAs {
+  const names = c.names ?? [];
+  const primary = names.find((n) => n.type === 'ONEME') ?? names[0];
+  if (primary?.firstName) return { firstName: primary.firstName, lastName: primary.lastName || undefined };
+  const [first, ...rest] = contactName(c).split(' ');
+  return { firstName: first || contactName(c), lastName: rest.join(' ') || undefined };
+}
+/** The search card's buttons: «Начать чат», and «➕ В контакты MAX» for a person not in the address book yet (bots aren't added). */
+export function cardButtons(uid: string, info: ShownContact): InlineKeyboardButton.CallbackButton[] {
+  if (!info.onMax) return [Markup.button.callback('◀️ Готово', 'tlmx_panel:dismiss')];
+  return [
+    Markup.button.callback('💬 Начать чат', `tlmx_panel:startchat:${uid}`),
+    ...(info.bot || info.added ? [] : [Markup.button.callback('➕ В контакты MAX', `tlmx_panel:addcontact:${uid}`)]),
+    Markup.button.callback('◀️ Готово', 'tlmx_panel:dismiss'),
+  ];
+}
+/** What the card says when MAX refused to add the person (CONTACT_ADD / CONTACT_UPDATE error codes). */
+export function contactAddFailure(err: unknown): string {
+  const code = isMaxServerError(err) ? err.serverCode : undefined;
+  if (code === 'user.not.found') return '❌ MAX не нашёл этого человека — в контакты не добавить.';
+  if (code === 'error.add.self') return '❌ Это ваш собственный номер — себя в контакты не добавить.';
+  if (code === 'error.invalid-phone') return '❌ MAX считает этот номер неверным — в контакты не добавить.';
+  return `❌ Не удалось добавить в контакты: ${err instanceof Error ? err.message : 'ошибка'}`;
 }
 function isBot(c: MaxContactInfo): boolean {
   return Array.isArray(c.options) && c.options.includes('BOT');
@@ -256,7 +285,7 @@ function fileCardView(f: StoredFile, files: FileShare, link?: string, canResend 
 }
 function contactsView(): View {
   return {
-    text: '👤 Найти контакт в MAX:',
+    text: '👤 Найти контакт в MAX — найденному можно начать чат или добавить его в контакты MAX.\nИли перешлите сюда контакт из Telegram — найду по номеру, а в контакты MAX сохраню под тем же именем.',
     markup: Markup.inlineKeyboard([
       [Markup.button.callback('🔢 По номеру', 'tlmx_panel:find:phone'), Markup.button.callback('@ По нику', 'tlmx_panel:find:nick')],
       [Markup.button.callback('🆔 По ID', 'tlmx_panel:find:id')],
@@ -632,23 +661,30 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
     await edit(ctx, contactsView());
   });
 
-  async function sendCard(chatId: number, c: MaxContactInfo): Promise<void> {
+  /** `saveAs`: the name on a Telegram contact card the admin shared — «➕ В контакты MAX» saves the person under it. */
+  async function sendCard(chatId: number, c: MaxContactInfo, saveAs?: SaveAs): Promise<void> {
     const uid = String(c.id);
     const name = contactName(c);
     const onMax = isOnMax(c);
-    boundedSet(shownContacts, uid, { name, onMax, bot: isBot(c) });
+    const digits = c.phone != null ? String(c.phone).replace(/\D/g, '') : '';
+    const info: ShownContact = { name, onMax, bot: isBot(c), added: isAddedContact(c), phone: digits ? `+${digits}` : undefined, saveAs: saveAs ?? profileName(c) };
+    boundedSet(shownContacts, uid, info);
     const phone = c.phone != null ? ` · ${String(c.phone)}` : '';
     const country = c.country ? ` · ${c.country}` : '';
     const slug = linkSlug(c.link);
     const nick = slug ? ` · @${slug}` : '';
-    const text = `${isBot(c) ? '🤖' : '👤'} ${name}\nID ${uid}${nick}${phone}${country}${onMax ? '' : '\n⚠️ Контакт не в MAX — начать чат нельзя.'}`;
-    const buttons = onMax
-      ? [Markup.button.callback('💬 Начать чат', `tlmx_panel:startchat:${uid}`), Markup.button.callback('◀️ Готово', 'tlmx_panel:dismiss')]
-      : [Markup.button.callback('◀️ Готово', 'tlmx_panel:dismiss')];
-    await bot.telegram.sendMessage(chatId, text, { reply_markup: Markup.inlineKeyboard(buttons, { columns: 1 }).reply_markup });
+    const status = !onMax
+      ? '\n⚠️ Контакт не в MAX — начать чат нельзя.'
+      : info.added
+        ? '\n📒 Уже в ваших контактах MAX.'
+        : saveAs && !info.bot
+          ? `\n➕ В контакты MAX сохранится как «${[saveAs.firstName, saveAs.lastName].filter(Boolean).join(' ')}» — как в вашем Telegram.`
+          : '';
+    const text = `${info.bot ? '🤖' : '👤'} ${name}\nID ${uid}${nick}${phone}${country}${status}`;
+    await bot.telegram.sendMessage(chatId, text, { reply_markup: Markup.inlineKeyboard(cardButtons(uid, info), { columns: 1 }).reply_markup });
   }
 
-  async function runSearch(chatId: number, mode: SearchMode, query: string): Promise<void> {
+  async function runSearch(chatId: number, mode: SearchMode, query: string, saveAs?: SaveAs): Promise<void> {
     try {
       if (mode === 'phone') {
         const phone = normalizePhoneQuery(query);
@@ -657,7 +693,7 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
           return;
         }
         const contact = await max.searchContactByPhone(phone);
-        logger.info(`Phone search ${maskPhone(phone)}: ${contact ? 'found' : 'not found'}`);
+        logger.info(`Phone search ${maskPhone(phone)}: ${contact ? `found${isAddedContact(contact) ? ', in contacts' : ''}` : 'not found'}`);
         if (!contact) {
           // MAX answers the same «not found» when the person limited search by number in their privacy
           // settings — then nobody can find them, the MAX app included; only a message from them opens the chat.
@@ -667,7 +703,7 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
           );
           return;
         }
-        await sendCard(chatId, contact);
+        await sendCard(chatId, contact, saveAs);
         return;
       }
       if (mode === 'id') {
@@ -707,7 +743,7 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
         await bot.telegram.sendMessage(chatId, '❌ Ничего не найдено. По нику находятся только боты и каналы MAX; людей ищите по номеру или MAX ID.');
         return;
       }
-      for (const c of contacts) boundedSet(shownContacts, String(c.id), { name: contactName(c), onMax: isOnMax(c), bot: isBot(c) });
+      for (const c of contacts) boundedSet(shownContacts, String(c.id), { name: contactName(c), onMax: isOnMax(c), bot: isBot(c), added: isAddedContact(c) });
       // Channels can't be opened as a bridge topic — a link into MAX is all we can offer.
       const buttons = [
         ...contacts.map((c) =>
@@ -734,11 +770,44 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
       await ctx.editMessageText('Список устарел — повторите поиск.').catch(() => {});
       return;
     }
-    const text = `${info.bot ? '🤖' : '👤'} ${info.name}\nID ${uid}${info.onMax ? '' : '\n⚠️ Не в MAX — начать чат нельзя.'}`;
-    const buttons = info.onMax
-      ? [Markup.button.callback('💬 Начать чат', `tlmx_panel:startchat:${uid}`), Markup.button.callback('◀️ Готово', 'tlmx_panel:dismiss')]
-      : [Markup.button.callback('◀️ Готово', 'tlmx_panel:dismiss')];
-    await ctx.editMessageText(text, { reply_markup: Markup.inlineKeyboard(buttons, { columns: 1 }).reply_markup }).catch(() => {});
+    const text = `${info.bot ? '🤖' : '👤'} ${info.name}\nID ${uid}${info.onMax ? (info.added ? '\n📒 Уже в ваших контактах MAX.' : '') : '\n⚠️ Не в MAX — начать чат нельзя.'}`;
+    await ctx.editMessageText(text, { reply_markup: Markup.inlineKeyboard(cardButtons(uid, info), { columns: 1 }).reply_markup }).catch(() => {});
+  });
+
+  // «➕ В контакты MAX» on a search card: saves the person into the account's MAX address book (it
+  // shows on the phone too). With a phone on the card it is what MAX's own «Добавить контакт» form
+  // sends — under the name from a shared Telegram contact card, else under their MAX name; without
+  // one (an ID search may hide it) the person is added by id and MAX keeps their own name.
+  bot.action(/^tlmx_panel:addcontact:(.+)$/, async (ctx) => {
+    const uid = ctx.match?.[1];
+    if (!uid) return;
+    const info = shownContacts.get(uid);
+    if (!info) {
+      await ctx.answerCbQuery('Карточка устарела — повторите поиск.', { show_alert: true }).catch(() => {});
+      return;
+    }
+    // Answer first: a MAX round-trip can outlast Telegram's callback window (see startchat below).
+    await ctx.answerCbQuery('Добавляю в контакты MAX…').catch(() => {});
+    let line: string;
+    try {
+      if (info.phone && info.saveAs) {
+        const { isNew } = await max.addContactByPhone(info.phone, info.saveAs.firstName, info.saveAs.lastName);
+        const as = [info.saveAs.firstName, info.saveAs.lastName].filter(Boolean).join(' ');
+        line = isNew ? `✅ Добавлен в контакты MAX как «${as}».` : '📒 Уже был в ваших контактах MAX.';
+        logger.info(`MAX contact ${uid} added by phone${isNew ? '' : ' (was there already)'}`);
+      } else {
+        await max.addContactById(uid);
+        line = '✅ Добавлен в контакты MAX.';
+        logger.info(`MAX contact ${uid} added by id`);
+      }
+      info.added = true;
+    } catch (err) {
+      logger.error(`Adding MAX contact ${uid} failed`, err);
+      line = contactAddFailure(err);
+    }
+    // The card's first two lines are the name and the ID line; the status line below them is replaced.
+    const card = (ctx.callbackQuery.message as { text?: string } | undefined)?.text?.split('\n').slice(0, 2).join('\n') ?? `👤 ${info.name}`;
+    await ctx.editMessageText(`${card}\n${line}`, { reply_markup: Markup.inlineKeyboard(cardButtons(uid, info), { columns: 1 }).reply_markup }).catch(() => {});
   });
 
   bot.action(/^tlmx_panel:startchat:(.+)$/, async (ctx) => {
@@ -802,7 +871,10 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
     await endPrompt(chatIdOf(ctx), userId);
     const who = [m.contact?.first_name, m.contact?.last_name].filter(Boolean).join(' ').trim();
     await ctx.reply(`📇 Контакт из Telegram${who ? ` «${who}»` : ''} — ищу в MAX по номеру…`).catch(() => {});
-    await runSearch(chatIdOf(ctx), 'phone', phone);
+    // The card's name is how the admin knows this person — «➕ В контакты MAX» saves them under it.
+    const firstName = m.contact?.first_name?.trim();
+    const saveAs = firstName ? { firstName, lastName: m.contact?.last_name?.trim() || undefined } : undefined;
+    await runSearch(chatIdOf(ctx), 'phone', phone, saveAs);
   });
 
   // Force-reply answers to a search prompt. Registered here (early in wireBridge) so it

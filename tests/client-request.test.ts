@@ -2,7 +2,7 @@ import tls from 'node:tls';
 import { EventEmitter } from 'node:events';
 import { pack } from 'msgpackr';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { MaxClient, MaxConnectionLostError, isUploadReadyPush } from '../src/max/client.js';
+import { MaxClient, MaxConnectionLostError, MaxServerError, isAddedContact, isMaxServerError, isUploadReadyPush } from '../src/max/client.js';
 import { OPCODES, DIR } from '../src/max/opcodes.js';
 import { encodeFrame } from '../src/max/frame.js';
 import { isTransientMaxError } from '../src/bridge/transient.js';
@@ -290,5 +290,49 @@ describe('MAX user agent', () => {
     expect(maxUserAgent({ MAX_APP_VERSION: '26.40.2', MAX_BUILD_NUMBER: '81234' })).toMatchObject({ appVersion: '26.40.2', buildNumber: 81234 });
     // Junk falls back to the built-in pair rather than sending something MAX would refuse outright.
     expect(maxUserAgent({ MAX_APP_VERSION: 'latest', MAX_BUILD_NUMBER: '-1' })).toMatchObject({ appVersion: '26.35.1', buildNumber: 80662 });
+  });
+});
+
+describe('MAX address book', () => {
+  /** Answers every request with one scripted frame and records what was sent. */
+  class ScriptedClient extends MaxClient {
+    readonly sent: Array<{ opcode: number; payload: unknown }> = [];
+    constructor(private readonly answer: { dir: number; payload: unknown }) {
+      super({ reconnect: false });
+    }
+    override send(opcode: number, payload?: unknown): void {
+      this.sent.push({ opcode, payload });
+      queueMicrotask(() => this.emit('message', { dir: this.answer.dir, seq: 1, opcode, payload: this.answer.payload, length: 0 }));
+    }
+  }
+
+  it('adds by phone the way MAX web does it: {phone, firstName, lastName?} on CONTACT_ADD', async () => {
+    const client = new ScriptedClient({ dir: DIR.OK, payload: { contact: { id: 42, flags: 512 }, new: true } });
+    const res = await client.addContactByPhone('+79161234567', 'Вася');
+    expect(client.sent).toEqual([{ opcode: OPCODES.CONTACT_ADD, payload: { phone: '+79161234567', firstName: 'Вася' } }]);
+    expect(res).toEqual({ contact: { id: 42, flags: 512 }, isNew: true });
+    await client.addContactByPhone('+79161234567', 'Вася', 'Пупкин');
+    expect(client.sent[1]!.payload).toEqual({ phone: '+79161234567', firstName: 'Вася', lastName: 'Пупкин' });
+  });
+
+  it('keeps MAX error codes for the panel to explain', async () => {
+    const client = new ScriptedClient({ dir: DIR.ERR, payload: { error: 'error.add.self', localizedMessage: 'Нельзя добавить себя' } });
+    const err = await client.addContactByPhone('+79161234567', 'Я').catch((e: unknown) => e);
+    expect(isMaxServerError(err, OPCODES.CONTACT_ADD)).toBe(true);
+    expect((err as MaxServerError).serverCode).toBe('error.add.self');
+    expect((err as Error).message).toBe('Нельзя добавить себя');
+  });
+
+  it('adds by id with CONTACT_UPDATE action ADD', async () => {
+    const client = new ScriptedClient({ dir: DIR.OK, payload: { contact: { id: 42, flags: 512 } } });
+    expect(await client.addContactById('42')).toEqual({ id: 42, flags: 512 });
+    expect(client.sent).toEqual([{ opcode: OPCODES.CONTACT_UPDATE, payload: { contactId: 42n, action: 'ADD' } }]);
+  });
+
+  it('reads «in my contacts» from flags bit 512', () => {
+    expect(isAddedContact({ flags: 512 })).toBe(true);
+    expect(isAddedContact({ flags: 512 | 2 })).toBe(true);
+    expect(isAddedContact({ flags: 2 })).toBe(false);
+    expect(isAddedContact({})).toBe(false);
   });
 });
