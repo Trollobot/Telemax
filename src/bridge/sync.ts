@@ -2,7 +2,7 @@ import path from 'node:path';
 import { rm, stat, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { Markup, type Context, type Telegraf } from 'telegraf';
-import type { ChatAction, TelegramEmoji } from 'telegraf/types';
+import type { ChatAction, Message, TelegramEmoji } from 'telegraf/types';
 import { CONTACT_FLAG_ADDED, isAddedContact, type MaxClient, type MaxContactInfo, type MaxMessageEvent, type MaxHistoryMessage } from '../max/client.js';
 import { OPCODES, formatOpcode } from '../max/opcodes.js';
 import { resolveContactDisplayName, resolveChatName, isFallbackTitle, type ContactProfile } from '../max/names.js';
@@ -32,6 +32,8 @@ import { addToMaxContacts, profileName, wireControlPanel, type PauseControl } fr
 import { keepPanelBack } from './panelBack.js';
 import { createBugReports, isBugReportInboxEnabled, BUGREPORT_BOT_HANDLE, type BugReports } from './bugReports.js';
 import { createMaxAuthFlow, type MaxAuthCallbacks } from './maxAuthFlow.js';
+import { createBroadcasts, type IncomingCopy } from './broadcast.js';
+import { BroadcastStore } from '../store/broadcastStore.js';
 import { createTelemetry } from './telemetry.js';
 import { checkVersion, type VersionStatus } from './version.js';
 import { buildStatusText, collectHostStats, maskPhone } from './status.js';
@@ -929,6 +931,8 @@ export interface ChatCatchUpDeps {
   strikes?: StrikeCounter;
   /** Pause after each backfilled message (HISTORY_SEND_DELAY_MS) — injectable for tests. */
   paceMs?: number;
+  /** A message the catch-up put into its topic — «трансляция» copies it on (broadcast.ts; its cursor drops replays). */
+  onRelayed?: (c: IncomingCopy) => void;
 }
 
 /**
@@ -1190,12 +1194,17 @@ export class ChatCatchUp {
           // withFloodRetry lives INSIDE sendAttachments, around each single send (see the NOTE there).
           attachIds = await sendAttachments(bot, groupId, topicId, attaches, downloadCtx, undefined, paceMs, sent, lastTry);
         }
+        // A broadcast copies the attachments, not a lone keyboard message.
+        const mediaIds = [...attachIds];
         if (keyboard && textIds.length === 0) {
           phase = 'text';
           attachIds.push(...(await sendKeyboardAlone(bot, groupId, topicId, keyboard, { paceMs, sent, maxMessageId: msg.id })));
         }
         const linkIds = buildLinkIds(textIds, attachIds);
-        if (linkIds && msg.id != null) messageLinks.add({ maxChatId: chatId, maxMessageId: msg.id, ...linkIds });
+        if (linkIds && msg.id != null) {
+          messageLinks.add({ maxChatId: chatId, maxMessageId: msg.id, ...linkIds });
+          this.deps.onRelayed?.({ maxChatId: String(chatId), maxMessageId: msg.id, time: Number(msg.time), text, mediaIds });
+        }
         this.strikes.clear(abortKey);
       } catch (err) {
         if (isThreadNotFound(err)) throw err;
@@ -1476,6 +1485,21 @@ export function wireBridge({
   // In-Telegram MAX (re)authorization: a private /login conversation (SMS code + optional 2FA
   // password) — the only login path. In DM so code/password stay private, and admin-gated.
   const maxAuth = createMaxAuthFlow({ targetGroupId, auth });
+  // «Трансляция» (broadcast.ts): new messages of a MAX chat copied into Telegram groups and channels.
+  const broadcasts = createBroadcasts({
+    bot,
+    targetGroupId,
+    store: new BroadcastStore(),
+    chatTitle: async (maxChatId) => resolveTopicTitle(maxChatId) ?? (await chatMapStore.getByMaxChatId(maxChatId))?.title ?? 'Чат',
+    topicOf: async (maxChatId) => (await chatMapStore.getByMaxChatId(maxChatId))?.telegramTopicId,
+    chatOfTopic: async (topicId) => (await chatMapStore.getByTopicId(topicId))?.maxChatId,
+    ownerName: async () => {
+      const myId = getMyAccountId();
+      const profile = myId != null ? await resolveProfile(max, myId, 'the account owner', getContactProfiles()) : undefined;
+      return myId != null && profile ? resolveContactDisplayName(myId, profile) : 'Владелец';
+    },
+    isGroupAdmin: (userId) => isGroupAdmin(userId),
+  });
 
   // A button press answered after Telegram's ~15 s window (it waited out a restart) used to throw
   // out of every handler that starts with `await ctx.answerCbQuery()` — the action never ran and the
@@ -1501,11 +1525,17 @@ export function wireBridge({
     if (ctx.chat && String(ctx.chat.id) !== targetGroupId) {
       // A private DM from an outsider is a bug report (or a redirect); only GROUPS get the hard reject.
       if (ctx.chat.type === 'private') {
-        // The /login auth flow gets first refusal (it admin-gates internally).
+        // A broadcast's chat picker, then the /login auth flow get first refusal (both admin-gate internally).
+        if (await broadcasts.handlePrivate(ctx)) return;
         if (await maxAuth.handlePrivate(ctx)) return;
         await bugReports.handleIncomingPrivate(ctx);
         return;
       }
+      // A broadcast's group or channel: readers' messages there go nowhere. And no reject for the
+      // service message of the bot being added — the chat picker does exactly that before it says which chat.
+      if (await broadcasts.isTarget(ctx.chat.id).catch(() => false)) return;
+      const m = ctx.message as { new_chat_members?: unknown; left_chat_member?: unknown; group_chat_created?: unknown; supergroup_chat_created?: unknown; migrate_to_chat_id?: unknown; migrate_from_chat_id?: unknown } | undefined;
+      if (m && (m.new_chat_members || m.left_chat_member || m.group_chat_created || m.supergroup_chat_created || m.migrate_to_chat_id || m.migrate_from_chat_id)) return;
       if (ctx.callbackQuery) {
         ctx.answerCbQuery('Не вы меня создали.').catch(() => {});
       } else {
@@ -1574,6 +1604,7 @@ export function wireBridge({
     sendCard: (chatId, topicId, sender) => sendAutoInfoCard(chatId, sender, topicId),
     forgetChatLinks,
     isWiping: () => wiping,
+    onRelayed: (c) => broadcasts.copyIncoming(c),
   });
 
   /**
@@ -1971,6 +2002,7 @@ export function wireBridge({
       return;
     }
     for (const messageId of p.messageIds) {
+      broadcasts.copyDelete(String(p.chatId), messageId);
       const link = messageLinks.getByMax(p.chatId, messageId);
       if (!link) continue;
       await dropLinkedMessage(link, `MAX NOTIF_MSG_DELETE of message ${String(messageId)}`);
@@ -2192,6 +2224,7 @@ export function wireBridge({
         await dropLinkedMessage(link, `MAX deletion of message ${String(message.id)}`);
         logger.info(`MAX -> TG: deletion of message ${String(message.id)} in chat ${String(chatId)} mirrored (${linkTelegramIds(link).length} Telegram message(s) removed)`);
       }
+      broadcasts.copyDelete(String(chatId), message.id);
       return;
     }
     // Everything below writes into the chat's topic: open it and catch the chat up first
@@ -2224,11 +2257,14 @@ export function wireBridge({
     // `message`, the OUTGOING reply `messageId`). A NATIVE Telegram reply when the quoted message
     // is in the link store; a text-quote prefix otherwise (the store is in-memory and bounded).
     let replyParameters: { message_id: number; allow_sending_without_reply: boolean } | undefined;
+    // The same reply for a broadcast: a native reply there too when the quoted message was copied, else a quote line.
+    let broadcastQuote: IncomingCopy['quote'];
     if (message.link?.type === 'REPLY') {
       const quotedId = message.link.message?.id;
       const linked = quotedId != null ? messageLinks.getByMax(chatId, quotedId) : undefined;
       if (linked) {
         replyParameters = { message_id: linked.telegramMessageId, allow_sending_without_reply: true };
+        broadcastQuote = { maxMessageId: quotedId, text: typeof message.link.message?.text === 'string' ? message.link.message.text : '' };
       } else {
         const quotedText = typeof message.link.message?.text === 'string' ? message.link.message.text : '';
         // Cut by code points: a UTF-16 slice ending inside a surrogate pair gets the whole message refused.
@@ -2277,6 +2313,7 @@ export function wireBridge({
         } catch (err) {
           await relayEditFallback(chatId, message.id, existingLink, marked, err);
         }
+        broadcasts.copyEdit(String(chatId), message.id, marked);
       }
       const updatedPoll = attaches.find((a) => (a as MaxAttachment)._type === 'POLL') as MaxAttachment | undefined;
       if (updatedPoll) {
@@ -2409,6 +2446,9 @@ export function wireBridge({
           }
           if (linkIds && message.id != null) {
             messageLinks.add({ maxChatId: chatId, maxMessageId: message.id, ...linkIds, ...(noticeIds.length > 0 ? { noticeTelegramMessageIds: noticeIds } : {}) });
+            // Readers get the poll as text: votes in a copied poll would never reach MAX.
+            const pollText = renderPollAsText(pollAttach.title, options, settings);
+            broadcasts.copyIncoming({ maxChatId: String(chatId), maxMessageId: message.id, time: Number(message.time), text: text ? `${text}\n${pollText}` : pollText, mediaIds: [], quote: broadcastQuote });
           }
           await chatSync.advanceCursor(chatId, message.time, 'incoming poll');
           // A fresh Telegram poll starts at zero (no way to pre-seed a vote): a tally already
@@ -2444,6 +2484,8 @@ export function wireBridge({
             // The reply goes on the text when there is one; only a media-only reply threads it into the first attachment.
             attachIds = await sendAttachments(bot, targetGroupId, topicId, attaches, downloadCtx, textIds.length > 0 ? undefined : replyParameters, undefined, sent);
           }
+          // A broadcast copies the attachments, not a lone keyboard message.
+          const mediaIds = [...attachIds];
           if (keyboard && textIds.length === 0) {
             const reply = attachIds.length === 0 ? replyParameters : undefined;
             attachIds.push(...(await sendKeyboardAlone(bot, targetGroupId, topicId, keyboard, { replyParameters: reply, sent, maxMessageId: message.id })));
@@ -2451,6 +2493,8 @@ export function wireBridge({
           const linkIds = buildLinkIds(textIds, attachIds);
           if (linkIds) {
             messageLinks.add({ maxChatId: chatId, maxMessageId: message.id, ...linkIds });
+            // An orphan edit is no new message — the broadcast has nothing to put it under.
+            if (!orphanEdit) broadcasts.copyIncoming({ maxChatId: String(chatId), maxMessageId: message.id, time: Number(message.time), text, mediaIds, quote: broadcastQuote });
             lastInAt = Date.now();
             logger.info(`MAX -> TG: message ${String(message.id)} of chat ${String(chatId)} -> topic ${topicId} (${linkTelegramIds(linkIds).length} Telegram message(s))`);
             // Mirror image of rememberOutgoingSend: without it a reconnect's catch-up relays this
@@ -2534,6 +2578,7 @@ export function wireBridge({
 Сообщения, файлы, голосовые, стикеры и опросы синхронизируются в обе стороны автоматически — команды нужны только для управления. Обычная пересылка сообщений (drag-forward) в тему тоже работает сама — прилетит в привязанный MAX-чат с пометкой «↩️ Переслано от/из...». Звонки — только текстовые уведомления (входящий звонит / завершённый / пропущенный), без передачи аудио — для этого нужен WebRTC, вне рамок Bot API-моста.
 
 /info — карточка контакта или чата (просто в теме). Кнопка «➕ В контакты MAX» сохраняет собеседника в контакты вашего MAX, в группе — выбранного участника
+/broadcast — трансляция: новые сообщения этого чата копируются в выбранные группы и каналы Telegram — для тех, у кого нет MAX (в теме чата)
 /file — отправить в этот чат MAX большой файл (до 4 ГБ) по ссылке: загружается один раз, мимо лимита Telegram в 20 МБ. Там же — файлы, которые уже лежат на сервере: нажмёте — уйдут в этот чат прямо с сервера
 
 Файлообменник: /panel → 📁 Файлы → «📤 Загрузить файл». Положите на свой сервер файл любого размера — сколько вместит диск — и получите ссылку на скачивание, которой можно делиться где угодно. Файл хранится 3 дня от последней ссылки.
@@ -2932,6 +2977,9 @@ export function wireBridge({
     const roster = await buildRoster(chat?.participants, chat?.type, max, getMyAccountId(), getContactProfiles());
     await sendContactInfoCard(bot, targetGroupId, topicId, chat?.title || mapping.title || 'Чат', chat?.type, count, otherId, profile, roster);
   });
+
+  // /broadcast and its card's buttons — after the admin gate, like every command.
+  broadcasts.register();
 
   /** «➕ В контакты MAX» from an /info card: the profile from the warm cache (or MAX), then the panel's addToMaxContacts — by phone under their MAX name, else by id. */
   async function addParticipantToContacts(uid: number): Promise<{ ok: boolean; line: string; name: string }> {
@@ -3602,11 +3650,18 @@ export function wireBridge({
         return;
       }
 
+      // What went to MAX goes on to the chat's broadcasts too, under the owner's name (broadcast.ts).
+      const quotedTelegram = replyToMessage as { text?: string; caption?: string } | undefined;
+      const ownerQuote = replyLink ? { maxMessageId: replyLink.messageId, text: quotedTelegram?.text ?? quotedTelegram?.caption ?? '' } : undefined;
+      const copyToBroadcasts = (messageId: unknown, time: unknown) =>
+        broadcasts.copyOwner(String(mapping.maxChatId), messageId, Number(time), ctx.message as Message, ownerQuote, forwardPrefix ?? undefined);
+
       if (location) {
         const locationAttach = { _type: 'LOCATION', latitude: location.latitude, longitude: location.longitude, zoom: 14 };
         const { cid, messageId, time } = await max.sendMessage(mapping.maxChatId, null, [locationAttach]);
         rememberOutgoingSend(mapping.maxChatId, cid, time);
         messageLinks.add({ maxChatId: mapping.maxChatId, maxMessageId: messageId, telegramMessageId: ctx.message.message_id, telegramTopicId: topicId, outgoing: true });
+        copyToBroadcasts(messageId, time);
         return;
       }
 
@@ -3625,6 +3680,7 @@ export function wireBridge({
         const { cid, messageId, time } = await max.sendMessage(mapping.maxChatId, null, [contactAttach]);
         rememberOutgoingSend(mapping.maxChatId, cid, time);
         messageLinks.add({ maxChatId: mapping.maxChatId, maxMessageId: messageId, telegramMessageId: ctx.message.message_id, telegramTopicId: topicId, outgoing: true });
+        copyToBroadcasts(messageId, time);
         return;
       }
 
@@ -3641,6 +3697,7 @@ export function wireBridge({
         // Linked right away, not after the hint: a catch-up reaching the poll during that extra
         // round trip would find no link and post it again.
         messageLinks.add({ maxChatId: mapping.maxChatId, maxMessageId: messageId, telegramMessageId: ctx.message.message_id, telegramTopicId: topicId, outgoing: true });
+        copyToBroadcasts(messageId, time);
         // Votes cast on THIS Telegram poll can't reach MAX: a bot gets poll_answer only for polls
         // it sent itself (and never for anonymous ones) — say so instead of letting counts drift.
         const hint = await bot.telegram
@@ -3664,6 +3721,7 @@ export function wireBridge({
         rememberOutgoingSend(mapping.maxChatId, cid, time);
         const link: MessageLink = { maxChatId: mapping.maxChatId, maxMessageId: messageId, telegramMessageId: ctx.message.message_id, telegramTopicId: topicId, outgoing: true };
         messageLinks.add(link);
+        copyToBroadcasts(messageId, time);
         await sendMorePieces(mapping.maxChatId, morePieces, link);
         return;
       }
@@ -3738,6 +3796,7 @@ export function wireBridge({
       const { cid, messageId, time } = await max.sendMessage(mapping.maxChatId, caption, [attach], replyLink);
       rememberOutgoingSend(mapping.maxChatId, cid, time);
       messageLinks.add({ maxChatId: mapping.maxChatId, maxMessageId: messageId, telegramMessageId: ctx.message.message_id, telegramTopicId: topicId, outgoing: true });
+      copyToBroadcasts(messageId, time);
     } catch (err) {
       logger.error('Telegram -> MAX forward failed', err);
       // A swallowed send is indistinguishable from success to the sender — report it in the topic.

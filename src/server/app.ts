@@ -457,6 +457,7 @@ const BOT_COMMANDS = [
   { command: 'version', description: 'Версия бота, обновление по кнопке' },
   { command: 'info', description: 'Карточка контакта/чата (просто в теме)' },
   { command: 'file', description: 'Большой файл в MAX по ссылке (в теме, до 4 ГБ)' },
+  { command: 'broadcast', description: 'Трансляция чата в группы и каналы Telegram (в теме)' },
   { command: 'poll', description: 'Актуальный счёт опроса (ответом на сообщение)' },
   { command: 'delete', description: 'Удалить сообщение с обеих сторон (ответом)' },
   { command: 'newgroup', description: 'Создать группу в MAX: /newgroup <название>' },
