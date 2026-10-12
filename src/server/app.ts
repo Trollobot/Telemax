@@ -434,17 +434,25 @@ const TELEGRAM_RETRY_DELAYS_MS = [2_000, 5_000, 15_000, 30_000, 60_000];
 // It used to embed the active phone number here, which leaked it to any such viewer
 // (confirmed 2026-08-15). /help and /status inside the group show it only masked (+7999***9999).
 // A constant, so it's set once at Telegram launch. The command list comes from BOT_COMMANDS, so
-// the profile never drifts from the "/" menu (it used to miss /panel, /rename and /setdesc) —
-// mind the 512 limit when adding commands (503 chars with today's 20 — /file was the last that fit).
+// the profile never drifts from the "/" menu (it used to miss /panel, /rename and /setdesc). The
+// list stops where the 512 limit would be crossed — /broadcast crossed it in 1.3.5-beta.3 and
+// Telegram refused the whole description (BOT_DESC_INVALID); /help has every command anyway.
+const BOT_DESCRIPTION_LIMIT = 512;
 function buildBotDescription(): string {
-  return `Мост MAX ↔ Telegram: сообщения, файлы, голосовые, стикеры, опросы, пересылка. Звонки — только уведомления, без аудио.
+  const head = `Мост MAX ↔ Telegram: сообщения, файлы, голосовые, стикеры, опросы, пересылка. Звонки — только уведомления, без аудио.
 
-Удаление: свайпом своего (подхватится сам), реакцией 👎 на своё или /delete ответом (/delete me — только у себя).
+Удаление: свайпом своего, реакцией 👎 на своё или /delete ответом (/delete me — только у себя).
 
 Ограничения:
 • Голоса за опрос из MAX сами не появляются в Telegram — счёт через /poll ответом на опрос.
 
-Команды: ${BOT_COMMANDS.map((c) => `/${c.command}`).join(' ')}`;
+Команды:`;
+  let text = head;
+  for (const c of BOT_COMMANDS) {
+    if (text.length + c.command.length + 2 > BOT_DESCRIPTION_LIMIT) break;
+    text += ` /${c.command}`;
+  }
+  return text;
 }
 
 // Populates Telegram's "/" command menu with one-line descriptions. /help (bridge/sync.ts)
