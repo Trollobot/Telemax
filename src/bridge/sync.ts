@@ -14,6 +14,7 @@ import {
   telegramSendKind,
   TELEGRAM_UPLOAD_LIMIT_BYTES,
   takeKeyboard,
+  absorbShares,
   KEYBOARD_NA,
   KEYBOARD_PRESS,
   KEYBOARD_GEO,
@@ -29,7 +30,7 @@ import { FileShare, fileShareOptionsFromEnv, TELEGRAM_BOT_DOWNLOAD_LIMIT } from 
 import { createBigFiles } from './bigFiles.js';
 import { canRenderAnimatedStickers } from './lottie.js';
 import { reportBridgeError } from './errorReporter.js';
-import { addToMaxContacts, logoutConfirmView, profileName, wireControlPanel, type PauseControl } from './panel.js';
+import { addToMaxContacts, countRu, logoutConfirmView, profileName, wireControlPanel, type PauseControl } from './panel.js';
 import { keepPanelBack } from './panelBack.js';
 import { createBugReports, isBugReportInboxEnabled, BUGREPORT_BOT_HANDLE, type BugReports } from './bugReports.js';
 import { createMaxAuthFlow, type MaxAuthCallbacks } from './maxAuthFlow.js';
@@ -834,6 +835,21 @@ export function bridgeGroupLink(groupId: string): string {
   return `https://t.me/c/${groupId.replace(/^-100/, '')}`;
 }
 
+/** What a channel's card shows, from the cached chat (CHATS_LIST or the CHAT_JOIN answer). */
+function channelInfoOf(chat: unknown): { subscribers?: number; description?: string; link?: string } {
+  const c = chat as { participantsCount?: number; description?: string; link?: string } | undefined;
+  return { subscribers: c?.participantsCount, description: c?.description, link: c?.link };
+}
+
+/** The info card of a MAX channel's topic (/info and the first card). Pure + exported for unit testing. */
+export function channelCardText(title: string, channel?: { subscribers?: number; description?: string; link?: string }): string {
+  const lines = [`📢 ${title}`, `Канал MAX${typeof channel?.subscribers === 'number' ? ` · ${countRu(channel.subscribers, ['подписчик', 'подписчика', 'подписчиков'])}` : ''}`];
+  if (channel?.description) lines.push('', truncateCodePoints(channel.description, 400, '…'));
+  if (channel?.link) lines.push('', channel.link);
+  lines.push('', 'Сюда приходят посты канала. Писать в него может только его администратор. Отписаться — /leavegroup в этой теме.');
+  return lines.join('\n');
+}
+
 /** A channel's topic filled from scratch gets this many of its newest posts at most (HISTORY_LIMIT may say fewer). */
 export const CHANNEL_HISTORY_LIMIT = 50;
 
@@ -1230,6 +1246,8 @@ export class ChatCatchUp {
       const taken = takeKeyboard(forwarded ? forwarded.attaches : Array.isArray(msg.attaches) ? (msg.attaches as MaxAttachment[]) : [], chatId);
       let attaches = taken.attaches;
       const keyboard = taken.keyboard;
+      // MAX's link preview (SHARE) becomes text — see absorbShares.
+      ({ text, attaches } = absorbShares(text, attaches));
       // A poll goes out as its text rendering, options included — sendAttachments only knows a
       // «[опрос: …]» placeholder for it.
       const pollAttach = attaches.find((a) => a._type === 'POLL');
@@ -1423,7 +1441,15 @@ async function sendContactInfoCard(
   otherId: number | undefined,
   profile: ContactProfile | undefined,
   roster?: Array<{ id: number; name: string; isSelf: boolean; addable: boolean }>,
+  channel?: { subscribers?: number; description?: string; link?: string },
 ): Promise<number> {
+  // A channel is no group: no roster (its «Участников: 1, Состав: Вы» was just the account itself,
+  // seen live 2026-10-13), and the topic is read-only unless the account runs the channel.
+  if (chatType === 'CHANNEL') {
+    const lines = [channelCardText(fallbackTitle, channel)];
+    const sent = await bot.telegram.sendMessage(targetGroupId, lines.join('\n'), { message_thread_id: topicId });
+    return sent.message_id;
+  }
   if (chatType !== 'DIALOG' || otherId == null) {
     const lines = [`ℹ️ ${fallbackTitle}`];
     if (participantCount != null) lines.push(`Участников: ${participantCount}`);
@@ -2212,7 +2238,7 @@ export function wireBridge({
         return;
       }
       const roster = await buildRoster(chat.participants, chat.type, max, getMyAccountId(), getContactProfiles());
-      const messageId = await sendContactInfoCard(bot, targetGroupId, topicId, chat.title || `MAX chat ${String(chatId)}`, chat.type, count, otherId, profile, roster);
+      const messageId = await sendContactInfoCard(bot, targetGroupId, topicId, chat.title || `MAX chat ${String(chatId)}`, chat.type, count, otherId, profile, roster, channelInfoOf(chat));
       await pinInfoCard(bot, targetGroupId, messageId);
       return;
     }
@@ -2375,6 +2401,8 @@ export function wireBridge({
     const taken = takeKeyboard(attaches, chatId);
     attaches = taken.attaches;
     const keyboard = taken.keyboard;
+    // MAX's link preview (SHARE) becomes text — see absorbShares.
+    ({ text, attaches } = absorbShares(text, attaches));
     // Text of its own, before any forward/reply prefix — an orphan edit without it has nothing to post.
     const hasOwnText = Boolean(forwarded ? message.link?.message?.text : message.text);
 
@@ -3125,7 +3153,7 @@ export function wireBridge({
     const { chat, otherId, profile } = resolveDialogContact(mapping.maxChatId);
     const count = chat?.participants ? Object.keys(chat.participants).length : undefined;
     const roster = await buildRoster(chat?.participants, chat?.type, max, getMyAccountId(), getContactProfiles());
-    await sendContactInfoCard(bot, targetGroupId, topicId, chat?.title || mapping.title || 'Чат', chat?.type, count, otherId, profile, roster);
+    await sendContactInfoCard(bot, targetGroupId, topicId, chat?.title || mapping.title || 'Чат', chat?.type, count, otherId, profile, roster, channelInfoOf(chat));
   });
 
   // /broadcast and its card's buttons — after the admin gate, like every command.
@@ -3431,19 +3459,23 @@ export function wireBridge({
     const mapping = await chatMapStore.getByTopicId(topicId);
     if (!mapping) return;
     if (await refuseInDialog(mapping.maxChatId, topicId, '/leavegroup')) return;
+    // In a channel's topic the same CHAT_LEAVE unsubscribes (MAX web does it that way too).
+    const channel = (getChats().find((c) => c && typeof c === 'object' && String((c as { id?: unknown }).id) === String(mapping.maxChatId)) as { type?: string } | undefined)?.type === 'CHANNEL';
     const confirm = (ctx as unknown as { payload?: string }).payload?.trim().toUpperCase();
     if (confirm !== 'ПОДТВЕРДИТЬ') {
-      await bot.telegram.sendMessage(targetGroupId, '⚠️ Это выход из группы на стороне MAX. Для подтверждения: /leavegroup ПОДТВЕРДИТЬ', {
-        message_thread_id: topicId,
-      });
+      await bot.telegram.sendMessage(
+        targetGroupId,
+        channel ? '⚠️ Это отписка от канала на стороне MAX. Для подтверждения: /leavegroup ПОДТВЕРДИТЬ' : '⚠️ Это выход из группы на стороне MAX. Для подтверждения: /leavegroup ПОДТВЕРДИТЬ',
+        { message_thread_id: topicId },
+      );
       return;
     }
     try {
       await max.leaveChat(mapping.maxChatId);
-      await bot.telegram.sendMessage(targetGroupId, '✅ Вышел из группы на стороне MAX.', { message_thread_id: topicId });
+      await bot.telegram.sendMessage(targetGroupId, channel ? '✅ Отписался от канала на стороне MAX.' : '✅ Вышел из группы на стороне MAX.', { message_thread_id: topicId });
     } catch (err) {
       logger.error('Failed to leave chat', err);
-      await bot.telegram.sendMessage(targetGroupId, 'Не удалось выйти из группы.', { message_thread_id: topicId });
+      await bot.telegram.sendMessage(targetGroupId, channel ? 'Не удалось отписаться от канала.' : 'Не удалось выйти из группы.', { message_thread_id: topicId });
     }
   });
 

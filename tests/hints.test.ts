@@ -57,3 +57,24 @@ describe('MAX groups and channels by link', () => {
     expect(group.markup.inline_keyboard.flat().map((b) => b.text)).toEqual(['➕ Вступить', '◀️ Готово']);
   });
 });
+
+describe('channel posts', () => {
+  it('MAX link preview (SHARE) becomes text: dropped when the link is already there, a 🔗 line otherwise', async () => {
+    const { absorbShares } = await import('../src/bridge/attachments.js');
+    const share = { _type: 'SHARE', url: 'http://emailmax.ru', title: 'WWPager для MAX — почта в мессенджере', host: 'WWPager для MAX' };
+    const photo = { _type: 'PHOTO' };
+    expect(absorbShares('Адреса на доменах emailmax.ru и maxemail.ru', [share, photo])).toEqual({ text: 'Адреса на доменах emailmax.ru и maxemail.ru', attaches: [photo] });
+    expect(absorbShares('Смотрите', [share])).toEqual({ text: 'Смотрите\n\n🔗 WWPager для MAX — почта в мессенджере\nhttp://emailmax.ru', attaches: [] });
+    expect(absorbShares(undefined, [{ _type: 'SHARE', url: 'https://x.ru/' }])).toEqual({ text: '🔗 https://x.ru/', attaches: [] });
+    expect(absorbShares('без превью', [photo])).toEqual({ text: 'без превью', attaches: [photo] });
+  });
+
+  it("a channel's card: what it is, how many follow it, and that only its admin writes there", async () => {
+    const { channelCardText } = await import('../src/bridge/sync.js');
+    const text = channelCardText('WWPager для MAX', { subscribers: 2, description: 'Новости сервиса', link: 'https://max.ru/channel_wwpager' });
+    expect(text).toBe(
+      '📢 WWPager для MAX\nКанал MAX · 2 подписчика\n\nНовости сервиса\n\nhttps://max.ru/channel_wwpager\n\nСюда приходят посты канала. Писать в него может только его администратор. Отписаться — /leavegroup в этой теме.',
+    );
+    expect(channelCardText('Без данных')).toMatch(/^📢 Без данных\nКанал MAX\n\n/);
+  });
+});

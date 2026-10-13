@@ -330,7 +330,8 @@ export function describeAttachment(att: MaxAttachment): string {
     case 'CONTROL':
       switch (att.event) {
         case 'new':
-          return '🆕 Группа создана';
+          // The same event opens a channel's history (seen live 2026-10-13) — no «Группа» there.
+          return '🆕 Чат создан';
         case 'join':
           return '➕ Участник добавлен';
         case 'leave':
@@ -468,6 +469,28 @@ export function maxKeyboardToTelegram(att: unknown, chatId?: unknown): InlineKey
     if (buttons.length > 0) out.push(buttons);
   }
   return out.length > 0 ? { inline_keyboard: out } : undefined;
+}
+
+/**
+ * MAX's own link preview — a SHARE attach: url, title, description, host, image (seen live
+ * 2026-10-13 in a channel post) — goes as text, not as a «[вложение: SHARE]» placeholder: Telegram
+ * draws its own preview from a link in the text. A link the text already has → dropped; otherwise
+ * «🔗 title\nurl» is added. Pure + exported for unit testing.
+ */
+export function absorbShares<T extends { _type?: string }>(text: string | undefined, attaches: readonly T[]): { text: string | undefined; attaches: T[] } {
+  if (!attaches.some((a) => a._type === 'SHARE')) return { text, attaches: [...attaches] };
+  let out = text;
+  for (const a of attaches) {
+    if (a._type !== 'SHARE') continue;
+    const s = a as unknown as { url?: unknown; title?: unknown };
+    const url = typeof s.url === 'string' ? s.url.trim() : '';
+    if (!url) continue;
+    const bare = url.replace(/^https?:\/\//i, '').replace(/\/+$/, '').toLowerCase();
+    if (out?.toLowerCase().includes(bare)) continue;
+    const line = typeof s.title === 'string' && s.title.trim() ? `🔗 ${s.title.trim()}\n${url}` : `🔗 ${url}`;
+    out = out ? `${out}\n\n${line}` : line;
+  }
+  return { text: out, attaches: attaches.filter((a) => a._type !== 'SHARE') };
 }
 
 /** Splits a message's attaches into its keyboard (the first usable one) and everything else. */

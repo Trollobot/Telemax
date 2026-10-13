@@ -138,7 +138,7 @@ export function maxLinkOf(raw: string): string | null {
 }
 
 /** «12 подписчиков» / «3 участника»: the Russian form for the number. */
-function countRu(n: number, forms: [string, string, string]): string {
+export function countRu(n: number, forms: [string, string, string]): string {
   const d = n % 10;
   const dd = n % 100;
   const form = d === 1 && dd !== 11 ? forms[0] : d >= 2 && d <= 4 && (dd < 12 || dd > 14) ? forms[1] : forms[2];
