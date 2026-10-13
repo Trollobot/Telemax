@@ -380,6 +380,7 @@ async function startServer(): Promise<void> {
         triggerFullResync: () => refreshChatsAndNames().then(() => syncChatsIfPossible()),
         killEverything: killMaxSession,
         logoutMax,
+        rememberChat: (chat) => upsertCachedChat(chat),
         suspendChatSync,
         auth: {
           getLastKnownPhone: () => maxSession.lastKnownPhone,

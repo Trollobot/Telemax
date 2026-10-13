@@ -3,7 +3,7 @@ import { rm, stat, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { Markup, type Context, type Telegraf } from 'telegraf';
 import type { ChatAction, Message, TelegramEmoji } from 'telegraf/types';
-import { CONTACT_FLAG_ADDED, isAddedContact, type MaxClient, type MaxContactInfo, type MaxMessageEvent, type MaxHistoryMessage } from '../max/client.js';
+import { CONTACT_FLAG_ADDED, isAddedContact, type MaxClient, type MaxContactInfo, type MaxLinkChat, type MaxMessageEvent, type MaxHistoryMessage } from '../max/client.js';
 import { OPCODES, formatOpcode } from '../max/opcodes.js';
 import { resolveContactDisplayName, resolveChatName, isFallbackTitle, type ContactProfile } from '../max/names.js';
 import { cursorToMs, type ChatMapStore } from '../store/chatMapStore.js';
@@ -834,12 +834,19 @@ export function bridgeGroupLink(groupId: string): string {
   return `https://t.me/c/${groupId.replace(/^-100/, '')}`;
 }
 
-/** The first line of a topic HISTORY_LIMIT cut short: «последние 300 сообщений» (agreed with the number). */
-export function historyLimitNotice(limit: number): string {
+/** A channel's topic filled from scratch gets this many of its newest posts at most (HISTORY_LIMIT may say fewer). */
+export const CHANNEL_HISTORY_LIMIT = 50;
+
+/** The first line of a topic HISTORY_LIMIT (or the channel cap) cut short: «последние 300 сообщений» (agreed with the number). */
+export function historyLimitNotice(limit: number, channel = false): string {
   const d = limit % 10;
   const dd = limit % 100;
   const one = d === 1 && dd !== 11;
   const few = d >= 2 && d <= 4 && (dd < 12 || dd > 14);
+  if (channel) {
+    const posts = one ? `последний ${limit} пост` : `последние ${limit} ${few ? 'поста' : 'постов'}`;
+    return `📜 Здесь ${posts} канала. Более ранние — в MAX.`;
+  }
   const phrase = one ? `последнее ${limit} сообщение` : `последние ${limit} ${few ? 'сообщения' : 'сообщений'}`;
   return `📜 Здесь ${phrase} этого чата — так задано при установке (HISTORY_LIMIT в .env). Более ранняя переписка осталась в MAX.`;
 }
@@ -1135,7 +1142,11 @@ export class ChatCatchUp {
   private async replay(chatId: unknown, topicId: number, cursor: number | null, cancelled: () => boolean): Promise<void> {
     const session = this.session;
     // HISTORY_LIMIT caps only a topic filled from scratch; a catch-up from a cursor takes everything new.
-    const limit = cursor == null ? (this.deps.historyLimit ?? 0) : 0;
+    // A channel filled from scratch brings its newest CHANNEL_HISTORY_LIMIT posts at most: it is a
+    // feed, and a big one would otherwise pour in for hours at ~20 messages a minute.
+    const isChannel = (this.deps.getChats().find((c) => c && typeof c === 'object' && String((c as { id?: unknown }).id) === String(chatId)) as { type?: string } | undefined)?.type === 'CHANNEL';
+    let limit = cursor == null ? (this.deps.historyLimit ?? 0) : 0;
+    if (cursor == null && isChannel) limit = limit > 0 ? Math.min(limit, CHANNEL_HISTORY_LIMIT) : CHANNEL_HISTORY_LIMIT;
     const { messages: history, truncated } = await fetchFullHistory(this.deps.max, chatId, cursor, cancelled, limit);
     if (history.length > 0) {
       logger.info(
@@ -1143,7 +1154,7 @@ export class ChatCatchUp {
       );
       // Says why the topic starts mid-conversation — a 5 000-message chat needs ~4 hours in full.
       if (truncated) {
-        await sendTextPieces(this.deps.bot, this.deps.groupId, topicId, historyLimitNotice(limit));
+        await sendTextPieces(this.deps.bot, this.deps.groupId, topicId, historyLimitNotice(limit, isChannel));
       }
       await this.backfill(chatId, topicId, history, cancelled);
     }
@@ -1518,6 +1529,8 @@ export interface BridgeOptions {
   killEverything: () => Promise<{ endedOnMax: boolean }>;
   /** «🚪 Выйти из MAX» / /logout: ends the session on MAX too and forgets it here — topics, links and settings stay (server/maxSession.ts logout). */
   logoutMax?: () => Promise<{ endedOnMax: boolean }>;
+  /** Puts a chat into the cached snapshot getChats() returns — a group/channel joined from the panel, before MAX sends its own update. */
+  rememberChat?: (chat: unknown) => void;
   /** Cancels the in-flight history sync, waits for it to stop, and holds off new runs until the returned release is called — /reboot and /kill wrap their wipe in it so the old run can't refill the topics they delete. */
   suspendChatSync: () => Promise<() => void>;
   /** MAX auth steps for the in-Telegram /login flow (server/maxSession.ts). */
@@ -1551,6 +1564,7 @@ export function wireBridge({
   pause,
   restartBridge,
   logoutMax,
+  rememberChat,
 }: BridgeOptions): WiredBridge {
   // Bug-report channel: private DMs from outsiders become bug reports. The inbox is only ON where
   // BUGREPORT_INBOX is set (the maintainer's prod bot); elsewhere outsiders get a redirect stub.
@@ -2994,6 +3008,27 @@ export function wireBridge({
       return { ok: false, error: (err as Error).message, topicName: name };
     }
   };
+  // «📢 Подписаться» / «Вступить» from the panel (panel.ts): the joined chat goes into the cached
+  // snapshot (so it is named and carded) and its topic opens with its recent posts right away — as a
+  // new chat's first message would do, without waiting for one. A channel brings CHANNEL_HISTORY_LIMIT.
+  const openJoinedChat = async (chat: MaxLinkChat): Promise<{ ok: boolean; error?: string; topicName: string; chatLink?: string }> => {
+    const name = chat.title || (chat.type === 'CHANNEL' ? 'Канал' : 'Группа');
+    if (chat.id == null) return { ok: false, error: 'MAX не вернул чат', topicName: name };
+    try {
+      rememberChat?.(chat);
+      let topicId: number | undefined;
+      await chatSync.runInChat(chat.id, async () => {
+        const opened = await chatSync.openTopic(chat.id, clampTopicTitle(name));
+        if (opened) topicId = opened.topicId;
+      });
+      if (topicId == null) return { ok: false, error: 'тема не открылась — она появится с первым новым сообщением', topicName: name };
+      return { ok: true, topicName: name, chatLink: `https://t.me/c/${targetGroupId.replace(/^-100/, '')}/${topicId}` };
+    } catch (err) {
+      logger.error('Opening the topic of a joined chat failed', err);
+      return { ok: false, error: (err as Error).message, topicName: name };
+    }
+  };
+
   wireControlPanel({
     bot,
     targetGroupId,
@@ -3004,6 +3039,7 @@ export function wireBridge({
     pause,
     restart: restartBridge,
     logout: logoutMax,
+    openJoinedChat,
     files: fileShare,
     resendToMax: (id) => bigFiles.resendToMax(id),
     offerStore: (panelMessageId) => bigFiles.offerStore(panelMessageId),
@@ -3929,8 +3965,13 @@ export function wireBridge({
     } catch (err) {
       logger.error('Telegram -> MAX forward failed', err);
       // A swallowed send is indistinguishable from success to the sender — report it in the topic.
+      // A channel's topic is read-only unless the account runs that channel: say so, not MAX's raw refusal.
+      const chatType = (getChats().find((c) => c && typeof c === 'object' && String((c as { id?: unknown }).id) === String(mapping.maxChatId)) as { type?: string } | undefined)?.type;
+      const text = chatType === 'CHANNEL'
+        ? '⚠️ Это канал MAX — писать в него может только его администратор. Сообщение не отправлено.'
+        : `⚠️ Не удалось отправить в MAX: ${(err as Error).message}`;
       await bot.telegram
-        .sendMessage(targetGroupId, `⚠️ Не удалось отправить в MAX: ${(err as Error).message}`, { message_thread_id: topicId })
+        .sendMessage(targetGroupId, text, { message_thread_id: topicId })
         .catch((e) => logger.error('Failed to report TG->MAX forward failure to Telegram', e));
     }
   });

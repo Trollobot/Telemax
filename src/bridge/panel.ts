@@ -2,12 +2,12 @@ import path from 'node:path';
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { Markup, type Telegraf, type Context } from 'telegraf';
 import type { InlineKeyboardButton } from 'telegraf/types';
-import { isAddedContact, isMaxServerError, type MaxClient, type MaxContactInfo } from '../max/client.js';
+import { isAddedContact, isMaxServerError, type MaxClient, type MaxContactInfo, type MaxLinkChat } from '../max/client.js';
 import { getAppVersion } from './version.js';
 import { formatBytes, maskPhone } from './status.js';
 import { keepPanelBack } from './panelBack.js';
 import { createLogger } from '../logger.js';
-import { truncateUtf16 } from './text.js';
+import { truncateCodePoints, truncateUtf16 } from './text.js';
 import { formatExpiry } from './bigFiles.js';
 import { MAX_FILE_LIMIT, type FileShare, type ServiceResult, type StoredFile, type UploadTicket } from './fileShare.js';
 
@@ -53,6 +53,8 @@ export interface ControlPanelDeps {
   restart?: (where: { chatId: number; messageId: number }) => void;
   /** «🚪 Выйти из MAX»: ends the session on MAX and here, topics stay (server/app.ts logoutMax). */
   logout?: () => Promise<{ endedOnMax: boolean }>;
+  /** «📢 Подписаться» / «➕ Вступить»: a joined group or channel gets its topic at once (sync.ts openJoinedChat). */
+  openJoinedChat?: (chat: MaxLinkChat) => Promise<{ ok: boolean; error?: string; topicName: string; chatLink?: string }>;
 }
 
 export interface PauseControl {
@@ -119,6 +121,47 @@ export function profileName(c: MaxContactInfo): SaveAs {
   const [first, ...rest] = contactName(c).split(' ');
   return { firstName: first || contactName(c), lastName: rest.join(' ') || undefined };
 }
+// Group/channel links shown on cards and search lists: callback data can't hold a URL (64 bytes),
+// so the buttons carry a short key. Bounded like the other panel maps.
+const shownLinks = new Map<string, { link: string; chat?: MaxLinkChat }>();
+let linkKeySeq = 0;
+function rememberLink(link: string, chat?: MaxLinkChat): string {
+  const key = String(++linkKeySeq);
+  boundedSet(shownLinks, key, { link, chat });
+  return key;
+}
+
+/** A pasted max.ru link → its canonical https form (null when it isn't one). Pure + exported for unit testing. */
+export function maxLinkOf(raw: string): string | null {
+  const m = /^(?:https?:\/\/)?(?:www\.)?max\.ru\/(\S+)$/i.exec(raw.trim());
+  return m ? `https://max.ru/${m[1]!.replace(/\/+$/, '')}` : null;
+}
+
+/** «12 подписчиков» / «3 участника»: the Russian form for the number. */
+function countRu(n: number, forms: [string, string, string]): string {
+  const d = n % 10;
+  const dd = n % 100;
+  const form = d === 1 && dd !== 11 ? forms[0] : d >= 2 && d <= 4 && (dd < 12 || dd > 14) ? forms[1] : forms[2];
+  return `${n} ${form}`;
+}
+
+/** A group or channel found by link or nick: what it is and «📢 Подписаться» / «➕ Вступить». Pure + exported for unit testing. */
+export function chatCardView(chat: MaxLinkChat, key: string): View {
+  const channel = chat.type === 'CHANNEL';
+  const lines = [`${channel ? '📢' : '👥'} ${chat.title || (channel ? 'Канал' : 'Группа')}`];
+  if (typeof chat.participantsCount === 'number') {
+    lines.push(countRu(chat.participantsCount, channel ? ['подписчик', 'подписчика', 'подписчиков'] : ['участник', 'участника', 'участников']));
+  }
+  if (chat.description) lines.push('', truncateCodePoints(chat.description, 400, '…'));
+  lines.push('', channel ? 'Подпишитесь — канал появится темой: последние посты сразу, новые — по мере выхода. Писать в чужой канал нельзя.' : 'Вступите — группа появится темой, как остальные чаты.');
+  const rows = [
+    [Markup.button.callback(channel ? '📢 Подписаться' : '➕ Вступить', `tlmx_panel:join:${key}`)],
+    ...(chat.link ? [[Markup.button.url('🔗 Открыть в MAX', chat.link)]] : []),
+    [Markup.button.callback('◀️ Готово', 'tlmx_panel:dismiss')],
+  ];
+  return { text: lines.join('\n'), markup: Markup.inlineKeyboard(rows).reply_markup };
+}
+
 /** The search card's buttons: «Начать чат», and «➕ В контакты MAX» for a person not in the address book yet (bots aren't added). */
 export function cardButtons(uid: string, info: ShownContact): InlineKeyboardButton.CallbackButton[] {
   if (!info.onMax) return [Markup.button.callback('◀️ Готово', 'tlmx_panel:dismiss')];
@@ -399,7 +442,7 @@ function pauseView(): View {
 }
 
 export function wireControlPanel(deps: ControlPanelDeps): void {
-  const { bot, targetGroupId, max, getActivePhone, triggerFullResync, leaves, startDialog, resolveContactName, getStatus, pause, files, resendToMax, offerStore, restart, logout } = deps;
+  const { bot, targetGroupId, max, getActivePhone, triggerFullResync, leaves, startDialog, resolveContactName, getStatus, pause, files, resendToMax, offerStore, restart, logout, openJoinedChat } = deps;
   const card = (f: StoredFile, link?: string): View => fileCardView(f, files!, link, Boolean(resendToMax));
   const root = (): View => rootView(getActivePhone(), pause.until());
   const system = (): View => systemView(pause.until() != null);
@@ -712,7 +755,7 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
         ? '🔎 Поиск по номеру\nНапишите номер в чат следующим сообщением — с + или без, можно с пробелами, скобками и тире.'
         : mode === 'id'
           ? '🔎 Поиск по MAX ID\nНапишите MAX ID в чат следующим сообщением (число — например, из карточки группы или из сообщения о выходе участника).'
-          : '🔎 Поиск по нику\nНапишите в чат следующим сообщением ник бота или канала MAX, ссылку max.ru/… или их название.\nЛюдей по нику не найти — их ищите по номеру или MAX ID. Ник из Telegram тоже не подойдёт.';
+          : '🔎 Поиск по нику\nНапишите в чат следующим сообщением ник бота или канала MAX, ссылку max.ru/… (приглашение в группу или канал — тоже) или их название. На канал можно подписаться прямо отсюда.\nЛюдей по нику не найти — их ищите по номеру или MAX ID. Ник из Telegram тоже не подойдёт.';
     const toast = mode === 'phone' ? '✍️ Напишите номер в чат' : mode === 'id' ? '✍️ Напишите MAX ID в чат' : '✍️ Напишите ник или название в чат';
     await ctx.answerCbQuery(toast);
     // The prompt replaces the panel IN PLACE: the admin is looking at the panel (often scrolled up to
@@ -829,8 +872,10 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
         await bot.telegram.sendMessage(chatId, 'Пусто — отмена.');
         return;
       }
+      // An invite or any other max.ru link: MAX says what it points at — a group or channel gets its
+      // card with «Вступить»/«Подписаться», a person their contact card (before 1.3.8: «не открывает»).
       if ('personalLink' in parsed) {
-        await bot.telegram.sendMessage(chatId, '❌ Это личная ссылка или приглашение — поиск MAX их не открывает. Откройте её в приложении MAX или найдите человека по номеру либо MAX ID.');
+        await sendLinkCard(chatId, maxLinkOf(query) ?? query);
         return;
       }
       const { contacts, channels: allChannels } = await max.publicSearch(parsed.query, 8);
@@ -842,19 +887,23 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
         await sendCard(chatId, exact[0] ?? contacts[0]!);
         return;
       }
+      const exactChannel = channels.filter((ch) => linkSlug(ch.link)?.toLowerCase() === parsed.query.toLowerCase());
+      if ((exactChannel.length === 1 && exact.length === 0) || (channels.length === 1 && contacts.length === 0)) {
+        await sendLinkCard(chatId, (exactChannel[0] ?? channels[0]!).link!);
+        return;
+      }
       if (contacts.length === 0 && channels.length === 0) {
         await bot.telegram.sendMessage(chatId, '❌ Ничего не найдено. По нику находятся только боты и каналы MAX; людей ищите по номеру или MAX ID.');
         return;
       }
       for (const c of contacts) boundedSet(shownContacts, String(c.id), { name: contactName(c), onMax: isOnMax(c), bot: isBot(c), added: isAddedContact(c) });
-      // Channels can't be opened as a bridge topic — a link into MAX is all we can offer.
       const buttons = [
         ...contacts.map((c) =>
           Markup.button.callback(`${isBot(c) ? '🤖 ' : ''}${contactName(c)}${isOnMax(c) ? '' : ' (не в MAX)'}`, `tlmx_panel:pick:${String(c.id)}`),
         ),
-        ...channels.map((ch) => Markup.button.url(`📢 ${truncateUtf16(ch.title, 120)}`, ch.link!)),
+        ...channels.map((ch) => Markup.button.callback(`📢 ${truncateUtf16(ch.title, 120)}`, `tlmx_panel:chat:${rememberLink(ch.link!)}`)),
       ].slice(0, 8);
-      const hint = channels.length ? '\n📢 — каналы: они откроются в MAX, в мост их не добавить.' : '';
+      const hint = channels.length ? '\n📢 — каналы: откройте, чтобы подписаться.' : '';
       await bot.telegram.sendMessage(chatId, `Нашёл ${buttons.length}. Выберите:${hint}`, {
         reply_markup: Markup.inlineKeyboard(buttons, { columns: 1 }).reply_markup,
       });
@@ -863,6 +912,72 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
       await bot.telegram.sendMessage(chatId, `❌ Поиск не удался: ${(err as Error).message}`).catch(() => {});
     }
   }
+
+  // --- Groups and channels by link: a card, then «📢 Подписаться» / «➕ Вступить» ----------------
+  // LINK_INFO tells what a max.ru link is, CHAT_JOIN joins it (both read from MAX's web client); the
+  // joined chat's topic opens at once with its recent posts (sync.ts openJoinedChat).
+  async function sendLinkCard(chatId: number, link: string): Promise<void> {
+    let info: Awaited<ReturnType<MaxClient['linkInfo']>>;
+    try {
+      info = await max.linkInfo(link);
+    } catch (err) {
+      logger.error(`LINK_INFO for a pasted link failed`, err);
+      await bot.telegram.sendMessage(chatId, `❌ MAX не открыл эту ссылку: ${(err as Error).message}`).catch(() => {});
+      return;
+    }
+    if (info.contact) {
+      await sendCard(chatId, info.contact);
+      return;
+    }
+    if (!info.chat) {
+      await bot.telegram.sendMessage(chatId, '❌ По этой ссылке MAX ничего не нашёл — проверьте её.').catch(() => {});
+      return;
+    }
+    const { text, markup } = chatCardView(info.chat, rememberLink(link, info.chat));
+    await bot.telegram.sendMessage(chatId, text, { reply_markup: markup });
+  }
+  bot.action(/^tlmx_panel:chat:(\d+)$/, async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    const item = shownLinks.get(ctx.match[1]!);
+    if (!item) {
+      await ctx.editMessageText('Список устарел — повторите поиск.').catch(() => {});
+      return;
+    }
+    try {
+      const { chat } = await max.linkInfo(item.link);
+      if (!chat) throw new Error('MAX не узнал ссылку');
+      item.chat = chat;
+      const { text, markup } = chatCardView(chat, ctx.match[1]!);
+      await ctx.editMessageText(text, { reply_markup: markup }).catch(() => {});
+    } catch (err) {
+      logger.error('LINK_INFO for a found channel failed', err);
+      await ctx.editMessageText(`❌ Не удалось открыть канал: ${(err as Error).message}`).catch(() => {});
+    }
+  });
+  bot.action(/^tlmx_panel:join:(\d+)$/, async (ctx) => {
+    const item = shownLinks.get(ctx.match[1]!);
+    if (!item) {
+      await ctx.answerCbQuery('Карточка устарела — повторите поиск.', { show_alert: true }).catch(() => {});
+      return;
+    }
+    const channel = item.chat?.type === 'CHANNEL';
+    await ctx.answerCbQuery(channel ? 'Подписываюсь…' : 'Вступаю…').catch(() => {});
+    let text: string;
+    let markup: ReturnType<typeof Markup.inlineKeyboard>['reply_markup'] | undefined;
+    try {
+      const joined = await max.joinChat(item.link);
+      const chat = { ...item.chat, ...(joined ?? {}) };
+      logger.info(`Joined MAX ${channel ? 'channel' : 'chat'} ${String(chat.id)} by link`);
+      const res = openJoinedChat ? await openJoinedChat(chat) : { ok: false, error: 'тема появится с первым новым сообщением', topicName: chat.title ?? '' };
+      const done = channel ? `✅ Вы подписались на канал «${res.topicName}».` : `✅ Вы вступили в «${res.topicName}».`;
+      text = res.ok ? `${done} Тема открыта${channel ? ' — в ней последние посты, новые будут приходить сами' : ''}.` : `${done} Тема пока не открылась: ${res.error}.`;
+      if (res.chatLink) markup = Markup.inlineKeyboard([[Markup.button.url('➡️ Открыть тему', res.chatLink)]]).reply_markup;
+    } catch (err) {
+      logger.error('CHAT_JOIN failed', err);
+      text = `❌ Не удалось ${channel ? 'подписаться' : 'вступить'}: ${(err as Error).message}`;
+    }
+    await ctx.editMessageText(text, markup ? { reply_markup: markup } : {}).catch(() => {});
+  });
 
   bot.action(/^tlmx_panel:pick:(.+)$/, async (ctx) => {
     await ctx.answerCbQuery();

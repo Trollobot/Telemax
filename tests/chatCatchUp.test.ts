@@ -391,3 +391,11 @@ describe('HISTORY_LIMIT setting', () => {
     expect(historyLimitNotice(300)).toMatch(/последние 300 сообщений этого/);
   });
 });
+
+describe('channel topics filled from scratch', () => {
+  it('say «последние N постов канала»', () => {
+    expect(historyLimitNotice(50, true)).toBe('📜 Здесь последние 50 постов канала. Более ранние — в MAX.');
+    expect(historyLimitNotice(21, true)).toBe('📜 Здесь последний 21 пост канала. Более ранние — в MAX.');
+    expect(historyLimitNotice(3, true)).toBe('📜 Здесь последние 3 поста канала. Более ранние — в MAX.');
+  });
+});

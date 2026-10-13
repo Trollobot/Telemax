@@ -36,3 +36,24 @@ describe('«🚪 Выйти из MAX»', () => {
     expect(v.markup.inline_keyboard.flat().map((b) => ('callback_data' in b ? b.callback_data : ''))).toEqual(['tlmx_panel:logout:go', 'tlmx_panel:web']);
   });
 });
+
+describe('MAX groups and channels by link', () => {
+  it('turns a pasted link into its https form', async () => {
+    const { maxLinkOf } = await import('../src/bridge/panel.js');
+    expect(maxLinkOf('max.ru/join/AbC123')).toBe('https://max.ru/join/AbC123');
+    expect(maxLinkOf('https://max.ru/azs_radar/')).toBe('https://max.ru/azs_radar');
+    expect(maxLinkOf('@azs_radar')).toBeNull();
+  });
+
+  it('a channel card offers «Подписаться», counts subscribers the Russian way, links to MAX', async () => {
+    const { chatCardView } = await import('../src/bridge/panel.js');
+    const v = chatCardView({ id: -5, type: 'CHANNEL', title: 'АЗС Радар', participantsCount: 1234, description: 'Цены', link: 'https://max.ru/azs_radar' }, '7');
+    expect(v.text).toMatch(/^📢 АЗС Радар\n1234 подписчика\n\nЦены/);
+    const buttons = v.markup.inline_keyboard.flat();
+    expect(buttons.map((b) => b.text)).toEqual(['📢 Подписаться', '🔗 Открыть в MAX', '◀️ Готово']);
+    expect('callback_data' in buttons[0]! && buttons[0].callback_data).toBe('tlmx_panel:join:7');
+    const group = chatCardView({ type: 'CHAT', title: 'Дача', participantsCount: 21 }, '8');
+    expect(group.text).toMatch(/^👥 Дача\n21 участник\n/);
+    expect(group.markup.inline_keyboard.flat().map((b) => b.text)).toEqual(['➕ Вступить', '◀️ Готово']);
+  });
+});

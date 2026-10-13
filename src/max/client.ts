@@ -36,6 +36,19 @@ export interface MaxContactInfo {
   link?: string;
 }
 
+/** A group or channel as LINK_INFO / CHAT_JOIN describe it (MAX web's chat model; only what the panel shows). */
+export interface MaxLinkChat {
+  id?: unknown;
+  type?: string; // 'CHANNEL' | 'CHAT'
+  title?: string;
+  description?: string;
+  link?: string;
+  participantsCount?: number;
+  participants?: Record<string, unknown>;
+  access?: string;
+  status?: string;
+}
+
 /** A public channel found by PUBLIC_SEARCH. */
 export interface MaxPublicChannel {
   id: unknown;
@@ -837,6 +850,21 @@ export class MaxClient extends EventEmitter {
     const p = payload as { contact?: MaxContactInfo; new?: boolean } | null;
     if (!p?.contact) throw new Error(`CONTACT_ADD: unexpected answer (keys: ${Object.keys(payload ?? {}).join(', ') || 'none'})`);
     return { contact: p.contact, isNew: !!p.new };
+  }
+
+  /** What a max.ru link points at (LINK_INFO, 0x0059 — MAX web's link preview): a group/channel, or a person. */
+  async linkInfo(link: string): Promise<{ chat?: MaxLinkChat; contact?: MaxContactInfo }> {
+    const { dir, payload } = await this.request(OPCODES.LINK_INFO, { link });
+    if (dir === DIR.ERR) throw new MaxServerError(describeAuthError(payload, 'LINK_INFO failed'), OPCODES.LINK_INFO, (payload as { error?: string } | null)?.error);
+    const p = payload as { chat?: MaxLinkChat; user?: { contact?: MaxContactInfo } } | null;
+    return { chat: p?.chat, contact: p?.user?.contact };
+  }
+
+  /** Joins a group or subscribes to a channel by its max.ru link (CHAT_JOIN, 0x0039 — MAX web's «Вступить»/«Подписаться»); a closed one makes it a join request. */
+  async joinChat(link: string): Promise<MaxLinkChat | null> {
+    const { dir, payload } = await this.request(OPCODES.CHAT_JOIN, { link });
+    if (dir === DIR.ERR) throw new MaxServerError(describeAuthError(payload, 'CHAT_JOIN failed'), OPCODES.CHAT_JOIN, (payload as { error?: string } | null)?.error);
+    return (payload as { chat?: MaxLinkChat } | null)?.chat ?? null;
   }
 
   /** Ends this session on MAX's side (LOGOUT, 0x0014) — what MAX web sends from «Выйти»; there is no web-push subscription to name here. */

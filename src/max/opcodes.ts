@@ -42,6 +42,11 @@ export const OPCODES = {
   CHAT_SET_INFO: 0x0037,
   // Not in max-protocol-full.md — supplied by the user 2026-08-10. `{chatId}`.
   CHAT_LEAVE: 0x003a,
+  // Read from MAX's web client 2026-10-13. CHAT_JOIN `{link}` — its «Вступить»/«Подписаться» on a
+  // group or channel link (a closed one turns into a join request) → `{chat}`. LINK_INFO `{link}` —
+  // what a max.ru link points at → `{chat}` or `{user: {contact, presence}}` (its link preview).
+  CHAT_JOIN: 0x0039,
+  LINK_INFO: 0x0059,
   CHAT_MEMBERS: 0x003b,
   MSG_SEND: 0x0040,
   // `{chatId, messageIds: [...], forMe: bool}` — supplied by the user 2026-08-10.

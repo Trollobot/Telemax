@@ -329,6 +329,19 @@ describe('MAX address book', () => {
     expect(client.sent).toEqual([{ opcode: OPCODES.CONTACT_UPDATE, payload: { contactId: 42n, action: 'ADD' } }]);
   });
 
+  it('opens a max.ru link (LINK_INFO) and joins by it (CHAT_JOIN) — what MAX web sends', async () => {
+    const chat = { id: -7n, type: 'CHANNEL', title: 'АЗС Радар' };
+    const client = new ScriptedClient({ dir: DIR.OK, payload: { chat } });
+    expect(await client.linkInfo('https://max.ru/azs_radar')).toEqual({ chat, contact: undefined });
+    expect(await client.joinChat('https://max.ru/azs_radar')).toEqual(chat);
+    expect(client.sent).toEqual([
+      { opcode: OPCODES.LINK_INFO, payload: { link: 'https://max.ru/azs_radar' } },
+      { opcode: OPCODES.CHAT_JOIN, payload: { link: 'https://max.ru/azs_radar' } },
+    ]);
+    const person = new ScriptedClient({ dir: DIR.OK, payload: { user: { contact: { id: 9 } } } });
+    expect((await person.linkInfo('https://max.ru/u/x')).contact).toEqual({ id: 9 });
+  });
+
   it('reads «in my contacts» from flags bit 512', () => {
     expect(isAddedContact({ flags: 512 })).toBe(true);
     expect(isAddedContact({ flags: 512 | 2 })).toBe(true);
