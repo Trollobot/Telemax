@@ -3050,7 +3050,12 @@ export function wireBridge({
         // still names the dead topic, and nothing gets written that would notice. Probe it like
         // startDialog does; gone → forget it, so openTopic makes a fresh topic and refills it.
         const existing = await chatMapStore.getByMaxChatId(chat.id);
-        if (existing && !existing.banned) {
+        // Left before (/leavegroup flags it) or muted with /ban: joining by hand means «I want it» —
+        // a fresh topic; the old one, if still there, stays as the archive it was.
+        if (existing?.banned) {
+          await chatMapStore.remove(chat.id);
+          chatSync.markDirty(chat.id);
+        } else if (existing) {
           try {
             await bot.telegram.editForumTopic(targetGroupId, existing.telegramTopicId, { name: clampTopicTitle(name) });
           } catch (err) {
@@ -3496,7 +3501,16 @@ export function wireBridge({
     }
     try {
       await max.leaveChat(mapping.maxChatId);
-      await bot.telegram.sendMessage(targetGroupId, channel ? '✅ Отписался от канала на стороне MAX.' : '✅ Вышел из группы на стороне MAX.', { message_thread_id: topicId });
+      // Stop filling the topic: a catch-up kept pouring a channel's posts in after the unsubscribe
+      // (live 2026-10-13). Flagged like /ban — pushes and catch-ups skip it, a running backfill stops
+      // at its next message — but the topic stays as an archive. Joining again from the panel starts
+      // a fresh topic (openJoinedChat).
+      await chatMapStore.setBanned(mapping.maxChatId, true);
+      await bot.telegram.sendMessage(
+        targetGroupId,
+        `${channel ? '✅ Отписался от канала на стороне MAX.' : '✅ Вышел из группы на стороне MAX.'} Тема осталась как архив — новое сюда больше не приходит; удалите её, если не нужна.`,
+        { message_thread_id: topicId },
+      );
     } catch (err) {
       logger.error('Failed to leave chat', err);
       await bot.telegram.sendMessage(targetGroupId, channel ? 'Не удалось отписаться от канала.' : 'Не удалось выйти из группы.', { message_thread_id: topicId });
