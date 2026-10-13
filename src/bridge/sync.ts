@@ -3046,6 +3046,21 @@ export function wireBridge({
       rememberChat?.(chat);
       let topicId: number | undefined;
       await chatSync.runInChat(chat.id, async () => {
+        // Unsubscribe, delete the topic by hand, subscribe again (seen live 2026-10-13): the mapping
+        // still names the dead topic, and nothing gets written that would notice. Probe it like
+        // startDialog does; gone → forget it, so openTopic makes a fresh topic and refills it.
+        const existing = await chatMapStore.getByMaxChatId(chat.id);
+        if (existing && !existing.banned) {
+          try {
+            await bot.telegram.editForumTopic(targetGroupId, existing.telegramTopicId, { name: clampTopicTitle(name) });
+          } catch (err) {
+            if (isThreadNotFound(err)) {
+              await chatMapStore.remove(chat.id);
+              chatSync.markDirty(chat.id);
+            }
+            // Any other error («topic not modified») means the topic is alive.
+          }
+        }
         const opened = await chatSync.openTopic(chat.id, clampTopicTitle(name));
         if (opened) topicId = opened.topicId;
       });
