@@ -851,7 +851,7 @@ export function channelCardText(title: string, channel?: { subscribers?: number;
 }
 
 /** A channel's topic filled from scratch gets this many of its newest posts at most (HISTORY_LIMIT may say fewer). */
-export const CHANNEL_HISTORY_LIMIT = 50;
+export const CHANNEL_HISTORY_LIMIT = 10;
 
 /** The first line of a topic HISTORY_LIMIT (or the channel cap) cut short: «последние 300 сообщений» (agreed with the number). */
 export function historyLimitNotice(limit: number, channel = false): string {
@@ -3066,9 +3066,9 @@ export function wireBridge({
         if (ensured.created) await sendAutoInfoCard(chat.id, undefined, topicId).catch((err) => logger.error('Failed to send the card of a joined chat', err));
       });
       if (topicId == null) return { ok: false, error: 'тема не открылась — она появится с первым новым сообщением', topicName: name };
-      // The recent posts follow in the chat's queue, NOT awaited: 50 of them take ~2.5 minutes at
-      // Telegram's pace, and awaiting them held the button press (and with it the bot) past
-      // telegraf's 90 s limit while the user saw nothing (live 2026-10-13).
+      // The recent posts follow in the chat's queue, NOT awaited: they go at Telegram's ~20 a minute,
+      // and awaiting 50 of them held the button press (and with it the bot) past telegraf's 90 s
+      // limit while the user saw nothing (live 2026-10-13).
       void chatSync
         .runInChat(chat.id, async () => {
           await chatSync.ensureCaughtUp(chat.id);
