@@ -699,9 +699,10 @@ async function sendOneAttachment(
   }
   const source = { source: downloaded.buffer, filename: downloaded.filename };
   if (kind === 'photo') {
-    // MAX takes images Telegram won't show as a photo: HEIC/TIFF (format), or past sendPhoto's
-    // 10 000 px (width + height) or 20:1 — MAX allows 7680×7680. Such a picture goes as a file
-    // instead of a «[фото]» placeholder (seen live 2026-10-13 on a user's bridge).
+    // A safety net: MAX takes images Telegram won't show as a photo — past sendPhoto's 10 000 px
+    // (width + height) or 20:1 (MAX allows 7680×7680), or in a format like TIFF. Such a picture goes
+    // as a file instead of a «[фото]» placeholder. In practice MAX hands out its own compressed copy:
+    // a HEIC sent from the MAX app came as a 78 KB WebP (live 2026-10-13), so HEIC never gets here.
     const ext = downloaded.filename.split('.').pop() ?? 'jpg';
     if (ext !== 'jpg') logger.info(`MAX photo arrived as ${ext} (${downloaded.buffer.byteLength} bytes)`);
     if (PHOTO_AS_FILE.has(ext)) return withFloodRetry(() => bot.telegram.sendDocument(groupId, source, opts));

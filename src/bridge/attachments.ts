@@ -236,7 +236,7 @@ export function imageExtension(buf: Uint8Array): string {
   return 'jpg';
 }
 
-/** Image formats Telegram doesn't take as a photo — they go as a file straight away instead of a doomed sendPhoto. */
+/** Image formats Telegram doesn't take as a photo — they go as a file straight away instead of a doomed sendPhoto. A safety net: MAX serves its photos as its own WebP/JPEG copies (a HEIC came as WebP, live 2026-10-13). */
 export const PHOTO_AS_FILE = new Set(['heic', 'tiff', 'avif']);
 
 async function downloadAttachmentOrThrow(att: MaxAttachment, ctx: DownloadContext): Promise<DownloadedAttachment | null> {
