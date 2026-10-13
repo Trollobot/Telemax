@@ -117,9 +117,6 @@
   .newsbar .nb-tag{background:var(--terra);color:#fff8ef;font-weight:800;font-size:.76rem;border-radius:999px;padding:3px 10px;white-space:nowrap}
   .newsbar .nb-text{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .newsbar .nb-go{color:var(--terra);font-weight:800;padding-right:6px}
-  .diagram{margin:0 auto;max-width:660px;background:var(--card);border:1px solid var(--line);
-    border-radius:var(--radius);box-shadow:var(--shadow);padding:24px}
-  .diagram svg{width:100%;height:auto;display:block}
   section{padding:58px 0;border-top:1px solid var(--line-soft)}
   section.alt{background:var(--paper-2)}
   .kicker{color:var(--terra);font-weight:700;text-transform:uppercase;letter-spacing:.09em;font-size:.76rem;margin-bottom:10px;font-family:inherit}
@@ -183,6 +180,83 @@
   footer .links{display:flex;gap:12px 20px;flex-wrap:wrap;margin-bottom:18px}
   .disc{font-size:.85rem;background:var(--paper-2);border:1px solid var(--line);border-radius:12px;padding:15px 18px}
   .center{text-align:center}
+  /* hero animation: MAX ↔ your server ↔ Telegram (scenes: переписка, файлы, трансляция, всё ваше) */
+  .flow{margin:0 auto;max-width:760px;background:var(--card);border:1px solid var(--line);
+    border-radius:var(--radius);box-shadow:var(--shadow);padding:18px 18px 16px;text-align:center}
+  .flow-stage{position:relative;height:clamp(250px,42vw,320px);overflow:hidden;border-radius:10px;
+    background:
+      radial-gradient(circle at 50% 38%,rgba(194,87,31,.07),transparent 46%),
+      linear-gradient(var(--paper-2),var(--card))}
+  .flow-lines{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+  .flow-lines line{stroke-linecap:round;vector-effect:non-scaling-stroke}
+  .flow-lines .track{stroke:var(--terra);stroke-width:3;stroke-dasharray:2 9;animation:march 1.2s linear infinite}
+  .flow-lines .branch{stroke:var(--terra);stroke-width:2;stroke-dasharray:2 8;opacity:0;transition:opacity .5s;animation:march 1.2s linear infinite}
+  .flow[data-scene="cast"] .flow-lines .branch{opacity:.75}
+  @keyframes march{to{stroke-dashoffset:-11}}
+
+  .fnode{position:absolute;transform:translate(-50%,-50%);display:flex;flex-direction:column;align-items:center;justify-content:center;
+    z-index:2;font-family:var(--serif);font-weight:800;line-height:1.1;user-select:none}
+  .fnode small{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;font-weight:500;font-size:.68rem;color:var(--muted);margin-top:3px}
+  .fnode.round{width:clamp(74px,14vw,104px);height:clamp(74px,14vw,104px);border-radius:50%;background:var(--paper-2);border:2px solid var(--ink)}
+  .fmax{left:13%;top:38%;color:var(--olive);border-color:var(--olive)!important;font-size:clamp(1rem,2.6vw,1.3rem)}
+  .ftg{left:87%;top:38%;font-size:clamp(.82rem,2.1vw,1.02rem)}
+  .fsrv{left:50%;top:38%;width:clamp(104px,20vw,142px);height:clamp(58px,10vw,74px);border-radius:16px;background:var(--terra);color:#fff8ef;
+    font-size:clamp(.95rem,2.4vw,1.15rem);box-shadow:0 8px 22px rgba(157,67,21,.28)}
+  .fsrv small{color:#f6e6d2}
+  .flow[data-scene="own"] .fsrv{animation:glow 1.8s ease-in-out infinite}
+  @keyframes glow{50%{box-shadow:0 0 0 10px rgba(194,87,31,.14),0 8px 22px rgba(157,67,21,.28)}}
+  .cnt{position:absolute;top:2px;right:2px;min-width:22px;height:22px;padding:0 6px;border-radius:999px;background:var(--terra);color:#fff8ef;
+    font:800 .74rem/22px -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;opacity:0;transform:scale(.4);transition:opacity .2s,transform .25s}
+  .cnt.on{opacity:1;transform:scale(1)}
+
+  .ftarget{width:auto;height:auto;padding:7px 12px;border-radius:12px;background:var(--card);border:1.5px solid var(--terra);font-size:1.1rem;
+    flex-direction:row;gap:6px;opacity:0;transition:opacity .45s,transform .45s;transform:translate(-50%,-30%)}
+  .ftarget small{margin:0;font-size:.74rem;color:var(--ink);font-weight:700}
+  .fgroup{left:62%;top:84%}
+  .fchan{left:86%;top:84%}
+  .flow[data-scene="cast"] .ftarget{opacity:1;transform:translate(-50%,-50%)}
+
+  .fbadge{position:absolute;transform:translate(-50%,-50%) translateY(8px);z-index:3;opacity:0;transition:opacity .4s,transform .4s;
+    background:var(--card);border:1px solid var(--line);border-radius:999px;padding:4px 11px;font-size:clamp(.66rem,1.7vw,.8rem);font-weight:700;
+    color:var(--ink);white-space:nowrap;box-shadow:0 4px 12px rgba(90,55,20,.1)}
+  .fbadge.store{left:50%;top:72%;display:flex;align-items:center;gap:8px}
+  .fbadge.store .bar{display:inline-block;width:64px;height:6px;border-radius:9px;background:var(--terra-tint);overflow:hidden}
+  .fbadge.store .bar i{display:block;height:100%;width:0;background:var(--terra);border-radius:9px}
+  .flow[data-scene="files"] .fbadge.store{opacity:1;transform:translate(-50%,-50%)}
+  .fbadge.own{border-color:var(--terra);color:var(--terra-dark)}
+  .b-acc{left:13%;top:72%}.b-srv{left:50%;top:72%}.b-bot{left:87%;top:72%}
+  .b-free{left:50%;top:11%;background:var(--terra);color:#fff8ef;border-color:var(--terra);font-size:clamp(.72rem,1.9vw,.9rem);padding:5px 14px}
+  .flow[data-scene="own"] .fbadge.own{opacity:1;transform:translate(-50%,-50%)}
+  .flow[data-scene="own"] .b-srv{transition-delay:.15s}.flow[data-scene="own"] .b-bot{transition-delay:.3s}.flow[data-scene="own"] .b-free{transition-delay:.55s}
+
+  .fchip{position:absolute;left:0;top:0;z-index:4;white-space:nowrap;pointer-events:none;will-change:transform,opacity;
+    background:var(--card);border:1px solid var(--line);border-radius:14px 14px 14px 4px;padding:5px 11px;
+    font-size:clamp(.68rem,1.8vw,.86rem);font-weight:600;color:var(--ink);box-shadow:0 6px 16px rgba(90,55,20,.14);opacity:0}
+  .fchip.back{border-radius:14px 14px 4px 14px;background:#f2f6e9;border-color:#d3e0bd}
+  .fchip.big{border-color:var(--terra);font-weight:700}
+  .fchip.btn{background:var(--terra);color:#fff8ef;border-color:var(--terra);border-radius:10px}
+  .fchip.copy{font-size:clamp(.6rem,1.5vw,.72rem);padding:3px 8px}
+
+  .flow-cap{min-height:74px;margin-top:14px;transition:opacity .25s}
+  .flow-cap.fade{opacity:0}
+  .flow-title{font-family:var(--serif);font-weight:700;font-size:clamp(1.15rem,2.8vw,1.45rem);line-height:1.2}
+  .flow-sub{color:var(--muted);font-size:.94rem;max-width:560px;margin:4px auto 0}
+  .flow-steps{display:flex;justify-content:center;gap:8px;flex-wrap:wrap;margin-top:12px}
+  .flow-steps button{font:inherit;font-size:.82rem;font-weight:700;color:var(--muted);background:transparent;border:1px solid var(--line);
+    border-radius:999px;padding:5px 12px;cursor:pointer;position:relative;overflow:hidden}
+  .flow-steps button:hover{border-color:var(--terra);color:var(--terra-dark)}
+  .flow-steps button.on{color:#fff8ef;background:var(--terra);border-color:var(--terra)}
+  .flow-steps button.on::after{content:"";position:absolute;left:0;bottom:0;height:3px;background:rgba(255,248,239,.7);
+    animation:prog var(--dur,8s) linear forwards}
+  @keyframes prog{from{width:0}to{width:100%}}
+  @media(max-width:560px){
+    .flow{padding:12px 10px 14px}
+    .ftarget{padding:5px 8px;font-size:.92rem;gap:4px}.ftarget small{font-size:.64rem}
+    .fgroup{left:55%}.fchan{left:84%}
+    .b-acc{left:19%}.b-bot{left:83%}
+    .fbadge{padding:3px 8px}
+  }
+  @media(prefers-reduced-motion:reduce){.flow-lines .track,.flow-lines .branch{animation:none}.flow[data-scene="own"] .fsrv{animation:none}.flow-steps button.on::after{display:none}}
 </style>
 </head>
 <body>
@@ -223,19 +297,26 @@
     <a class="newsbar" href="news/#v1.3.5"><span class="nb-tag">Новое · v1.3.5</span><span class="nb-text">📡 Трансляция чатов и контакты MAX</span><span class="nb-go" aria-hidden="true">→</span></a>
     <!-- /news:latest -->
 
-    <div class="diagram" aria-label="Схема: MAX ↔ Telemax ↔ Telegram">
-      <svg viewBox="0 0 680 190" xmlns="http://www.w3.org/2000/svg" role="img">
-        <line x1="150" y1="95" x2="530" y2="95" stroke="var(--terra)" stroke-width="4" stroke-dasharray="2 10" stroke-linecap="round"/>
-        <circle cx="90" cy="95" r="52" fill="var(--paper-2)" stroke="var(--olive)" stroke-width="2"/>
-        <text x="90" y="90" text-anchor="middle" font-size="20" font-weight="800" font-family="Georgia,serif" fill="var(--olive)">MAX</text>
-        <text x="90" y="112" text-anchor="middle" font-size="11" fill="var(--muted)">ваш аккаунт</text>
-        <rect x="278" y="62" width="124" height="66" rx="16" fill="var(--terra)"/>
-        <text x="340" y="92" text-anchor="middle" font-size="17" font-weight="800" font-family="Georgia,serif" fill="#fff8ef">Telemax</text>
-        <text x="340" y="112" text-anchor="middle" font-size="10" fill="#f6e6d2">ваш сервер</text>
-        <circle cx="590" cy="95" r="52" fill="var(--paper-2)" stroke="var(--ink)" stroke-width="2"/>
-        <text x="590" y="90" text-anchor="middle" font-size="15" font-weight="800" font-family="Georgia,serif" fill="var(--ink)">Telegram</text>
-        <text x="590" y="112" text-anchor="middle" font-size="11" fill="var(--muted)">ваш бот</text>
-      </svg>
+    <div class="flow" id="flow" data-scene="chat" role="region" aria-label="Как работает Telemax: MAX, ваш сервер и Telegram">
+      <div class="flow-stage" aria-hidden="true">
+        <svg class="flow-lines" viewBox="0 0 100 100" preserveAspectRatio="none">
+          <line class="track" x1="13" y1="38" x2="87" y2="38"/>
+          <line class="branch" data-to="group" x1="50" y1="38" x2="62" y2="84"/>
+          <line class="branch" data-to="chan" x1="50" y1="38" x2="86" y2="84"/>
+        </svg>
+        <div class="fnode round fmax" data-node="max">MAX<small>ваш аккаунт</small><span class="cnt"></span></div>
+        <div class="fnode fsrv" data-node="srv">Telemax<small>ваш сервер</small></div>
+        <div class="fnode round ftg" data-node="tg">Telegram<small>ваша группа</small><span class="cnt"></span></div>
+        <div class="fnode ftarget fgroup" data-node="group">👥<small>группа</small></div>
+        <div class="fnode ftarget fchan" data-node="chan">📢<small>канал</small></div>
+        <div class="fbadge store">💾 файл на вашем сервере <span class="bar"><i></i></span></div>
+        <div class="fbadge own b-acc">👤 ваш аккаунт</div>
+        <div class="fbadge own b-srv">🔑 ваш сервер</div>
+        <div class="fbadge own b-bot">🤖 ваш бот</div>
+        <div class="fbadge own b-free">🔓 открытый код · 0 ₽</div>
+      </div>
+      <div class="flow-cap" aria-live="polite"><div class="flow-title">Переписка в обе стороны</div><div class="flow-sub">Текст, голосовые, фото, кружки и стикеры идут из MAX в Telegram через ваш сервер, а ответы уходят обратно от вашего имени.</div></div>
+      <div class="flow-steps"></div>
     </div>
   </div>
 
@@ -440,6 +521,188 @@
     <p style="margin-top:16px">© Telemax — бесплатный мост MAX ↔ Telegram · AGPL-3.0</p>
   </div>
 </footer>
+
+<script>
+(function () {
+  var root = document.getElementById('flow');
+  if (!root || !root.animate) return;
+  var stage = root.querySelector('.flow-stage');
+  var reduce = window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var token = 0, visible = true, timers = [];
+
+  var SCENES = [
+    { id: 'chat', label: 'Переписка', title: 'Переписка в обе стороны',
+      sub: 'Текст, голосовые, фото, кружки и стикеры идут из MAX в Telegram через ваш сервер, а ответы уходят обратно от вашего имени.', dur: 7600,
+      play: function () {
+        at(0, function () { fly('💬 Привет! Ты где?', 'max', 'tg'); });
+        at(800, function () { fly('🎤 Голосовое · 0:14', 'max', 'tg'); });
+        at(1700, function () { fly('💬 Уже еду 🚗', 'tg', 'max'); });
+        at(2500, function () { fly('🖼️ Фото', 'max', 'tg'); });
+        at(3400, function () { fly('😄 Стикер', 'tg', 'max'); });
+        at(4200, function () { fly('⭕ Кружок · 0:09', 'max', 'tg'); });
+      } },
+    { id: 'files', label: 'Файлы', title: 'Большие файлы — по ссылке',
+      sub: 'Видео на гигабайт ложится на ваш сервер, а в Telegram приходит кнопка «Скачать». В MAX уходят файлы до 4 ГБ.', dur: 8200,
+      play: function () {
+        var bar = stage.querySelector('.store .bar i');
+        bar.getAnimations().forEach(function (a) { a.cancel(); });
+        at(0, function () { fly('🎬 Видео · 1,2 ГБ', 'max', 'srv', { direct: true, dur: 1500, kind: 'big' }); });
+        at(1300, function () { bar.animate([{ width: '0%' }, { width: '100%' }], { duration: 1300, easing: 'ease-in-out', fill: 'forwards' }); });
+        at(2800, function () { fly('⬇️ Скачать · видео.mp4', 'srv', 'tg', { direct: true, dur: 1600, kind: 'btn' }); });
+        at(4300, function () { fly('📎 Отчёт.zip · 3 ГБ', 'tg', 'srv', { direct: true, dur: 1500, kind: 'big' }); });
+        at(5800, function () { fly('📎 Отчёт.zip', 'srv', 'max', { direct: true, dur: 1500 }); });
+      } },
+    { id: 'cast', label: 'Трансляция', title: 'Трансляция',
+      sub: 'Новые сообщения чата копируются в любые группы и каналы Telegram — для тех, у кого нет MAX.', dur: 7800,
+      play: function () {
+        at(300, function () { cast('💬 Собрание в субботу'); });
+        at(1900, function () { cast('🖼️ Фото объявления'); });
+        at(3500, function () { cast('📊 Опрос: кто придёт?'); });
+      } },
+    { id: 'own', label: 'Всё ваше', title: 'Всё ваше — и бесплатно',
+      sub: 'Ваш аккаунт, ваш сервер, ваш бот и открытый код. Никаких подписок — платите только за свой VPS.', dur: 7200,
+      play: function () {
+        at(900, function () { fly('💬 Спасибо!', 'max', 'tg'); });
+        at(2300, function () { fly('👍', 'tg', 'max'); });
+        at(3700, function () { fly('🎤 Голосовое · 0:05', 'max', 'tg'); });
+      } }
+  ];
+
+  // --- helpers -----------------------------------------------------------------------------
+  function at(ms, fn) {
+    var t = token;
+    timers.push(setTimeout(function () { if (t === token) fn(); }, ms));
+  }
+  function node(name) { return stage.querySelector('[data-node="' + name + '"]'); }
+  function pt(name) {
+    var s = stage.getBoundingClientRect(), r = node(name).getBoundingClientRect();
+    return { x: r.left - s.left + r.width / 2, y: r.top - s.top + r.height / 2 };
+  }
+  function pulse(name) {
+    node(name).animate([{ transform: 'translate(-50%,-50%) scale(1)' }, { transform: 'translate(-50%,-50%) scale(1.09)' }, { transform: 'translate(-50%,-50%) scale(1)' }],
+      { duration: 420, easing: 'ease-out' });
+  }
+  function bump(name) {
+    var c = node(name).querySelector('.cnt');
+    if (!c) return;
+    c.textContent = String((parseInt(c.textContent, 10) || 0) + 1);
+    c.classList.add('on');
+    c.animate([{ transform: 'scale(1.35)' }, { transform: 'scale(1)' }], { duration: 260, easing: 'ease-out' });
+  }
+  function resetCounters() {
+    stage.querySelectorAll('.cnt').forEach(function (c) { c.textContent = ''; c.classList.remove('on'); });
+  }
+
+  /** A message bubble from one node to another — through the server unless `direct`. Rightward rides above the line, leftward below. */
+  function fly(text, from, to, o) {
+    o = o || {};
+    var el = document.createElement('div');
+    var back = pt(to).x < pt(from).x;
+    el.className = 'fchip' + (back ? ' back' : '') + (o.kind ? ' ' + o.kind : '');
+    el.textContent = text;
+    stage.appendChild(el);
+    var W = stage.clientWidth, w = el.offsetWidth, h = el.offsetHeight;
+    var lift = o.dy != null ? o.dy : back ? 26 : -26;
+    function tf(p, sc) {
+      var x = Math.min(Math.max(p.x - w / 2, 4), W - w - 4);
+      return 'translate(' + x + 'px,' + (p.y - h / 2 + lift) + 'px) scale(' + sc + ')';
+    }
+    var A = pt(from), B = pt(to), dur = o.dur || 2700;
+    var frames;
+    if (o.direct) {
+      frames = [
+        { transform: tf(A, .6), opacity: 0, offset: 0 },
+        { transform: tf(A, 1), opacity: 1, offset: .14, easing: 'cubic-bezier(.4,0,.3,1)' },
+        { transform: tf(B, 1), opacity: 1, offset: .86 },
+        { transform: tf(B, .6), opacity: 0, offset: 1 }
+      ];
+    } else {
+      var S = pt('srv');
+      frames = [
+        { transform: tf(A, .6), opacity: 0, offset: 0 },
+        { transform: tf(A, 1), opacity: 1, offset: .1, easing: 'cubic-bezier(.4,0,.3,1)' },
+        { transform: tf(S, .8), opacity: 1, offset: .46 },
+        { transform: tf(S, .8), opacity: 1, offset: .54, easing: 'cubic-bezier(.4,0,.3,1)' },
+        { transform: tf(B, 1), opacity: 1, offset: .9 },
+        { transform: tf(B, .6), opacity: 0, offset: 1 }
+      ];
+      at(dur * .48, function () { pulse('srv'); });
+    }
+    var anim = el.animate(frames, { duration: dur, fill: 'forwards' });
+    at(dur * (o.direct ? .86 : .9), function () { pulse(to); bump(to); if (o.onArrive) o.onArrive(); });
+    anim.finished.then(function () { el.remove(); }, function () { el.remove(); });
+  }
+
+  /** A message of a broadcast chat: MAX → server → Telegram, and copies from the server to the group and the channel. */
+  function cast(text) {
+    fly(text, 'max', 'tg', { dur: 2700 });
+    at(1350, function () {
+      fly(text, 'srv', 'group', { direct: true, dur: 1500, kind: 'copy', dy: 0 });
+      fly(text, 'srv', 'chan', { direct: true, dur: 1600, kind: 'copy', dy: 0 });
+    });
+  }
+
+  /** Branch lines end where the targets actually are (their spot differs on narrow screens). */
+  function placeBranches() {
+    var s = stage.getBoundingClientRect();
+    if (!s.width) return;
+    stage.querySelectorAll('.branch').forEach(function (l) {
+      var p = pt(l.getAttribute('data-to'));
+      l.setAttribute('x2', (p.x / s.width * 100).toFixed(1));
+      l.setAttribute('y2', (p.y / s.height * 100).toFixed(1));
+    });
+  }
+  window.addEventListener('resize', placeBranches);
+
+  // --- scenes ------------------------------------------------------------------------------
+  var steps = root.querySelector('.flow-steps');
+  var cap = root.querySelector('.flow-cap');
+  SCENES.forEach(function (s, i) {
+    var b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = s.label;
+    b.addEventListener('click', function () { show(i); });
+    steps.appendChild(b);
+  });
+
+  function clearStage() {
+    timers.forEach(clearTimeout);
+    timers = [];
+    stage.querySelectorAll('.fchip').forEach(function (c) { c.remove(); });
+  }
+  function show(i) {
+    token++;
+    clearStage();
+    resetCounters();
+    var s = SCENES[i];
+    root.dataset.scene = s.id;
+    steps.querySelectorAll('button').forEach(function (b, k) {
+      b.classList.toggle('on', k === i);
+      b.style.setProperty('--dur', s.dur + 'ms');
+      if (k === i) { b.classList.remove('on'); void b.offsetWidth; b.classList.add('on'); } // restart the progress line
+    });
+    cap.classList.add('fade');
+    setTimeout(function () {
+      cap.querySelector('.flow-title').textContent = s.title;
+      cap.querySelector('.flow-sub').textContent = s.sub;
+      cap.classList.remove('fade');
+    }, 180);
+    setTimeout(placeBranches, 500); // after the targets' slide-in
+    if (reduce) return; // a still picture per scene, no flying and no auto-advance
+    s.play();
+    at(s.dur, function () { next(i); });
+  }
+  function next(i) {
+    if (!visible || document.hidden) { setTimeout(function () { next(i); }, 600); return; }
+    show((i + 1) % SCENES.length);
+  }
+  if ('IntersectionObserver' in window) {
+    new IntersectionObserver(function (e) { visible = e[0].isIntersecting; }).observe(root);
+  }
+  placeBranches();
+  show(reduce ? 3 : 0);
+})();
+</script>
 
 <script>
   // Счётчик посещений без cookie: сообщает только, откуда пришли и на каком адресе открыт сайт.
