@@ -88,9 +88,23 @@ describe('resolveForwardContent (shared by the live path and the backfill)', () 
   it('a forward from a hidden chat (the backfill used to drop its file) still gets the recipient-chat fallback', async () => {
     const { max } = fakeMax(async () => []);
     const out = await resolveForwardContent(max, chats, { type: 'FORWARD', chatId: 0, message: { id: 'orig-1', sender: 7, attaches: [{ _type: 'FILE' }] } }, 100, 'wrap-1');
-    expect(out?.text).toBe('↩️ Переслано из «MAX chat 0» (от MAX ID 7):');
+    // No name for the source — no «MAX chat 0» stand-in either (seen live as «MAX chat 381718116»).
+    expect(out?.text).toBe('↩️ Переслано (от MAX ID 7):');
     expect(out?.download.fallbackChatId).toBe(100);
     expect(out?.download.fallbackMessageId).toBe('wrap-1');
+  });
+
+  it('names a 1:1 dialog by the other person, and skips it when that is the sender again', async () => {
+    const { max } = fakeMax(async () => [VLADIMIR]);
+    const profiles = new Map<number, ContactProfile>([[9, { id: 9, names: [{ name: 'Анна', type: 'ONEME' }] }]]);
+    const dialogs = [
+      { id: 381718116, type: 'DIALOG', participants: { 1: 0, 9: 0 } },
+      { id: 381718117, type: 'DIALOG', participants: { 1: 0, 7: 0 } },
+    ];
+    const fromAnna = await resolveForwardContent(max, dialogs, { type: 'FORWARD', chatId: 381718116, message: { text: 'x', sender: 7 } }, 100, 'w', profiles, 1);
+    expect(fromAnna?.text).toBe('↩️ Переслано из «Анна» (от Владимир П.):\nx');
+    const fromVladimir = await resolveForwardContent(max, dialogs, { type: 'FORWARD', chatId: 381718117, message: { text: 'y', sender: 7 } }, 100, 'w', profiles, 1);
+    expect(fromVladimir?.text).toBe('↩️ Переслано (от Владимир П.):\ny');
   });
 
   it('uses and fills the profile cache when one is passed', async () => {

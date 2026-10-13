@@ -3,7 +3,7 @@ import type { Telegraf } from 'telegraf';
 import { splitTelegramText, truncateCodePoints, truncateUtf16, MAX_TEXT_LIMIT, TELEGRAM_TEXT_LIMIT } from '../src/bridge/text.js';
 import { dialogParticipantIds, isFallbackTitle, resolveChatName, resolveContactDisplayName } from '../src/max/names.js';
 import { clampTopicTitle, ensureTopicForMaxChat, withTopicLock } from '../src/telegram/bot.js';
-import { telegramSendKind, TELEGRAM_PHOTO_LIMIT_BYTES, TELEGRAM_UPLOAD_LIMIT_BYTES } from '../src/bridge/attachments.js';
+import { imageExtension, telegramSendKind, TELEGRAM_PHOTO_LIMIT_BYTES, TELEGRAM_UPLOAD_LIMIT_BYTES } from '../src/bridge/attachments.js';
 import {
   buildLinkIds,
   describeUnrelayableTelegramMessage,
@@ -494,5 +494,24 @@ describe('dialogParticipantIds', () => {
       null,
     ];
     expect(dialogParticipantIds(chats, me).sort()).toEqual([2, 3]);
+  });
+});
+
+describe('imageExtension (a MAX picture named by what it really is)', () => {
+  const bytes = (...parts: Array<string | number[]>) =>
+    Uint8Array.from(parts.flatMap((p) => (typeof p === 'string' ? [...p].map((c) => c.charCodeAt(0)) : p)));
+  it('tells the formats MAX takes apart, JPEG by default', () => {
+    expect(imageExtension(bytes([0xff, 0xd8, 0xff, 0xe0]))).toBe('jpg');
+    expect(imageExtension(bytes([0x89], 'PNG', [0x0d, 0x0a]))).toBe('png');
+    expect(imageExtension(bytes('GIF89a'))).toBe('gif');
+    expect(imageExtension(bytes('RIFF', [0, 0, 0, 0], 'WEBPVP8 '))).toBe('webp');
+    expect(imageExtension(bytes('BM', [0, 0, 0, 0]))).toBe('bmp');
+    expect(imageExtension(bytes('II*', [0]))).toBe('tiff');
+    expect(imageExtension(bytes('MM', [0], '*'))).toBe('tiff');
+    expect(imageExtension(bytes([0, 0, 0, 0x18], 'ftypheic'))).toBe('heic');
+    expect(imageExtension(bytes([0, 0, 0, 0x18], 'ftypmif1'))).toBe('heic');
+    expect(imageExtension(bytes([0, 0, 0, 0x1c], 'ftypavif'))).toBe('avif');
+    expect(imageExtension(bytes([0, 0, 0, 0x18], 'ftypisom'))).toBe('jpg');
+    expect(imageExtension(new Uint8Array(0))).toBe('jpg');
   });
 });

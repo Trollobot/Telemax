@@ -216,11 +216,34 @@ export async function downloadMaxAttachment(att: MaxAttachment, ctx: DownloadCon
   }
 }
 
+/**
+ * An image's real format from its first bytes — MAX takes JPG, PNG, GIF, TIFF, BMP and HEIC (its
+ * upload docs), Telegram's sendPhoto refuses some of them, and a HEIC named `.jpg` opens nowhere.
+ * 'jpg' when nothing matches. Pure + exported for unit testing.
+ */
+export function imageExtension(buf: Uint8Array): string {
+  const ascii = (from: number, to: number) => String.fromCharCode(...buf.subarray(from, to));
+  if (buf[0] === 0x89 && ascii(1, 4) === 'PNG') return 'png';
+  if (ascii(0, 4) === 'GIF8') return 'gif';
+  if (ascii(0, 4) === 'RIFF' && ascii(8, 12) === 'WEBP') return 'webp';
+  if (ascii(0, 2) === 'BM') return 'bmp';
+  if (ascii(0, 4) === 'II*\0' || ascii(0, 4) === 'MM\0*') return 'tiff';
+  if (ascii(4, 8) === 'ftyp') {
+    const brand = ascii(8, 12);
+    if (brand === 'avif' || brand === 'avis') return 'avif';
+    if (['heic', 'heix', 'hevc', 'hevx', 'heim', 'heis', 'mif1', 'msf1'].includes(brand)) return 'heic';
+  }
+  return 'jpg';
+}
+
+/** Image formats Telegram doesn't take as a photo — they go as a file straight away instead of a doomed sendPhoto. */
+export const PHOTO_AS_FILE = new Set(['heic', 'tiff', 'avif']);
+
 async function downloadAttachmentOrThrow(att: MaxAttachment, ctx: DownloadContext): Promise<DownloadedAttachment | null> {
   if (att._type === 'PHOTO' && att.baseUrl && att.photoToken) {
     const buffer = await downloadUrl(att.baseUrl + att.photoToken);
     if (!buffer) return null;
-    return { buffer, filename: `photo_${String(att.photoId ?? Date.now())}.jpg`, kind: 'photo' };
+    return { buffer, filename: `photo_${String(att.photoId ?? Date.now())}.${imageExtension(buffer)}`, kind: 'photo' };
   }
 
   // Animated stickers carry a `lottieUrl`: gzip-compressed Lottie JSON that is already a valid

@@ -19,6 +19,7 @@ import {
   KEYBOARD_GEO,
   KEYBOARD_CONTACT,
   pressableButton,
+  PHOTO_AS_FILE,
   type MaxAttachment,
   type DownloadContext,
 } from './attachments.js';
@@ -697,7 +698,21 @@ async function sendOneAttachment(
     return withFloodRetry(() => bot.telegram.sendMessage(groupId, describeAttachment(att), opts));
   }
   const source = { source: downloaded.buffer, filename: downloaded.filename };
-  if (kind === 'photo') return withFloodRetry(() => bot.telegram.sendPhoto(groupId, source, opts));
+  if (kind === 'photo') {
+    // MAX takes images Telegram won't show as a photo: HEIC/TIFF (format), or past sendPhoto's
+    // 10 000 px (width + height) or 20:1 — MAX allows 7680×7680. Such a picture goes as a file
+    // instead of a «[фото]» placeholder (seen live 2026-10-13 on a user's bridge).
+    const ext = downloaded.filename.split('.').pop() ?? 'jpg';
+    if (ext !== 'jpg') logger.info(`MAX photo arrived as ${ext} (${downloaded.buffer.byteLength} bytes)`);
+    if (PHOTO_AS_FILE.has(ext)) return withFloodRetry(() => bot.telegram.sendDocument(groupId, source, opts));
+    try {
+      return await withFloodRetry(() => bot.telegram.sendPhoto(groupId, source, opts));
+    } catch (err) {
+      if (!isPermanentTelegramRefusal(err)) throw err;
+      logger.error(`Telegram refused a MAX photo (${ext}, ${downloaded.buffer.byteLength} bytes: ${telegramErrorText(err)}) — sending it as a file`);
+      return withFloodRetry(() => bot.telegram.sendDocument(groupId, source, opts));
+    }
+  }
   if (kind === 'video') return withFloodRetry(() => bot.telegram.sendVideo(groupId, source, opts));
   if (kind === 'video_note') {
     try {
@@ -835,6 +850,7 @@ export async function resolveForwardContent(
   wrapperChatId: unknown,
   wrapperMessageId: unknown,
   profiles?: Map<number, ContactProfile>,
+  myAccountId: number | null = null,
 ): Promise<{ text: string; attaches: MaxAttachment[]; download: ForwardDownloadIds } | null> {
   if (link?.type !== 'FORWARD') return null;
   const original = link.message;
@@ -843,11 +859,13 @@ export async function resolveForwardContent(
   const senderName = Number.isNaN(senderId)
     ? 'неизвестно'
     : resolveContactDisplayName(senderId, await resolveProfile(max, senderId, 'forward sender', profiles));
-  const sourceChat = chats.find((c) => c && typeof c === 'object' && String((c as { id?: unknown }).id) === String(link.chatId)) as
-    | { title?: string }
-    | undefined;
-  const sourceLabel = sourceChat?.title || `MAX chat ${String(link.chatId)}`;
-  const prefix = `↩️ Переслано из «${sourceLabel}» (от ${senderName}):`;
+  // The source chat is named the way its topic is: a 1:1 dialog has no title of its own — it is the
+  // other person (seen live 2026-10-13 as «MAX chat 381718116»). No real name, or just the sender
+  // again (a forward out of a dialog with them) — the «из «…»» part is left out.
+  const sourceChat = chats.find((c) => c && typeof c === 'object' && String((c as { id?: unknown }).id) === String(link.chatId));
+  const sourceName = sourceChat ? resolveChatName(sourceChat, myAccountId, profiles ?? new Map()) : undefined;
+  const sourceLabel = sourceName && !isFallbackTitle(sourceName) && sourceName !== senderName ? sourceName : undefined;
+  const prefix = sourceLabel ? `↩️ Переслано из «${sourceLabel}» (от ${senderName}):` : `↩️ Переслано (от ${senderName}):`;
   return {
     text: original?.text ? `${prefix}\n${original.text}` : prefix,
     attaches,
@@ -1146,7 +1164,7 @@ export class ChatCatchUp {
         await chatMapStore.advanceHistoryCursor(chatId, msg.time);
         continue;
       }
-      const forwarded = await resolveForwardContent(max, chats, msg.link, chatId, msg.id, profiles);
+      const forwarded = await resolveForwardContent(max, chats, msg.link, chatId, msg.id, profiles, myAccountId);
       let text = forwarded ? forwarded.text : msg.text;
       const taken = takeKeyboard(forwarded ? forwarded.attaches : Array.isArray(msg.attaches) ? (msg.attaches as MaxAttachment[]) : [], chatId);
       let attaches = taken.attaches;
@@ -2257,7 +2275,7 @@ export function wireBridge({
     if (!opened || opened.deferred) return;
     const topicId = opened.topicId;
 
-    const forwarded = await resolveForwardContent(max, getChats(), message.link, chatId, message.id, getContactProfiles());
+    const forwarded = await resolveForwardContent(max, getChats(), message.link, chatId, message.id, getContactProfiles(), getMyAccountId());
     if (forwarded) {
       text = forwarded.text;
       attaches = forwarded.attaches;
