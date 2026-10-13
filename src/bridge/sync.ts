@@ -1166,7 +1166,7 @@ export class ChatCatchUp {
     const { messages: history, truncated } = await fetchFullHistory(this.deps.max, chatId, cursor, cancelled, limit);
     if (history.length > 0) {
       logger.info(
-        `${cursor == null ? 'Backfilling' : 'Catching up on'} ${history.length} messages for MAX chat ${String(chatId)}${truncated ? ` (the newest ${limit} — HISTORY_LIMIT)` : ''}`,
+        `${cursor == null ? 'Backfilling' : 'Catching up on'} ${history.length} messages for MAX chat ${String(chatId)}${truncated ? ` (the newest ${limit} — ${isChannel ? 'channel cap' : 'HISTORY_LIMIT'})` : ''}`,
       );
       // Says why the topic starts mid-conversation — a 5 000-message chat needs ~4 hours in full.
       if (truncated) {
@@ -3061,10 +3061,19 @@ export function wireBridge({
             // Any other error («topic not modified») means the topic is alive.
           }
         }
-        const opened = await chatSync.openTopic(chat.id, clampTopicTitle(name));
-        if (opened) topicId = opened.topicId;
+        const ensured = await ensureTopicForMaxChat(bot, targetGroupId, chat.id, chatMapStore, clampTopicTitle(name));
+        topicId = ensured.topicId;
+        if (ensured.created) await sendAutoInfoCard(chat.id, undefined, topicId).catch((err) => logger.error('Failed to send the card of a joined chat', err));
       });
       if (topicId == null) return { ok: false, error: 'тема не открылась — она появится с первым новым сообщением', topicName: name };
+      // The recent posts follow in the chat's queue, NOT awaited: 50 of them take ~2.5 minutes at
+      // Telegram's pace, and awaiting them held the button press (and with it the bot) past
+      // telegraf's 90 s limit while the user saw nothing (live 2026-10-13).
+      void chatSync
+        .runInChat(chat.id, async () => {
+          await chatSync.ensureCaughtUp(chat.id);
+        })
+        .catch((err) => logger.error(`Filling the topic of joined chat ${String(chat.id)} failed — the next catch-up retries`, err));
       return { ok: true, topicName: name, chatLink: `https://t.me/c/${targetGroupId.replace(/^-100/, '')}/${topicId}` };
     } catch (err) {
       logger.error('Opening the topic of a joined chat failed', err);

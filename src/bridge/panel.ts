@@ -970,7 +970,7 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
       logger.info(`Joined MAX ${channel ? 'channel' : 'chat'} ${String(chat.id)} by link`);
       const res = openJoinedChat ? await openJoinedChat(chat) : { ok: false, error: 'тема появится с первым новым сообщением', topicName: chat.title ?? '' };
       const done = channel ? `✅ Вы подписались на канал «${res.topicName}».` : `✅ Вы вступили в «${res.topicName}».`;
-      text = res.ok ? `${done} Тема открыта${channel ? ' — в ней последние посты, новые будут приходить сами' : ''}.` : `${done} Тема пока не открылась: ${res.error}.`;
+      text = res.ok ? `${done} Тема открыта${channel ? ' — последние посты подгружаются (около 20 в минуту), новые будут приходить сами' : ''}.` : `${done} Тема пока не открылась: ${res.error}.`;
       if (res.chatLink) markup = Markup.inlineKeyboard([[Markup.button.url('➡️ Открыть тему', res.chatLink)]]).reply_markup;
     } catch (err) {
       logger.error('CHAT_JOIN failed', err);
