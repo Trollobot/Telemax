@@ -8,6 +8,9 @@ export const OPCODES = {
   START_AUTH: 0x0011,
   CHECK_CODE: 0x0012,
   LOGIN: 0x0013,
+  // Read from MAX's web client 2026-10-13 (its «Выйти»: `send(20, {pushToken})`, pushToken = its
+  // web-push subscription). Ends the session on MAX's side — it leaves «Настройки → Устройства».
+  LOGOUT: 0x0014,
   // Not in max-protocol-full.md — supplied by the user 2026-08-14 from a live capture.
   // Sent instead of LOGIN when CHECK_CODE's response carries a `passwordChallenge`
   // instead of a login token (some MAX accounts have a password set as a second

@@ -27,6 +27,7 @@ class FakeClient extends EventEmitter {
   requestSms = vi.fn(async () => 'auth-token');
   verifyCode = vi.fn(async () => ({ status: 'ok' as const, loginToken: 'login-token' }));
   checkPassword = vi.fn(async () => 'login-token');
+  logout = vi.fn(async () => {});
 }
 
 function setup(session: MaxSession | null = SESSION) {
@@ -288,5 +289,43 @@ describe('MaxSessionController — outage notice', () => {
     await settle();
     expect(notices).toHaveBeenCalledTimes(2);
     expect(notices.mock.calls[1]?.[0]).toContain('восстановлена');
+  });
+});
+
+describe('MaxSessionController — «🚪 Выйти из MAX»', () => {
+  const loggedIn = async () => {
+    const w = setup();
+    w.client.login.mockResolvedValueOnce({ sessionToken: 'tok2', payload: {} });
+    w.client.emit('ready');
+    await settle();
+    expect(w.ctl.state).toBe('loggedIn');
+    return w;
+  };
+
+  it('ends the session on MAX too, forgets it here, keeps the phone for /login', async () => {
+    const { ctl, client, store } = await loggedIn();
+    expect(await ctl.logout()).toEqual({ endedOnMax: true });
+    expect(client.logout).toHaveBeenCalledTimes(1);
+    expect(store.clear).toHaveBeenCalledTimes(1);
+    expect(client.disconnect).toHaveBeenCalled();
+    expect(ctl.state).toBe('stopped');
+    expect(ctl.activePhone).toBe('');
+    expect(ctl.lastKnownPhone).toBe(SESSION.phone);
+  });
+
+  it('a refused LOGOUT still forgets the session here — and says MAX was not told', async () => {
+    const { ctl, client, store } = await loggedIn();
+    client.logout.mockRejectedValueOnce(new Error('LOGOUT failed'));
+    expect(await ctl.logout()).toEqual({ endedOnMax: false });
+    expect(store.clear).toHaveBeenCalledTimes(1);
+    expect(ctl.state).toBe('stopped');
+  });
+
+  it('not logged in right now — nothing to send, the local copy goes all the same', async () => {
+    const { ctl, client, store } = setup();
+    expect(ctl.state).not.toBe('loggedIn');
+    expect(await ctl.logout()).toEqual({ endedOnMax: false });
+    expect(client.logout).not.toHaveBeenCalled();
+    expect(store.clear).toHaveBeenCalledTimes(1);
   });
 });

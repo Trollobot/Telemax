@@ -29,7 +29,7 @@ import { FileShare, fileShareOptionsFromEnv, TELEGRAM_BOT_DOWNLOAD_LIMIT } from 
 import { createBigFiles } from './bigFiles.js';
 import { canRenderAnimatedStickers } from './lottie.js';
 import { reportBridgeError } from './errorReporter.js';
-import { addToMaxContacts, profileName, wireControlPanel, type PauseControl } from './panel.js';
+import { addToMaxContacts, logoutConfirmView, profileName, wireControlPanel, type PauseControl } from './panel.js';
 import { keepPanelBack } from './panelBack.js';
 import { createBugReports, isBugReportInboxEnabled, BUGREPORT_BOT_HANDLE, type BugReports } from './bugReports.js';
 import { createMaxAuthFlow, type MaxAuthCallbacks } from './maxAuthFlow.js';
@@ -1515,7 +1515,9 @@ export interface BridgeOptions {
   /** Refetches MAX's chat list and re-runs the full backfill sync — used by /reboot after wiping local state. Fire-and-forget on the caller's side (server/app.ts already guards against overlapping runs). */
   triggerFullResync: () => Promise<void>;
   /** Disconnects from MAX and deletes the encrypted session — used by /kill. Awaited (unlike triggerFullResync) since /kill's own confirmation message should only go out once this has actually finished. */
-  killEverything: () => Promise<void>;
+  killEverything: () => Promise<{ endedOnMax: boolean }>;
+  /** «🚪 Выйти из MAX» / /logout: ends the session on MAX too and forgets it here — topics, links and settings stay (server/maxSession.ts logout). */
+  logoutMax?: () => Promise<{ endedOnMax: boolean }>;
   /** Cancels the in-flight history sync, waits for it to stop, and holds off new runs until the returned release is called — /reboot and /kill wrap their wipe in it so the old run can't refill the topics they delete. */
   suspendChatSync: () => Promise<() => void>;
   /** MAX auth steps for the in-Telegram /login flow (server/maxSession.ts). */
@@ -1548,6 +1550,7 @@ export function wireBridge({
   auth,
   pause,
   restartBridge,
+  logoutMax,
 }: BridgeOptions): WiredBridge {
   // Bug-report channel: private DMs from outsiders become bug reports. The inbox is only ON where
   // BUGREPORT_INBOX is set (the maintainer's prod bot); elsewhere outsiders get a redirect stub.
@@ -2710,7 +2713,8 @@ export function wireBridge({
 /login — войти в MAX через бота: номер + код из SMS (и пароль, если включён 2FA) — в личке бота. И первая авторизация, и повторная (после сбоя, /kill, смена номера) — через него.
 /version — проверить версию, обновить по кнопке (раз в сутки бот сам напомнит, если вышло обновление)
 /reboot — удалить ВСЕ темы в этой Telegram-группе и пересинхронизировать всё с нуля из MAX (требует подтверждения, MAX не затрагивается)
-/kill — то же самое + отключить мост от MAX и стереть сохранённую сессию (после нужна новая авторизация через /login). Саму сессию в MAX завершите в приложении: Настройки → Устройства. Необратимо, требует подтверждения.
+/logout — выйти из MAX: сессия завершится и в MAX, темы и настройки останутся. Войти снова — /login
+/kill — то же самое + выйти из MAX и стереть сохранённую сессию (после нужна новая авторизация через /login). Необратимо, требует подтверждения.
 
 🔒 Команды выполняются только у администраторов группы. Обычные участники могут читать и писать (участвовать в обсуждении), но не командовать ботом.
 
@@ -2999,6 +3003,7 @@ export function wireBridge({
     startDialog,
     pause,
     restart: restartBridge,
+    logout: logoutMax,
     files: fileShare,
     resendToMax: (id) => bigFiles.resendToMax(id),
     offerStore: (panelMessageId) => bigFiles.offerStore(panelMessageId),
@@ -3556,12 +3561,25 @@ export function wireBridge({
    * 2026-09-11): only OUR copy of the session is dropped, the token stays valid on MAX's side —
    * the texts point at the app's device list, don't promise a server-side logout.
    */
+  // /logout: «🚪 Выйти из MAX» without wiping anything — the same confirmation as the panel's
+  // (panel.ts tlmx_panel:logout:go does the rest). Before 1.3.7 only /kill logged out.
+  bot.command('logout', async (ctx) => {
+    const phone = getActivePhone();
+    const where = ctx.message.message_thread_id != null ? { message_thread_id: ctx.message.message_thread_id } : {};
+    if (!phone || !logoutMax) {
+      await ctx.reply('MAX сейчас не авторизован — выходить не из чего. Войти: /login в личке бота.', where).catch(() => {});
+      return;
+    }
+    const { text, markup } = logoutConfirmView(maskPhone(phone), { text: '✖️ Отмена', data: 'tlmx_panel:dismiss' });
+    await ctx.reply(text, { ...where, reply_markup: markup }).catch(() => {});
+  });
+
   bot.command('kill', async (ctx) => {
     const confirm = (ctx as unknown as { payload?: string }).payload?.trim().toUpperCase();
     if (confirm !== 'УНИЧТОЖИТЬ') {
       await bot.telegram.sendMessage(
         targetGroupId,
-        '☢️ Это отключит мост от MAX и сотрёт сохранённую ЗДЕСЬ сессию (после потребуется новая авторизация через /login в личке бота), а также ВСЕ темы, историю и связки в этой Telegram-группе. ⚠️ Саму сессию на стороне MAX мост завершить не может — после /kill завершите её в приложении MAX: Настройки → Устройства. Необратимо. Подтвердите: /kill УНИЧТОЖИТЬ',
+        '☢️ Это отключит мост от MAX и сотрёт сохранённую ЗДЕСЬ сессию (после потребуется новая авторизация через /login в личке бота), а также ВСЕ темы, историю и связки в этой Telegram-группе. Сессия завершится и в самом MAX. Нужно только выйти, без удаления тем? — /logout. Необратимо. Подтвердите: /kill УНИЧТОЖИТЬ',
       );
       return;
     }
@@ -3570,10 +3588,12 @@ export function wireBridge({
       'kill',
       (n) => `☢️ Удаляю ${n} тем, разлогиниваю MAX и стираю все данные...`,
       async () => {
-        await killEverything();
+        const { endedOnMax } = await killEverything();
         await bot.telegram.sendMessage(
           targetGroupId,
-          '✅ Готово. Мост отключён от MAX, сохранённая здесь сессия и все данные стёрты. ⚠️ Не забудьте завершить сессию и в приложении MAX (Настройки → Устройства) — мост сделать это не может. Чтобы продолжить — авторизуйтесь заново: /login (в личке бота).',
+          endedOnMax
+            ? '✅ Готово. Мост вышел из MAX — сессия завершена и там, сохранённая здесь сессия и все данные стёрты. Чтобы продолжить — авторизуйтесь заново: /login (в личке бота).'
+            : '✅ Готово. Мост отключён от MAX, сохранённая здесь сессия и все данные стёрты. ⚠️ Завершить сессию в самом MAX не удалось — закройте её в приложении MAX (Настройки → Устройства). Чтобы продолжить — авторизуйтесь заново: /login (в личке бота).',
         );
       },
     );

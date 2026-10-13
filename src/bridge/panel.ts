@@ -5,6 +5,7 @@ import type { InlineKeyboardButton } from 'telegraf/types';
 import { isAddedContact, isMaxServerError, type MaxClient, type MaxContactInfo } from '../max/client.js';
 import { getAppVersion } from './version.js';
 import { formatBytes, maskPhone } from './status.js';
+import { keepPanelBack } from './panelBack.js';
 import { createLogger } from '../logger.js';
 import { truncateUtf16 } from './text.js';
 import { formatExpiry } from './bigFiles.js';
@@ -50,6 +51,8 @@ export interface ControlPanelDeps {
   resendToMax?: (id: string) => Promise<{ ok: boolean; text: string }>;
   /** «🔁 Перезапустить мост»: ends the process for Docker to start it again (server/app.ts); `where` = the panel message to put back afterwards. */
   restart?: (where: { chatId: number; messageId: number }) => void;
+  /** «🚪 Выйти из MAX»: ends the session on MAX and here, topics stay (server/app.ts logoutMax). */
+  logout?: () => Promise<{ endedOnMax: boolean }>;
 }
 
 export interface PauseControl {
@@ -330,18 +333,32 @@ function chatsView(): View {
     ]).reply_markup,
   };
 }
-function webView(botUsername?: string): View {
+function webView(botUsername?: string, loggedInAs?: string): View {
   // Auth is a deep link into the bot's DM (t.me/<bot>?start=login) — SMS code and 2FA password
   // are entered privately there, never in the group. Button shown only once we know the username.
   const rows = [
-    ...(botUsername ? [[Markup.button.url('🔐 Войти в MAX', `https://t.me/${botUsername}?start=login`)]] : []),
+    ...(botUsername ? [[Markup.button.url(loggedInAs ? '🔐 Войти другим номером' : '🔐 Войти в MAX', `https://t.me/${botUsername}?start=login`)]] : []),
+    ...(loggedInAs ? [[Markup.button.callback('🚪 Выйти из MAX', 'tlmx_panel:logout')]] : []),
     [Markup.button.callback('◀️ Назад', 'tlmx_panel:root')],
   ];
+  const head = loggedInAs ? `🔐 Вход в MAX: сейчас ${loggedInAs}.\n` : '';
   return {
-    text: botUsername
-      ? '🔐 Вход в MAX — в личке бота:\nнажмите кнопку (или напишите боту в личку /login). Код и пароль не попадут в группу.'
-      : '🔐 Вход в MAX: напишите боту в личку /login.',
+    text:
+      head +
+      (botUsername
+        ? '🔐 Вход в MAX — в личке бота:\nнажмите кнопку (или напишите боту в личку /login). Код и пароль не попадут в группу.'
+        : '🔐 Вход в MAX: напишите боту в личку /login.'),
     markup: Markup.inlineKeyboard(rows).reply_markup,
+  };
+}
+/** «🚪 Выйти из MAX» — asked first, in the panel or under /logout; `back` is where «Отмена» goes. */
+export function logoutConfirmView(phone: string, back: { text: string; data: string }): View {
+  return {
+    text:
+      `🚪 Выйти из MAX${phone ? ` (${phone})` : ''}?\n` +
+      'Сессия завершится и в самом MAX — пропадёт из «Настройки → Устройства». Темы, история и настройки останутся: войдёте снова (/login в личке бота) — всё продолжится в тех же темах.\n' +
+      'Другой номер — другой аккаунт: старые темы останутся в группе, убрать их — /reboot.',
+    markup: Markup.inlineKeyboard([[Markup.button.callback('🚪 Да, выйти', 'tlmx_panel:logout:go')], [Markup.button.callback(back.text, back.data)]]).reply_markup,
   };
 }
 /** «⚙️ Система» — exported for the bridge that comes back from «🔁 Перезапустить мост» (server/app.ts), with `note` under the title. */
@@ -382,7 +399,7 @@ function pauseView(): View {
 }
 
 export function wireControlPanel(deps: ControlPanelDeps): void {
-  const { bot, targetGroupId, max, getActivePhone, triggerFullResync, leaves, startDialog, resolveContactName, getStatus, pause, files, resendToMax, offerStore, restart } = deps;
+  const { bot, targetGroupId, max, getActivePhone, triggerFullResync, leaves, startDialog, resolveContactName, getStatus, pause, files, resendToMax, offerStore, restart, logout } = deps;
   const card = (f: StoredFile, link?: string): View => fileCardView(f, files!, link, Boolean(resendToMax));
   const root = (): View => rootView(getActivePhone(), pause.until());
   const system = (): View => systemView(pause.until() != null);
@@ -474,7 +491,34 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
   });
   bot.action('tlmx_panel:web', async (ctx) => {
     await ctx.answerCbQuery();
-    await edit(ctx, webView(ctx.botInfo?.username));
+    const phone = getActivePhone();
+    await edit(ctx, webView(ctx.botInfo?.username, phone && logout ? maskPhone(phone) : undefined));
+  });
+
+  // «🚪 Выйти из MAX» (also /logout, sync.ts): asked first, then the session ends on MAX and here —
+  // the topics stay. Before 1.3.7 only /kill logged out, and it wiped every topic on the way.
+  bot.action('tlmx_panel:logout', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    await edit(ctx, logoutConfirmView(maskPhone(getActivePhone()), { text: '◀️ Назад', data: 'tlmx_panel:web' }));
+  });
+  bot.action('tlmx_panel:logout:go', async (ctx) => {
+    if (!logout) {
+      await ctx.answerCbQuery('Выход отсюда недоступен', { show_alert: true }).catch(() => {});
+      return;
+    }
+    await ctx.answerCbQuery('Выхожу из MAX…').catch(() => {});
+    const back = keepPanelBack(ctx);
+    let text: string;
+    try {
+      const { endedOnMax } = await logout();
+      text = endedOnMax
+        ? '🚪 Вы вышли из MAX — сессия завершена и в самом MAX. Темы и настройки на месте. Войти снова: /login в личке бота.'
+        : '🚪 Мост вышел из MAX здесь, но завершить сессию в самом MAX не удалось — закройте её в приложении MAX (Настройки → Устройства). Темы и настройки на месте. Войти снова: /login в личке бота.';
+    } catch (err) {
+      logger.error('Logout from MAX failed', err);
+      text = `❌ Не удалось выйти из MAX: ${(err as Error).message}`;
+    }
+    await ctx.editMessageText(text, back).catch(() => {});
   });
   bot.action('tlmx_panel:system', async (ctx) => {
     await ctx.answerCbQuery();

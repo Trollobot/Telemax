@@ -839,6 +839,12 @@ export class MaxClient extends EventEmitter {
     return { contact: p.contact, isNew: !!p.new };
   }
 
+  /** Ends this session on MAX's side (LOGOUT, 0x0014) — what MAX web sends from «Выйти»; there is no web-push subscription to name here. */
+  async logout(): Promise<void> {
+    const { dir, payload } = await this.request(OPCODES.LOGOUT, {});
+    if (dir === DIR.ERR) throw new Error(describeAuthError(payload, 'LOGOUT failed'));
+  }
+
   /** Adds a MAX user known by id to the address book (CONTACT_UPDATE, action ADD) — no phone needed; MAX keeps their own name. */
   async addContactById(contactId: unknown): Promise<MaxContactInfo | null> {
     const { dir, payload } = await this.request(OPCODES.CONTACT_UPDATE, { contactId: toUserId(contactId), action: 'ADD' });

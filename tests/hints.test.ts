@@ -25,3 +25,14 @@ describe('«⚙️ Система» in the panel', () => {
     expect(systemView(false, '✅ Мост перезапущен — всё работает.').text).toBe('⚙️ Система:\n✅ Мост перезапущен — всё работает.');
   });
 });
+
+describe('«🚪 Выйти из MAX»', () => {
+  it('asks first, says the topics stay, and goes back where it came from', async () => {
+    const { logoutConfirmView } = await import('../src/bridge/panel.js');
+    const v = logoutConfirmView('+7999***9999', { text: '◀️ Назад', data: 'tlmx_panel:web' });
+    expect(v.text).toMatch(/^🚪 Выйти из MAX \(\+7999\*\*\*9999\)\?/);
+    expect(v.text).toMatch(/завершится и в самом MAX/);
+    expect(v.text).toMatch(/Темы, история и настройки останутся/);
+    expect(v.markup.inline_keyboard.flat().map((b) => ('callback_data' in b ? b.callback_data : ''))).toEqual(['tlmx_panel:logout:go', 'tlmx_panel:web']);
+  });
+});

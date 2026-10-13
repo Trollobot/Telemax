@@ -46,6 +46,7 @@ export interface SessionClient {
   requestSms(phone: string): Promise<string>;
   verifyCode(authToken: string, code: string): Promise<VerifyCodeResult>;
   checkPassword(trackId: string, password: string): Promise<string>;
+  logout(): Promise<void>;
 }
 
 export interface MaxSessionDeps {
@@ -419,6 +420,29 @@ export class MaxSessionController {
     this.pendingPhone = '';
     this.pendingAuthToken = null;
     this.pendingPasswordTrackId = null;
+  }
+
+  /**
+   * «🚪 Выйти из MAX» (and /kill before its wipe): ends the session on MAX's side too — LOGOUT, so
+   * it leaves «Устройства» (before 1.3.7 the user had to close it in the MAX app) — then forgets it
+   * here like kill(). The phone stays known, so /login offers it again. `endedOnMax` false = MAX
+   * could not be asked (not logged in right now, no socket, an error): only the local copy is gone.
+   */
+  async logout(): Promise<{ endedOnMax: boolean }> {
+    let endedOnMax = false;
+    if (this.state_ === 'loggedIn') {
+      try {
+        await this.deps.client.logout();
+        endedOnMax = true;
+      } catch (err) {
+        logger.error('MAX LOGOUT failed — the session is forgotten here only', err);
+      }
+    }
+    const phone = this.lastKnownPhone_;
+    await this.kill();
+    this.lastKnownPhone_ = phone;
+    logger.info(`Logged out of MAX${endedOnMax ? ' (session ended on MAX too)' : ' (here only)'}`);
+    return { endedOnMax };
   }
 
   /** SIGTERM / a fatal startup error: closes the socket and stops every reconnect. */

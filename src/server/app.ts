@@ -268,11 +268,20 @@ async function runCatchUpRetry(): Promise<void> {
 }
 
 /** /kill: the controller closes the connection and deletes the session; every in-memory cache derived from the old account goes with it so nothing lingers after a different number logs in later. */
-async function killMaxSession(): Promise<void> {
+/** /kill: logs out (the session ends on MAX too), then forgets the phone as well — a wipe leaves nothing to offer at /login. */
+async function killMaxSession(): Promise<{ endedOnMax: boolean }> {
+  const result = await logoutMax();
   await maxSession.kill();
+  return result;
+}
+
+/** «🚪 Выйти из MAX» / /logout: the session ends on MAX and here; topics and settings stay, /login brings it back. */
+async function logoutMax(): Promise<{ endedOnMax: boolean }> {
+  const result = await maxSession.logout();
   cachedChats = [];
   myAccountId = null;
   contactProfiles = new Map();
+  return result;
 }
 
 /** Keeps the LOGIN-derived chat snapshot from going stale as messages flow in either direction. Ids compare via String() — cached ids can be number OR BigInt (channels), and a strict === across those types silently never matches. */
@@ -370,6 +379,7 @@ async function startServer(): Promise<void> {
         getMaxState: () => maxSession.status(),
         triggerFullResync: () => refreshChatsAndNames().then(() => syncChatsIfPossible()),
         killEverything: killMaxSession,
+        logoutMax,
         suspendChatSync,
         auth: {
           getLastKnownPhone: () => maxSession.lastKnownPhone,
@@ -465,6 +475,7 @@ const BOT_COMMANDS = [
   { command: 'help', description: 'Полный список команд и ограничений' },
   { command: 'donate', description: 'Поддержать проект (рубли / TON)' },
   { command: 'login', description: 'Войти в MAX (номер + SMS, в личке бота)' },
+  { command: 'logout', description: 'Выйти из MAX — темы и настройки останутся' },
   { command: 'version', description: 'Версия бота, обновление по кнопке' },
   { command: 'info', description: 'Карточка контакта/чата (просто в теме)' },
   { command: 'file', description: 'Большой файл в MAX по ссылке (в теме, до 4 ГБ)' },
