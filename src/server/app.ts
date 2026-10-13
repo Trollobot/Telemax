@@ -8,6 +8,7 @@ import { dialogParticipantIds, extractMyAccountId, resolveChatName, type Contact
 import { SessionStore } from '../store/sessionStore.js';
 import { ChatMapStore } from '../store/chatMapStore.js';
 import { wireBridge, syncAllChatsToTelegram, type ChatCatchUp } from '../bridge/sync.js';
+import { systemView } from '../bridge/panel.js';
 import { RetryBackoff } from '../bridge/catchUp.js';
 import { isStaleCallbackQuery, isTransientTelegramError } from '../bridge/transient.js';
 import { configureErrorReporter, reportBridgeError } from '../bridge/errorReporter.js';
@@ -381,8 +382,10 @@ async function startServer(): Promise<void> {
           stop: () => maxSession.unpause(),
           until: () => maxSession.pausedUntil,
         },
+        restartBridge: (where) => void restartFromPanel(where),
       }));
       chatSync.setRetryHandler(scheduleCatchUpRetry);
+      watchPolling(bot);
       launchTelegramBotWithRetry(bot);
       // Route throttled operator error notices (MAX down, delivery failures, internal
       // errors) to the target group. Captured in a const so the closure keeps the
@@ -545,6 +548,96 @@ async function announceGroupReadyOnce(bot: Telegraf): Promise<void> {
 // delay starts over instead of staying at the 60 s cap accumulated over the process's life.
 const TELEGRAM_STABLE_POLLING_MS = 10 * 60_000;
 
+// --- Telegram polling watchdog -------------------------------------------------------------------
+// Telegraf gives every API call 500 s (hard-coded), and getUpdates is a ≤50 s long poll. When its
+// connection dies quietly — a local proxy that came up after the bridge, a NAT dropping it — the
+// bridge looked connected but was deaf for up to 8 minutes (a user's home server after a reboot,
+// 2026-10-13). A poll in flight past POLL_STALL_MS is cut and polling relaunched; a second stall
+// soon after that ends the process and Docker (restart: unless-stopped) starts it afresh.
+const POLL_STALL_MS = 120_000;
+const POLL_RESTALL_WINDOW_MS = 10 * 60_000;
+let pollInFlightSince: number | null = null;
+let lastPollRelaunchAt = 0;
+
+/**
+ * Notes when a polling getUpdates goes out and when it settles — the watchdog's only signal. Only the
+ * long polls (`timeout` > 0): a stopped Telegraf also sends a short `{offset, limit: 1}` one with no
+ * abort signal, which on a dead connection would hang and look like a second stall.
+ */
+function watchPolling(bot_: Telegraf): void {
+  const callApi = bot_.telegram.callApi.bind(bot_.telegram);
+  bot_.telegram.callApi = ((method: string, payload: unknown, extra?: unknown) => {
+    const longPoll = method === 'getUpdates' && Number((payload as { timeout?: unknown } | null)?.timeout) > 0;
+    if (!longPoll) return (callApi as (m: string, p: unknown, e?: unknown) => Promise<unknown>)(method, payload, extra);
+    pollInFlightSince = Date.now();
+    return (callApi as (m: string, p: unknown, e?: unknown) => Promise<unknown>)(method, payload, extra).finally(() => {
+      pollInFlightSince = null;
+    });
+  }) as typeof bot_.telegram.callApi;
+  setInterval(() => {
+    if (pollInFlightSince == null || Date.now() - pollInFlightSince < POLL_STALL_MS) return;
+    const stalledFor = Math.round((Date.now() - pollInFlightSince) / 1000);
+    pollInFlightSince = null;
+    if (Date.now() - lastPollRelaunchAt < POLL_RESTALL_WINDOW_MS) {
+      logger.error(`Telegram polling stalled again (${stalledFor}s without an answer) soon after a reconnect — restarting the bridge`);
+      void reportError({ kind: 'internal', step: 'telegram-poll-stall', error: new Error(`getUpdates hung ${stalledFor}s twice — restart`) });
+      exitForRestart(1);
+      return;
+    }
+    lastPollRelaunchAt = Date.now();
+    logger.error(`Telegram polling stalled: getUpdates unanswered for ${stalledFor}s — cutting it and reconnecting`);
+    void reportError({ kind: 'internal', step: 'telegram-poll-stall', error: new Error(`getUpdates hung ${stalledFor}s — reconnected`) });
+    try {
+      bot_.stop('watchdog'); // aborts the hung request; that launch() then resolves quietly
+    } catch {
+      // not running — the relaunch below starts it
+    }
+    // After the stopped loop's own short getUpdates (offset sync): two at once get a 409 from Telegram.
+    setTimeout(() => void launchTelegramBotWithRetry(bot_), 5_000);
+  }, 30_000).unref();
+}
+
+/** Ends the process for Docker (restart: unless-stopped) to start it again — the panel's «Перезапустить» and the watchdog's last resort. */
+function exitForRestart(code: number): void {
+  try {
+    maxSession.shutdown();
+  } catch {
+    // exiting anyway
+  }
+  try {
+    bot?.stop('restart');
+  } catch {
+    // not running
+  }
+  setTimeout(() => process.exit(code), 800);
+}
+
+// «🔁 Перезапустить мост» (panel → Система): where the press came from, so the bridge that comes
+// back can put the panel back with «✅ Мост перезапущен» instead of leaving «Перезапускаю…».
+const RESTART_REQUESTED_MARKER = path.join(process.cwd(), '.data', 'restart-requested');
+
+async function restartFromPanel(where: { chatId: number; messageId: number }): Promise<void> {
+  logger.info('Restart requested from the panel');
+  await writeFile(RESTART_REQUESTED_MARKER, JSON.stringify({ ...where, at: Date.now() })).catch((err) => logger.error('Failed to write the restart marker', err));
+  exitForRestart(0);
+}
+
+async function reportIfJustRestarted(bot_: Telegraf): Promise<void> {
+  let marker: { chatId?: number; messageId?: number; at?: number };
+  try {
+    marker = JSON.parse(await readFile(RESTART_REQUESTED_MARKER, 'utf8')) as typeof marker;
+  } catch {
+    return;
+  }
+  await unlink(RESTART_REQUESTED_MARKER).catch(() => {});
+  // A marker older than a few minutes is left over from a restart that never came back that way.
+  if (marker.chatId == null || marker.messageId == null || Date.now() - (marker.at ?? 0) > 10 * 60_000) return;
+  const { text, markup } = systemView(maxSession.pausedUntil != null, '✅ Мост перезапущен — всё работает.');
+  await bot_.telegram
+    .editMessageText(marker.chatId, marker.messageId, undefined, text, { reply_markup: markup })
+    .catch((err) => logger.error('Failed to put the panel back after a restart', err));
+}
+
 function retryTelegramLaunch(bot: Telegraf, attempt: number, reason: unknown): void {
   tgActive = false;
   const idx = Math.min(attempt, TELEGRAM_RETRY_DELAYS_MS.length - 1);
@@ -578,6 +671,7 @@ async function launchTelegramBotWithRetry(bot: Telegraf, attempt = 0): Promise<v
   bot.telegram.setMyDescription(buildBotDescription()).catch((err) => logger.error('Failed to set bot description', err));
   bot.telegram.setMyCommands(BOT_COMMANDS).catch((err) => logger.error('Failed to set bot commands', err));
   void reportIfJustUpdated(bot);
+  void reportIfJustRestarted(bot);
   // SessionStore parked an unreadable session file (corrupt, or encrypted with a different
   // MAX_SESSION_KEY — the usual cause is restoring ./data without carrying .env across). The bridge
   // is up but unauthenticated, so say so in the group with the same re-auth prompt a rejected

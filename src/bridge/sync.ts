@@ -774,18 +774,23 @@ export function historyStartTime(now: number = Date.now()): number {
  * (batches can re-include the boundary message), oldest-first. With `sinceTime` only strictly
  * newer messages are returned and paging stops once a batch's oldest is at/before it — the cheap
  * "what's new since last time" every catch-up runs (a push arriving between TCP sessions is
- * otherwise lost forever — hit live 2026-08-12, mid-redeploy).
+ * otherwise lost forever — hit live 2026-08-12, mid-redeploy). `limit` (a chat filled from scratch,
+ * HISTORY_LIMIT) stops paging once that many are in hand and keeps the newest; `truncated` says
+ * older messages were left in MAX.
  */
 async function fetchFullHistory(
   max: MaxClient,
   chatId: unknown,
   sinceTime: number | null = null,
   isCancelled?: () => boolean,
-): Promise<MaxHistoryMessage[]> {
+  limit = 0,
+): Promise<{ messages: MaxHistoryMessage[]; truncated: boolean }> {
   const all: MaxHistoryMessage[] = [];
   const seenIds = new Set<string>();
   let fromTime = historyStartTime();
   for (let i = 0; i < HISTORY_MAX_BATCHES; i++) {
+    // One more than the limit tells «there is older history» from «the chat is exactly this long».
+    if (limit > 0 && all.length > limit) break;
     // A big chat pages for a minute or more — /reboot and /kill wait for the run to stop.
     if (isCancelled?.()) throw new SyncCancelledError();
     const batch = await max.getChatHistory(chatId, fromTime, HISTORY_BATCH_SIZE);
@@ -808,7 +813,41 @@ async function fetchFullHistory(
     fromTime = oldestTime;
   }
   all.sort((a, b) => a.time - b.time);
-  return all;
+  const truncated = limit > 0 && all.length > limit;
+  return { messages: truncated ? all.slice(-limit) : all, truncated };
+}
+
+/** What the bridge's admin reads when writing to the bot's DM (anything but /login). Pure + exported for unit testing. */
+export function adminDmHintText(groupTitle: string): string {
+  return [
+    '👋 Это ваш мост Telemax. Здесь, в личке, работает только вход в MAX — /login.',
+    '',
+    `Всё остальное — в группе моста${groupTitle ? ` «${groupTitle}»` : ''}:`,
+    '• /panel — пульт, в общей теме',
+    '• /info, /file, /broadcast — в теме нужного чата',
+    '• /help — все команды',
+  ].join('\n');
+}
+
+/** A members' link to the bridge's supergroup: https://t.me/c/<id without -100>. */
+export function bridgeGroupLink(groupId: string): string {
+  return `https://t.me/c/${groupId.replace(/^-100/, '')}`;
+}
+
+/** The first line of a topic HISTORY_LIMIT cut short: «последние 300 сообщений» (agreed with the number). */
+export function historyLimitNotice(limit: number): string {
+  const d = limit % 10;
+  const dd = limit % 100;
+  const one = d === 1 && dd !== 11;
+  const few = d >= 2 && d <= 4 && (dd < 12 || dd > 14);
+  const phrase = one ? `последнее ${limit} сообщение` : `последние ${limit} ${few ? 'сообщения' : 'сообщений'}`;
+  return `📜 Здесь ${phrase} этого чата — так задано при установке (HISTORY_LIMIT в .env). Более ранняя переписка осталась в MAX.`;
+}
+
+/** HISTORY_LIMIT from .env: how many of a chat's newest messages a topic filled from scratch gets (0 = all). */
+export function historyLimitFromEnv(env: NodeJS.ProcessEnv = process.env): number {
+  const n = Number((env.HISTORY_LIMIT ?? '').trim());
+  return Number.isInteger(n) && n > 0 ? n : 0;
 }
 
 /** A received forward's `link` — the same shape on PUSH_MESSAGE and in CHAT_HISTORY. */
@@ -952,6 +991,8 @@ export interface ChatCatchUpDeps {
   paceMs?: number;
   /** A message the catch-up put into its topic — «трансляция» copies it on (broadcast.ts; its cursor drops replays). */
   onRelayed?: (c: IncomingCopy) => void;
+  /** HISTORY_LIMIT: newest messages a topic filled from scratch gets (0 / unset = the whole history). */
+  historyLimit?: number;
 }
 
 /**
@@ -1093,9 +1134,17 @@ export class ChatCatchUp {
    */
   private async replay(chatId: unknown, topicId: number, cursor: number | null, cancelled: () => boolean): Promise<void> {
     const session = this.session;
-    const history = await fetchFullHistory(this.deps.max, chatId, cursor, cancelled);
+    // HISTORY_LIMIT caps only a topic filled from scratch; a catch-up from a cursor takes everything new.
+    const limit = cursor == null ? (this.deps.historyLimit ?? 0) : 0;
+    const { messages: history, truncated } = await fetchFullHistory(this.deps.max, chatId, cursor, cancelled, limit);
     if (history.length > 0) {
-      logger.info(`${cursor == null ? 'Backfilling' : 'Catching up on'} ${history.length} messages for MAX chat ${String(chatId)}`);
+      logger.info(
+        `${cursor == null ? 'Backfilling' : 'Catching up on'} ${history.length} messages for MAX chat ${String(chatId)}${truncated ? ` (the newest ${limit} — HISTORY_LIMIT)` : ''}`,
+      );
+      // Says why the topic starts mid-conversation — a 5 000-message chat needs ~4 hours in full.
+      if (truncated) {
+        await sendTextPieces(this.deps.bot, this.deps.groupId, topicId, historyLimitNotice(limit));
+      }
       await this.backfill(chatId, topicId, history, cancelled);
     }
     if (session === this.session) this.caughtUp.add(String(chatId));
@@ -1473,6 +1522,8 @@ export interface BridgeOptions {
   auth: MaxAuthCallbacks;
   /** The panel's MAX pause (server/maxSession.ts). */
   pause: PauseControl;
+  /** The panel's «🔁 Перезапустить мост»: ends the process for Docker to start again (server/app.ts). */
+  restartBridge?: (where: { chatId: number; messageId: number }) => void;
 }
 
 /** Wires MAX push messages <-> Telegram forum topics in both directions (ТЗ.md §1.2). */
@@ -1496,6 +1547,7 @@ export function wireBridge({
   suspendChatSync,
   auth,
   pause,
+  restartBridge,
 }: BridgeOptions): WiredBridge {
   // Bug-report channel: private DMs from outsiders become bug reports. The inbox is only ON where
   // BUGREPORT_INBOX is set (the maintainer's prod bot); elsewhere outsiders get a redirect stub.
@@ -1554,6 +1606,7 @@ export function wireBridge({
         // A broadcast's chat picker, then the /login auth flow get first refusal (both admin-gate internally).
         if (await broadcasts.handlePrivate(ctx)) return;
         if (await maxAuth.handlePrivate(ctx)) return;
+        if (await adminDmHint(ctx)) return;
         await bugReports.handleIncomingPrivate(ctx);
         return;
       }
@@ -1611,6 +1664,25 @@ export function wireBridge({
     }
   });
 
+  // The bridge's own admin writing to the bot's DM is told where the bridge lives instead of getting
+  // the outsiders' bug-report redirect: a user typed /panel, /info, /broadcast here and got «пишите в
+  // баг-бот» every time, and took the bridge for broken (2026-10-13). Only /login works in the DM.
+  let bridgeGroupTitle: string | undefined;
+  async function adminDmHint(ctx: Context): Promise<boolean> {
+    const userId = ctx.from?.id;
+    if (userId == null || !ctx.message || !(await isGroupAdmin(userId).catch(() => false))) return false;
+    if (bridgeGroupTitle === undefined) {
+      const chat = await bot.telegram.getChat(targetGroupId).catch(() => undefined);
+      bridgeGroupTitle = chat && 'title' in chat ? chat.title : '';
+    }
+    await ctx
+      .reply(adminDmHintText(bridgeGroupTitle), {
+        reply_markup: Markup.inlineKeyboard([[Markup.button.url('➡️ Открыть группу моста', bridgeGroupLink(targetGroupId))]]).reply_markup,
+      })
+      .catch((err) => logger.error('Failed to send the admin DM hint', err));
+    return true;
+  }
+
   /** Creator/administrator of the bridge group — the one notion of "admin" for commands, buttons and the 👎 delete gesture. Throws when Telegram can't be asked; callers fail closed. */
   async function isGroupAdmin(userId: number): Promise<boolean> {
     const member = await bot.telegram.getChatMember(targetGroupId, userId);
@@ -1640,6 +1712,7 @@ export function wireBridge({
     forgetChatLinks,
     isWiping: () => wiping,
     onRelayed: (c) => broadcasts.copyIncoming(c),
+    historyLimit: historyLimitFromEnv(),
   });
 
   /**
@@ -2925,6 +2998,7 @@ export function wireBridge({
     triggerFullResync,
     startDialog,
     pause,
+    restart: restartBridge,
     files: fileShare,
     resendToMax: (id) => bigFiles.resendToMax(id),
     offerStore: (panelMessageId) => bigFiles.offerStore(panelMessageId),

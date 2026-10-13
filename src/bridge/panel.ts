@@ -48,6 +48,8 @@ export interface ControlPanelDeps {
   offerStore?: (panelMessageId: number) => Promise<void>;
   /** «📤 Отправить в MAX» for a stored file that didn't make it (bigFiles.ts). */
   resendToMax?: (id: string) => Promise<{ ok: boolean; text: string }>;
+  /** «🔁 Перезапустить мост»: ends the process for Docker to start it again (server/app.ts); `where` = the panel message to put back afterwards. */
+  restart?: (where: { chatId: number; messageId: number }) => void;
 }
 
 export interface PauseControl {
@@ -342,17 +344,29 @@ function webView(botUsername?: string): View {
     markup: Markup.inlineKeyboard(rows).reply_markup,
   };
 }
-function systemView(paused: boolean): View {
+/** «⚙️ Система» — exported for the bridge that comes back from «🔁 Перезапустить мост» (server/app.ts), with `note` under the title. */
+export function systemView(paused: boolean, note?: string): View {
   const pauseBtn = paused
     ? Markup.button.callback('▶️ Возобновить MAX', 'tlmx_panel:resume')
     : Markup.button.callback('⏸ Пауза MAX', 'tlmx_panel:pause');
   return {
-    text: '⚙️ Система:',
+    text: note ? `⚙️ Система:\n${note}` : '⚙️ Система:',
     markup: Markup.inlineKeyboard([
       [Markup.button.callback('📊 Статус', 'tlmx_panel:status')],
       [pauseBtn, Markup.button.callback('⬆️ Обновление', 'tlmx_panel:update')],
       [Markup.button.callback('🔄 Пересинхронизация', 'tlmx_panel:resync'), Markup.button.callback('📋 Команды', 'tlmx_panel:help')],
+      [Markup.button.callback('🔁 Перезапустить мост', 'tlmx_panel:restart')],
       [Markup.button.callback('◀️ Назад', 'tlmx_panel:root')],
+    ]).reply_markup,
+  };
+}
+function restartConfirmView(): View {
+  return {
+    text:
+      '🔁 Перезапустить мост?\nКонтейнер перезапустится без пересборки — примерно за 10–20 секунд. Переписка не пострадает: что придёт за это время, догрузится само. Загрузка большого файла, если она идёт прямо сейчас, прервётся.\nПомогает, если мост ведёт себя странно. Не помог — пришлите /panel → 📊 Статус и логи разработчику.',
+    markup: Markup.inlineKeyboard([
+      [Markup.button.callback('🔁 Да, перезапустить', 'tlmx_panel:restart:go')],
+      [Markup.button.callback('◀️ Назад', 'tlmx_panel:system')],
     ]).reply_markup,
   };
 }
@@ -368,7 +382,7 @@ function pauseView(): View {
 }
 
 export function wireControlPanel(deps: ControlPanelDeps): void {
-  const { bot, targetGroupId, max, getActivePhone, triggerFullResync, leaves, startDialog, resolveContactName, getStatus, pause, files, resendToMax, offerStore } = deps;
+  const { bot, targetGroupId, max, getActivePhone, triggerFullResync, leaves, startDialog, resolveContactName, getStatus, pause, files, resendToMax, offerStore, restart } = deps;
   const card = (f: StoredFile, link?: string): View => fileCardView(f, files!, link, Boolean(resendToMax));
   const root = (): View => rootView(getActivePhone(), pause.until());
   const system = (): View => systemView(pause.until() != null);
@@ -593,6 +607,25 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
     await ctx.answerCbQuery('Пересинхронизация запущена');
     await ctx.reply('🔄 Пересинхронизация запущена…').catch(() => {});
     void triggerFullResync().catch((err) => logger.error('panel resync failed', err));
+  });
+
+  // «🔁 Перезапустить мост»: the process ends and Docker starts it again — no rebuild, no SSH. The
+  // way to unstick a bridge while it still answers (a user asked for one after a host reboot,
+  // 2026-10-13); a deaf one is the polling watchdog's job (server/app.ts).
+  bot.action('tlmx_panel:restart', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    await edit(ctx, restartConfirmView());
+  });
+  bot.action('tlmx_panel:restart:go', async (ctx) => {
+    const chatId = ctx.callbackQuery.message?.chat.id;
+    const messageId = ctx.callbackQuery.message?.message_id;
+    if (!restart || chatId == null || messageId == null) {
+      await ctx.answerCbQuery('Перезапуск отсюда недоступен — docker compose restart в папке моста', { show_alert: true }).catch(() => {});
+      return;
+    }
+    await ctx.answerCbQuery('Перезапускаю…').catch(() => {});
+    await ctx.editMessageText('🔁 Перезапускаю мост… Вернусь через 10–20 секунд — этот пульт обновится сам.').catch(() => {});
+    restart({ chatId, messageId });
   });
 
   // «📊 Статус»: server/bridge health in one card (see status.ts for what is and isn't visible).

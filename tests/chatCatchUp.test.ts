@@ -6,7 +6,7 @@ import type { Telegraf } from 'telegraf';
 import type { MaxClient, MaxHistoryMessage } from '../src/max/client.js';
 import { ChatMapStore } from '../src/store/chatMapStore.js';
 import { ChatBannedError, StrikeCounter } from '../src/bridge/catchUp.js';
-import { ChatCatchUp, MessageLinkStore, syncAllChatsToTelegram } from '../src/bridge/sync.js';
+import { ChatCatchUp, MessageLinkStore, historyLimitFromEnv, historyLimitNotice, syncAllChatsToTelegram } from '../src/bridge/sync.js';
 
 // One writer per chat, catch-up on first touch, and the cursor gate — see ChatCatchUp in sync.ts.
 
@@ -27,7 +27,7 @@ const threadNotFound = () => Object.assign(new Error('400: Bad Request: message 
 const msg = (id: number, time: number, text: string): MaxHistoryMessage => ({ id, time, text }) as unknown as MaxHistoryMessage;
 const tick = (ms = 20) => new Promise((r) => setTimeout(r, ms));
 
-function fakeWorld(history: MaxHistoryMessage[] = [], onSend?: (text: string, topicId: number) => Promise<void> | void, strikes?: StrikeCounter) {
+function fakeWorld(history: MaxHistoryMessage[] = [], onSend?: (text: string, topicId: number) => Promise<void> | void, strikes?: StrikeCounter, historyLimit?: number) {
   const sends: Array<{ text: string; topicId: number }> = [];
   let nextId = 1000;
   const telegram = {
@@ -64,6 +64,7 @@ function fakeWorld(history: MaxHistoryMessage[] = [], onSend?: (text: string, to
     isWiping: () => wiping,
     paceMs: 5,
     ...(strikes ? { strikes } : {}),
+    ...(historyLimit ? { historyLimit } : {}),
   });
   const retry = vi.fn();
   sync.setRetryHandler(retry);
@@ -157,6 +158,25 @@ describe('ChatCatchUp — catch-up on first touch', () => {
     expect(w.sends.map((s) => s.text)).toEqual(['earlier, while offline', 'hello']);
     expect(w.sync.isCaughtUp(7)).toBe(true);
     expect((await store.getByMaxChatId(7))?.historyBackfillCursor).toBe('200');
+  });
+
+  it('HISTORY_LIMIT: a chat filled from scratch gets only its newest messages, under a line saying why', async () => {
+    const live = msg(5, 500, 'm5');
+    const w = fakeWorld([msg(1, 100, 'm1'), msg(2, 200, 'm2'), msg(3, 300, 'm3'), msg(4, 400, 'm4'), live], undefined, undefined, 2);
+    await w.livePush(8, live);
+    expect(w.sends.map((s) => s.text)).toEqual([historyLimitNotice(2), 'm4', 'm5']);
+    expect((await store.getByMaxChatId(8))?.historyBackfillCursor).toBe('500');
+  });
+
+  it('HISTORY_LIMIT leaves a catch-up from a cursor alone, and a chat no longer than the limit gets no notice', async () => {
+    await store.upsert({ maxChatId: '43', telegramTopicId: 101, title: 'Б', createdAt: 'x', historyBackfillCursor: '50' });
+    const live = msg(3, 300, 'c');
+    const w = fakeWorld([msg(1, 100, 'a'), msg(2, 200, 'b'), live], undefined, undefined, 1);
+    await w.livePush(43, live);
+    expect(w.sends.map((s) => s.text)).toEqual(['a', 'b', 'c']);
+    const short = fakeWorld([msg(6, 600, 'only')], undefined, undefined, 5);
+    await short.livePush(44, msg(6, 600, 'only'));
+    expect(short.sends.map((s) => s.text)).toEqual(['only']);
   });
 
   it('a transient failure in the catch-up leaves the cursor before the failed message and the chat out of caughtUp', async () => {
@@ -349,5 +369,25 @@ describe('ChatBannedError', () => {
     const err = new ChatBannedError('7');
     expect(err.chatId).toBe('7');
     expect(err.name).toBe('ChatBannedError');
+  });
+});
+
+describe('HISTORY_LIMIT setting', () => {
+  it('reads a positive whole number, anything else means the whole history', () => {
+    expect(historyLimitFromEnv({ HISTORY_LIMIT: '300' })).toBe(300);
+    expect(historyLimitFromEnv({ HISTORY_LIMIT: ' 50 ' })).toBe(50);
+    expect(historyLimitFromEnv({})).toBe(0);
+    expect(historyLimitFromEnv({ HISTORY_LIMIT: '0' })).toBe(0);
+    expect(historyLimitFromEnv({ HISTORY_LIMIT: '-5' })).toBe(0);
+    expect(historyLimitFromEnv({ HISTORY_LIMIT: 'all' })).toBe(0);
+    expect(historyLimitFromEnv({ HISTORY_LIMIT: '1.5' })).toBe(0);
+  });
+
+  it('says the number the Russian way', () => {
+    expect(historyLimitNotice(1)).toMatch(/^📜 Здесь последнее 1 сообщение этого чата/);
+    expect(historyLimitNotice(3)).toMatch(/последние 3 сообщения этого/);
+    expect(historyLimitNotice(12)).toMatch(/последние 12 сообщений этого/);
+    expect(historyLimitNotice(21)).toMatch(/последнее 21 сообщение этого/);
+    expect(historyLimitNotice(300)).toMatch(/последние 300 сообщений этого/);
   });
 });
