@@ -47,6 +47,15 @@ export function normalizeError(error) {
     .slice(0, 160);
 }
 
+/**
+ * Causes the bridge already explains to its owner — counted in /reports, not announced to the
+ * maintainer. The user (2026-10-14): ports 80/443 closed or taken by another web server in the
+ * big-file service «обрабатывается автоматически» — the bot names the cause and the fix in the topic.
+ */
+export function isMutedReport(report) {
+  return report.step === 'big-file: service' && /порт/i.test(String(report.error ?? ''));
+}
+
 export function signatureOf(report) {
   return `${report.kind}|${report.step ?? ''}|${normalizeError(report.error)}`;
 }

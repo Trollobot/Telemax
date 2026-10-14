@@ -11,7 +11,7 @@ import { createReadStream } from 'node:fs';
 import { createGunzip } from 'node:zlib';
 import { createInterface } from 'node:readline';
 import path from 'node:path';
-import { sanitizeReport, acceptReport, recordReport, scheduleNotice, dueIn, formatNotice, listReports } from './reports.mjs';
+import { sanitizeReport, acceptReport, recordReport, isMutedReport, scheduleNotice, dueIn, formatNotice, listReports } from './reports.mjs';
 import { createSiteStats, summarize, createGeoBuilder, cleanIp } from './site.mjs';
 import { MAX_PACKAGES_URL, BRIDGE_CLIENT_URL, parsePackages, newestPackage, parseBridgeDefaults, shouldNotify, formatVersionNotice } from './maxversion.mjs';
 
@@ -322,7 +322,8 @@ const server = createServer(async (req, res) => {
       if (report && !ipRateLimited(ip, reportsByIp, REPORT_LIMIT_PER_IP) && acceptReport(report, db, reportsByInstall, now)) {
         const { sig, isNew } = recordReport(reports.signatures, report, now);
         // Queue first, save second: a notice waiting out the hourly limit must survive a restart.
-        if (isNew) void notifyMaintainer(sig);
+        // A muted cause is still counted in /reports, just not announced (isMutedReport).
+        if (isNew && !isMutedReport(report)) void notifyMaintainer(sig);
         void save(REPORTS_FILE, reports);
       }
     } catch {

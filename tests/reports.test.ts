@@ -4,6 +4,7 @@ import {
   acceptReport,
   dueIn,
   formatNotice,
+  isMutedReport,
   listReports,
   normalizeError,
   recordReport,
@@ -135,5 +136,15 @@ describe('formatNotice', () => {
     expect(text).toContain('Ubuntu 22.04');
     expect(text).toContain('и ещё 1 новых');
     expect(text).not.toContain('secret-install');
+  });
+});
+
+describe('muted causes', () => {
+  it('ports 80/443 in the big-file service are counted but not announced — the bot already explains them', () => {
+    expect(isMutedReport({ step: 'big-file: service', error: 'закрыты порты 80 и 443.' })).toBe(true);
+    expect(isMutedReport({ step: 'big-file: service', error: 'порты 80 и 443 заняты другим веб-сервером.' })).toBe(true);
+    expect(isMutedReport({ step: 'big-file: service', error: 'у сервера нет белого IP' })).toBe(false);
+    expect(isMutedReport({ step: 'telegram-poll-stall', error: 'getUpdates hung 123s — reconnected' })).toBe(false);
+    expect(isMutedReport({ step: 'update', error: 'порт' })).toBe(false);
   });
 });

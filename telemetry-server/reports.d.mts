@@ -35,6 +35,7 @@ export const MAX_SIGNATURES: number;
 export const MAX_INSTALLS_PER_SIGNATURE: number;
 export function sanitizeReport(body: unknown): Report | null;
 export function normalizeError(error: unknown): string;
+export function isMutedReport(report: Pick<Report, 'step' | 'error'>): boolean;
 export function signatureOf(report: Pick<Report, 'kind' | 'step' | 'error'>): string;
 export function acceptReport(report: Report, installs: Record<string, unknown>, recent: Map<string, number[]>, now: number): boolean;
 export function recordReport(signatures: Record<string, SignatureEntry>, report: Report, now: number): { sig: string; isNew: boolean };
