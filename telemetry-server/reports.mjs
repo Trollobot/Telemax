@@ -53,6 +53,9 @@ export function normalizeError(error) {
  * big-file service «обрабатывается автоматически» — the bot names the cause and the fix in the topic.
  */
 export function isMutedReport(report) {
+  // MAX outages (1.3.8+): counted to tell one install's flaky line from MAX down for everyone —
+  // read in /reports, never announced one by one.
+  if (report.step === 'max-down') return true;
   return report.step === 'big-file: service' && /порт/i.test(String(report.error ?? ''));
 }
 

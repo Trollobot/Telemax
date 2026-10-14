@@ -236,6 +236,63 @@ export function imageExtension(buf: Uint8Array): string {
   return 'jpg';
 }
 
+/**
+ * An image's pixel size from its header — JPEG (SOF segment), PNG, GIF, BMP, WebP (VP8, VP8L, VP8X)
+ * — without decoding it; null when unknown or truncated. Pure + exported for unit testing.
+ */
+export function imageSize(buf: Uint8Array): { width: number; height: number } | null {
+  const ascii = (from: number, to: number) => String.fromCharCode(...buf.subarray(from, to));
+  const u16be = (i: number) => (buf[i]! << 8) | buf[i + 1]!;
+  const u16le = (i: number) => buf[i]! | (buf[i + 1]! << 8);
+  const u24le = (i: number) => buf[i]! | (buf[i + 1]! << 8) | (buf[i + 2]! << 16);
+  const u32be = (i: number) => ((buf[i]! << 24) >>> 0) + (buf[i + 1]! << 16) + (buf[i + 2]! << 8) + buf[i + 3]!;
+  const ok = (width: number, height: number) => (width > 0 && height > 0 ? { width, height } : null);
+  if (buf.length >= 24 && buf[0] === 0x89 && ascii(1, 4) === 'PNG') return ok(u32be(16), u32be(20));
+  if (buf.length >= 10 && ascii(0, 4) === 'GIF8') return ok(u16le(6), u16le(8));
+  if (buf.length >= 26 && ascii(0, 2) === 'BM') {
+    const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+    return ok(Math.abs(view.getInt32(18, true)), Math.abs(view.getInt32(22, true)));
+  }
+  if (buf.length >= 16 && ascii(0, 4) === 'RIFF' && ascii(8, 12) === 'WEBP') {
+    const chunk = ascii(12, 16);
+    if (chunk === 'VP8 ' && buf.length >= 30 && buf[23] === 0x9d && buf[24] === 0x01 && buf[25] === 0x2a) return ok(u16le(26) & 0x3fff, u16le(28) & 0x3fff);
+    if (chunk === 'VP8L' && buf.length >= 25 && buf[20] === 0x2f) {
+      const [b1, b2, b3, b4] = [buf[21]!, buf[22]!, buf[23]!, buf[24]!];
+      return ok(1 + (b1 | ((b2 & 0x3f) << 8)), 1 + (((b2 & 0xc0) >> 6) | (b3 << 2) | ((b4 & 0x0f) << 10)));
+    }
+    if (chunk === 'VP8X' && buf.length >= 30) return ok(1 + u24le(24), 1 + u24le(27));
+    return null;
+  }
+  if (buf.length >= 4 && buf[0] === 0xff && buf[1] === 0xd8) {
+    let i = 2;
+    while (i + 9 < buf.length) {
+      if (buf[i] !== 0xff) return null;
+      const marker = buf[i + 1]!;
+      if (marker === 0xff) {
+        i += 1; // fill byte
+        continue;
+      }
+      // SOF0–SOF15, except DHT (C4), JPG (C8), DAC (CC): height then width.
+      if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) return ok(u16be(i + 7), u16be(i + 5));
+      i += 2 + u16be(i + 2);
+    }
+  }
+  return null;
+}
+
+/**
+ * Whether a picture survives as a Telegram photo. sendPhoto's documented limits are w+h ≤ 10 000
+ * and a ratio ≤ 20 — yet a 1810×44 MAX picture (41:1) was ACCEPTED and shrunk to a blurry,
+ * unzoomable ~1280×31 strip (live 2026-10-13). So: within those limits, and its short side still
+ * ≥ 64 px once Telegram brings the long side down to 1280. Pure + exported for unit testing.
+ */
+export function fitsTelegramPhoto({ width, height }: { width: number; height: number }): boolean {
+  const long = Math.max(width, height);
+  const short = Math.min(width, height);
+  if (width + height > 10_000 || long / short > 20) return false;
+  return long <= 1280 || (short * 1280) / long >= 64;
+}
+
 /** Image formats Telegram doesn't take as a photo — they go as a file straight away instead of a doomed sendPhoto. A safety net: MAX serves its photos as its own WebP/JPEG copies (a HEIC came as WebP, live 2026-10-13). */
 export const PHOTO_AS_FILE = new Set(['heic', 'tiff', 'avif']);
 

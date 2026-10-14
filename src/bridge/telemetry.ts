@@ -124,6 +124,9 @@ export function detectRestartLoop(previous: number[], now: number): { boots: num
 }
 
 const sentReports: { key: string; at: number }[] = [];
+// MAX outages (step 'max-down') keep their own budget: a flaky line must not use up the five
+// reports a day that real errors need.
+const sentOutageReports: { key: string; at: number }[] = [];
 
 /**
  * Sends an anonymous error report. Best-effort: never throws, no-op when telemetry is off.
@@ -136,7 +139,10 @@ export async function reportError(report: ErrorReport): Promise<void> {
   if (isTelemetryDisabled()) return;
   try {
     const error = report.error === undefined ? undefined : scrubError(report.error);
-    if (!shouldSendReport(sentReports, `${report.kind}|${error ?? ''}`, Date.now())) return;
+    const budget = report.step === 'max-down' ? sentOutageReports : sentReports;
+    // An outage is keyed by its cause alone — «~3 min» vs «~4 min» is the same kind of drop.
+    const key = report.step === 'max-down' ? `max-down|${(error ?? '').replace(/\d+/g, '#')}` : `${report.kind}|${error ?? ''}`;
+    if (!shouldSendReport(budget, key, Date.now())) return;
     const freeMb = await statfs(DATA_DIR).then(
       (s) => Math.round((s.bavail * s.bsize) / 1048576),
       () => undefined,

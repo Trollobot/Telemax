@@ -3,7 +3,7 @@ import type { Telegraf } from 'telegraf';
 import { splitTelegramText, truncateCodePoints, truncateUtf16, MAX_TEXT_LIMIT, TELEGRAM_TEXT_LIMIT } from '../src/bridge/text.js';
 import { dialogParticipantIds, isFallbackTitle, resolveChatName, resolveContactDisplayName } from '../src/max/names.js';
 import { clampTopicTitle, ensureTopicForMaxChat, withTopicLock } from '../src/telegram/bot.js';
-import { imageExtension, telegramSendKind, TELEGRAM_PHOTO_LIMIT_BYTES, TELEGRAM_UPLOAD_LIMIT_BYTES } from '../src/bridge/attachments.js';
+import { fitsTelegramPhoto, imageExtension, imageSize, telegramSendKind, TELEGRAM_PHOTO_LIMIT_BYTES, TELEGRAM_UPLOAD_LIMIT_BYTES } from '../src/bridge/attachments.js';
 import {
   buildLinkIds,
   describeUnrelayableTelegramMessage,
@@ -513,5 +513,38 @@ describe('imageExtension (a MAX picture named by what it really is)', () => {
     expect(imageExtension(bytes([0, 0, 0, 0x1c], 'ftypavif'))).toBe('avif');
     expect(imageExtension(bytes([0, 0, 0, 0x18], 'ftypisom'))).toBe('jpg');
     expect(imageExtension(new Uint8Array(0))).toBe('jpg');
+  });
+});
+
+describe('imageSize + fitsTelegramPhoto (a narrow MAX picture goes as a file, not a squashed photo)', () => {
+  const b = (...parts: Array<string | number[]>) => Uint8Array.from(parts.flatMap((p) => (typeof p === 'string' ? [...p].map((c) => c.charCodeAt(0)) : p)));
+  const be32 = (n: number) => [(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255];
+  const le16 = (n: number) => [n & 255, (n >>> 8) & 255];
+  const le24 = (n: number) => [n & 255, (n >>> 8) & 255, (n >>> 16) & 255];
+  const le32 = (n: number) => [n & 255, (n >>> 8) & 255, (n >>> 16) & 255, (n >>> 24) & 255];
+
+  it('reads the size from every header MAX hands out', () => {
+    expect(imageSize(b([0x89], 'PNG', [13, 10, 26, 10], be32(13), 'IHDR', be32(1810), be32(44)))).toEqual({ width: 1810, height: 44 });
+    expect(imageSize(b('GIF89a', le16(320), le16(240)))).toEqual({ width: 320, height: 240 });
+    expect(imageSize(b('BM', new Array(16).fill(0), le32(640), le32(-480)))).toEqual({ width: 640, height: 480 });
+    expect(imageSize(b('RIFF', le32(0), 'WEBP', 'VP8X', le32(10), [0, 0, 0, 0], le24(1809), le24(43)))).toEqual({ width: 1810, height: 44 });
+    expect(imageSize(b('RIFF', le32(0), 'WEBP', 'VP8 ', le32(0), [0, 0, 0], [0x9d, 0x01, 0x2a], le16(1200), le16(630)))).toEqual({ width: 1200, height: 630 });
+    // VP8L: 14 bits of width-1 then 14 bits of height-1, little-endian bit order: 100×50 → 99, 49.
+    const bits = 99 | (49 << 14);
+    expect(imageSize(b('RIFF', le32(0), 'WEBP', 'VP8L', le32(0), [0x2f], le32(bits)))).toEqual({ width: 100, height: 50 });
+    const jpeg = b([0xff, 0xd8], [0xff, 0xe0], [0, 16], 'JFIF', new Array(10).fill(0), [0xff, 0xc0], [0, 17, 8], [0, 44], [0x07, 0x12], new Array(12).fill(0));
+    expect(imageSize(jpeg)).toEqual({ width: 1810, height: 44 });
+    expect(imageSize(b('nothing an image'))).toBeNull();
+    expect(imageSize(b([0xff, 0xd8, 0xff]))).toBeNull();
+  });
+
+  it('keeps ordinary photos as photos and sends strips, giants and extreme ratios as files', () => {
+    expect(fitsTelegramPhoto({ width: 1810, height: 44 })).toBe(false); // the live case
+    expect(fitsTelegramPhoto({ width: 4000, height: 3000 })).toBe(true);
+    expect(fitsTelegramPhoto({ width: 1000, height: 60 })).toBe(true); // not downscaled — stays readable
+    expect(fitsTelegramPhoto({ width: 2000, height: 80 })).toBe(false); // ~1280×51 after Telegram's downscale
+    expect(fitsTelegramPhoto({ width: 9000, height: 1500 })).toBe(false); // w+h over 10 000
+    expect(fitsTelegramPhoto({ width: 300, height: 6100 })).toBe(false); // over 20:1
+    expect(fitsTelegramPhoto({ width: 4000, height: 1000 })).toBe(true); // a panorama
   });
 });

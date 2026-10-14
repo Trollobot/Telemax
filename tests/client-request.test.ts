@@ -286,10 +286,10 @@ describe('isUploadReadyPush', () => {
 describe('MAX user agent', () => {
   it('presents the current desktop client and lets .env override it', async () => {
     const { maxUserAgent } = await import('../src/max/client.js');
-    expect(maxUserAgent({})).toMatchObject({ deviceType: 'DESKTOP', appVersion: '26.35.1', buildNumber: 80662 });
+    expect(maxUserAgent({})).toMatchObject({ deviceType: 'DESKTOP', appVersion: '26.35.2', buildNumber: 80824 });
     expect(maxUserAgent({ MAX_APP_VERSION: '26.40.2', MAX_BUILD_NUMBER: '81234' })).toMatchObject({ appVersion: '26.40.2', buildNumber: 81234 });
     // Junk falls back to the built-in pair rather than sending something MAX would refuse outright.
-    expect(maxUserAgent({ MAX_APP_VERSION: 'latest', MAX_BUILD_NUMBER: '-1' })).toMatchObject({ appVersion: '26.35.1', buildNumber: 80662 });
+    expect(maxUserAgent({ MAX_APP_VERSION: 'latest', MAX_BUILD_NUMBER: '-1' })).toMatchObject({ appVersion: '26.35.2', buildNumber: 80824 });
   });
 });
 

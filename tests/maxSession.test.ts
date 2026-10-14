@@ -329,3 +329,39 @@ describe('MaxSessionController — «🚪 Выйти из MAX»', () => {
     expect(store.clear).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('MAX outage reports', () => {
+  it('name the cause from the client error', async () => {
+    const { outageCause, outageReportText } = await import('../src/server/maxSession.js');
+    expect(outageCause('MAX did not answer PING for 50s — connection is dead, reconnecting')).toBe('ping-timeout');
+    expect(outageCause('read ECONNRESET')).toBe('connection-reset');
+    expect(outageCause('getaddrinfo EAI_AGAIN api.oneme.ru')).toBe('dns');
+    expect(outageCause('connect ECONNREFUSED 1.2.3.4:443')).toBe('unreachable');
+    expect(outageCause('TLS handshake timed out after 15000 ms')).toBe('tls');
+    expect(outageCause('connect ETIMEDOUT 1.2.3.4:443')).toBe('connect-timeout');
+    expect(outageCause('')).toBe('socket-closed');
+    expect(outageReportText(185_000, 'ping-timeout')).toBe('MAX unreachable ~3 min: ping-timeout');
+    expect(outageReportText(20_000, null)).toBe('MAX unreachable ~1 min: socket-closed');
+  });
+
+  it('a reported outage is sent once MAX is back, with its length and first cause; a short blip is not', async () => {
+    const { ctl, client, reportError } = setup(null);
+    client.emit('ready');
+    await settle();
+    // A blip shorter than the notice window: no group notice, no report.
+    client.emit('error', new Error('read ECONNRESET'));
+    client.emit('disconnected');
+    await vi.advanceTimersByTimeAsync(30_000);
+    client.emit('ready');
+    await settle();
+    expect(reportError).not.toHaveBeenCalled();
+    // A real outage: past the 60 s window, then back.
+    client.emit('error', new Error('MAX did not answer PING for 50s — connection is dead, reconnecting'));
+    client.emit('disconnected');
+    await vi.advanceTimersByTimeAsync(3 * 60_000);
+    client.emit('ready');
+    await settle();
+    expect(reportError).toHaveBeenCalledWith({ kind: 'internal', step: 'max-down', error: 'MAX unreachable ~3 min: ping-timeout' });
+    expect(ctl.state).toBe('ready');
+  });
+});

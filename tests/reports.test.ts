@@ -146,5 +146,6 @@ describe('muted causes', () => {
     expect(isMutedReport({ step: 'big-file: service', error: 'у сервера нет белого IP' })).toBe(false);
     expect(isMutedReport({ step: 'telegram-poll-stall', error: 'getUpdates hung 123s — reconnected' })).toBe(false);
     expect(isMutedReport({ step: 'update', error: 'порт' })).toBe(false);
+    expect(isMutedReport({ step: 'max-down', error: 'MAX unreachable ~3 min: ping-timeout' })).toBe(true);
   });
 });

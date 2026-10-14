@@ -21,6 +21,8 @@ import {
   KEYBOARD_CONTACT,
   pressableButton,
   PHOTO_AS_FILE,
+  imageSize,
+  fitsTelegramPhoto,
   type MaxAttachment,
   type DownloadContext,
 } from './attachments.js';
@@ -707,6 +709,12 @@ async function sendOneAttachment(
     const ext = downloaded.filename.split('.').pop() ?? 'jpg';
     if (ext !== 'jpg') logger.info(`MAX photo arrived as ${ext} (${downloaded.buffer.byteLength} bytes)`);
     if (PHOTO_AS_FILE.has(ext)) return withFloodRetry(() => bot.telegram.sendDocument(groupId, source, opts));
+    // Telegram doesn't refuse a too-narrow picture — it squashes it (1810×44 → a blurry strip): a file keeps it whole.
+    const size = imageSize(downloaded.buffer);
+    if (size && !fitsTelegramPhoto(size)) {
+      logger.info(`MAX photo ${size.width}×${size.height} would be squashed as a Telegram photo — sent as a file`);
+      return withFloodRetry(() => bot.telegram.sendDocument(groupId, source, opts));
+    }
     try {
       return await withFloodRetry(() => bot.telegram.sendPhoto(groupId, source, opts));
     } catch (err) {

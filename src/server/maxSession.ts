@@ -40,6 +40,7 @@ export interface SessionClient {
   connect(): void;
   disconnect(): void;
   on(event: 'ready' | 'disconnected', listener: () => void): unknown;
+  on(event: 'error', listener: (err: unknown) => void): unknown;
   once(event: 'ready', listener: () => void): unknown;
   off(event: 'ready', listener: () => void): unknown;
   login(token: string): Promise<{ sessionToken: string; payload: unknown }>;
@@ -57,7 +58,7 @@ export interface MaxSessionDeps {
   /** Posts the «session rejected» notice (with the login button) to the group. */
   postReauthNotice: (text: string) => Promise<unknown>;
   /** Anonymous error report (bridge/telemetry.ts) — gets the server's refusal text, nothing else. */
-  reportError?: (report: { kind: 'session-rejected'; error: string }) => unknown;
+  reportError?: (report: { kind: 'session-rejected' | 'internal'; step?: string; error: string }) => unknown;
 }
 
 // The saved session is not wiped on the first resume miss: a fresh socket is reconnected and
@@ -107,6 +108,11 @@ export class MaxSessionController {
   private downReported = false;
   // Set once the group was told the session was lost, so «восстановлена» only follows an actual loss — once.
   private sessionLostReported = false;
+  // The MAX outage behind a «❌ Потеряна связь» notice: when it began and what the client said
+  // first. Reported anonymously on recovery (noteUp) — while it lasts, the network is down anyway.
+  private outageStartedAt: number | null = null;
+  private outageCause: string | null = null;
+  private lastClientError: { at: number; message: string } | null = null;
 
   constructor(private readonly deps: MaxSessionDeps) {}
 
@@ -139,6 +145,10 @@ export class MaxSessionController {
     if (session) this.lastKnownPhone_ = session.phone;
     this.deps.client.on('ready', () => this.onReady());
     this.deps.client.on('disconnected', () => this.onDisconnected());
+    // The client says why a socket died just before 'disconnected' (a missed PING, a reset…).
+    this.deps.client.on('error', (err: unknown) => {
+      this.lastClientError = { at: Date.now(), message: err instanceof Error ? err.message : String(err) };
+    });
     this.connect();
   }
 
@@ -155,7 +165,10 @@ export class MaxSessionController {
     }
     // Closed on purpose: no reconnect is coming, so «пытаюсь переподключиться» would be false —
     // and the auth chain died with the socket. Likewise on a new socket.
-    if (next === 'paused' || next === 'stopped') this.downTimer = clearTimer(this.downTimer);
+    if (next === 'paused' || next === 'stopped') {
+      this.downTimer = clearTimer(this.downTimer);
+      this.outageStartedAt = null; // on purpose — no outage to report
+    }
     if (next === 'paused' || next === 'stopped' || next === 'connecting') this.authChainStartedAt = null;
   }
 
@@ -467,6 +480,11 @@ export class MaxSessionController {
 
   /** Starts the outage window unless one runs or an outage is already reported. */
   private armDownNotice(): void {
+    if (this.outageStartedAt == null) {
+      this.outageStartedAt = Date.now();
+      const recent = this.lastClientError && Date.now() - this.lastClientError.at < 10_000 ? this.lastClientError.message : '';
+      this.outageCause = outageCause(recent);
+    }
     if (this.downTimer != null || this.downReported) return;
     this.downTimer = setTimeout(() => {
       this.downTimer = null;
@@ -480,11 +498,36 @@ export class MaxSessionController {
   /** MAX is up again: cancels a running outage window, and reports the recovery of a reported outage. */
   private noteUp(): void {
     this.downTimer = clearTimer(this.downTimer);
+    const startedAt = this.outageStartedAt;
+    const cause = this.outageCause;
+    this.outageStartedAt = null;
+    this.outageCause = null;
     if (!this.downReported) return;
     this.downReported = false;
     resetErrorKey('max-down');
     reportBridgeError('max-up', '✅ Связь с MAX восстановлена.');
+    // Counted on the telemetry server (not announced): one install's flaky line vs. MAX down for
+    // everyone at once shows in how many installs report the same hour (asked for 2026-10-14).
+    if (startedAt != null) void this.deps.reportError?.({ kind: 'internal', step: 'max-down', error: outageReportText(Date.now() - startedAt, cause) });
   }
+}
+
+/** What ended a MAX socket, as a short code for grouping outage reports (the client's error message in, '' when it gave none). Pure + exported for unit testing. */
+export function outageCause(message: string): string {
+  const m = message.toLowerCase();
+  if (!m) return 'socket-closed';
+  if (m.includes('ping')) return 'ping-timeout';
+  if (/enotfound|eai_again|getaddrinfo/.test(m)) return 'dns';
+  if (/econnrefused|ehostunreach|enetunreach|enetdown/.test(m)) return 'unreachable';
+  if (/handshake|tls|certificate|ssl/.test(m)) return 'tls';
+  if (/etimedout|timed out|timeout/.test(m)) return 'connect-timeout';
+  if (/econnreset|epipe|socket hang up|reset/.test(m)) return 'connection-reset';
+  return 'other';
+}
+
+/** The anonymous outage report: how long MAX was out of reach and how it started — no addresses, no ids. */
+export function outageReportText(durationMs: number, cause: string | null): string {
+  return `MAX unreachable ~${Math.max(1, Math.round(durationMs / 60_000))} min: ${cause ?? 'socket-closed'}`;
 }
 
 function clearTimer(timer: Timer | null): null {
