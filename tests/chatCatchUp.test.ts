@@ -6,7 +6,7 @@ import type { Telegraf } from 'telegraf';
 import type { MaxClient, MaxHistoryMessage } from '../src/max/client.js';
 import { ChatMapStore } from '../src/store/chatMapStore.js';
 import { ChatBannedError, StrikeCounter } from '../src/bridge/catchUp.js';
-import { ChatCatchUp, MessageLinkStore, historyLimitFromEnv, historyLimitNotice, syncAllChatsToTelegram } from '../src/bridge/sync.js';
+import { ChatCatchUp, MessageLinkStore, historyLimitFromEnv, historyLimitNotice, isLeftChat, syncAllChatsToTelegram } from '../src/bridge/sync.js';
 
 // One writer per chat, catch-up on first touch, and the cursor gate — see ChatCatchUp in sync.ts.
 
@@ -361,6 +361,60 @@ describe('syncAllChatsToTelegram', () => {
     expect(w.sends[0]?.text).toContain('• Море');
     expect(w.sends[0]?.text).toContain('• Горы');
     expect(w.links.getByTelegram(1000)?.maxMessageId).toBe(1);
+  });
+
+  it('asks MAX about mapped chats missing from the chat list: a group or channel the account left gets no catch-up, the rest as before', async () => {
+    await store.upsert({ maxChatId: '20', telegramTopicId: 120, title: 'Отписан', createdAt: 'x', historyBackfillCursor: '150' });
+    await store.upsert({ maxChatId: '21', telegramTopicId: 121, title: 'Канал', createdAt: 'x', historyBackfillCursor: '150' });
+    await store.upsert({ maxChatId: '22', telegramTopicId: 122, title: 'Без ответа', createdAt: 'x', historyBackfillCursor: '150' });
+    await store.upsert({ maxChatId: '23', telegramTopicId: 123, title: 'Бан', createdAt: 'x', banned: true });
+    const w = fakeWorld([msg(1, 100, 'old'), msg(2, 200, 'new')]);
+    const chatsInfo = vi.fn(async (_ids: unknown[]) => [
+      { id: 20, type: 'CHANNEL', status: 'LEFT' },
+      { id: 21, type: 'CHANNEL', status: 'ACTIVE' },
+    ]);
+    (w.sync.deps.max as unknown as { chatsInfo: typeof chatsInfo }).chatsInfo = chatsInfo;
+    const rememberChat = vi.fn();
+    w.sync.deps.rememberChat = rememberChat;
+    await syncAllChatsToTelegram(w.sync, [], () => 'x');
+    expect(chatsInfo).toHaveBeenCalledTimes(1);
+    expect(chatsInfo).toHaveBeenCalledWith(['20', '21', '22']); // a banned chat is not asked about
+    expect(w.sends).toEqual([
+      { text: 'new', topicId: 121 },
+      { text: 'new', topicId: 122 }, // MAX said nothing about it — caught up as before
+    ]);
+    expect(rememberChat).toHaveBeenCalledWith({ id: 21, type: 'CHANNEL', status: 'ACTIVE' });
+    expect(w.sync.isCaughtUp('20')).toBe(false);
+    // No ban: should MAX be wrong and the posts keep coming, the next live one goes through and brings the gap.
+    expect((await store.getByMaxChatId('20'))?.banned).toBeFalsy();
+    await w.livePush(20, msg(3, 300, 'live'));
+    expect(w.sends.slice(2)).toEqual([
+      { text: 'new', topicId: 120 },
+      { text: 'live', topicId: 120 },
+    ]);
+  });
+
+  it('catches the missing chats up as before when MAX does not describe them', async () => {
+    await store.upsert({ maxChatId: '20', telegramTopicId: 120, title: 'Канал', createdAt: 'x', historyBackfillCursor: '150' });
+    const w = fakeWorld([msg(2, 200, 'new')]);
+    (w.sync.deps.max as unknown as { chatsInfo: () => Promise<unknown[]> }).chatsInfo = async () => {
+      throw new Error('Timed out waiting for 0x0030 [CHAT_INFO]');
+    };
+    await syncAllChatsToTelegram(w.sync, [], () => 'x');
+    expect(w.sends).toEqual([{ text: 'new', topicId: 120 }]);
+  });
+});
+
+describe('isLeftChat', () => {
+  it('is MAX saying the account is out of a group or channel — never a dialog, never an unclear answer', () => {
+    expect(isLeftChat({ type: 'CHANNEL', status: 'LEFT' })).toBe(true);
+    expect(isLeftChat({ type: 'CHAT', status: 'REMOVED' })).toBe(true);
+    expect(isLeftChat({ type: 'CHAT', status: 'CLOSED' })).toBe(true);
+    expect(isLeftChat({ type: 'CHANNEL', status: 'ACTIVE' })).toBe(false);
+    expect(isLeftChat({ type: 'CHANNEL', status: 'HIDDEN' })).toBe(false);
+    expect(isLeftChat({ type: 'DIALOG', status: 'REMOVED' })).toBe(false);
+    expect(isLeftChat({ type: 'CHANNEL' })).toBe(false);
+    expect(isLeftChat(undefined)).toBe(false);
   });
 });
 

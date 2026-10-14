@@ -117,6 +117,7 @@ export const OPCODES = {
   // Contact search — supplied by the user 2026-08-16. Search by name/nick ({query, count})
   // and lookup by phone ({phone} — field is `phone`, not phoneNumber; `+` optional).
   CONTACT_SEARCH: 0x0025,
+  // Chats by id: {chatIds} → {chats} — read from MAX web 2026-10-14 (it asks for chats it has not got).
   CHAT_INFO: 0x0030,
   // Corrected 2026-08-09 (was 0x0041, an untested guess) — still unused: Telegram's
   // Bot API gives bots no way to detect a human typing, so there's nothing on the

@@ -860,6 +860,14 @@ export class MaxClient extends EventEmitter {
     return { chat: p?.chat, contact: p?.user?.contact };
   }
 
+  /** Chats by id (CHAT_INFO, 0x0030 — MAX web's lookup for chats it has not got) — the ones MAX knows; each carries its `type` and `status`. */
+  async chatsInfo(chatIds: unknown[]): Promise<unknown[]> {
+    const { dir, payload } = await this.request(OPCODES.CHAT_INFO, { chatIds: chatIds.map(toChatId) });
+    if (dir === DIR.ERR) throw new MaxServerError(describeAuthError(payload, 'CHAT_INFO failed'), OPCODES.CHAT_INFO, (payload as { error?: string } | null)?.error);
+    const chats = (payload as { chats?: unknown } | null)?.chats;
+    return Array.isArray(chats) ? chats : [];
+  }
+
   /** Joins a group or subscribes to a channel by its max.ru link (CHAT_JOIN, 0x0039 — MAX web's «Вступить»/«Подписаться»); a closed one makes it a join request. */
   async joinChat(link: string): Promise<MaxLinkChat | null> {
     const { dir, payload } = await this.request(OPCODES.CHAT_JOIN, { link });

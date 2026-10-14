@@ -1024,6 +1024,8 @@ export interface ChatCatchUpDeps {
   onRelayed?: (c: IncomingCopy) => void;
   /** HISTORY_LIMIT: newest messages a topic filled from scratch gets (0 / unset = the whole history). */
   historyLimit?: number;
+  /** Puts a chat MAX described (CHAT_INFO) into the chat cache — so a channel missing from the chat list still gets the channel cap. */
+  rememberChat?: (chat: unknown) => void;
 }
 
 /**
@@ -1764,6 +1766,7 @@ export function wireBridge({
     isWiping: () => wiping,
     onRelayed: (c) => broadcasts.copyIncoming(c),
     historyLimit: historyLimitFromEnv(),
+    rememberChat,
   });
 
   /**
@@ -4168,6 +4171,34 @@ export function wireBridge({
 }
 
 /**
+ * MAX's word that the account is no longer in a group or channel: left or unsubscribed, removed,
+ * or the chat closed — MAX web shows LEFT and CLOSED as REMOVED. A dialog is never "left" here:
+ * the contact's next message brings it back.
+ */
+export function isLeftChat(chat: unknown): boolean {
+  if (!chat || typeof chat !== 'object') return false;
+  const { type, status } = chat as { type?: unknown; status?: unknown };
+  return type !== 'DIALOG' && (status === 'LEFT' || status === 'REMOVED' || status === 'CLOSED');
+}
+
+/** The chats MAX describes (CHAT_INFO, 50 ids a request) by id string; a failure leaves the rest unknown — they are caught up as before. */
+async function describeChats(max: MaxClient, chatIds: string[]): Promise<Map<string, unknown>> {
+  const described = new Map<string, unknown>();
+  const ids = chatIds.filter((id) => /^-?\d+$/.test(id));
+  for (let i = 0; i < ids.length; i += 50) {
+    try {
+      for (const chat of await max.chatsInfo(ids.slice(i, i + 50))) {
+        const id = (chat as { id?: unknown } | null)?.id;
+        if (id != null) described.set(String(id), chat);
+      }
+    } catch (err) {
+      logger.warn('Chat sync: MAX did not describe the mapped chats missing from the chat list — catching them up as before', err);
+    }
+  }
+  return described;
+}
+
+/**
  * The LOGIN-time pass over every MAX chat: each gets a Telegram topic (created with its info card
  * when missing) and its catch-up (ChatCatchUp.ensureCaughtUp), one chat after another, each inside
  * the chat's queue. Safe to call on every LOGIN; a chat already caught up by a live event costs
@@ -4175,7 +4206,8 @@ export function wireBridge({
  * instead of waiting for a LOGIN that may never come while the socket stays up. After the
  * snapshot, mapped chats it did not contain get the same catch-up: the LOGIN snapshot is capped at
  * 50, and a chat born live meanwhile may be missing too — left out, its cursor stayed frozen all
- * session and the next restart re-sent everything. `isCancelled` (/reboot, /kill) is checked
+ * session and the next restart re-sent everything — unless MAX says the account is no longer in
+ * that group or channel (isLeftChat). `isCancelled` (/reboot, /kill) is checked
  * before every chat and every message. A topic deleted by hand is NOT looked for here: it comes
  * back, with its history, when the chat's next message arrives (decided 2026-09-29).
  */
@@ -4213,8 +4245,8 @@ export async function syncAllChatsToTelegram(
     const c = chat as { id?: unknown; status?: string };
     if (c.id == null) continue;
     // CHATS_LIST keeps returning chats the account left/closed (status "CLOSED") — MAX's own client
-    // hides those (confirmed live 2026-08-13). Not counted as in the snapshot: a mapped one still
-    // gets the second loop's catch-up (the owner may have been re-added meanwhile).
+    // hides those (confirmed live 2026-08-13). Not counted as in the snapshot: for a mapped one the
+    // second loop asks MAX first (the owner may have been re-added meanwhile).
     if (c.status && c.status !== 'ACTIVE') continue;
     const chatId = c.id;
     inSnapshot.add(String(chatId));
@@ -4236,6 +4268,8 @@ export async function syncAllChatsToTelegram(
 
   // Mapped chats the snapshot did not contain (see above) — their topics exist, so only the
   // cursor-bounded catch-up. A chat already caught up (a live event got there first) needs none.
+  // MAX is asked about them first: a public channel's history is readable without a subscription,
+  // so a channel left in the MAX app (or unbanned after /leavegroup) was pulled on every run.
   let mappings: Awaited<ReturnType<ChatMapStore['list']>> = [];
   try {
     mappings = await chatMapStore.list();
@@ -4243,15 +4277,24 @@ export async function syncAllChatsToTelegram(
     logger.error('Chat sync: failed to list mapped chats — skipping the ones missing from the chat list', err);
     return;
   }
-  for (const mapping of mappings) {
+  // Banned and pending ("pending:<userId>", no MAX dialog yet) chats get no catch-up — not asked about either.
+  const missing = mappings.filter((m) => !inSnapshot.has(m.maxChatId) && !m.banned && m.pendingUserId == null);
+  const described = missing.length > 0 && !isCancelled?.() ? await describeChats(chatSync.deps.max, missing.map((m) => m.maxChatId)) : new Map<string, unknown>();
+  for (const mapping of missing) {
     if (isCancelled?.()) {
       logger.info('Chat sync cancelled (/reboot or /kill) — stopping this run');
       return;
     }
-    if (inSnapshot.has(mapping.maxChatId)) continue;
+    const chat = described.get(mapping.maxChatId);
+    const said = chat ? ` (MAX: ${String((chat as { type?: unknown }).type)}, ${String((chat as { status?: unknown }).status)})` : '';
+    if (isLeftChat(chat)) {
+      logger.info(`MAX chat ${mapping.maxChatId} is mapped but the account is no longer in it${said} — no catch-up, its topic stays as it is`);
+      continue;
+    }
+    if (chat) chatSync.deps.rememberChat?.(chat);
     try {
-      // ensureCaughtUp itself skips a banned, pending ("pending:<userId>", no MAX dialog yet) or already caught-up chat.
-      logger.info(`MAX chat ${mapping.maxChatId} is mapped but missing from the chat list — checking its history anyway`);
+      // ensureCaughtUp itself skips an already caught-up chat.
+      logger.info(`MAX chat ${mapping.maxChatId} is mapped but missing from the chat list${said} — checking its history anyway`);
       await chatSync.runInChat(mapping.maxChatId, async () => {
         if (isCancelled?.()) throw new SyncCancelledError();
         await chatSync.ensureCaughtUp(mapping.maxChatId, isCancelled);
