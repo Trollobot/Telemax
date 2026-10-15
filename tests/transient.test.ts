@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   isStaleCallbackQuery,
   isTransientHttpStatus,
@@ -99,16 +99,29 @@ describe('isTransientHttpStatus', () => {
 
 describe('downloadMaxAttachment transient reporting', () => {
   const file = { _type: 'FILE', fileId: 7n, name: 'a.pdf' } as const;
-  function ctx(err: Error, throwOnTransient?: boolean): DownloadContext {
-    const max = { getFileDownloadUrl: async () => Promise.reject(err) } as unknown as MaxClient;
-    return { max, chatId: 1, messageId: 2, throwOnTransient };
+  function ctx(err: Error, throwOnTransient?: boolean): DownloadContext & { calls: () => number } {
+    const getFileDownloadUrl = vi.fn(async () => Promise.reject(err));
+    const max = { getFileDownloadUrl } as unknown as MaxClient;
+    return { max, chatId: 1, messageId: 2, throwOnTransient, retryDelaysMs: [0, 0], calls: () => getFileDownloadUrl.mock.calls.length };
   }
 
   it('throws TransientDownloadError for a dead MAX socket only when the caller opted in (backfill)', async () => {
     const down = new Error('MaxClient.send called while not connected');
-    await expect(downloadMaxAttachment(file, ctx(down, true))).rejects.toBeInstanceOf(TransientDownloadError);
-    // Live path: the placeholder, saying why.
-    await expect(downloadMaxAttachment(file, ctx(down))).rejects.toMatchObject({ name: 'DownloadMissError', why: 'не скачалось: нет связи с MAX' });
+    const backfill = ctx(down, true);
+    await expect(downloadMaxAttachment(file, backfill)).rejects.toBeInstanceOf(TransientDownloadError);
+    expect(backfill.calls()).toBe(1); // the backfill retries on its next run, not here
+    // Live path: three tries, then the placeholder, saying why.
+    const live = ctx(down);
+    await expect(downloadMaxAttachment(file, live)).rejects.toMatchObject({ name: 'DownloadMissError', why: 'не скачалось: нет связи с MAX, попыток: 3' });
+    expect(live.calls()).toBe(3);
+  });
+
+  it('a live retry stops at a permanent refusal', async () => {
+    const getFileDownloadUrl = vi.fn().mockRejectedValueOnce(new Error('MaxClient.send called while not connected')).mockRejectedValueOnce(new Error('FILE_DOWNLOAD did not return a url: file not found'));
+    const max = { getFileDownloadUrl } as unknown as MaxClient;
+    // The second try gets a permanent refusal: no third one, the miss says so.
+    await expect(downloadMaxAttachment(file, { max, chatId: 1, messageId: 2, retryDelaysMs: [0, 0] })).rejects.toMatchObject({ why: NO_LINK_WHY });
+    expect(getFileDownloadUrl).toHaveBeenCalledTimes(2);
   });
 
   it('a permanent MAX refusal is a miss either way — MAX gave no link', async () => {

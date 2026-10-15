@@ -92,11 +92,19 @@ export interface DownloadContext {
   // Retried with these when the primary (source) ids are denied — see sync.ts forwardDownloadIds.
   fallbackChatId?: unknown;
   fallbackMessageId?: unknown;
-  // Throw TransientDownloadError instead of returning null when the download failed for a reason
-  // that may pass (MAX socket down, CDN 5xx/network). Set by the backfill, which must not advance
-  // its cursor past a file it could not fetch; the live path keeps the text placeholder.
+  // Throw TransientDownloadError instead of a DownloadMissError when the download failed for a
+  // reason that may pass (MAX socket down, CDN 5xx/network). Set by the backfill, which must not
+  // advance its cursor past a file it could not fetch (it tries again on its next run); the live
+  // path tries again itself (LIVE_RETRY_DELAYS_MS), then posts the placeholder.
   throwOnTransient?: boolean;
+  /** The live path's pauses between tries — injectable for tests. */
+  retryDelaysMs?: readonly number[];
 }
+
+/** Live: pauses before the 2nd and 3rd try of a download that failed transiently — a CDN hiccup lasts seconds (a user report on 1.3.7: «то фото, то заглушка», one try only). */
+const LIVE_RETRY_DELAYS_MS = [2000, 5000];
+/** …and no new try once this long has gone by since the first: the chat's queue waits for it. */
+const LIVE_RETRY_BUDGET_MS = 60_000;
 
 // Generous (a large video on a slow CDN) but finite: a hung download must not stall the relay forever.
 const DOWNLOAD_TIMEOUT_MS = 120_000;
@@ -247,16 +255,27 @@ export async function getMaxFileUrl(att: MaxAttachment, ctx: DownloadContext): P
  * Downloads a MAX attachment for re-upload to Telegram. Null means "nothing to fetch" (a kind the
  * bridge does not download) — the caller posts describeAttachment()'s placeholder. DownloadMissError
  * means it could not be had: the caller posts placeholderText with its `why`. A transient failure
- * (see TransientDownloadError) becomes a DownloadMissError too, unless ctx.throwOnTransient is set —
- * then it is thrown so the backfill can stop without moving its cursor past the file.
+ * (see TransientDownloadError) is tried again (LIVE_RETRY_DELAYS_MS) and then becomes a
+ * DownloadMissError too — unless ctx.throwOnTransient is set: then it is thrown at once so the
+ * backfill can stop without moving its cursor past the file.
  */
 export async function downloadMaxAttachment(att: MaxAttachment, ctx: DownloadContext): Promise<DownloadedAttachment | null> {
-  try {
-    return await downloadAttachmentOrThrow(att, ctx);
-  } catch (err) {
-    if (!(err instanceof TransientDownloadError) || ctx.throwOnTransient) throw err;
-    logger.error(`Transient failure downloading a MAX ${att._type ?? 'attachment'} — sending the placeholder instead`, err);
-    throw new DownloadMissError(err.why, err);
+  const delays = ctx.retryDelaysMs ?? LIVE_RETRY_DELAYS_MS;
+  const startedAt = Date.now();
+  for (let tries = 1; ; tries++) {
+    try {
+      return await downloadAttachmentOrThrow(att, ctx);
+    } catch (err) {
+      if (!(err instanceof TransientDownloadError) || ctx.throwOnTransient) throw err;
+      const pause = delays[tries - 1];
+      if (pause != null && Date.now() - startedAt + pause < LIVE_RETRY_BUDGET_MS) {
+        logger.info(`Transient failure downloading a MAX ${att._type ?? 'attachment'} (try ${tries}: ${err.message}) — trying again in ${pause / 1000} s`);
+        await new Promise((resolve) => setTimeout(resolve, pause));
+        continue;
+      }
+      logger.error(`Transient failure downloading a MAX ${att._type ?? 'attachment'} after ${tries} tries — sending the placeholder instead`, err);
+      throw new DownloadMissError(tries > 1 ? `${err.why}, попыток: ${tries}` : err.why, err);
+    }
   }
 }
 
