@@ -433,14 +433,20 @@ export function createBroadcasts(deps: BroadcastDeps): Broadcasts {
       const targetTitle = knownTitle ?? (chat && 'title' in chat ? chat.title : undefined) ?? String(chatId);
       const title = await deps.chatTitle(p.maxChatId);
       const now = Date.now();
-      await store.add({ id: randomBytes(6).toString('base64url'), maxChatId: p.maxChatId, targetChatId: chatId, targetTitle, targetType: kind, since: now, cursor: now });
-      logger.info(`Broadcast on: MAX chat ${p.maxChatId} -> ${kind} ${chatId}`);
+      const b: Broadcast = { id: randomBytes(6).toString('base64url'), maxChatId: p.maxChatId, targetChatId: chatId, targetTitle, targetType: kind, since: now, cursor: now };
+      // A group the bot may pin in gets «📌» at once (the group link asks for that right; decided
+      // 2026-10-15). Not a channel: the right to edit, which it always has there, pins too — and a
+      // channel holds nothing but these posts.
+      if (kind === 'group' && (await pinRights(b)).pin) b.pin = true;
+      await store.add(b);
+      logger.info(`Broadcast on: MAX chat ${p.maxChatId} -> ${kind} ${chatId}${b.pin ? ' (📌)' : ''}`);
       await bot.telegram
-        .sendMessage(chatId, `📡 Сюда транслируется чат «${title}» из MAX — новые сообщения будут появляться здесь.`)
+        .sendMessage(chatId, `📡 Сюда транслируется чат «${title}» из MAX — новые сообщения будут появляться здесь${b.pin ? ' и закрепляться: их легко найти по закрепам' : ''}.`)
         .catch((err) => logger.error('Broadcast hello to the target failed', err));
-      await notifyTopic(p.maxChatId, `📡 Трансляция в «${targetTitle}» включена — новые сообщения этого чата копируются туда. Закреп «📌» и остановка — в карточке /broadcast.`);
+      const pinNote = b.pin ? ' Новые сообщения там закрепляются — выключить «📌» можно в карточке /broadcast.' : ' Закреп «📌» и остановка — в карточке /broadcast.';
+      await notifyTopic(p.maxChatId, `📡 Трансляция в «${targetTitle}» включена — новые сообщения этого чата копируются туда.${pinNote}`);
       await refreshCard(p.maxChatId, p.requesterId);
-      return `✅ Готово: чат «${title}» транслируется в «${targetTitle}». Закреп «📌» и остановка — в карточке /broadcast в теме чата.`;
+      return `✅ Готово: чат «${title}» транслируется в «${targetTitle}».${pinNote}`;
     } finally {
       binding.delete(key);
     }

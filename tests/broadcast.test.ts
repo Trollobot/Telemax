@@ -301,9 +301,12 @@ describe('switching a broadcast on', () => {
 
   it('«👥 В группу» with admin rights: the join itself switches it on, the card in the topic shows it, a later /start adds nothing', async () => {
     const { store, telegram, bc, code } = await setup();
+    telegram.getChatMember.mockResolvedValue({ status: 'administrator', can_pin_messages: true, can_delete_messages: true });
     const join = { chat: { id: -700, type: 'supergroup', title: 'Читалка' }, from: { id: 9 }, myChatMember: { old_chat_member: { status: 'left' }, new_chat_member: { status: 'administrator', can_pin_messages: true } } };
     expect(await bc.handleChat(join as never)).toBe(true);
-    expect((await store.forChat('100')).map((b) => [b.targetChatId, b.targetType, b.targetTitle])).toEqual([[-700, 'group', 'Читалка']]);
+    // Added with the right to pin: «📌» is on from the start.
+    expect((await store.forChat('100')).map((b) => [b.targetChatId, b.targetType, b.targetTitle, b.pin])).toEqual([[-700, 'group', 'Читалка', true]]);
+    expect(telegram.sendMessage.mock.calls[0]![1]).toMatch(/и закрепляться/);
     expect(telegram.editMessageText).toHaveBeenCalledWith('-1001', 500, undefined, expect.stringMatching(/👥 Читалка/), expect.anything());
     expect(telegram.sendMessage).toHaveBeenLastCalledWith(9, expect.stringMatching(/^✅ Готово/));
     const sends = telegram.sendMessage.mock.calls.length;
