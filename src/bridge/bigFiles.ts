@@ -6,7 +6,7 @@ import { Markup, type Telegraf } from 'telegraf';
 import type { MaxClient } from '../max/client.js';
 import { maxFetchBig } from '../max/ca.js';
 import { createLogger } from '../logger.js';
-import { getMaxFileUrl, describeAttachment, type DownloadContext, type MaxAttachment } from './attachments.js';
+import { getMaxFileUrl, describeAttachment, NO_LINK_WHY, placeholderText, type DownloadContext, type MaxAttachment } from './attachments.js';
 import { FileShare, MAX_FILE_LIMIT, nodeReadable, type UploadTicket } from './fileShare.js';
 import { formatBytes } from './status.js';
 import { uploadFileFromDiskToMax } from './upload.js';
@@ -383,7 +383,7 @@ export function createBigFiles({ bot, max, targetGroupId, fileShare, onSentToMax
       );
     }
     const url = await getMaxFileUrl(att, ctx);
-    if (!url) return send(describeAttachment(att), opts);
+    if (!url) return send(placeholderText(att, NO_LINK_WHY), opts);
     // The recipient sees at once that something is coming — saving gigabytes takes minutes.
     const notice = `📥 Пришёл файл ${label} — ${WHY_TG_UPLOAD}, поэтому мост сохраняет его на ваш сервер и пришлёт сюда ссылку.`;
     const msg = await send(`${notice}

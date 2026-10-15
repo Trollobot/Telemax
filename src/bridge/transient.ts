@@ -110,7 +110,12 @@ export function isTransientHttpStatus(status: number): boolean {
  * text placeholder instead.
  */
 export class TransientDownloadError extends Error {
-  constructor(message: string, cause?: unknown) {
+  /** `why` — for the owner, in the placeholder the attachment becomes when it still does not come (placeholderText). */
+  constructor(
+    message: string,
+    cause?: unknown,
+    readonly why = 'не скачалось: нет связи с MAX',
+  ) {
     super(message, { cause });
     this.name = 'TransientDownloadError';
   }

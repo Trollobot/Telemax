@@ -397,6 +397,19 @@ describe('partial delivery', () => {
     await expect(sendAttachments(gone, 'g', 7, [location] as never, { max: {} } as never, undefined, undefined, undefined, true)).rejects.toThrow('thread not found');
   });
 
+  it('a placeholder says why: the download miss, or Telegram refusing the attachment', async () => {
+    const sendMessage = vi.fn(async (_group: string, _text: string) => ({ message_id: 900 }));
+    const sendLocation = vi.fn(async () => {
+      throw answered(400, 'Bad Request: wrong latitude');
+    });
+    const bot = { telegram: { sendLocation, sendMessage } } as unknown as Telegraf;
+    await sendAttachments(bot, 'g', 7, [{ _type: 'PHOTO', photoId: 1 }, location] as never, { max: {} } as never);
+    expect(sendMessage.mock.calls.map((c) => c[1])).toEqual([
+      '[фото] — не скачалось: MAX не дал ссылку. Откройте в MAX.',
+      '📍 [геолокация] — Telegram не принял: Bad Request: wrong latitude. Откройте в MAX.',
+    ]);
+  });
+
   it('sendTextPieces reports each piece as it goes out', async () => {
     let next = 1;
     const sendMessage = vi.fn(async () => {

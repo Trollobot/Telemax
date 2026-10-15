@@ -11,6 +11,9 @@ import { ensureTopicForMaxChat, clampTopicTitle } from '../telegram/bot.js';
 import {
   downloadMaxAttachment,
   describeAttachment,
+  DownloadMissError,
+  placeholderText,
+  TOO_BIG_WHY,
   telegramSendKind,
   TELEGRAM_UPLOAD_LIMIT_BYTES,
   takeKeyboard,
@@ -645,7 +648,7 @@ export async function sendAttachments(
     } catch (err) {
       if (isThreadNotFound(err) || (!degradeTransient && !isPermanentTelegramRefusal(err))) throw err;
       logger.error(`Could not send a MAX ${att._type ?? 'attachment'} to Telegram — sending its placeholder instead`, err);
-      msg = await withFloodRetry(() => bot.telegram.sendMessage(groupId, describeAttachment(att), opts));
+      msg = await withFloodRetry(() => bot.telegram.sendMessage(groupId, placeholderText(att, placeholderWhy(err)), opts));
     }
     ids.push(msg.message_id);
     sent?.push(msg.message_id);
@@ -653,6 +656,15 @@ export async function sendAttachments(
     if (paceMs) await sleep(paceMs);
   }
   return ids;
+}
+
+/** Why an attachment became its placeholder after all (sendAttachments): the download's own reason, or Telegram's. */
+function placeholderWhy(err: unknown): string {
+  if (err instanceof TransientDownloadError) return err.why;
+  if (isTransientTelegramError(err)) return 'Telegram не ответил';
+  const e = err as { description?: unknown; response?: { description?: unknown }; message?: unknown } | null;
+  const description = e?.description ?? e?.response?.description ?? e?.message ?? String(err);
+  return `Telegram не принял: ${truncateUtf16(String(description), 100)}`;
 }
 
 async function sendOneAttachment(
@@ -691,14 +703,21 @@ async function sendOneAttachment(
   if (bigFileRelay && att._type === 'FILE' && Number(att.size ?? 0) > TELEGRAM_UPLOAD_LIMIT_BYTES) {
     return bigFileRelay(att, downloadCtx, opts);
   }
-  const downloaded = await downloadMaxAttachment(att, downloadCtx);
+  let downloaded: Awaited<ReturnType<typeof downloadMaxAttachment>>;
+  try {
+    downloaded = await downloadMaxAttachment(att, downloadCtx);
+  } catch (err) {
+    if (!(err instanceof DownloadMissError)) throw err;
+    logger.error(`MAX ${att._type ?? 'attachment'} not relayed (${err.why}) — sending its placeholder`);
+    return withFloodRetry(() => bot.telegram.sendMessage(groupId, placeholderText(att, err.why), opts));
+  }
   // Bot API upload limits (50 MB, a photo 10 MB) — see telegramSendKind.
   const kind = downloaded ? telegramSendKind(downloaded.kind, downloaded.buffer.byteLength) : null;
   if (!downloaded || !kind) {
     if (downloaded) {
       logger.error(`MAX ${att._type ?? 'attachment'} is ${downloaded.buffer.byteLength} bytes — over Telegram's upload limit, sending its placeholder`);
     }
-    return withFloodRetry(() => bot.telegram.sendMessage(groupId, describeAttachment(att), opts));
+    return withFloodRetry(() => bot.telegram.sendMessage(groupId, downloaded ? placeholderText(att, TOO_BIG_WHY) : describeAttachment(att), opts));
   }
   const source = { source: downloaded.buffer, filename: downloaded.filename };
   if (kind === 'photo') {

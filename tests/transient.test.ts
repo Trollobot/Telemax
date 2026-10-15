@@ -7,7 +7,7 @@ import {
   isTransientTelegramError,
   TransientDownloadError,
 } from '../src/bridge/transient.js';
-import { downloadMaxAttachment, type DownloadContext } from '../src/bridge/attachments.js';
+import { downloadMaxAttachment, DownloadMissError, networkFailureName, NO_LINK_WHY, placeholderText, type DownloadContext } from '../src/bridge/attachments.js';
 import { MaxConnectionLostError, type MaxClient } from '../src/max/client.js';
 
 /** The shape telegraf's TelegramError has: an answered API error. */
@@ -107,14 +107,44 @@ describe('downloadMaxAttachment transient reporting', () => {
   it('throws TransientDownloadError for a dead MAX socket only when the caller opted in (backfill)', async () => {
     const down = new Error('MaxClient.send called while not connected');
     await expect(downloadMaxAttachment(file, ctx(down, true))).rejects.toBeInstanceOf(TransientDownloadError);
-    // Live path: placeholder as before.
-    await expect(downloadMaxAttachment(file, ctx(down))).resolves.toBeNull();
+    // Live path: the placeholder, saying why.
+    await expect(downloadMaxAttachment(file, ctx(down))).rejects.toMatchObject({ name: 'DownloadMissError', why: 'не скачалось: нет связи с MAX' });
   });
 
-  it('returns null for a permanent MAX refusal either way', async () => {
+  it('a permanent MAX refusal is a miss either way — MAX gave no link', async () => {
     const denied = new Error('FILE_DOWNLOAD did not return a url: file not found');
-    await expect(downloadMaxAttachment(file, ctx(denied, true))).resolves.toBeNull();
-    await expect(downloadMaxAttachment(file, ctx(denied))).resolves.toBeNull();
+    await expect(downloadMaxAttachment(file, ctx(denied, true))).rejects.toMatchObject({ name: 'DownloadMissError', why: NO_LINK_WHY });
+    await expect(downloadMaxAttachment(file, ctx(denied))).rejects.toMatchObject({ name: 'DownloadMissError', why: NO_LINK_WHY });
+  });
+
+  it('a photo MAX sent without its link is a miss, not a silent «[фото]»', async () => {
+    const photo = { _type: 'PHOTO', photoId: 5 } as const;
+    await expect(downloadMaxAttachment(photo, { max: {} as MaxClient, chatId: 1, messageId: 2 })).rejects.toBeInstanceOf(DownloadMissError);
+    // A kind the bridge does not fetch is still just its placeholder.
+    await expect(downloadMaxAttachment({ _type: 'LOCATION' } as never, { max: {} as MaxClient, chatId: 1, messageId: 2 })).resolves.toBeNull();
+  });
+});
+
+describe('placeholderText', () => {
+  it('names the attachment and, when known, why it did not come', () => {
+    expect(placeholderText({ _type: 'PHOTO' })).toBe('[фото]');
+    expect(placeholderText({ _type: 'PHOTO' }, 'не скачалось: сервер MAX не ответил (таймаут)')).toBe(
+      '[фото] — не скачалось: сервер MAX не ответил (таймаут). Откройте в MAX.',
+    );
+    expect(placeholderText({ _type: 'FILE', name: 'RFQ640.xlsx' }, NO_LINK_WHY)).toBe('[файл: RFQ640.xlsx] — не скачалось: MAX не дал ссылку. Откройте в MAX.');
+  });
+});
+
+describe('networkFailureName', () => {
+  it('puts the code on undici\'s cause into a word', () => {
+    const wrapped = (code: string) => Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error('x'), { code }) });
+    expect(networkFailureName(wrapped('UND_ERR_CONNECT_TIMEOUT'))).toBe('таймаут');
+    expect(networkFailureName(wrapped('ECONNRESET'))).toBe('обрыв связи');
+    expect(networkFailureName(wrapped('ENOTFOUND'))).toBe('не найден адрес сервера');
+    expect(networkFailureName(wrapped('ECONNREFUSED'))).toBe('соединение отклонено');
+    expect(networkFailureName(wrapped('UNABLE_TO_VERIFY_LEAF_SIGNATURE'))).toBe('сертификат сервера не принят');
+    expect(networkFailureName(Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' }))).toBe('таймаут');
+    expect(networkFailureName(new Error('something else'))).toBe('');
   });
 });
 

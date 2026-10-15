@@ -118,34 +118,77 @@ export function telegramSendKind(kind: DownloadedAttachment['kind'], bytes: numb
   return kind;
 }
 
+/**
+ * An attachment the bridge could not have — refused for good by the CDN (a 4xx), over the size cap,
+ * no link to fetch it by, or (live) an outage that outlasted the try. `why` goes into its
+ * placeholder (placeholderText): a bare «[фото]» left the owner guessing (a user report on 1.3.7).
+ */
+export class DownloadMissError extends Error {
+  constructor(
+    readonly why: string,
+    cause?: unknown,
+  ) {
+    super(why, { cause });
+    this.name = 'DownloadMissError';
+  }
+}
+
+export const NO_LINK_WHY = 'не скачалось: MAX не дал ссылку';
+export const TOO_BIG_WHY = `больше ${TELEGRAM_UPLOAD_LIMIT_BYTES / 1048576} МБ — столько бот в Telegram не загрузит`;
+
+/** The placeholder of an attachment that did not go to Telegram: what it was, and why when known. Pure + exported for unit testing. */
+export function placeholderText(att: MaxAttachment, why?: string): string {
+  const what = describeAttachment(att);
+  return why ? `${what} — ${why}. Откройте в MAX.` : what;
+}
+
+/** A network failure in a word for the owner («таймаут», «обрыв связи», …) — '' when not recognised. Pure + exported for unit testing. */
+export function networkFailureName(err: unknown, depth = 0): string {
+  if (!err || typeof err !== 'object') return '';
+  const e = err as { code?: unknown; name?: unknown; message?: unknown; cause?: unknown };
+  const code = typeof e.code === 'string' ? e.code : '';
+  if (/TIMEOUT|ETIMEDOUT/.test(code) || e.name === 'TimeoutError' || e.name === 'AbortError') return 'таймаут';
+  if (code === 'ECONNRESET' || code === 'UND_ERR_SOCKET' || code === 'UND_ERR_CLOSED' || code === 'EPIPE' || e.message === 'terminated') return 'обрыв связи';
+  if (code === 'ENOTFOUND' || code === 'EAI_AGAIN') return 'не найден адрес сервера';
+  if (code === 'ECONNREFUSED') return 'соединение отклонено';
+  if (code === 'EHOSTUNREACH' || code === 'ENETUNREACH' || code === 'ENETDOWN') return 'сервер недоступен';
+  if (/CERT|SELF_SIGNED|UNABLE_TO_VERIFY/.test(code) || (typeof e.message === 'string' && /certificate/i.test(e.message))) return 'сертификат сервера не принят';
+  return depth < 3 && e.cause != null ? networkFailureName(e.cause, depth + 1) : '';
+}
+
 // Every URL here is a MAX-owned CDN host — hence maxFetch, which trusts the Russian state chain.
-// Null for a permanent failure (4xx, over the size cap); throws TransientDownloadError for one
-// that may pass (5xx, network, timeout).
-async function downloadUrl(url: string): Promise<Buffer | null> {
+// Throws DownloadMissError for a permanent failure (4xx, over the size cap, an error that is no
+// outage) and TransientDownloadError for one that may pass (5xx, network, timeout).
+async function downloadUrl(url: string): Promise<Buffer> {
   try {
     const res = await maxFetch(url, { signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
     if (!res.ok) {
       logger.error(`downloadUrl got non-OK response ${res.status} ${res.statusText} for ${url}`);
-      if (isTransientHttpStatus(res.status)) throw new TransientDownloadError(`MAX CDN answered ${res.status}`);
-      return null;
+      if (isTransientHttpStatus(res.status)) {
+        throw new TransientDownloadError(`MAX CDN answered ${res.status}`, undefined, `не скачалось: сервер MAX ответил ошибкой ${res.status}`);
+      }
+      throw new DownloadMissError(`не скачалось: сервер MAX отказал (${res.status})`);
     }
     const declared = Number(res.headers.get('content-length') ?? '');
     if (Number.isFinite(declared) && declared > MAX_DOWNLOAD_BYTES) {
       logger.error(`downloadUrl refused ${declared} bytes (limit ${MAX_DOWNLOAD_BYTES}) for ${url}`);
-      return null;
+      throw new DownloadMissError(TOO_BIG_WHY);
     }
     const buf = Buffer.from(await res.arrayBuffer());
     // Header can lie or be absent — check what actually arrived too.
     if (buf.byteLength > MAX_DOWNLOAD_BYTES) {
       logger.error(`downloadUrl got ${buf.byteLength} bytes, over the ${MAX_DOWNLOAD_BYTES} limit, for ${url}`);
-      return null;
+      throw new DownloadMissError(TOO_BIG_WHY);
     }
     return buf;
   } catch (err) {
-    if (err instanceof TransientDownloadError) throw err;
+    if (err instanceof TransientDownloadError || err instanceof DownloadMissError) throw err;
     logger.error(`downloadUrl threw for ${url}`, err);
-    if (isTransientNetworkError(err)) throw new TransientDownloadError(`MAX CDN download failed: ${(err as Error).message}`, err);
-    return null;
+    const name = networkFailureName(err);
+    if (isTransientNetworkError(err)) {
+      throw new TransientDownloadError(`MAX CDN download failed: ${(err as Error).message}`, err, `не скачалось: сервер MAX не ответил${name ? ` (${name})` : ''}`);
+    }
+    throw new DownloadMissError(`не скачалось: ${name || truncateUtf16(String((err as Error)?.message ?? err), 80)}`, err);
   }
 }
 
@@ -201,10 +244,11 @@ export async function getMaxFileUrl(att: MaxAttachment, ctx: DownloadContext): P
 }
 
 /**
- * Downloads a MAX attachment for re-upload to Telegram. Null means "no file to send" — the caller
- * posts describeAttachment()'s placeholder. A transient failure (see TransientDownloadError) is
- * also null unless ctx.throwOnTransient is set, in which case it is thrown so the backfill can stop
- * without moving its cursor past the file.
+ * Downloads a MAX attachment for re-upload to Telegram. Null means "nothing to fetch" (a kind the
+ * bridge does not download) — the caller posts describeAttachment()'s placeholder. DownloadMissError
+ * means it could not be had: the caller posts placeholderText with its `why`. A transient failure
+ * (see TransientDownloadError) becomes a DownloadMissError too, unless ctx.throwOnTransient is set —
+ * then it is thrown so the backfill can stop without moving its cursor past the file.
  */
 export async function downloadMaxAttachment(att: MaxAttachment, ctx: DownloadContext): Promise<DownloadedAttachment | null> {
   try {
@@ -212,7 +256,7 @@ export async function downloadMaxAttachment(att: MaxAttachment, ctx: DownloadCon
   } catch (err) {
     if (!(err instanceof TransientDownloadError) || ctx.throwOnTransient) throw err;
     logger.error(`Transient failure downloading a MAX ${att._type ?? 'attachment'} — sending the placeholder instead`, err);
-    return null;
+    throw new DownloadMissError(err.why, err);
   }
 }
 
@@ -299,7 +343,6 @@ export const PHOTO_AS_FILE = new Set(['heic', 'tiff', 'avif']);
 async function downloadAttachmentOrThrow(att: MaxAttachment, ctx: DownloadContext): Promise<DownloadedAttachment | null> {
   if (att._type === 'PHOTO' && att.baseUrl && att.photoToken) {
     const buffer = await downloadUrl(att.baseUrl + att.photoToken);
-    if (!buffer) return null;
     return { buffer, filename: `photo_${String(att.photoId ?? Date.now())}.${imageExtension(buffer)}`, kind: 'photo' };
   }
 
@@ -309,16 +352,15 @@ async function downloadAttachmentOrThrow(att: MaxAttachment, ctx: DownloadContex
   if (att._type === 'STICKER' && att.lottieUrl) {
     try {
       const buffer = await downloadUrl(att.lottieUrl);
-      if (buffer) return { buffer: gzipSync(buffer), filename: `sticker_${String(att.stickerId ?? Date.now())}.tgs`, kind: 'sticker' };
+      return { buffer: gzipSync(buffer), filename: `sticker_${String(att.stickerId ?? Date.now())}.tgs`, kind: 'sticker' };
     } catch (err) {
-      // The static preview below is still a sticker — only with no preview is a transient failure worth reporting.
+      // The static preview below is still a sticker — only with no preview is the failure worth reporting.
       if (!att.url) throw err;
     }
   }
 
   if (att._type === 'STICKER' && att.url) {
     const buffer = await downloadUrl(att.url);
-    if (!buffer) return null;
     // Confirmed live 2026-08-13: the preview URL serves image/png regardless of sticker type.
     return { buffer, filename: `sticker_${String(att.stickerId ?? Date.now())}.png`, kind: 'photo' };
   }
@@ -328,9 +370,8 @@ async function downloadAttachmentOrThrow(att: MaxAttachment, ctx: DownloadContex
     const url = await withDownloadFallback(ctx, `FILE_DOWNLOAD fileId ${String(fileId)}`, (chatId, messageId) =>
       ctx.max.getFileDownloadUrl(chatId, messageId, fileId),
     );
-    if (!url) return null;
+    if (!url) throw new DownloadMissError(NO_LINK_WHY);
     const buffer = await downloadUrl(url);
-    if (!buffer) return null;
     // A literal quote in a filename breaks telegraf's multipart Content-Disposition — sendDocument
     // dies with "invalid json response body" (hit live 2026-08-15).
     const safeName = (att.name ?? `file_${Date.now()}`).replace(/[\r\n"\\]/g, '_');
@@ -339,7 +380,6 @@ async function downloadAttachmentOrThrow(att: MaxAttachment, ctx: DownloadContex
 
   if (att._type === 'AUDIO' && att.url) {
     const buffer = await downloadUrl(att.url);
-    if (!buffer) return null;
     return { buffer, filename: `voice_${String(att.audioId ?? Date.now())}.ogg`, kind: 'voice' };
   }
 
@@ -348,19 +388,27 @@ async function downloadAttachmentOrThrow(att: MaxAttachment, ctx: DownloadContex
     const urls = await withDownloadFallback(ctx, `VIDEO_PLAY videoId ${String(videoId)}`, (chatId, messageId) =>
       ctx.max.getVideoPlayUrls(chatId, messageId, videoId),
     );
-    if (!urls) return null;
+    if (!urls) throw new DownloadMissError(NO_LINK_WHY);
     // Highest resolution first, stepping down while a quality is over the size cap.
     const mp4Keys = Object.keys(urls)
       .filter((k) => k.startsWith('MP4_') && urls[k])
       .sort((a, b) => Number(b.slice(4)) - Number(a.slice(4)));
+    let miss: DownloadMissError | undefined;
     for (const mp4Key of mp4Keys) {
-      const buffer = await downloadUrl(urls[mp4Key] as string);
-      if (buffer) return { buffer, filename: `video_${String(videoId)}.mp4`, kind: att.videoType === 1 ? 'video_note' : 'video' };
-      logger.info(`VIDEO ${String(videoId)}: ${mp4Key} not usable — trying a lower quality`);
+      try {
+        const buffer = await downloadUrl(urls[mp4Key] as string);
+        return { buffer, filename: `video_${String(videoId)}.mp4`, kind: att.videoType === 1 ? 'video_note' : 'video' };
+      } catch (err) {
+        if (!(err instanceof DownloadMissError)) throw err;
+        miss = err;
+        logger.info(`VIDEO ${String(videoId)}: ${mp4Key} not usable — trying a lower quality`);
+      }
     }
-    return null;
+    throw miss ?? new DownloadMissError(NO_LINK_WHY);
   }
 
+  // A photo, file, voice or video with nothing to fetch it by (MAX left the link out).
+  if (att._type === 'PHOTO' || att._type === 'FILE' || att._type === 'AUDIO' || att._type === 'VIDEO') throw new DownloadMissError(NO_LINK_WHY);
   return null;
 }
 
