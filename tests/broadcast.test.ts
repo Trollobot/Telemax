@@ -58,7 +58,7 @@ describe('broadcast texts', () => {
     const links = addLinks('tlmx_bot', 'x');
     const empty = broadcastCard('Дача', [], links);
     expect(empty.text).toMatch(/сам добавит туда бота/);
-    expect(empty.markup.inline_keyboard.flat().map((b) => b.text)).toEqual(['👥 В группу', '📢 В канал', '🔎 Бот уже там', '◀️ Готово']);
+    expect(empty.markup.inline_keyboard.flat().map((b) => b.text)).toEqual(['👥 В группу', '📢 В канал', '🔎 Бот уже в группе или канале', '◀️ Готово']);
     const two = broadcastCard('Дача', [broadcast(), broadcast({ id: 'b2', targetTitle: 'Новости', targetType: 'channel', pin: true })], links);
     expect(two.text).toMatch(/👥 Читалка — с \d\d\.\d\d\n/);
     expect(two.text).toMatch(/📢 Новости — с \d\d\.\d\d, 📌 закрепляются/);
@@ -71,7 +71,7 @@ describe('broadcast texts', () => {
       'tlmx_bc:pin:b2',
       '👥 В группу',
       '📢 В канал',
-      '🔎 Бот уже там',
+      '🔎 Бот уже в группе или канале',
       'tlmx_panel:dismiss',
     ]);
     expect(broadcastCard('Дача', [], undefined).text).toMatch(/не знает своё имя/);

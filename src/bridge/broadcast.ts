@@ -114,7 +114,7 @@ export function broadcastCard(
   if (links) {
     lines.push(
       '',
-      '«👥 В группу» / «📢 В канал» — Telegram покажет ваши группы или каналы и сам добавит туда бота администратором (публиковать, закреплять). Бот уже там — «🔎 Бот уже там».',
+      '«👥 В группу» / «📢 В канал» — Telegram покажет ваши группы или каналы и сам добавит туда бота администратором (публиковать, закреплять). Бот уже в той группе или канале — «🔎 Бот уже в группе или канале».',
     );
   } else {
     lines.push('', '⚠️ Бот ещё не знает своё имя — повторите /broadcast через минуту.');
@@ -125,7 +125,7 @@ export function broadcastCard(
   ]);
   if (links) {
     rows.push([Markup.button.url('👥 В группу', links.group), Markup.button.url('📢 В канал', links.channel)]);
-    rows.push([Markup.button.url('🔎 Бот уже там', links.pick)]);
+    rows.push([Markup.button.url('🔎 Бот уже в группе или канале', links.pick)]);
   }
   rows.push([Markup.button.callback('◀️ Готово', 'tlmx_panel:dismiss')]);
   return { text: lines.join('\n'), markup: { inline_keyboard: rows } };
@@ -451,7 +451,7 @@ export function createBroadcasts(deps: BroadcastDeps): Broadcasts {
     const userId = ctx.from?.id;
     if (!msg || userId == null) return false;
 
-    // «🔎 Бот уже там»: the DM chat picker.
+    // «🔎 Бот уже в группе или канале»: the DM chat picker.
     const start = 'text' in msg ? /^\/start bc_([\w-]+)$/.exec(msg.text) : null;
     if (start) {
       const p = codeOf(userId, start[1]!);
