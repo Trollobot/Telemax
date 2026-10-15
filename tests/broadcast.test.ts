@@ -264,6 +264,7 @@ describe('switching a broadcast on', () => {
       sendMessage: vi.fn(async (_chatId: number | string, _text: string, _extra?: unknown) => ({ message_id: next++ })),
       getChatMember: vi.fn(async (_chatId: number | string, _userId: number): Promise<Record<string, unknown>> => ({ status: 'member' })),
       getChat: vi.fn(async (chatId: number | string) => ({ id: chatId, title: 'Из getChat' })),
+      editMessageText: vi.fn(async (_chatId: number | string, _id: number, _inline: unknown, _text: string, _extra?: unknown) => true),
     };
     const bot = { telegram, botInfo: { id: 42, username: 'tlmx_bot' }, command: vi.fn(), action: vi.fn() };
     const bc = createBroadcasts({
@@ -279,7 +280,7 @@ describe('switching a broadcast on', () => {
     bc.register();
     // An admin (id 9) writes /broadcast in the chat's topic: the card's links carry a fresh code.
     const onBroadcast = bot.command.mock.calls.find((c) => c[0] === 'broadcast')![1] as (ctx: unknown) => Promise<void>;
-    const reply = vi.fn(async () => ({}));
+    const reply = vi.fn(async () => ({ message_id: 500 }));
     await onBroadcast({ message: { message_thread_id: 5 }, from: { id: 9 }, reply });
     const markup = (reply.mock.calls[0] as unknown as [string, { reply_markup: { inline_keyboard: Array<Array<{ url?: string }>> } }])[1].reply_markup;
     const groupLink = markup.inline_keyboard.flat().find((b) => b.url?.includes('startgroup'))!.url!;
@@ -296,6 +297,24 @@ describe('switching a broadcast on', () => {
     expect(telegram.sendMessage.mock.calls[0]![1]).toMatch(/Сюда транслируется чат «Дача»/);
     expect(telegram.sendMessage.mock.calls[1]![1]).toMatch(/Трансляция в «Читалка» включена/);
     expect(telegram.sendMessage.mock.calls[2]![1]).toMatch(/^✅ Готово: чат «Дача» транслируется в «Читалка»/);
+  });
+
+  it('«👥 В группу» with admin rights: the join itself switches it on, the card in the topic shows it, a later /start adds nothing', async () => {
+    const { store, telegram, bc, code } = await setup();
+    const join = { chat: { id: -700, type: 'supergroup', title: 'Читалка' }, from: { id: 9 }, myChatMember: { old_chat_member: { status: 'left' }, new_chat_member: { status: 'administrator', can_pin_messages: true } } };
+    expect(await bc.handleChat(join as never)).toBe(true);
+    expect((await store.forChat('100')).map((b) => [b.targetChatId, b.targetType, b.targetTitle])).toEqual([[-700, 'group', 'Читалка']]);
+    expect(telegram.editMessageText).toHaveBeenCalledWith('-1001', 500, undefined, expect.stringMatching(/👥 Читалка/), expect.anything());
+    expect(telegram.sendMessage).toHaveBeenLastCalledWith(9, expect.stringMatching(/^✅ Готово/));
+    const sends = telegram.sendMessage.mock.calls.length;
+    const start = groupCtx(9, `/start@tlmx_bot bc_${code}`);
+    expect(await bc.handleChat(start as never)).toBe(true);
+    expect(start.reply).not.toHaveBeenCalled();
+    expect(telegram.sendMessage.mock.calls.length).toBe(sends);
+    expect(await store.all()).toHaveLength(1);
+    // Someone without a card adding the bot somewhere switches nothing on.
+    expect(await bc.handleChat({ ...join, chat: { id: -701, type: 'group', title: 'Чужая' }, from: { id: 10 } } as never)).toBe(true);
+    expect(await store.all()).toHaveLength(1);
   });
 
   it("someone else's /start with the code switches nothing on", async () => {

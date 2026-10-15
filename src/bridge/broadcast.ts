@@ -170,6 +170,7 @@ export function isPinRefusal(err: unknown): boolean {
   return r?.error_code === 403 || /not enough rights|need administrator rights|CHAT_ADMIN_REQUIRED|have no rights/i.test(r?.description ?? '');
 }
 const CANCEL = '✖️ Отмена';
+const ALREADY = 'Этот чат уже транслируется туда.';
 
 type CopyLink = { broadcastId: string; targetChatId: number; ids: number[]; anchor?: number };
 type PickRequest = { maxChatId: string; requesterId: number; at: number };
@@ -394,6 +395,16 @@ export function createBroadcasts(deps: BroadcastDeps): Broadcasts {
   async function card(maxChatId: string, requesterId: number) {
     return broadcastCard(await deps.chatTitle(maxChatId), await store.forChat(maxChatId), issue(maxChatId, requesterId));
   }
+  /** The newest /broadcast card per MAX chat (its message in the bridge group) — a place switched on from Telegram's own picker shows up in it at once, «📌» included. */
+  const cards = new Map<string, number>();
+  async function refreshCard(maxChatId: string, requesterId: number): Promise<void> {
+    const messageId = cards.get(maxChatId);
+    if (messageId == null) return;
+    const { text, markup } = await card(maxChatId, requesterId);
+    await bot.telegram.editMessageText(targetGroupId, messageId, undefined, text, { reply_markup: markup }).catch((err) => {
+      if (!/not modified/i.test((err as Error).message)) logger.info(`Broadcast: the /broadcast card was not refreshed (${(err as Error).message})`);
+    });
+  }
   const removeKeyboard = { reply_markup: { remove_keyboard: true as const } };
   const botHandle = () => (bot.botInfo?.username ? `@${bot.botInfo.username}` : 'бота');
 
@@ -405,21 +416,34 @@ export function createBroadcasts(deps: BroadcastDeps): Broadcasts {
     return member?.status === 'member' || member?.status === 'administrator' || (member?.status === 'restricted' && member.can_send_messages);
   }
 
-  /** Switches the broadcast on (rights checked by the caller): saved, a hello in the place, a notice in the topic. Returns what to tell the admin. */
+  /** In-flight binds, `${maxChatId}:${chatId}`: a group's join and its `/start bc_<code>` may come together. */
+  const binding = new Set<string>();
+  /**
+   * Switches the broadcast on (rights checked by the caller): saved, a hello in the place, a notice
+   * in the topic, the topic's card refreshed. Returns what to tell the admin — ALREADY when that
+   * place is on already (or being switched on right now).
+   */
   async function bind(p: PickRequest, chatId: number, kind: 'group' | 'channel', knownTitle?: string): Promise<string> {
     if (String(chatId) === targetGroupId) return 'Это группа самого моста — выберите другую.';
-    if ((await store.forChat(p.maxChatId)).some((b) => b.targetChatId === chatId)) return 'Этот чат уже транслируется туда.';
-    const chat = knownTitle ? undefined : await bot.telegram.getChat(chatId).catch(() => undefined);
-    const targetTitle = knownTitle ?? (chat && 'title' in chat ? chat.title : undefined) ?? String(chatId);
-    const title = await deps.chatTitle(p.maxChatId);
-    const now = Date.now();
-    await store.add({ id: randomBytes(6).toString('base64url'), maxChatId: p.maxChatId, targetChatId: chatId, targetTitle, targetType: kind, since: now, cursor: now });
-    logger.info(`Broadcast on: MAX chat ${p.maxChatId} -> ${kind} ${chatId}`);
-    await bot.telegram
-      .sendMessage(chatId, `📡 Сюда транслируется чат «${title}» из MAX — новые сообщения будут появляться здесь.`)
-      .catch((err) => logger.error('Broadcast hello to the target failed', err));
-    await notifyTopic(p.maxChatId, `📡 Трансляция в «${targetTitle}» включена — новые сообщения этого чата копируются туда. Управление — /broadcast.`);
-    return `✅ Готово: чат «${title}» транслируется в «${targetTitle}». Остановить — /broadcast в теме чата.`;
+    const key = `${p.maxChatId}:${chatId}`;
+    if (binding.has(key) || (await store.forChat(p.maxChatId)).some((b) => b.targetChatId === chatId)) return ALREADY;
+    binding.add(key);
+    try {
+      const chat = knownTitle ? undefined : await bot.telegram.getChat(chatId).catch(() => undefined);
+      const targetTitle = knownTitle ?? (chat && 'title' in chat ? chat.title : undefined) ?? String(chatId);
+      const title = await deps.chatTitle(p.maxChatId);
+      const now = Date.now();
+      await store.add({ id: randomBytes(6).toString('base64url'), maxChatId: p.maxChatId, targetChatId: chatId, targetTitle, targetType: kind, since: now, cursor: now });
+      logger.info(`Broadcast on: MAX chat ${p.maxChatId} -> ${kind} ${chatId}`);
+      await bot.telegram
+        .sendMessage(chatId, `📡 Сюда транслируется чат «${title}» из MAX — новые сообщения будут появляться здесь.`)
+        .catch((err) => logger.error('Broadcast hello to the target failed', err));
+      await notifyTopic(p.maxChatId, `📡 Трансляция в «${targetTitle}» включена — новые сообщения этого чата копируются туда. Закреп «📌» и остановка — в карточке /broadcast.`);
+      await refreshCard(p.maxChatId, p.requesterId);
+      return `✅ Готово: чат «${title}» транслируется в «${targetTitle}». Закреп «📌» и остановка — в карточке /broadcast в теме чата.`;
+    } finally {
+      binding.delete(key);
+    }
   }
 
   async function handlePrivate(ctx: Context): Promise<boolean> {
@@ -492,22 +516,29 @@ export function createBroadcasts(deps: BroadcastDeps): Broadcasts {
     const chat = ctx.chat;
     if (!chat || chat.type === 'private') return false;
 
-    // «📢 В канал»: Telegram made the bot an admin there — the promoting admin's newest card says which MAX chat.
+    // «📢 В канал»: Telegram made the bot an admin there; «👥 В группу»: Telegram added it to a group
+    // (added as an admin, it may get no `/start bc_<code>` at all — live 2026-10-15). Either way the
+    // adding admin's newest card says which MAX chat.
     const change = ctx.myChatMember;
     if (change) {
       const now = change.new_chat_member;
       const before = change.old_chat_member.status;
       const promoted = chat.type === 'channel' && now.status === 'administrator' && before !== 'administrator';
-      const p = promoted && userId != null ? codeOf(userId) : undefined;
+      const joined = chat.type !== 'channel' && (before === 'left' || before === 'kicked') && now.status !== 'left' && now.status !== 'kicked';
+      const p = (promoted || joined) && userId != null ? codeOf(userId) : undefined;
       if (!p || userId == null) return true; // nothing of ours — and never a reply into someone's channel
-      if (!(now.status === 'administrator' && now.can_post_messages)) {
+      if (promoted && !(now.status === 'administrator' && now.can_post_messages)) {
         await bot.telegram
           .sendMessage(userId, `Бота добавили в «${chat.title}» без права публиковать сообщения — трансляции туда не будет. Дайте ему это право и нажмите «📢 В канал» ещё раз.`)
           .catch(() => {});
         return true;
       }
-      const answer = await bind(p, chat.id, 'channel', chat.title);
-      await bot.telegram.sendMessage(userId, answer).catch((err) => logger.error('Broadcast: could not tell the admin in DM', err));
+      if (joined && now.status === 'restricted' && !now.can_send_messages) {
+        await bot.telegram.sendMessage(userId, `Бота добавили в «${chat.title}», но запретили ему писать — разрешите отправку сообщений и нажмите «👥 В группу» ещё раз.`).catch(() => {});
+        return true;
+      }
+      const answer = await bind(p, chat.id, promoted ? 'channel' : 'group', chat.title);
+      if (answer !== ALREADY) await bot.telegram.sendMessage(userId, answer).catch((err) => logger.error('Broadcast: could not tell the admin in DM', err));
       return true;
     }
 
@@ -525,6 +556,8 @@ export function createBroadcasts(deps: BroadcastDeps): Broadcasts {
       return true;
     }
     const answer = await bind(p, chat.id, 'group', 'title' in chat ? chat.title : undefined);
+    // Switched on by the join already (my_chat_member) — nothing to add.
+    if (answer === ALREADY) return true;
     // The hello already went into the group; the admin gets the outcome in DM (a refusal stays visible there).
     if (!answer.startsWith('✅')) await ctx.reply(answer).catch(() => {});
     await bot.telegram.sendMessage(userId!, answer).catch(() => {});
@@ -554,7 +587,8 @@ export function createBroadcasts(deps: BroadcastDeps): Broadcasts {
         return;
       }
       const { text, markup } = await card(maxChatId, userId);
-      await ctx.reply(text, { message_thread_id: topicId, reply_markup: markup });
+      const sent = await ctx.reply(text, { message_thread_id: topicId, reply_markup: markup });
+      if (sent?.message_id != null) cards.set(maxChatId, sent.message_id);
     });
 
     bot.action(/^tlmx_bc:stop:([\w-]+)$/, async (ctx) => {
