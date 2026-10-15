@@ -370,12 +370,14 @@ describe('syncAllChatsToTelegram', () => {
     await store.upsert({ maxChatId: '23', telegramTopicId: 123, title: 'Бан', createdAt: 'x', banned: true });
     const w = fakeWorld([msg(1, 100, 'old'), msg(2, 200, 'new')]);
     const chatsInfo = vi.fn(async (_ids: unknown[]) => [
-      { id: 20, type: 'CHANNEL', status: 'LEFT' },
-      { id: 21, type: 'CHANNEL', status: 'ACTIVE' },
+      // Unsubscribed: the channel itself stays ACTIVE — the account is just not among its participants.
+      { id: 20, type: 'CHANNEL', status: 'ACTIVE', participants: { '9': 1 } },
+      { id: 21, type: 'CHANNEL', status: 'ACTIVE', participants: { '5': 1 } },
     ]);
     (w.sync.deps.max as unknown as { chatsInfo: typeof chatsInfo }).chatsInfo = chatsInfo;
     const rememberChat = vi.fn();
     w.sync.deps.rememberChat = rememberChat;
+    w.sync.deps.getMyAccountId = () => 5;
     await syncAllChatsToTelegram(w.sync, [], () => 'x');
     expect(chatsInfo).toHaveBeenCalledTimes(1);
     expect(chatsInfo).toHaveBeenCalledWith(['20', '21', '22']); // a banned chat is not asked about
@@ -383,7 +385,7 @@ describe('syncAllChatsToTelegram', () => {
       { text: 'new', topicId: 121 },
       { text: 'new', topicId: 122 }, // MAX said nothing about it — caught up as before
     ]);
-    expect(rememberChat).toHaveBeenCalledWith({ id: 21, type: 'CHANNEL', status: 'ACTIVE' });
+    expect(rememberChat).toHaveBeenCalledWith({ id: 21, type: 'CHANNEL', status: 'ACTIVE', participants: { '5': 1 } });
     expect(w.sync.isCaughtUp('20')).toBe(false);
     // No ban: should MAX be wrong and the posts keep coming, the next live one goes through and brings the gap.
     expect((await store.getByMaxChatId('20'))?.banned).toBeFalsy();
@@ -412,7 +414,14 @@ describe('isLeftChat', () => {
     expect(isLeftChat({ type: 'CHAT', status: 'CLOSED' })).toBe(true);
     expect(isLeftChat({ type: 'CHANNEL', status: 'ACTIVE' })).toBe(false);
     expect(isLeftChat({ type: 'CHANNEL', status: 'HIDDEN' })).toBe(false);
+    // A channel's status is its own: membership is the account among the participants.
+    expect(isLeftChat({ type: 'CHANNEL', status: 'ACTIVE', participants: { '9': 1 } }, 5)).toBe(true);
+    expect(isLeftChat({ type: 'CHANNEL', status: 'ACTIVE', participants: {} }, 5)).toBe(true);
+    expect(isLeftChat({ type: 'CHANNEL', status: 'ACTIVE', participants: { '5': 1 } }, 5)).toBe(false);
+    expect(isLeftChat({ type: 'CHANNEL', status: 'ACTIVE', participants: { '9': 1 } })).toBe(false); // own id unknown
+    expect(isLeftChat({ type: 'CHANNEL', status: 'ACTIVE' }, 5)).toBe(false); // no participants: not known
     expect(isLeftChat({ type: 'DIALOG', status: 'REMOVED' })).toBe(false);
+    expect(isLeftChat({ type: 'DIALOG', status: 'ACTIVE', participants: { '9': 1 } }, 5)).toBe(false);
     expect(isLeftChat({ type: 'CHANNEL' })).toBe(false);
     expect(isLeftChat(undefined)).toBe(false);
   });

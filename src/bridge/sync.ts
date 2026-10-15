@@ -4172,13 +4172,26 @@ export function wireBridge({
 
 /**
  * MAX's word that the account is no longer in a group or channel: left or unsubscribed, removed,
- * or the chat closed — MAX web shows LEFT and CLOSED as REMOVED. A dialog is never "left" here:
- * the contact's next message brings it back.
+ * or the chat closed — MAX web shows LEFT and CLOSED as REMOVED. A channel's status is the
+ * channel's own, though (an unsubscribed one answered CHANNEL, ACTIVE — live 2026-10-14): there it
+ * is the account missing from `participants` (MAX web's isViewerParticipant, which its
+ * «Отписаться»/«Покинуть» needs). No `participants` or no account id: not known, so not left.
+ * A dialog is never "left" here: the contact's next message brings it back.
  */
-export function isLeftChat(chat: unknown): boolean {
+export function isLeftChat(chat: unknown, myAccountId?: number | null): boolean {
   if (!chat || typeof chat !== 'object') return false;
-  const { type, status } = chat as { type?: unknown; status?: unknown };
-  return type !== 'DIALOG' && (status === 'LEFT' || status === 'REMOVED' || status === 'CLOSED');
+  const { type, status, participants } = chat as { type?: unknown; status?: unknown; participants?: unknown };
+  if (type === 'DIALOG') return false;
+  if (status === 'LEFT' || status === 'REMOVED' || status === 'CLOSED') return true;
+  return myAccountId != null && participants != null && typeof participants === 'object' && !(String(myAccountId) in participants);
+}
+
+/** What MAX said about a chat, for the log: type, status, and whether the account is among the participants. */
+function describedChatNote(chat: unknown, myAccountId: number | null): string {
+  const { type, status, participants } = chat as { type?: unknown; status?: unknown; participants?: unknown };
+  const members = participants != null && typeof participants === 'object' ? Object.keys(participants) : undefined;
+  const you = !members || myAccountId == null ? '?' : members.includes(String(myAccountId)) ? 'yes' : 'no';
+  return ` (MAX: ${String(type)}, ${String(status)}, participants ${members ? members.length : '—'}, you among them: ${you})`;
 }
 
 /** The chats MAX describes (CHAT_INFO, 50 ids a request) by id string; a failure leaves the rest unknown — they are caught up as before. */
@@ -4286,8 +4299,9 @@ export async function syncAllChatsToTelegram(
       return;
     }
     const chat = described.get(mapping.maxChatId);
-    const said = chat ? ` (MAX: ${String((chat as { type?: unknown }).type)}, ${String((chat as { status?: unknown }).status)})` : '';
-    if (isLeftChat(chat)) {
+    const myAccountId = chatSync.deps.getMyAccountId();
+    const said = chat ? describedChatNote(chat, myAccountId) : '';
+    if (isLeftChat(chat, myAccountId)) {
       logger.info(`MAX chat ${mapping.maxChatId} is mapped but the account is no longer in it${said} — no catch-up, its topic stays as it is`);
       continue;
     }
