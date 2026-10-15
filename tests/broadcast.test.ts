@@ -46,10 +46,10 @@ describe('broadcast texts', () => {
     expect(isGoneError(new Error('socket hang up'))).toBe(false);
   });
 
-  it("adds the bot through Telegram's own links: a group gets the code, a channel the admin rights", () => {
+  it("adds the bot through Telegram's own links: a group gets the code, both the admin rights «📌» needs", () => {
     expect(addLinks('tlmx_bot', 'abc')).toEqual({
-      group: 'https://t.me/tlmx_bot?startgroup=bc_abc',
-      channel: 'https://t.me/tlmx_bot?startchannel&admin=post_messages+edit_messages',
+      group: 'https://t.me/tlmx_bot?startgroup=bc_abc&admin=pin_messages+delete_messages',
+      channel: 'https://t.me/tlmx_bot?startchannel&admin=post_messages+edit_messages+delete_messages',
       pick: 'https://t.me/tlmx_bot?start=bc_abc',
     });
   });
@@ -59,12 +59,16 @@ describe('broadcast texts', () => {
     const empty = broadcastCard('Дача', [], links);
     expect(empty.text).toMatch(/сам добавит туда бота/);
     expect(empty.markup.inline_keyboard.flat().map((b) => b.text)).toEqual(['👥 В группу', '📢 В канал', '🔎 Бот уже там', '◀️ Готово']);
-    const two = broadcastCard('Дача', [broadcast(), broadcast({ id: 'b2', targetTitle: 'Новости', targetType: 'channel' })], links);
-    expect(two.text).toMatch(/👥 Читалка/);
-    expect(two.text).toMatch(/📢 Новости/);
+    const two = broadcastCard('Дача', [broadcast(), broadcast({ id: 'b2', targetTitle: 'Новости', targetType: 'channel', pin: true })], links);
+    expect(two.text).toMatch(/👥 Читалка — с \d\d\.\d\d\n/);
+    expect(two.text).toMatch(/📢 Новости — с \d\d\.\d\d, 📌 закрепляются/);
+    expect(two.markup.inline_keyboard[0]!.map((b) => b.text)).toEqual(['⏹ Остановить: Читалка', '📌 Закреп: выкл']);
+    expect(two.markup.inline_keyboard[1]!.map((b) => b.text)).toEqual(['⏹ Остановить: Новости', '📌 Закреп: вкл']);
     expect(two.markup.inline_keyboard.flat().map((b) => ('callback_data' in b ? b.callback_data : b.text))).toEqual([
       'tlmx_bc:stop:b1',
+      'tlmx_bc:pin:b1',
       'tlmx_bc:stop:b2',
+      'tlmx_bc:pin:b2',
       '👥 В группу',
       '📢 В канал',
       '🔎 Бот уже там',
@@ -100,6 +104,8 @@ describe('copying into broadcasts', () => {
       copyMessage: vi.fn(async (_chatId: number | string, _from: number | string, _id: number, _extra?: unknown) => ({ message_id: next++ })),
       editMessageText: vi.fn(async (_chatId: number | string, _id: number, _inline: unknown, _text: string) => true),
       deleteMessages: vi.fn(async (_chatId: number | string, _ids: number[]) => true),
+      deleteMessage: vi.fn(async (_chatId: number | string, _id: number) => true),
+      pinChatMessage: vi.fn(async (_chatId: number | string, _id: number, _extra?: unknown) => true),
       getChatMember: vi.fn(async (_chatId: number | string, _userId: number): Promise<Record<string, unknown>> => ({ status: 'member' })),
       getChat: vi.fn(async (chatId: number | string) => ({ id: chatId, title: 'Из getChat' })),
     };
@@ -187,6 +193,66 @@ describe('copying into broadcasts', () => {
     expect(bot.telegram.copyMessage.mock.calls[0]).toEqual([-500, '-1001', 12, { caption: `${prefix}↩️ Переслано от Пети\nдача`, caption_entities: undefined }]);
     expect(bot.telegram.sendMessage.mock.calls[1]![1]).toBe('🧑 Сергей:');
     expect(bot.telegram.copyMessage.mock.calls[1]!.slice(0, 3)).toEqual([-500, '-1001', 14]);
+  });
+
+  it('«📌»: the first copy of every message is pinned, silently — the owner\'s too; a place without the flag is left alone', async () => {
+    const { store, bot, bc } = await setup(broadcast({ pin: true }), broadcast({ id: 'b2', targetChatId: -600 }));
+    bc.copyIncoming({ maxChatId: '100', maxMessageId: 7, time: 2000, text: '👤 Петя:\nфото', mediaIds: [55, 56] });
+    bc.copyOwner('100', 8, 3000, { message_id: 10, text: 'ок' } as unknown as Message);
+    await vi.waitFor(async () => expect((await store.get('b2'))!.cursor).toBe(3000));
+    await vi.waitFor(async () => expect((await store.get('b1'))!.cursor).toBe(3000));
+    const toPlace = (chatId: number) => bot.telegram.sendMessage.mock.results.filter((_r, i) => bot.telegram.sendMessage.mock.calls[i]![0] === chatId);
+    const firstIds = await Promise.all(toPlace(-500).map((r) => r.value as Promise<{ message_id: number }>));
+    expect(bot.telegram.pinChatMessage.mock.calls).toEqual(firstIds.map((m) => [-500, m.message_id, { disable_notification: true }]));
+  });
+
+  it('«📌» without the right to pin goes off and says so in the topic; copying goes on', async () => {
+    const { store, bot, bc } = await setup(broadcast({ pin: true }));
+    bot.telegram.pinChatMessage.mockRejectedValue(Object.assign(new Error('400'), { response: { error_code: 400, description: 'Bad Request: not enough rights to manage pinned messages in the chat' } }));
+    bc.copyIncoming({ maxChatId: '100', maxMessageId: 7, time: 2000, text: 'раз', mediaIds: [] });
+    await vi.waitFor(async () => expect((await store.get('b1'))!.cursor).toBe(2000));
+    expect((await store.get('b1'))!.pin).toBeUndefined();
+    expect(bot.telegram.sendMessage).toHaveBeenCalledWith('-1001', expect.stringMatching(/Закреп в «Читалка» выключен: у бота там нет права закреплять/), { message_thread_id: 77 });
+    bc.copyIncoming({ maxChatId: '100', maxMessageId: 8, time: 3000, text: 'два', mediaIds: [] });
+    await vi.waitFor(async () => expect((await store.get('b1'))!.cursor).toBe(3000));
+    expect(bot.telegram.pinChatMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('the «… закрепил» line goes only for the bot\'s own pin', async () => {
+    const { store, bot, bc } = await setup(broadcast({ pin: true }));
+    bc.copyIncoming({ maxChatId: '100', maxMessageId: 7, time: 2000, text: 'раз', mediaIds: [] });
+    await vi.waitFor(async () => expect((await store.get('b1'))!.cursor).toBe(2000));
+    const ours = bot.telegram.pinChatMessage.mock.calls[0]![1];
+    await bc.onTargetUpdate({ chat: { id: -500 }, message: { message_id: 300, pinned_message: { message_id: 999 } } } as never);
+    expect(bot.telegram.deleteMessage).not.toHaveBeenCalled();
+    await bc.onTargetUpdate({ chat: { id: -500 }, message: { message_id: 301, pinned_message: { message_id: ours } } } as never);
+    expect(bot.telegram.deleteMessage).toHaveBeenCalledWith(-500, 301);
+    // A channel's line arrives as a channel post.
+    bc.copyIncoming({ maxChatId: '100', maxMessageId: 8, time: 3000, text: 'два', mediaIds: [] });
+    await vi.waitFor(() => expect(bot.telegram.pinChatMessage).toHaveBeenCalledTimes(2));
+    await bc.onTargetUpdate({ chat: { id: -500 }, channelPost: { message_id: 302, pinned_message: { message_id: bot.telegram.pinChatMessage.mock.calls[1]![1] } } } as never);
+    expect(bot.telegram.deleteMessage).toHaveBeenLastCalledWith(-500, 302);
+  });
+
+  it('the «📌» button switches it on only where the bot may pin, and off again', async () => {
+    const { store, bot, bc } = await setup(broadcast());
+    bc.register();
+    const [, onPin] = bot.action.mock.calls.find((c) => String(c[0]).includes('pin'))! as [RegExp, (ctx: unknown) => Promise<void>];
+    const press = () => {
+      const ctx = { match: ['', 'b1'], from: { id: 9 }, answerCbQuery: vi.fn(async () => true), editMessageText: vi.fn(async () => true) };
+      return onPin(ctx).then(() => ctx);
+    };
+    let ctx = await press(); // a plain member
+    expect(ctx.answerCbQuery).toHaveBeenCalledWith(expect.stringMatching(/администратором с правом «Закрепление сообщений»/), { show_alert: true });
+    expect((await store.get('b1'))!.pin).toBeUndefined();
+    bot.telegram.getChatMember.mockResolvedValue({ status: 'administrator', can_pin_messages: true, can_delete_messages: false });
+    ctx = await press();
+    expect((await store.get('b1'))!.pin).toBe(true);
+    expect(ctx.answerCbQuery).toHaveBeenCalledWith(expect.stringMatching(/закрепил» останется/), { show_alert: true });
+    expect(ctx.editMessageText).toHaveBeenCalledWith(expect.stringMatching(/📌 закрепляются/), expect.anything());
+    ctx = await press();
+    expect((await store.get('b1'))!.pin).toBeUndefined();
+    expect(ctx.answerCbQuery).toHaveBeenCalledWith('📌 Закреп выключен');
   });
 });
 

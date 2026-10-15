@@ -54,6 +54,8 @@ export interface Broadcasts {
   copyDelete(maxChatId: string, maxMessageId: unknown): void;
   /** True for a chat that receives a broadcast — the bridge leaves its updates alone. */
   isTarget(chatId: number): Promise<boolean>;
+  /** An update from a broadcast's place: the «… закрепил» line Telegram adds for the bot's own pin goes away. */
+  onTargetUpdate(ctx: Context): Promise<void>;
   /** The DM part of switching one on (deep link, chat picker); true when the update was ours. */
   handlePrivate(ctx: Context): Promise<boolean>;
   /** A group or channel outside the bridge: the bot added there by a card's link (true = ours, nothing else may answer it). */
@@ -102,17 +104,25 @@ export function broadcastCard(
       'Новые сообщения этого чата можно копировать в группы и каналы Telegram — для тех, у кого нет MAX. Мест — сколько угодно. История до включения не переносится, а что пишут там — в MAX не уходит.',
     );
   } else {
-    lines.push('Новые сообщения копируются сюда:', ...list.map((b) => `• ${where(b)} — с ${day(b.since)}`));
+    lines.push(
+      'Новые сообщения копируются сюда:',
+      ...list.map((b) => `• ${where(b)} — с ${day(b.since)}${b.pin ? ', 📌 закрепляются' : ''}`),
+      '',
+      '«📌» — закреплять там каждое новое сообщение, тихо: в группе, где все пишут, их легко найти по закрепам.',
+    );
   }
   if (links) {
     lines.push(
       '',
-      '«👥 В группу» / «📢 В канал» — Telegram покажет ваши группы или каналы и сам добавит туда бота (в канал — администратором с правом публиковать). Бот уже там — «🔎 Бот уже там».',
+      '«👥 В группу» / «📢 В канал» — Telegram покажет ваши группы или каналы и сам добавит туда бота администратором (публиковать, закреплять). Бот уже там — «🔎 Бот уже там».',
     );
   } else {
     lines.push('', '⚠️ Бот ещё не знает своё имя — повторите /broadcast через минуту.');
   }
-  const rows: InlineKeyboardButton[][] = list.map((b) => [Markup.button.callback(`⏹ Остановить: ${truncateCodePoints(b.targetTitle, 40, '…')}`, `tlmx_bc:stop:${b.id}`)]);
+  const rows: InlineKeyboardButton[][] = list.map((b) => [
+    Markup.button.callback(`⏹ Остановить: ${truncateCodePoints(b.targetTitle, 30, '…')}`, `tlmx_bc:stop:${b.id}`),
+    Markup.button.callback(b.pin ? '📌 Закреп: вкл' : '📌 Закреп: выкл', `tlmx_bc:pin:${b.id}`),
+  ]);
   if (links) {
     rows.push([Markup.button.url('👥 В группу', links.group), Markup.button.url('📢 В канал', links.channel)]);
     rows.push([Markup.button.url('🔎 Бот уже там', links.pick)]);
@@ -124,11 +134,15 @@ export function broadcastCard(
 /** The card's three ways to add a place — all carry the same one-time code (see createBroadcasts). */
 export type AddLinks = { group: string; channel: string; pick: string };
 
-/** Telegram's own «add the bot» links: a group gets `/start@bot bc_<code>` (the code says which chat); a channel makes the bot an admin with these rights. */
+/**
+ * Telegram's own «add the bot» links: a group gets `/start@bot bc_<code>` (the code says which chat);
+ * both make the bot an admin with these rights — pinning for «📌» (a channel pins with
+ * edit_messages), deleting for the «… закрепил» line each pin leaves.
+ */
 export function addLinks(username: string, code: string): AddLinks {
   return {
-    group: `https://t.me/${username}?startgroup=bc_${code}`,
-    channel: `https://t.me/${username}?startchannel&admin=post_messages+edit_messages`,
+    group: `https://t.me/${username}?startgroup=bc_${code}&admin=pin_messages+delete_messages`,
+    channel: `https://t.me/${username}?startchannel&admin=post_messages+edit_messages+delete_messages`,
     pick: `https://t.me/${username}?start=bc_${code}`,
   };
 }
@@ -148,6 +162,13 @@ const CHANNEL_RIGHTS: ChatAdministratorRights = {
 };
 const LINK_TTL_MS = 30 * 60_000;
 const COPY_MAP_CAP = 1000;
+const PINNED_CAP = 200;
+
+/** Telegram refusing the bot a pin for want of rights (not an admin, no «Закрепление сообщений»). */
+export function isPinRefusal(err: unknown): boolean {
+  const r = (err as { response?: { error_code?: number; description?: string } } | null)?.response;
+  return r?.error_code === 403 || /not enough rights|need administrator rights|CHAT_ADMIN_REQUIRED|have no rights/i.test(r?.description ?? '');
+}
 const CANCEL = '✖️ Отмена';
 
 type CopyLink = { broadcastId: string; targetChatId: number; ids: number[]; anchor?: number };
@@ -214,6 +235,34 @@ export function createBroadcasts(deps: BroadcastDeps): Broadcasts {
     }
   }
 
+  /** The bot's own pins, `${chatId}:${messageId}` — only their «… закрепил» line is removed (onTargetUpdate). */
+  const pinned = new Set<string>();
+  /** «📌»: the first copy of a message pinned, silently. No right to pin → the flag goes off and the topic says why, once. */
+  async function pinCopy(b: Broadcast, messageId: number): Promise<void> {
+    const key = `${b.targetChatId}:${messageId}`;
+    if (pinned.size >= PINNED_CAP) pinned.delete(pinned.values().next().value!);
+    pinned.add(key);
+    try {
+      await withFloodRetry(() => bot.telegram.pinChatMessage(b.targetChatId, messageId, { disable_notification: true }));
+    } catch (err) {
+      pinned.delete(key);
+      if (!isPinRefusal(err)) {
+        logger.error(`Broadcast ${b.id}: pinning message ${messageId} in ${b.targetChatId} failed`, err);
+        return;
+      }
+      if (!(await store.setPin(b.id, false))) return;
+      logger.info(`Broadcast ${b.id}: «📌» off — no right to pin in ${b.targetChatId} (${(err as Error).message})`);
+      await notifyTopic(b.maxChatId, `📌 Закреп в «${b.targetTitle}» выключен: у бота там нет права закреплять сообщения. Дайте его и включите «📌» снова — /broadcast.`);
+    }
+  }
+  /** What the bot may do in a place for «📌»: pin (a channel pins with the right to edit) and delete the «закрепил» line. */
+  async function pinRights(b: Broadcast): Promise<{ pin: boolean; del: boolean }> {
+    const botId = bot.botInfo?.id;
+    const m = botId != null ? await bot.telegram.getChatMember(b.targetChatId, botId).catch(() => undefined) : undefined;
+    if (m?.status !== 'administrator') return { pin: false, del: false };
+    return { pin: b.targetType === 'channel' ? m.can_edit_messages === true : m.can_pin_messages !== false, del: m.can_delete_messages === true };
+  }
+
   /** Reply target in this broadcast for a quoted MAX message — its copy's anchor, if it was copied. */
   function replyTo(b: Broadcast, maxChatId: string, quote?: { maxMessageId: unknown }): number | undefined {
     if (!quote) return undefined;
@@ -241,6 +290,7 @@ export function createBroadcasts(deps: BroadcastDeps): Broadcasts {
           const m = await withFloodRetry(() => bot.telegram.copyMessage(b.targetChatId, targetGroupId, id, ids.length === 0 ? replyExtra(reply) : {}));
           ids.push(m.message_id);
         }
+        if (b.pin && ids.length) await pinCopy(b, ids[0]!);
       } finally {
         if (ids.length) remember(keyOf(c.maxChatId, c.maxMessageId), { broadcastId: b.id, targetChatId: b.targetChatId, ids, anchor });
       }
@@ -289,6 +339,7 @@ export function createBroadcasts(deps: BroadcastDeps): Broadcasts {
           await send(prefix.trimEnd());
           await copy();
         }
+        if (b.pin && ids.length) await pinCopy(b, ids[0]!);
       } finally {
         if (ids.length) remember(keyOf(maxChatId, maxMessageId), { broadcastId: b.id, targetChatId: b.targetChatId, ids, anchor });
       }
@@ -480,6 +531,19 @@ export function createBroadcasts(deps: BroadcastDeps): Broadcasts {
     return true;
   }
 
+  async function onTargetUpdate(ctx: Context): Promise<void> {
+    const msg = (ctx.channelPost ?? ctx.message) as { message_id: number; pinned_message?: { message_id: number } } | undefined;
+    const chatId = ctx.chat?.id;
+    const pinnedId = msg?.pinned_message?.message_id;
+    if (!msg || chatId == null || pinnedId == null) return;
+    // Someone else's pin is theirs — only the line of the bot's own goes.
+    if (!pinned.delete(`${chatId}:${pinnedId}`)) return;
+    await bot.telegram
+      .deleteMessage(chatId, msg.message_id)
+      .then(() => logger.info(`Broadcast: removed the «pinned» line of message ${pinnedId} in ${chatId}`))
+      .catch((err) => logger.info(`Broadcast: the «pinned» line in ${chatId} stays (${(err as Error).message})`));
+  }
+
   function register(): void {
     bot.command('broadcast', async (ctx) => {
       const topicId = ctx.message.message_thread_id;
@@ -506,6 +570,36 @@ export function createBroadcasts(deps: BroadcastDeps): Broadcasts {
       const { text, markup } = await card(maxChatId, ctx.from.id);
       await ctx.editMessageText(text, { reply_markup: markup }).catch(() => {});
     });
+
+    bot.action(/^tlmx_bc:pin:([\w-]+)$/, async (ctx) => {
+      const b = await store.get(ctx.match[1]!);
+      if (!b) {
+        await ctx.answerCbQuery('Эта трансляция уже остановлена').catch(() => {});
+      } else if (b.pin) {
+        await store.setPin(b.id, false);
+        await ctx.answerCbQuery('📌 Закреп выключен').catch(() => {});
+      } else {
+        const rights = await pinRights(b);
+        if (!rights.pin) {
+          const right = b.targetType === 'channel' ? '«Редактирование сообщений»' : '«Закрепление сообщений»';
+          await ctx.answerCbQuery(`Чтобы закреплять в «${truncateCodePoints(b.targetTitle, 40, '…')}», бот должен быть там администратором с правом ${right}. Выдайте его и нажмите ещё раз.`, { show_alert: true }).catch(() => {});
+        } else {
+          await store.setPin(b.id, true);
+          logger.info(`Broadcast ${b.id}: «📌» on in ${b.targetChatId}`);
+          await ctx
+            .answerCbQuery(
+              rights.del
+                ? '📌 Новые сообщения будут закрепляться'
+                : '📌 Включено. Строка «… закрепил» останется в чате: у бота нет права удалять сообщения — дайте его, чтобы её не было.',
+              { show_alert: !rights.del },
+            )
+            .catch(() => {});
+        }
+      }
+      if (!b) return;
+      const { text, markup } = await card(b.maxChatId, ctx.from.id);
+      await ctx.editMessageText(text, { reply_markup: markup }).catch(() => {});
+    });
   }
 
   return {
@@ -514,6 +608,7 @@ export function createBroadcasts(deps: BroadcastDeps): Broadcasts {
     copyEdit,
     copyDelete,
     isTarget: (chatId) => store.isTarget(chatId),
+    onTargetUpdate,
     handlePrivate,
     handleChat,
     register,

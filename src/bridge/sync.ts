@@ -1682,9 +1682,15 @@ export function wireBridge({
         await bugReports.handleIncomingPrivate(ctx);
         return;
       }
-      // A broadcast's group or channel: readers' messages there go nowhere. And no reject for the
-      // service message of the bot being added — the chat picker does exactly that before it says which chat.
-      if (await broadcasts.isTarget(ctx.chat.id).catch(() => false)) return;
+      // A broadcast's group or channel: readers' messages there go nowhere (only the «закрепил» line of
+      // a «📌» pin is looked at). And no reject for the service message of the bot being added — the
+      // chat picker does exactly that before it says which chat.
+      if (await broadcasts.isTarget(ctx.chat.id).catch(() => false)) {
+        await broadcasts.onTargetUpdate(ctx).catch((err) => logger.error('Broadcast: update from a place failed', err));
+        return;
+      }
+      // Any other channel's post (channel_post is on for «📌»): never a reply into someone's channel.
+      if (ctx.channelPost || ctx.editedChannelPost) return;
       // «👥 В группу» from a /broadcast card: Telegram added the bot and sent `/start@bot bc_<code>` here.
       if (
         await broadcasts.handleChat(ctx).catch((err) => {

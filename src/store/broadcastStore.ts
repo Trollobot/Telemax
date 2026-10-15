@@ -15,6 +15,8 @@ export interface Broadcast {
   /** MAX time (ms) of the last message copied — a replayed history (/reboot, a restored topic) and
    * a catch-up that relays a message twice stay at or below it and are not copied again. */
   cursor: number;
+  /** «📌»: every message copied there gets pinned, silently — easy to find in a busy group (asked for 2026-10-15). */
+  pin?: boolean;
 }
 
 /**
@@ -58,6 +60,16 @@ export class BroadcastStore {
     this.cache = all.filter((b) => b.id !== id);
     await this.persist(this.cache);
     return gone;
+  }
+
+  /** Switches «📌» on or off; the broadcast, or undefined when it is gone. */
+  async setPin(id: string, on: boolean): Promise<Broadcast | undefined> {
+    const b = (await this.load()).find((x) => x.id === id);
+    if (!b) return undefined;
+    if (on) b.pin = true;
+    else delete b.pin;
+    await this.persist(this.cache!);
+    return b;
   }
 
   /** Moves the broadcast's cursor forward (never back) to `time`. */
