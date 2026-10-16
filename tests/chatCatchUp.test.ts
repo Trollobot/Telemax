@@ -439,6 +439,16 @@ describe('late messages and authors', () => {
     expect(w.sends).toHaveLength(1);
     expect(w.sends[0]!.text).toMatch(/^👤 [^\n]+:\nлифт сломан\n🕓 \d\d\.\d\d\.\d{4}, \d\d:\d\d$/);
   });
+
+  it('an author line with nothing under it (a bare photo) gets the time right below, no empty line', async () => {
+    delete process.env.BACKFILL_TIME;
+    await store.upsert({ maxChatId: '7', telegramTopicId: 100, title: 'Дом', createdAt: 'x' });
+    const old = Date.now() - 86_400_000;
+    const w = fakeWorld([{ id: 1, time: old, sender: 42, attaches: [{ _type: 'PHOTO', photoId: 9 }] } as unknown as MaxHistoryMessage]);
+    w.sync.deps.getChats = () => [{ id: 7, type: 'CHAT' }];
+    await w.sync.ensureCaughtUp(7);
+    expect(w.sends[0]!.text).toMatch(/^👤 [^\n]+:\n🕓 \d\d\.\d\d\.\d{4}, \d\d:\d\d$/);
+  });
 });
 
 describe('isLeftChat', () => {

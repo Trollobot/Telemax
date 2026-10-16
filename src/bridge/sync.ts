@@ -1357,7 +1357,8 @@ export class ChatCatchUp {
       // Delivered late: its MAX time at the end (lateTimeStamp). A bare photo of a 1:1 gets none — a
       // text message of its own for just the time would be noise.
       const stamp = lateTimeStamp(msg.time);
-      if (stamp && text) text = `${text}\n${stamp}`;
+      // An author line alone (a photo without a caption) ends in its own line break already.
+      if (stamp && text) text = text.endsWith('\n') ? `${text}${stamp}` : `${text}\n${stamp}`;
       const abortKey = `${String(chatId)}:${String(msg.id ?? msg.time)}`;
       const lastTry = this.strikes.isLastTry(abortKey);
       const sent: number[] = [];
