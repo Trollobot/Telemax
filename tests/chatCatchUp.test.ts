@@ -6,7 +6,7 @@ import type { Telegraf } from 'telegraf';
 import type { MaxClient, MaxHistoryMessage } from '../src/max/client.js';
 import { ChatMapStore } from '../src/store/chatMapStore.js';
 import { ChatBannedError, StrikeCounter } from '../src/bridge/catchUp.js';
-import { ChatCatchUp, MessageLinkStore, historyLimitFromEnv, historyLimitNotice, isLeftChat, syncAllChatsToTelegram } from '../src/bridge/sync.js';
+import { ChatCatchUp, MessageLinkStore, historyLimitFromEnv, historyLimitNotice, isLeftChat, lateTimeStamp, showsAuthor, syncAllChatsToTelegram } from '../src/bridge/sync.js';
 
 // One writer per chat, catch-up on first touch, and the cursor gate — see ChatCatchUp in sync.ts.
 
@@ -16,9 +16,12 @@ let store: ChatMapStore;
 beforeEach(async () => {
   dir = await mkdtemp(path.join(tmpdir(), 'telemax-catchup-'));
   store = new ChatMapStore(path.join(dir, 'chat-map.json'));
+  // The fixtures' MAX times are of 1970: every message would be «late» and get its time line (lateTimeStamp).
+  process.env.BACKFILL_TIME = 'off';
 });
 
 afterEach(async () => {
+  delete process.env.BACKFILL_TIME;
   await rm(dir, { recursive: true, force: true });
 });
 
@@ -404,6 +407,37 @@ describe('syncAllChatsToTelegram', () => {
     };
     await syncAllChatsToTelegram(w.sync, [], () => 'x');
     expect(w.sends).toEqual([{ text: 'new', topicId: 120 }]);
+  });
+});
+
+describe('late messages and authors', () => {
+  it('a message delivered late gets its MAX time; a fresh one and BACKFILL_TIME=off get none', () => {
+    const sent = Date.parse('2026-09-10T08:27:00Z');
+    expect(lateTimeStamp(sent, { TZ: 'Europe/Moscow' }, sent + 6 * 60_000)).toBe('🕓 10.09.2026, 11:27');
+    expect(lateTimeStamp(sent, {}, sent + 6 * 60_000)).toBe('🕓 10.09.2026, 11:27'); // МСК by default
+    expect(lateTimeStamp(sent, {}, sent + 4 * 60_000)).toBeUndefined(); // the live message a catch-up delivers
+    expect(lateTimeStamp(sent, { BACKFILL_TIME: 'off' }, sent + 60 * 60_000)).toBeUndefined();
+    expect(lateTimeStamp('мусор', {}, sent)).toBeUndefined();
+  });
+
+  it('a group shows its authors by its type, whatever part of its members the chat list carries', () => {
+    expect(showsAuthor({ type: 'CHAT', participants: { '1': 0, '2': 0 } })).toBe(true); // GitHub #3: a big group listed with two
+    expect(showsAuthor({ type: 'CHAT' })).toBe(true);
+    expect(showsAuthor({ type: 'DIALOG', participants: { '1': 0, '2': 0 } })).toBe(false);
+    expect(showsAuthor({ participants: { '1': 0, '2': 0, '3': 0 } })).toBe(true); // no type: as before
+    expect(showsAuthor({ type: 'CHANNEL', participants: { '1': 0 } })).toBe(false);
+    expect(showsAuthor(undefined)).toBe(false);
+  });
+
+  it('a history fill writes the author of a group message and its time', async () => {
+    delete process.env.BACKFILL_TIME;
+    await store.upsert({ maxChatId: '7', telegramTopicId: 100, title: 'Дом', createdAt: 'x' });
+    const old = Date.now() - 3 * 86_400_000;
+    const w = fakeWorld([{ id: 1, time: old, text: 'лифт сломан', sender: 42 } as unknown as MaxHistoryMessage]);
+    w.sync.deps.getChats = () => [{ id: 7, type: 'CHAT', participants: { '5': 0, '42': 0 } }];
+    await w.sync.ensureCaughtUp(7);
+    expect(w.sends).toHaveLength(1);
+    expect(w.sends[0]!.text).toMatch(/^👤 [^\n]+:\nлифт сломан\n🕓 \d\d\.\d\d\.\d{4}, \d\d:\d\d$/);
   });
 });
 

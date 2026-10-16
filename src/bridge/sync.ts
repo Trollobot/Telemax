@@ -919,6 +919,36 @@ export function historyLimitNotice(limit: number, channel = false): string {
   return `📜 Здесь ${phrase} этого чата — так задано при установке (HISTORY_LIMIT в .env). Более ранняя переписка осталась в MAX.`;
 }
 
+/** A catch-up also delivers the live message that set it off: only a message at least this old at delivery is «late». */
+const LATE_MIN_AGE_MS = 5 * 60_000;
+
+/**
+ * «🕓 10.09.2026, 11:27» — the MAX time of a message delivered late (a history fill, a catch-up
+ * after downtime), in TZ (МСК by default); undefined for a fresh one or with BACKFILL_TIME=off.
+ * Otherwise a filled history reads as all sent at the fill (GitHub #2, Mackey-way, 2026-10-13).
+ * Pure + exported for unit testing.
+ */
+export function lateTimeStamp(time: unknown, env: NodeJS.ProcessEnv = process.env, now: number = Date.now()): string | undefined {
+  if ((env.BACKFILL_TIME ?? '').trim().toLowerCase() === 'off') return undefined;
+  const ms = Number(time);
+  if (!Number.isFinite(ms) || ms <= 0 || now - ms < LATE_MIN_AGE_MS) return undefined;
+  const when = new Date(ms).toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit', timeZone: env.TZ || 'Europe/Moscow' });
+  return `🕓 ${when}`;
+}
+
+/**
+ * Whether a chat's messages carry «👤 Имя:». A group always, by MAX's own type: a big group's
+ * `participants` in the chat list can be partial, and two in it hid every author (GitHub #3,
+ * AlexHighTower, on 1.3.7). A 1:1 never — the topic IS the contact. Anything else (a channel, a
+ * chat without a type) by its participants, as before. Pure + exported for unit testing.
+ */
+export function showsAuthor(chat: unknown): boolean {
+  const c = chat as { type?: unknown; participants?: Record<string, unknown> } | null | undefined;
+  if (c?.type === 'CHAT') return true;
+  if (c?.type === 'DIALOG') return false;
+  return !!c?.participants && Object.keys(c.participants).length > 2;
+}
+
 /** HISTORY_LIMIT from .env: how many of a chat's newest messages a topic filled from scratch gets (0 = all). */
 export function historyLimitFromEnv(env: NodeJS.ProcessEnv = process.env): number {
   const n = Number((env.HISTORY_LIMIT ?? '').trim());
@@ -1038,8 +1068,7 @@ async function resolveAuthorPrefix(
   const id = typeof senderId === 'number' ? senderId : Number(senderId);
   if (Number.isNaN(id)) return '';
   if (myAccountId != null && id === myAccountId) return '🧑 Вы:\n';
-  const participants = (chat as { participants?: Record<string, unknown> } | null)?.participants;
-  if (!participants || Object.keys(participants).length <= 2) return ''; // 1:1 (or unknown) — contact's line stays plain
+  if (!showsAuthor(chat)) return ''; // 1:1 (or unknown) — contact's line stays plain
   const profile = await resolveProfile(max, id, 'group sender', profiles);
   return `👤 ${resolveContactDisplayName(id, profile)}:\n`;
 }
@@ -1325,6 +1354,10 @@ export class ChatCatchUp {
         const authorPrefix = await resolveAuthorPrefix(chat, (msg as { sender?: unknown }).sender, myAccountId, max, profiles);
         if (authorPrefix) text = text ? `${authorPrefix}${text}` : authorPrefix;
       }
+      // Delivered late: its MAX time at the end (lateTimeStamp). A bare photo of a 1:1 gets none — a
+      // text message of its own for just the time would be noise.
+      const stamp = lateTimeStamp(msg.time);
+      if (stamp && text) text = `${text}\n${stamp}`;
       const abortKey = `${String(chatId)}:${String(msg.id ?? msg.time)}`;
       const lastTry = this.strikes.isLastTry(abortKey);
       const sent: number[] = [];
