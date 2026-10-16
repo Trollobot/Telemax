@@ -8,6 +8,13 @@
   <language>ru</language>
   <lastBuildDate>Fri, 16 Oct 2026 09:00:00 GMT</lastBuildDate>
   <item>
+    <title>Telemax 1.3.11: Авторы в группах и время у сообщений из истории</title>
+    <link>https://telemax.svnest.ru/news/#v1.3.11</link>
+    <guid isPermaLink="false">telemax-1.3.11</guid>
+    <pubDate>Fri, 16 Oct 2026 09:00:00 GMT</pubDate>
+    <description><![CDATA[<ul><li><b>В группах MAX у каждого сообщения снова видно автора</b> — «👤 Имя:». В больших группах MAX присылает список участников не целиком, и мост принимал такую группу за личный чат — имена пропадали. Спасибо AlexHighTower за отчёт (GitHub #3)</li><li><b>Сообщение, пришедшее с опозданием больше 5 минут</b> — из истории или после простоя моста, — подписано временем отправки в MAX: «🕓 10.09.2026, 11:27». Выключить — <code>BACKFILL_TIME=off</code> в <code>.env</code>. Спасибо Mackey-way за идею (GitHub #2)</li></ul>]]></description>
+  </item>
+  <item>
     <title>Telemax 1.3.10: Фото из MAX снова приходят — обновитесь</title>
     <link>https://telemax.svnest.ru/news/#v1.3.10</link>
     <guid isPermaLink="false">telemax-1.3.10</guid>
@@ -209,13 +216,6 @@
     <guid isPermaLink="false">telemax-0.4.10</guid>
     <pubDate>Sat, 29 Aug 2026 09:00:00 GMT</pubDate>
     <description><![CDATA[<ul><li><b>Пометка правок из MAX в Telegram:</b> ✏️ с временем (МСК по умолчанию, TZ в <code>.env</code>) — Telegram не показывает «изменено» у бот-правок; заодно правка группового сообщения больше не теряет авторский префикс</li><li><b>README:</b> команда установки с резервного зеркала (когда GitHub недоступен)</li></ul>]]></description>
-  </item>
-  <item>
-    <title>Telemax 0.4.9: Аудит безопасности и меню настроек</title>
-    <link>https://telemax.svnest.ru/news/#v0.4.9</link>
-    <guid isPermaLink="false">telemax-0.4.9</guid>
-    <pubDate>Tue, 25 Aug 2026 09:00:00 GMT</pubDate>
-    <description><![CDATA[<ul><li><b>Безопасность и надёжность (полный аудит):</b> зеркало и телеметрия переведены на HTTPS, ключ подписи релизов закреплён в <code>install.sh</code>, контейнер работает без root, авто-реконнект при повреждённом кадре MAX, корректное завершение по SIGTERM, таймауты скачиваний и лимиты памяти</li><li><b>Настройка после установки:</b> повторный <code>./setup.sh</code> открывает меню — прокси Telegram с живой проверкой до записи, смена токена/группы, режим стикеров, проверка связи; README без веб-панели</li></ul>]]></description>
   </item>
 </channel>
 </rss>
