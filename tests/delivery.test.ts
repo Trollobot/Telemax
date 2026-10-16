@@ -18,9 +18,11 @@ import {
   MessageLinkStore,
   renderPollAsText,
   sendAttachments,
+  sendFailureText,
   sendTextPieces,
 } from '../src/bridge/sync.js';
-import { TransientDownloadError } from '../src/bridge/transient.js';
+import { MaxUnavailableError, TransientDownloadError } from '../src/bridge/transient.js';
+import { MaxConnectionLostError } from '../src/max/client.js';
 import type { ChatMapStore } from '../src/store/chatMapStore.js';
 
 const EMOJI = '😀'; // one code point, two UTF-16 units
@@ -395,6 +397,20 @@ describe('partial delivery', () => {
     // A deleted topic still propagates: the caller recreates it.
     const gone = { telegram: { sendLocation: vi.fn(async () => { throw new Error('400: Bad Request: message thread not found'); }), sendMessage } } as unknown as Telegraf;
     await expect(sendAttachments(gone, 'g', 7, [location] as never, { max: {} } as never, undefined, undefined, undefined, true)).rejects.toThrow('thread not found');
+  });
+
+  it('a message that did not go to MAX says why in words', () => {
+    const now = Date.parse('2026-10-16T07:18:22Z');
+    const downSince = Date.parse('2026-10-16T06:22:36Z');
+    expect(sendFailureText(new Error('MaxClient.send called while not connected'), downSince, now)).toBe(
+      '⚠️ Не отправлено: нет связи с MAX уже 55 мин — сервер не может до него достучаться. Отправьте ещё раз, когда связь вернётся.',
+    );
+    expect(sendFailureText(new MaxUnavailableError(), null, now)).toMatch(/^⚠️ Не отправлено: нет связи с MAX — /);
+    // Lost mid-send: it may have arrived — no «resend».
+    expect(sendFailureText(new MaxConnectionLostError('MSG_SEND', new Error('read ETIMEDOUT')))).toMatch(/проверьте в MAX, дошло ли сообщение/);
+    const timeout = Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error('x'), { code: 'UND_ERR_CONNECT_TIMEOUT' }) });
+    expect(sendFailureText(timeout)).toBe('⚠️ Не отправлено: сервер MAX не ответил (таймаут). Отправьте ещё раз через минуту.');
+    expect(sendFailureText(new Error('chat.denied'))).toBe('⚠️ Не удалось отправить в MAX: chat.denied');
   });
 
   it('a placeholder says why: the download miss, or Telegram refusing the attachment', async () => {

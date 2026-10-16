@@ -359,9 +359,40 @@ export function fitsTelegramPhoto({ width, height }: { width: number; height: nu
 /** Image formats Telegram doesn't take as a photo — they go as a file straight away instead of a doomed sendPhoto. A safety net: MAX serves its photos as its own WebP/JPEG copies (a HEIC came as WebP, live 2026-10-13). */
 export const PHOTO_AS_FILE = new Set(['heic', 'tiff', 'avif']);
 
+/**
+ * The ways to fetch a MAX photo, in order. First the bridge's own since the start: baseUrl with the
+ * token appended. Then MAX web's: baseUrl as it is (its «original»; the token is kept apart, never in
+ * the URL), or `url` for a photo without baseUrl. The CDN refused the first with a 400 for a phone
+ * screenshot (a user report on 1.3.8). Pure + exported for unit testing.
+ */
+export function photoUrls(att: Pick<MaxAttachment, 'baseUrl' | 'photoToken' | 'url'>): { how: string; url: string }[] {
+  const all = [
+    { how: 'baseUrl+token', url: att.baseUrl && att.photoToken ? att.baseUrl + att.photoToken : undefined },
+    { how: 'baseUrl', url: att.baseUrl },
+    { how: 'url', url: att.url },
+  ];
+  return all.filter((v, i): v is { how: string; url: string } => !!v.url && all.findIndex((w) => w.url === v.url) === i);
+}
+
+/** A photo by the first of photoUrls that the CDN gives — the next one tried only after a refusal (an outage is no reason to). */
+async function downloadPhoto(att: MaxAttachment): Promise<Buffer> {
+  let miss: DownloadMissError | undefined;
+  for (const { how, url } of photoUrls(att)) {
+    try {
+      const buffer = await downloadUrl(url);
+      if (miss) logger.info(`MAX photo ${String(att.photoId ?? '?')}: «${how}» worked after «${miss.why}»`);
+      return buffer;
+    } catch (err) {
+      if (!(err instanceof DownloadMissError)) throw err;
+      miss = err;
+    }
+  }
+  throw miss ?? new DownloadMissError(NO_LINK_WHY);
+}
+
 async function downloadAttachmentOrThrow(att: MaxAttachment, ctx: DownloadContext): Promise<DownloadedAttachment | null> {
-  if (att._type === 'PHOTO' && att.baseUrl && att.photoToken) {
-    const buffer = await downloadUrl(att.baseUrl + att.photoToken);
+  if (att._type === 'PHOTO' && (att.baseUrl || att.url)) {
+    const buffer = await downloadPhoto(att);
     return { buffer, filename: `photo_${String(att.photoId ?? Date.now())}.${imageExtension(buffer)}`, kind: 'photo' };
   }
 

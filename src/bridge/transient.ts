@@ -121,6 +121,24 @@ export class TransientDownloadError extends Error {
   }
 }
 
+/** No logged-in MAX socket even after waiting for the reconnect — a send that never left (bridge/sync.ts). */
+export class MaxUnavailableError extends Error {
+  constructor() {
+    super('MAX is not connected');
+    this.name = 'MaxUnavailableError';
+  }
+}
+
+const CONNECT_CODES = new Set(['UND_ERR_CONNECT_TIMEOUT', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'EHOSTUNREACH', 'ENETUNREACH', 'ENETDOWN']);
+
+/** The connection itself failed (refused, unreachable, no DNS answer, connect timeout): no byte of the request left. */
+export function isConnectFailure(err: unknown, depth = 0): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const e = err as { code?: unknown; cause?: unknown };
+  if (typeof e.code === 'string' && CONNECT_CODES.has(e.code)) return true;
+  return depth < 3 && e.cause != null && isConnectFailure(e.cause, depth + 1);
+}
+
 /** Telegram's flood-control 429 carries how long to wait — honor it instead of failing the send.
  * Capped: an endless 429 (the bot got flagged/limited for real) must eventually surface as an
  * error instead of holding a backfill loop hostage forever. */

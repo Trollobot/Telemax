@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
+  isConnectFailure,
   isStaleCallbackQuery,
   isTransientHttpStatus,
   isTransientMaxError,
@@ -7,7 +8,7 @@ import {
   isTransientTelegramError,
   TransientDownloadError,
 } from '../src/bridge/transient.js';
-import { downloadMaxAttachment, DownloadMissError, networkFailureName, NO_LINK_WHY, placeholderText, type DownloadContext } from '../src/bridge/attachments.js';
+import { downloadMaxAttachment, DownloadMissError, networkFailureName, NO_LINK_WHY, photoUrls, placeholderText, type DownloadContext } from '../src/bridge/attachments.js';
 import { MaxConnectionLostError, type MaxClient } from '../src/max/client.js';
 
 /** The shape telegraf's TelegramError has: an answered API error. */
@@ -135,6 +136,29 @@ describe('downloadMaxAttachment transient reporting', () => {
     await expect(downloadMaxAttachment(photo, { max: {} as MaxClient, chatId: 1, messageId: 2 })).rejects.toBeInstanceOf(DownloadMissError);
     // A kind the bridge does not fetch is still just its placeholder.
     await expect(downloadMaxAttachment({ _type: 'LOCATION' } as never, { max: {} as MaxClient, chatId: 1, messageId: 2 })).resolves.toBeNull();
+  });
+});
+
+describe('photoUrls', () => {
+  it("tries the bridge's own way first, then MAX web's: baseUrl as it is, or url", () => {
+    expect(photoUrls({ baseUrl: 'https://i.oneme.ru/i?r=AB', photoToken: 'TOK' }).map((v) => [v.how, v.url])).toEqual([
+      ['baseUrl+token', 'https://i.oneme.ru/i?r=ABTOK'],
+      ['baseUrl', 'https://i.oneme.ru/i?r=AB'],
+    ]);
+    expect(photoUrls({ baseUrl: 'https://i.oneme.ru/i?r=AB' }).map((v) => v.how)).toEqual(['baseUrl']);
+    expect(photoUrls({ url: 'https://i.oneme.ru/p.jpg', photoToken: 'TOK' }).map((v) => v.how)).toEqual(['url']);
+    expect(photoUrls({ baseUrl: 'https://x/a', url: 'https://x/a' }).map((v) => v.how)).toEqual(['baseUrl']); // the same URL once
+    expect(photoUrls({})).toEqual([]);
+  });
+});
+
+describe('isConnectFailure', () => {
+  it('is a request that never left: connect timeout, refused, no DNS answer — not a reset mid-way', () => {
+    const wrapped = (code: string) => Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error('x'), { code }) });
+    expect(['UND_ERR_CONNECT_TIMEOUT', 'ECONNREFUSED', 'EAI_AGAIN', 'ENOTFOUND', 'EHOSTUNREACH'].map((c) => isConnectFailure(wrapped(c)))).toEqual([true, true, true, true, true]);
+    expect(isConnectFailure(wrapped('ECONNRESET'))).toBe(false);
+    expect(isConnectFailure(wrapped('UND_ERR_SOCKET'))).toBe(false);
+    expect(isConnectFailure(new Error('fetch failed'))).toBe(false);
   });
 });
 

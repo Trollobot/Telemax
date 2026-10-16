@@ -481,10 +481,33 @@ export class MaxClient extends EventEmitter {
         this.socket?.destroy(new Error(describeAuthError(payload, 'MAX rejected INIT')));
         return;
       }
-      if (header.opcode === OPCODES.LOGIN && header.cmd === DIR.OK) this.authed = true;
+      if (header.opcode === OPCODES.LOGIN && header.cmd === DIR.OK) {
+        this.authed = true;
+        this.emit('authed');
+      }
       if (header.opcode === OPCODES.PING) this.lastPingSentAt = null;
       this.emit('message', event);
     }
+  }
+
+  /** True while the socket is up and logged in — what send() needs past the handshake. */
+  get isLoggedIn(): boolean {
+    return this.socket != null && this.authed;
+  }
+
+  /** True as soon as the client is logged in (now, or after the reconnect in progress), false after `ms` without. */
+  waitForLogin(ms: number): Promise<boolean> {
+    if (this.isLoggedIn) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      const done = (ok: boolean) => {
+        clearTimeout(timer);
+        this.off('authed', onAuthed);
+        resolve(ok);
+      };
+      const onAuthed = () => done(true);
+      const timer = setTimeout(() => done(false), ms);
+      this.on('authed', onAuthed);
+    });
   }
 
   send(opcode: number, payload?: unknown): void {

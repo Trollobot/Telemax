@@ -12,6 +12,7 @@ import {
   downloadMaxAttachment,
   describeAttachment,
   DownloadMissError,
+  networkFailureName,
   placeholderText,
   TOO_BIG_WHY,
   telegramSendKind,
@@ -46,7 +47,7 @@ import { checkVersion, type VersionStatus } from './version.js';
 import { buildStatusText, collectHostStats, maskPhone } from './status.js';
 import { toTelegramReaction } from '../max/reactions.js';
 import { ChatBannedError, StrikeCounter, SyncCancelledError, liveCursorTime } from './catchUp.js';
-import { isStaleCallbackQuery, isThreadNotFound, isTransientMaxError, isTransientTelegramError, TransientDownloadError, withFloodRetry } from './transient.js';
+import { isStaleCallbackQuery, isThreadNotFound, isTransientMaxError, isTransientNetworkError, isTransientTelegramError, MaxUnavailableError, TransientDownloadError, withFloodRetry } from './transient.js';
 import { createLogger, jsonStringify, redactSecrets } from '../logger.js';
 
 const logger = createLogger('bridge');
@@ -656,6 +657,30 @@ export async function sendAttachments(
     if (paceMs) await sleep(paceMs);
   }
   return ids;
+}
+
+/** How long a Telegram message waits for MAX to come back before its send fails (see the TG -> MAX handler). */
+const MAX_RECONNECT_WAIT_MS = 30_000;
+
+/**
+ * The topic's line for a message that did not go to MAX — what happened, in words, not
+ * «MaxClient.send called while not connected» or «fetch failed». A connection lost mid-send may
+ * have delivered it: said so, a blind resend could double it. Pure + exported for unit testing.
+ */
+export function sendFailureText(err: unknown, downSince?: number | null, now = Date.now()): string {
+  const message = String((err as Error | null)?.message ?? err);
+  if (err instanceof MaxUnavailableError || /while not connected/.test(message)) {
+    const mins = downSince != null ? Math.floor((now - downSince) / 60_000) : 0;
+    return `⚠️ Не отправлено: нет связи с MAX${mins >= 1 ? ` уже ${mins} мин` : ''} — сервер не может до него достучаться. Отправьте ещё раз, когда связь вернётся.`;
+  }
+  if ((err as Error | null)?.name === 'MaxConnectionLostError') {
+    return '⚠️ Связь с MAX оборвалась во время отправки — проверьте в MAX, дошло ли сообщение, прежде чем отправлять ещё раз.';
+  }
+  if (isTransientNetworkError(err)) {
+    const name = networkFailureName(err);
+    return `⚠️ Не отправлено: сервер MAX не ответил${name ? ` (${name})` : ''}. Отправьте ещё раз через минуту.`;
+  }
+  return `⚠️ Не удалось отправить в MAX: ${message}`;
 }
 
 /** Why an attachment became its placeholder after all (sendAttachments): the download's own reason, or Telegram's. */
@@ -1577,7 +1602,7 @@ export interface BridgeOptions {
   getContactProfiles: () => Map<number, ContactProfile>;
   getActivePhone: () => string;
   /** Live MAX-leg state for the panel's «📊 Статус» (connected flag + when the last LOGIN succeeded). */
-  getMaxState: () => { connected: boolean; lastLoginAt: number | null };
+  getMaxState: () => { connected: boolean; lastLoginAt: number | null; downSince?: number | null };
   /** Refetches MAX's chat list and re-runs the full backfill sync — used by /reboot after wiping local state. Fire-and-forget on the caller's side (server/app.ts already guards against overlapping runs). */
   triggerFullResync: () => Promise<void>;
   /** Disconnects from MAX and deletes the encrypted session — used by /kill. Awaited (unlike triggerFullResync) since /kill's own confirmation message should only go out once this has actually finished. */
@@ -3864,6 +3889,10 @@ export function wireBridge({
     logger.info(`TG -> MAX: message ${ctx.message.message_id} in topic ${topicId} (${kind}) -> chat ${mapping.maxChatId}`);
 
     try {
+      // MAX reconnecting (a ping timeout, a network blip): the message waits for it a while instead of
+      // failing at once — one sent 0.6 s before the reconnect failed live (prod, 2026-10-16). Not
+      // longer: Telegraf takes the next updates only after this one.
+      if (max.isLoggedIn === false && !(await max.waitForLogin(MAX_RECONNECT_WAIT_MS))) throw new MaxUnavailableError();
       // PENDING dialog (see ChatMapping.pendingUserId): the FIRST message opens the real 1:1 via
       // max.sendToNewDialog, and the pending mapping is rewritten into a real one. MAX needs
       // non-empty text for a first message; media go in follow-ups once the dialog exists.
@@ -4075,7 +4104,7 @@ export function wireBridge({
       const chatType = (getChats().find((c) => c && typeof c === 'object' && String((c as { id?: unknown }).id) === String(mapping.maxChatId)) as { type?: string } | undefined)?.type;
       const text = chatType === 'CHANNEL'
         ? '⚠️ Это канал MAX — писать в него может только его администратор. Сообщение не отправлено.'
-        : `⚠️ Не удалось отправить в MAX: ${(err as Error).message}`;
+        : sendFailureText(err, getMaxState().downSince);
       await bot.telegram
         .sendMessage(targetGroupId, text, { message_thread_id: topicId })
         .catch((e) => logger.error('Failed to report TG->MAX forward failure to Telegram', e));

@@ -222,13 +222,13 @@ describe('MaxSessionController — /login', () => {
   it('a fresh login sets lastLoginAt, saves the session and ends a pending resume retry', async () => {
     const { ctl, client, store, onLogin } = setup(null);
     client.autoReady = true;
-    expect(ctl.status()).toEqual({ connected: false, lastLoginAt: null });
+    expect(ctl.status()).toEqual({ connected: false, lastLoginAt: null, downSince: null });
     client.login.mockResolvedValueOnce({ sessionToken: 'fresh', payload: { chats: [] } });
     await ctl.requestSms('+79999999999');
     expect(client.connect).toHaveBeenCalledTimes(2); // a fresh socket before START_AUTH
     await expect(ctl.verifyCode('1234')).resolves.toEqual({ ok: true });
     expect(ctl.state).toBe('loggedIn');
-    expect(ctl.status()).toEqual({ connected: true, lastLoginAt: Date.now() });
+    expect(ctl.status()).toEqual({ connected: true, lastLoginAt: Date.now(), downSince: null });
     expect(ctl.activePhone).toBe('+79999999999');
     expect(store.save).toHaveBeenCalledWith(expect.objectContaining({ sessionToken: 'fresh', phone: '+79999999999', deviceId: 'dev' }));
     expect(onLogin).toHaveBeenCalledWith({ chats: [] });
@@ -240,7 +240,7 @@ describe('MaxSessionController — /login', () => {
     client.login.mockResolvedValueOnce({ sessionToken: 'rotated', payload: {} });
     client.emit('ready');
     await settle();
-    expect(ctl.status()).toEqual({ connected: true, lastLoginAt: Date.now() });
+    expect(ctl.status()).toEqual({ connected: true, lastLoginAt: Date.now(), downSince: null });
     expect(ctl.activePhone).toBe(SESSION.phone);
     expect(store.save).toHaveBeenCalledWith(expect.objectContaining({ sessionToken: 'rotated', phone: SESSION.phone }));
     expect(onLogin).toHaveBeenCalledTimes(1);

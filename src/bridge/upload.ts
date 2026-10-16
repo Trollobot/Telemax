@@ -15,8 +15,30 @@ import type { Telegraf } from 'telegraf';
 import { FormData } from 'undici';
 import type { MaxClient } from '../max/client.js';
 import { maxFetch, maxFetchBig } from '../max/ca.js';
+import { createLogger } from '../logger.js';
+import { networkFailureName } from './attachments.js';
+import { isConnectFailure } from './transient.js';
 import { getTelegramProxyAgent } from '../telegram/proxy.js';
 import { renderTgsToWebm } from './lottie.js';
+
+const logger = createLogger('upload');
+const CONNECT_RETRY_MS = 3000;
+
+/**
+ * maxFetch for an upload POST, tried once more (after 3 s) when the connection itself failed —
+ * nothing reached the upload server, so the slot is unused. A connect timeout to all three of its
+ * addresses lost a file live (prod, 2026-10-14). Not for a stream body (it is gone after one try).
+ */
+async function postToMax(url: string, init: Parameters<typeof maxFetch>[1]): ReturnType<typeof maxFetch> {
+  try {
+    return await maxFetch(url, init);
+  } catch (err) {
+    if (!isConnectFailure(err)) throw err;
+    logger.info(`MAX upload server not reached (${networkFailureName(err) || (err as Error).message}) — trying once more in ${CONNECT_RETRY_MS / 1000} s`);
+    await new Promise((resolve) => setTimeout(resolve, CONNECT_RETRY_MS));
+    return maxFetch(url, init);
+  }
+}
 
 async function fetchTelegramFile(bot: Telegraf, fileId: string): Promise<Buffer> {
   // getFileLink is a Bot API call — it already goes through Telegraf's (possibly
@@ -77,7 +99,7 @@ async function uploadPhotoToMax(max: MaxClient, buffer: Buffer): Promise<{ _type
   const { url } = await max.requestPhotoUpload();
   const form = new FormData();
   form.append('file', new Blob([buffer], { type: 'image/jpeg' }), 'photo.jpg');
-  const res = await maxFetch(url, {
+  const res = await postToMax(url, {
     method: 'POST',
     headers: {
       'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
@@ -97,7 +119,7 @@ async function uploadPhotoToMax(max: MaxClient, buffer: Buffer): Promise<{ _type
 
 async function uploadFileToMax(max: MaxClient, buffer: Buffer, filename: string): Promise<{ _type: 'FILE'; fileId: unknown }> {
   const slot = await max.requestFileUpload();
-  const res = await maxFetch(slot.url, {
+  const res = await postToMax(slot.url, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/octet-stream',
@@ -163,7 +185,7 @@ async function uploadVoiceToMax(max: MaxClient, buffer: Buffer, filename: string
   // If the POST throws first, this wait must not turn into an unhandled rejection later (a false
   // "internal bridge error"); the await below still sees its outcome.
   readyPromise.catch(() => {});
-  const res = await maxFetch(slot.url, {
+  const res = await postToMax(slot.url, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/octet-stream',
@@ -192,7 +214,7 @@ async function uploadVideoToMax(
   // If the POST throws first, this wait must not turn into an unhandled rejection later (a false
   // "internal bridge error"); the await below still sees its outcome.
   readyPromise.catch(() => {});
-  const res = await maxFetch(slot.url, {
+  const res = await postToMax(slot.url, {
     method: 'POST',
     headers: {
       'Content-Type': contentType,

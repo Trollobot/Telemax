@@ -135,8 +135,8 @@ export class MaxSessionController {
   }
 
   /** «📊 Статус»: connected = LOGIN accepted while a session exists (a socket whose LOGIN keeps failing must not read «🟢 подключён»), INIT OK without one. */
-  status(): { connected: boolean; lastLoginAt: number | null } {
-    return { connected: this.state_ === 'loggedIn' || this.state_ === 'ready', lastLoginAt: this.lastLoginAt };
+  status(): { connected: boolean; lastLoginAt: number | null; downSince: number | null } {
+    return { connected: this.state_ === 'loggedIn' || this.state_ === 'ready', lastLoginAt: this.lastLoginAt, downSince: this.outageStartedAt };
   }
 
   /** Wires the client's events and opens the first socket; `session` is what the store loaded (null on a fresh install). */
