@@ -360,46 +360,23 @@ export function fitsTelegramPhoto({ width, height }: { width: number; height: nu
 export const PHOTO_AS_FILE = new Set(['heic', 'tiff', 'avif']);
 
 /**
- * The ways to fetch a MAX photo, in order. First the bridge's own since the start: baseUrl with the
- * token appended. Then MAX web's: baseUrl as it is (its «original»; the token is kept apart, never in
- * the URL), or `url` for a photo without baseUrl. The CDN refused the first with a 400 for a phone
- * screenshot (a user report on 1.3.8). Pure + exported for unit testing.
+ * The ways to fetch a MAX photo, in order. MAX web's first: baseUrl as it is — its «original», the
+ * photo at the size MAX declares (the token is kept apart, never in the URL) — or `url` for a photo
+ * without baseUrl. Last, the bridge's own way since the start, baseUrl with the token appended: the
+ * CDN began refusing it with a 400 for every photo (a phone screenshot first, a user report on 1.3.8;
+ * all of them on test, 2026-10-16). Pure + exported for unit testing.
  */
 export function photoUrls(att: Pick<MaxAttachment, 'baseUrl' | 'photoToken' | 'url'>): { how: string; url: string }[] {
   const all = [
-    { how: 'baseUrl+token', url: att.baseUrl && att.photoToken ? att.baseUrl + att.photoToken : undefined },
     { how: 'baseUrl', url: att.baseUrl },
     { how: 'url', url: att.url },
+    { how: 'baseUrl+token', url: att.baseUrl && att.photoToken ? att.baseUrl + att.photoToken : undefined },
   ];
   return all.filter((v, i): v is { how: string; url: string } => !!v.url && all.findIndex((w) => w.url === v.url) === i);
 }
 
-/**
- * TEMPORARY diagnostic (PHOTO_COMPARE=1, test server only, 2026-10-16): fetches a MAX photo every
- * way — photoUrls plus MAX web's on-screen size (`&fn=w_1440`) — and logs what each gives, to settle
- * which way goes first. Remove before the release.
- */
-async function comparePhotoUrls(att: MaxAttachment): Promise<void> {
-  const id = String(att.photoId ?? '?');
-  const declared = att as { width?: unknown; height?: unknown };
-  logger.info(`PHOTO_COMPARE ${id}: MAX says ${String(declared.width)}×${String(declared.height)}`);
-  const ways = [...photoUrls(att)];
-  if (att.baseUrl) ways.push({ how: 'baseUrl&fn=w_1440', url: `${att.baseUrl}&fn=w_1440` });
-  for (const { how, url } of ways) {
-    try {
-      const res = await maxFetch(url, { signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
-      const buf = res.ok ? Buffer.from(await res.arrayBuffer()) : undefined;
-      const size = buf ? imageSize(buf) : null;
-      logger.info(`PHOTO_COMPARE ${id}: «${how}» → ${res.status}${buf ? `, ${buf.byteLength} bytes, ${imageExtension(buf)}${size ? `, ${size.width}×${size.height}` : ''}` : ''}`);
-    } catch (err) {
-      logger.info(`PHOTO_COMPARE ${id}: «${how}» → ${(err as Error).message}`);
-    }
-  }
-}
-
 /** A photo by the first of photoUrls that the CDN gives — the next one tried only after a refusal (an outage is no reason to). */
 async function downloadPhoto(att: MaxAttachment): Promise<Buffer> {
-  if (process.env.PHOTO_COMPARE === '1') void comparePhotoUrls(att);
   let miss: DownloadMissError | undefined;
   for (const { how, url } of photoUrls(att)) {
     try {

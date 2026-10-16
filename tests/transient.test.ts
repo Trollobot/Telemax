@@ -140,10 +140,10 @@ describe('downloadMaxAttachment transient reporting', () => {
 });
 
 describe('photoUrls', () => {
-  it("tries the bridge's own way first, then MAX web's: baseUrl as it is, or url", () => {
+  it("tries MAX web's way first — baseUrl as it is, or url — and the old glued one last", () => {
     expect(photoUrls({ baseUrl: 'https://i.oneme.ru/i?r=AB', photoToken: 'TOK' }).map((v) => [v.how, v.url])).toEqual([
-      ['baseUrl+token', 'https://i.oneme.ru/i?r=ABTOK'],
       ['baseUrl', 'https://i.oneme.ru/i?r=AB'],
+      ['baseUrl+token', 'https://i.oneme.ru/i?r=ABTOK'],
     ]);
     expect(photoUrls({ baseUrl: 'https://i.oneme.ru/i?r=AB' }).map((v) => v.how)).toEqual(['baseUrl']);
     expect(photoUrls({ url: 'https://i.oneme.ru/p.jpg', photoToken: 'TOK' }).map((v) => v.how)).toEqual(['url']);
