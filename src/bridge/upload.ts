@@ -40,6 +40,16 @@ async function postToMax(url: string, init: Parameters<typeof maxFetch>[1]): Ret
   }
 }
 
+/**
+ * How long MAX may take to say an uploaded video (or voice) is ready. Counted from BEFORE the POST —
+ * the upload itself is in it, then MAX's processing. A flat 15 s lost a video on prod (2026-10-23:
+ * timed out after 19 s, the resend went through): a minute, plus 3 s per MB, 5 minutes at most.
+ * Pure + exported for unit testing.
+ */
+export function uploadReadyTimeoutMs(bytes: number): number {
+  return Math.min(5 * 60_000, 60_000 + Math.ceil(Math.max(0, bytes) / 1_048_576) * 3000);
+}
+
 async function fetchTelegramFile(bot: Telegraf, fileId: string): Promise<Buffer> {
   // getFileLink is a Bot API call — it already goes through Telegraf's (possibly
   // proxied) client. Only the download of the returned api.telegram.org/file/… URL
@@ -181,7 +191,7 @@ export async function uploadFileFromDiskToMax(max: MaxClient, filePath: string, 
 async function uploadVoiceToMax(max: MaxClient, buffer: Buffer, filename: string, duration: number): Promise<{ _type: 'AUDIO'; audioId: unknown; token: string; duration: number }> {
   const slot = await max.requestVoiceUploadSlot();
   // Keyed on this slot's id: the voice's audioId IS the slot's videoId (see above).
-  const readyPromise = max.waitForAudioReady(slot.videoId); // start listening before the POST so the push can't arrive unheard
+  const readyPromise = max.waitForAudioReady(slot.videoId, uploadReadyTimeoutMs(buffer.length)); // start listening before the POST so the push can't arrive unheard
   // If the POST throws first, this wait must not turn into an unhandled rejection later (a false
   // "internal bridge error"); the await below still sees its outcome.
   readyPromise.catch(() => {});
@@ -210,7 +220,7 @@ async function uploadVideoToMax(
   contentType = 'video/mp4',
 ): Promise<{ _type: 'VIDEO'; videoId: unknown; token: string }> {
   const slot = await max.requestVideoUpload();
-  const readyPromise = max.waitForVideoReady(slot.videoId); // start listening before the POST so the push can't arrive unheard
+  const readyPromise = max.waitForVideoReady(slot.videoId, uploadReadyTimeoutMs(buffer.length)); // start listening before the POST so the push can't arrive unheard
   // If the POST throws first, this wait must not turn into an unhandled rejection later (a false
   // "internal bridge error"); the await below still sees its outcome.
   readyPromise.catch(() => {});

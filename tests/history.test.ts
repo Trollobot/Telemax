@@ -7,6 +7,7 @@ import { historyDepthView, systemView } from '../src/bridge/panel.js';
 import { videoDimensions } from '../src/bridge/attachments.js';
 import { NO_AUTO_UPDATE_TEXT } from '../src/bridge/fileShare.js';
 import { SettingsStore } from '../src/store/settingsStore.js';
+import { uploadReadyTimeoutMs } from '../src/bridge/upload.js';
 
 describe('history depth texts', () => {
   it('names the depth in Russian', () => {
@@ -74,5 +75,14 @@ describe('no auto-update on the server', () => {
     expect(NO_AUTO_UPDATE_TEXT).toMatch(/^на этом сервере не работает автообновление Телемакса\.\n\nПочему это мешает: /);
     expect(NO_AUTO_UPDATE_TEXT).toMatch(/Что сделать: в папке моста на сервере выполните sudo \.\/setup\.sh/);
     expect(NO_AUTO_UPDATE_TEXT).toMatch(/FILES=off в \.env$/);
+  });
+});
+
+describe('uploadReadyTimeoutMs', () => {
+  it('gives MAX a minute plus 3 s per MB to process an upload, 5 minutes at most', () => {
+    expect(uploadReadyTimeoutMs(0)).toBe(60_000);
+    expect(uploadReadyTimeoutMs(5 * 1_048_576)).toBe(75_000);
+    expect(uploadReadyTimeoutMs(20 * 1_048_576)).toBe(120_000); // Telegram's bot download limit
+    expect(uploadReadyTimeoutMs(2_000 * 1_048_576)).toBe(300_000);
   });
 });

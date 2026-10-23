@@ -1563,7 +1563,7 @@ async function sendContactInfoCard(
   // seen live 2026-10-13), and the topic is read-only unless the account runs the channel.
   if (chatType === 'CHANNEL') {
     const lines = [channelCardText(fallbackTitle, channel)];
-    const sent = await bot.telegram.sendMessage(targetGroupId, lines.join('\n'), { message_thread_id: topicId });
+    const sent = await withFloodRetry(() => bot.telegram.sendMessage(targetGroupId, lines.join('\n'), { message_thread_id: topicId }));
     return sent.message_id;
   }
   if (chatType !== 'DIALOG' || otherId == null) {
@@ -1577,12 +1577,12 @@ async function sendContactInfoCard(
     // "Open a DM with a participant" / "add one to MAX contacts" — each expands into a button per person (tlmx_roster:open / :add).
     const hasOthers = !!roster?.some((p) => !p.isSelf);
     const markup = hasOthers ? rosterKeyboard(!!roster?.some((p) => p.addable)) : undefined;
-    const sent = await bot.telegram.sendMessage(targetGroupId, lines.join('\n'), { message_thread_id: topicId, reply_markup: markup });
+    const sent = await withFloodRetry(() => bot.telegram.sendMessage(targetGroupId, lines.join('\n'), { message_thread_id: topicId, reply_markup: markup }));
     return sent.message_id;
   }
 
   if (!profile) {
-    const sent = await bot.telegram.sendMessage(targetGroupId, 'ℹ️ Нет данных о контакте.', { message_thread_id: topicId });
+    const sent = await withFloodRetry(() => bot.telegram.sendMessage(targetGroupId, 'ℹ️ Нет данных о контакте.', { message_thread_id: topicId }));
     return sent.message_id;
   }
 
@@ -1617,7 +1617,7 @@ async function sendContactInfoCard(
 /** Pins the auto-sent intro card so it stays visible at the top of the topic even after the chat scrolls — not used for on-demand /info, only the first-contact auto-card. */
 async function pinInfoCard(bot: Telegraf, targetGroupId: string, messageId: number): Promise<void> {
   try {
-    await bot.telegram.pinChatMessage(targetGroupId, messageId, { disable_notification: true });
+    await withFloodRetry(() => bot.telegram.pinChatMessage(targetGroupId, messageId, { disable_notification: true }));
   } catch (err) {
     logger.error('Failed to pin auto contact-info card', err);
   }
