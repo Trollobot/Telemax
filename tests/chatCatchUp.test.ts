@@ -6,6 +6,7 @@ import type { Telegraf } from 'telegraf';
 import type { MaxClient, MaxHistoryMessage } from '../src/max/client.js';
 import { ChatMapStore } from '../src/store/chatMapStore.js';
 import { ChatBannedError, StrikeCounter } from '../src/bridge/catchUp.js';
+import { historyDaysNotice } from '../src/bridge/history.js';
 import { ChatCatchUp, MessageLinkStore, historyLimitFromEnv, historyLimitNotice, isLeftChat, lateTimeStamp, showsAuthor, syncAllChatsToTelegram } from '../src/bridge/sync.js';
 
 // One writer per chat, catch-up on first touch, and the cursor gate — see ChatCatchUp in sync.ts.
@@ -448,6 +449,42 @@ describe('late messages and authors', () => {
     w.sync.deps.getChats = () => [{ id: 7, type: 'CHAT' }];
     await w.sync.ensureCaughtUp(7);
     expect(w.sends[0]!.text).toMatch(/^👤 [^\n]+:\n🕓 \d\d\.\d\d\.\d{4}, \d\d:\d\d$/);
+  });
+});
+
+describe('history depth (days)', () => {
+  const DAY = 86_400_000;
+
+  it('a topic filled from scratch gets only the last N days, under a line saying so', async () => {
+    await store.upsert({ maxChatId: '7', telegramTopicId: 100, title: 'Дом', createdAt: 'x' });
+    const now = Date.now();
+    const w = fakeWorld([msg(1, now - 10 * DAY, 'старое'), msg(2, now - 2 * DAY, 'на неделе'), msg(3, now - 60_000, 'свежее')]);
+    w.sync.deps.historyDays = () => 7;
+    await w.sync.ensureCaughtUp(7);
+    expect(w.sends.map((s) => s.text)).toEqual([historyDaysNotice(7), 'на неделе', 'свежее']);
+  });
+
+  it('nothing within the depth: the topic says so once, and the next catch-up starts where the depth began', async () => {
+    await store.upsert({ maxChatId: '7', telegramTopicId: 100, title: 'Дом', createdAt: 'x' });
+    const old = Date.now() - 40 * DAY;
+    const w = fakeWorld([msg(1, old, 'давно')]);
+    w.sync.deps.historyDays = () => 30;
+    await w.sync.ensureCaughtUp(7);
+    expect(w.sends.map((s) => s.text)).toEqual([historyDaysNotice(30)]);
+    expect(Number((await store.getByMaxChatId('7'))?.historyBackfillCursor)).toBeGreaterThan(old);
+  });
+
+  it('the whole history (0) is not cut, and neither is a catch-up from a cursor', async () => {
+    await store.upsert({ maxChatId: '7', telegramTopicId: 100, title: 'Дом', createdAt: 'x' });
+    await store.upsert({ maxChatId: '8', telegramTopicId: 101, title: 'Дача', createdAt: 'x', historyBackfillCursor: String(Date.now() - 90 * DAY) });
+    const now = Date.now();
+    const w = fakeWorld([msg(1, now - 60 * DAY, 'давно'), msg(2, now - 60_000, 'свежее')]);
+    w.sync.deps.historyDays = () => 0;
+    await w.sync.ensureCaughtUp(7);
+    expect(w.sends.map((s) => s.text)).toEqual(['давно', 'свежее']);
+    w.sync.deps.historyDays = () => 7;
+    await w.sync.ensureCaughtUp(8); // its cursor is older than the depth: everything new still comes
+    expect(w.sends.slice(2).map((s) => s.text)).toEqual(['давно', 'свежее']);
   });
 });
 

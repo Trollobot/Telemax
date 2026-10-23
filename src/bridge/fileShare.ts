@@ -159,6 +159,12 @@ export const SERVICE_TIMEOUT_TEXT = explain(
   `если сервер за роутером — нужен белый IP у роутера и проброс портов 80 и 443 на сервер; если это VPS — откройте порты в панели хостинга; ${NO_FILES}. ${LOG_HINT}`,
 );
 export const SERVICE_TIMEOUT_NAT_TEXT = explain(NO_WHITE_IP, NAT_WHY, `${NAT_TODO}. ${LOG_HINT}`);
+/** The service is started by the update watcher — the systemd timer ./setup.sh installs as root. A manual docker compose install, or setup.sh without root, has none (item 21, reported on 1.3.3–1.3.11). */
+export const NO_AUTO_UPDATE_TEXT = explain(
+  'на этом сервере не работает автообновление Телемакса',
+  'службу больших файлов запускает автообновление — его ставит ./setup.sh, запущенный от root. Без него служба не поднимается, а сам мост её запустить не может',
+  'в папке моста на сервере выполните sudo ./setup.sh — он поставит автообновление, и большие файлы заработают. Мост, поставленный вручную через docker compose без setup.sh, автообновления не получит — тогда выключите большие файлы: FILES=off в .env',
+);
 
 export class FileShare {
   readonly dir: string;
@@ -440,7 +446,7 @@ export class FileShare {
         if (!(await this.watcherAlive())) {
           return {
             ok: false,
-            reason: 'службу файлов запускает автообновление, а оно на этом сервере не работает (setup.sh запускали не от root?)',
+            reason: NO_AUTO_UPDATE_TEXT,
           };
         }
       }

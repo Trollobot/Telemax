@@ -581,9 +581,9 @@ if [ -f .env ]; then
     local history_limit
     history_limit=$(env_read HISTORY_LIMIT)
     if [ -n "$history_limit" ]; then
-      echo "  История чатов:    при первой синхронизации — последних сообщений: $history_limit"
+      echo "  История чатов:    выбирается в Telegram (/panel → ⚙️ Система), плюс не больше $history_limit сообщений (HISTORY_LIMIT)"
     else
-      echo "  История чатов:    вся (ограничить — HISTORY_LIMIT в .env)"
+      echo "  История чатов:    выбирается в Telegram (/panel → ⚙️ Система), по умолчанию — 7 дней"
     fi
     echo "  MAX-авторизация:  через бота — /login в личку (статус виден в /panel)"
   }
@@ -914,28 +914,9 @@ if [ "$FILES_CHECK" != ok ]; then
   fi
 fi
 
-# How much of each chat's past the first sync brings in. A bot may post ~20 messages a minute into
-# one group, so a 5 000-message work chat took ~4 hours to come in (a user, 2026-10-13). 30-second
-# timeout — defaults to the whole history, as before.
-echo
-echo "История чатов при первом запуске:"
-echo "  мост переносит её в Telegram со скоростью ~20 сообщений в минуту (так ограничивает Telegram) —"
-echo "  чат на 5 000 сообщений заливается около 4 часов. Новые сообщения приходят сразу в любом случае."
-HISTORY_LIMIT=""
-if read -t 30 -rp "Сколько последних сообщений каждого чата перенести? Число (например 300) или Enter (жду 30с) — всю историю: " HISTORY_CHOICE; then
-  case "${HISTORY_CHOICE:-}" in
-    '') ;;
-    *[!0-9]*) echo "  (это не число — переношу всю историю)" ;;
-    *) [ "$HISTORY_CHOICE" -gt 0 ] 2>/dev/null && HISTORY_LIMIT=$HISTORY_CHOICE ;;
-  esac
-else
-  echo
-fi
-if [ -n "$HISTORY_LIMIT" ]; then
-  echo "  → история: последних сообщений каждого чата — $HISTORY_LIMIT"
-else
-  echo "  → история: вся"
-fi
+# How much of each chat's past the first sync brings in is asked in Telegram now («📜 Сколько истории
+# перенести?» before the first fill, /panel → ⚙️ Система later): the 30-second question here was easy
+# to miss mid-install (GitHub #4). HISTORY_LIMIT in .env still caps it, for whoever sets it by hand.
 
 # .env carries the session-encryption key and bot token — don't leave it readable to
 # other local users. STICKERS is read by docker-compose.yml as a build arg.
@@ -960,7 +941,6 @@ TELEGRAM_PROXY=$(env_quote "$TELEGRAM_PROXY")
 STICKERS=$(env_quote "$STICKERS")
 EOF
 [ "$FILES_SETTING" = off ] && printf "FILES='off'\n" >> .env
-[ -n "$HISTORY_LIMIT" ] && printf "HISTORY_LIMIT=%s\n" "$HISTORY_LIMIT" >> .env
 
 echo
 bold "Готово: .env создан."

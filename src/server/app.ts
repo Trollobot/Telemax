@@ -7,6 +7,8 @@ import { DIR, OPCODES } from '../max/opcodes.js';
 import { dialogParticipantIds, extractMyAccountId, resolveChatName, type ContactProfile } from '../max/names.js';
 import { SessionStore } from '../store/sessionStore.js';
 import { ChatMapStore } from '../store/chatMapStore.js';
+import { SettingsStore } from '../store/settingsStore.js';
+import { DEFAULT_HISTORY_DAYS } from '../bridge/history.js';
 import { wireBridge, syncAllChatsToTelegram, type ChatCatchUp } from '../bridge/sync.js';
 import { systemView } from '../bridge/panel.js';
 import { RetryBackoff } from '../bridge/catchUp.js';
@@ -48,10 +50,14 @@ process.on('uncaughtException', (err) => {
 
 const sessionStore = new SessionStore();
 const chatMapStore = new ChatMapStore();
+const settingsStore = new SettingsStore();
 const max = new MaxClient({ host: config.maxHost, sni: config.maxSni });
 
 let bot: Telegraf | null = null;
 let chatSync: ChatCatchUp | null = null;
+// «📜 Сколько истории перенести?» (sync.ts) — asked before a sync that fills every chat from scratch.
+let askHistoryDepth: (() => Promise<number>) | null = null;
+let historyQuestionDue: (() => boolean) | null = null;
 let tgActive = false;
 // LOGIN's embedded chat list is capped at chatsCount (<=50) and, live, has also
 // been observed to just omit chats a later resumed-session LOGIN included —
@@ -167,12 +173,18 @@ function syncChatsIfPossible(): Promise<void> {
   }
   const generation = chatSyncGeneration;
   catchUpRetryRequestedDuringRun = false;
-  chatSyncInFlight = syncAllChatsToTelegram(
-    chatSync,
-    cachedChats,
-    (chat) => resolveChatName(chat, myAccountId, contactProfiles),
-    () => generation !== chatSyncGeneration,
-  )
+  const sync = chatSync;
+  chatSyncInFlight = (async () => {
+    // No topic yet (a fresh install, /reboot, /kill + /login): every chat is about to be filled from
+    // scratch — how far back is the owner's call, asked in the group first (2 minutes at most).
+    if (askHistoryDepth && historyQuestionDue?.() && (await chatMapStore.list()).length === 0) await askHistoryDepth();
+    await syncAllChatsToTelegram(
+      sync,
+      cachedChats,
+      (chat) => resolveChatName(chat, myAccountId, contactProfiles),
+      () => generation !== chatSyncGeneration,
+    );
+  })()
     .catch((err) => {
       catchUpRetryRequestedDuringRun = true; // not a clean run — keep the backoff where it is
       logger.error('Chat sync to Telegram failed:', err);
@@ -333,6 +345,7 @@ async function startServer(): Promise<void> {
     }
   });
 
+  await settingsStore.load().catch((err) => logger.error('Failed to read .data/settings.json — the defaults apply', err));
   maxSession.start(await sessionStore.load());
 
   // Build the Telegram proxy agent (TELEGRAM_PROXY from .env) before the bot is
@@ -367,7 +380,7 @@ async function startServer(): Promise<void> {
         );
         void reportError({ kind: 'internal', step: 'telegram-handler', error: err });
       });
-      ({ chatSync } = wireBridge({
+      ({ chatSync, askHistoryDepth, historyQuestionDue } = wireBridge({
         max,
         bot,
         chatMapStore,
@@ -381,6 +394,7 @@ async function startServer(): Promise<void> {
         killEverything: killMaxSession,
         logoutMax,
         rememberChat: (chat) => upsertCachedChat(chat),
+        settings: settingsStore,
         suspendChatSync,
         auth: {
           getLastKnownPhone: () => maxSession.lastKnownPhone,
@@ -644,7 +658,7 @@ async function reportIfJustRestarted(bot_: Telegraf): Promise<void> {
   await unlink(RESTART_REQUESTED_MARKER).catch(() => {});
   // A marker older than a few minutes is left over from a restart that never came back that way.
   if (marker.chatId == null || marker.messageId == null || Date.now() - (marker.at ?? 0) > 10 * 60_000) return;
-  const { text, markup } = systemView(maxSession.pausedUntil != null, '✅ Мост перезапущен — всё работает.');
+  const { text, markup } = systemView(maxSession.pausedUntil != null, '✅ Мост перезапущен — всё работает.', settingsStore.get().historyDays ?? DEFAULT_HISTORY_DAYS);
   await bot_.telegram
     .editMessageText(marker.chatId, marker.messageId, undefined, text, { reply_markup: markup })
     .catch((err) => logger.error('Failed to put the panel back after a restart', err));

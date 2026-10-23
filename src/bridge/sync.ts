@@ -7,6 +7,8 @@ import { CONTACT_FLAG_ADDED, isAddedContact, type MaxClient, type MaxContactInfo
 import { OPCODES, formatOpcode } from '../max/opcodes.js';
 import { resolveContactDisplayName, resolveChatName, isFallbackTitle, type ContactProfile } from '../max/names.js';
 import { cursorToMs, type ChatMapStore } from '../store/chatMapStore.js';
+import type { SettingsStore } from '../store/settingsStore.js';
+import { DEFAULT_HISTORY_DAYS, HISTORY_DAY_CHOICES, historyChoiceKeyboard, historyDaysLabel, historyDaysNotice, historyQuestionText } from './history.js';
 import { ensureTopicForMaxChat, clampTopicTitle } from '../telegram/bot.js';
 import {
   downloadMaxAttachment,
@@ -767,7 +769,9 @@ async function sendOneAttachment(
       return withFloodRetry(() => bot.telegram.sendDocument(groupId, source, opts));
     }
   }
-  if (kind === 'video') return withFloodRetry(() => bot.telegram.sendVideo(groupId, source, opts));
+  // The size MAX shows the video at (videoDimensions): without it Telegram may squash a vertical one.
+  const videoExtra = { ...opts, width: downloaded.width, height: downloaded.height, supports_streaming: true };
+  if (kind === 'video') return withFloodRetry(() => bot.telegram.sendVideo(groupId, source, videoExtra));
   if (kind === 'video_note') {
     try {
       // sendVideoNote is the only way Telegram renders the round "circle" bubble.
@@ -775,7 +779,7 @@ async function sendOneAttachment(
     } catch (err) {
       if (!isPermanentTelegramRefusal(err)) throw err;
       logger.error('sendVideoNote failed, falling back to sendVideo', err);
-      return withFloodRetry(() => bot.telegram.sendVideo(groupId, source, opts));
+      return withFloodRetry(() => bot.telegram.sendVideo(groupId, source, videoExtra));
     }
   }
   if (kind === 'voice') {
@@ -837,10 +841,12 @@ async function fetchFullHistory(
   sinceTime: number | null = null,
   isCancelled?: () => boolean,
   limit = 0,
-): Promise<{ messages: MaxHistoryMessage[]; truncated: boolean }> {
+): Promise<{ messages: MaxHistoryMessage[]; truncated: boolean; older: boolean }> {
   const all: MaxHistoryMessage[] = [];
   const seenIds = new Set<string>();
   let fromTime = historyStartTime();
+  // A message at or before sinceTime was seen: there is history older than what this returns.
+  let older = false;
   for (let i = 0; i < HISTORY_MAX_BATCHES; i++) {
     // One more than the limit tells «there is older history» from «the chat is exactly this long».
     if (limit > 0 && all.length > limit) break;
@@ -859,15 +865,18 @@ async function fetchFullHistory(
       if (time < oldestTime) oldestTime = time;
       if (sinceTime == null || time > sinceTime) all.push({ ...m, time });
     }
-    // Everything further back was already delivered in a previous run.
-    if (sinceTime != null && oldestTime <= sinceTime) break;
+    // Everything further back was already delivered in a previous run (or is older than the history depth).
+    if (sinceTime != null && oldestTime <= sinceTime) {
+      older = true;
+      break;
+    }
     // `from` not moving = the start of the chat (and would loop forever).
     if (!(oldestTime < fromTime)) break;
     fromTime = oldestTime;
   }
   all.sort((a, b) => a.time - b.time);
   const truncated = limit > 0 && all.length > limit;
-  return { messages: truncated ? all.slice(-limit) : all, truncated };
+  return { messages: truncated ? all.slice(-limit) : all, truncated, older };
 }
 
 /** What the bridge's admin reads when writing to the bot's DM (anything but /login). Pure + exported for unit testing. */
@@ -906,6 +915,10 @@ export function channelCardText(title: string, channel?: { subscribers?: number;
 export const CHANNEL_HISTORY_LIMIT = 10;
 
 /** The first line of a topic HISTORY_LIMIT (or the channel cap) cut short: «последние 300 сообщений» (agreed with the number). */
+const DAY_MS = 86_400_000;
+/** How long «📜 Сколько истории перенести?» waits for an answer before the saved depth applies. */
+const HISTORY_QUESTION_MS = 2 * 60_000;
+
 export function historyLimitNotice(limit: number, channel = false): string {
   const d = limit % 10;
   const dd = limit % 100;
@@ -1097,6 +1110,8 @@ export interface ChatCatchUpDeps {
   onRelayed?: (c: IncomingCopy) => void;
   /** HISTORY_LIMIT: newest messages a topic filled from scratch gets (0 / unset = the whole history). */
   historyLimit?: number;
+  /** The history depth: days back a topic filled from scratch reaches (0 = the whole history). Read per fill — a change in the panel applies to the next one. */
+  historyDays?: () => number;
   /** Puts a chat MAX described (CHAT_INFO) into the chat cache — so a channel missing from the chat list still gets the channel cap. */
   rememberChat?: (chat: unknown) => void;
 }
@@ -1246,16 +1261,29 @@ export class ChatCatchUp {
     const isChannel = (this.deps.getChats().find((c) => c && typeof c === 'object' && String((c as { id?: unknown }).id) === String(chatId)) as { type?: string } | undefined)?.type === 'CHANNEL';
     let limit = cursor == null ? (this.deps.historyLimit ?? 0) : 0;
     if (cursor == null && isChannel) limit = limit > 0 ? Math.min(limit, CHANNEL_HISTORY_LIMIT) : CHANNEL_HISTORY_LIMIT;
-    const { messages: history, truncated } = await fetchFullHistory(this.deps.max, chatId, cursor, cancelled, limit);
+    // The history depth bounds a fill from scratch by time, as the lower bound of the paging — so a
+    // years-long chat is not paged through at all (a user's «Госуслуги» filled all night, GitHub #4).
+    const days = cursor == null ? (this.deps.historyDays?.() ?? 0) : 0;
+    const floor = days > 0 ? Date.now() - days * DAY_MS : null;
+    const { messages: history, truncated, older } = await fetchFullHistory(this.deps.max, chatId, cursor ?? floor, cancelled, limit);
+    const cutByDays = floor != null && older && !truncated;
     if (history.length > 0) {
       logger.info(
-        `${cursor == null ? 'Backfilling' : 'Catching up on'} ${history.length} messages for MAX chat ${String(chatId)}${truncated ? ` (the newest ${limit} — ${isChannel ? 'channel cap' : 'HISTORY_LIMIT'})` : ''}`,
+        `${cursor == null ? 'Backfilling' : 'Catching up on'} ${history.length} messages for MAX chat ${String(chatId)}${truncated ? ` (the newest ${limit} — ${isChannel ? 'channel cap' : 'HISTORY_LIMIT'})` : cutByDays ? ` (the last ${historyDaysLabel(days)})` : ''}`,
       );
       // Says why the topic starts mid-conversation — a 5 000-message chat needs ~4 hours in full.
       if (truncated) {
         await sendTextPieces(this.deps.bot, this.deps.groupId, topicId, historyLimitNotice(limit, isChannel));
+      } else if (cutByDays) {
+        await sendTextPieces(this.deps.bot, this.deps.groupId, topicId, historyDaysNotice(days));
       }
       await this.backfill(chatId, topicId, history, cancelled);
+    } else if (cutByDays && floor != null) {
+      // Nothing within the depth: the topic says why it is empty, once — the cursor moves to where the
+      // depth begins, so the next catch-up starts there instead of filling from scratch again.
+      logger.info(`MAX chat ${String(chatId)}: nothing in the last ${historyDaysLabel(days)} — its topic starts empty`);
+      await sendTextPieces(this.deps.bot, this.deps.groupId, topicId, historyDaysNotice(days));
+      await this.deps.chatMapStore.advanceHistoryCursor(chatId, floor);
     }
     if (session === this.session) this.caughtUp.add(String(chatId));
   }
@@ -1653,12 +1681,18 @@ export interface BridgeOptions {
   pause: PauseControl;
   /** The panel's «🔁 Перезапустить мост»: ends the process for Docker to start again (server/app.ts). */
   restartBridge?: (where: { chatId: number; messageId: number }) => void;
+  /** The owner's settings (.data/settings.json) — the history depth lives there. */
+  settings?: SettingsStore;
 }
 
 /** Wires MAX push messages <-> Telegram forum topics in both directions (ТЗ.md §1.2). */
 export interface WiredBridge {
   /** The per-chat queues and catch-up state — pass to syncAllChatsToTelegram (see ChatCatchUp). */
   chatSync: ChatCatchUp;
+  /** «📜 Сколько истории перенести?» in the group — before every chat is filled from scratch; resolves with the days chosen (saved). */
+  askHistoryDepth: () => Promise<number>;
+  /** True when that question is due — no depth chosen yet, or the group was wiped since (the caller checks no topic exists). */
+  historyQuestionDue: () => boolean;
 }
 
 export function wireBridge({
@@ -1679,7 +1713,9 @@ export function wireBridge({
   restartBridge,
   logoutMax,
   rememberChat,
+  settings,
 }: BridgeOptions): WiredBridge {
+  const historyDays = (): number => settings?.get().historyDays ?? DEFAULT_HISTORY_DAYS;
   // Bug-report channel: private DMs from outsiders become bug reports. The inbox is only ON where
   // BUGREPORT_INBOX is set (the maintainer's prod bot); elsewhere outsiders get a redirect stub.
   const bugReportInboxEnabled = isBugReportInboxEnabled();
@@ -1850,8 +1886,50 @@ export function wireBridge({
     isWiping: () => wiping,
     onRelayed: (c) => broadcasts.copyIncoming(c),
     historyLimit: historyLimitFromEnv(),
+    historyDays,
     rememberChat,
   });
+
+  // «📜 Сколько истории перенести?» — one question at a time; a second caller waits for its answer.
+  // Due when no depth was ever chosen, or after a wipe (/reboot, /kill) — the caller also checks
+  // that no topic exists yet: a filled bridge (an update from an older version) is not asked.
+  let historyAskAgain = false;
+  const historyQuestionDue = (): boolean => settings?.get().historyDays === undefined || historyAskAgain;
+  let historyAnswer: Promise<number> | null = null;
+  let answerHistory: ((days: number) => void) | null = null;
+  async function askHistoryDepth(): Promise<number> {
+    if (historyAnswer) return historyAnswer;
+    const current = historyDays();
+    historyAnswer = (async () => {
+      const sent = await bot.telegram
+        .sendMessage(targetGroupId, historyQuestionText(current, HISTORY_QUESTION_MS / 60_000), { reply_markup: { inline_keyboard: historyChoiceKeyboard(current, 'tlmx_hist:') } })
+        .catch((err) => {
+          logger.error('Could not ask how much history to bring over — the saved depth applies', err);
+          return undefined;
+        });
+      if (!sent) return current;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const picked = await new Promise<number | null>((resolve) => {
+        answerHistory = resolve;
+        timer = setTimeout(() => resolve(null), HISTORY_QUESTION_MS);
+      });
+      clearTimeout(timer);
+      answerHistory = null;
+      const days = picked ?? current;
+      historyAskAgain = false;
+      await settings?.set({ historyDays: days }).catch((err: unknown) => logger.error('Failed to save the history depth', err));
+      logger.info(`History depth for topics filled from scratch: ${historyDaysLabel(days)}${picked == null ? ' (no answer — the saved one)' : ''}`);
+      await bot.telegram
+        .editMessageText(targetGroupId, sent.message_id, undefined, `📜 История: ${historyDaysLabel(days)}${picked == null ? ' — ответа не было, оставил как было' : ''}. Заливаю темы. Поменять для новых тем: /panel → ⚙️ Система.`)
+        .catch(() => {});
+      return days;
+    })();
+    try {
+      return await historyAnswer;
+    } finally {
+      historyAnswer = null;
+    }
+  }
 
   /**
    * The cursor moves to the sent message's MAX server time after every outgoing send: `outgoingCids`
@@ -3192,6 +3270,7 @@ export function wireBridge({
     restart: restartBridge,
     logout: logoutMax,
     openJoinedChat,
+    historyDepth: settings ? { get: historyDays, set: (days) => settings.set({ historyDays: days }) } : undefined,
     files: fileShare,
     resendToMax: (id) => bigFiles.resendToMax(id),
     offerStore: (panelMessageId) => bigFiles.offerStore(panelMessageId),
@@ -3711,6 +3790,8 @@ export function wireBridge({
         // linked a message written into a topic not yet deleted. Before the map goes.
         forgetAllLinks();
         await chatMapStore.clear();
+        // The fill that follows starts from scratch: «📜 Сколько истории перенести?» is due again.
+        historyAskAgain = true;
         // Every cursor went with the map: no chat is caught up until a resync backfills it.
         chatSync.reset();
         stateWiped = true;
@@ -3748,7 +3829,8 @@ export function wireBridge({
       'reboot',
       (n) => `🔄 Удаляю ${n} тем и запускаю полную пересинхронизацию...`,
       async (resume) => {
-        // Wipe done: let syncs run again, then start the fresh one.
+        // Wipe done: let syncs run again, then start the fresh one — it asks how far back the topics go
+        // (the map is empty now, see historyQuestionDue).
         resume();
         triggerFullResync().catch((err) => logger.error('Full resync after /reboot failed', err));
         await bot.telegram.sendMessage(targetGroupId, '✅ Пересинхронизация запущена — темы появятся по мере обработки.');
@@ -4255,7 +4337,20 @@ export function wireBridge({
     }
   });
 
-  return { chatSync };
+  // «📜 Сколько истории перенести?»: the answer to a question in flight, or — pressed later — just the saved depth.
+  bot.action(/^tlmx_hist:(\d+)$/, async (ctx) => {
+    const days = Number(ctx.match[1]);
+    if (!HISTORY_DAY_CHOICES.includes(days as (typeof HISTORY_DAY_CHOICES)[number])) return;
+    await ctx.answerCbQuery(`📜 ${historyDaysLabel(days)}`).catch(() => {});
+    if (answerHistory) {
+      answerHistory(days);
+      return;
+    }
+    await settings?.set({ historyDays: days }).catch((err: unknown) => logger.error('Failed to save the history depth', err));
+    await ctx.editMessageText(`📜 История для новых тем: ${historyDaysLabel(days)}. Поменять: /panel → ⚙️ Система.`).catch(() => {});
+  });
+
+  return { chatSync, askHistoryDepth, historyQuestionDue };
 }
 
 /**

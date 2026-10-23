@@ -6,6 +6,7 @@ import { isAddedContact, isMaxServerError, type MaxClient, type MaxContactInfo, 
 import { getAppVersion } from './version.js';
 import { formatBytes, maskPhone } from './status.js';
 import { keepPanelBack } from './panelBack.js';
+import { HISTORY_DAY_CHOICES, historyChoiceKeyboard, historyDaysLabel } from './history.js';
 import { createLogger } from '../logger.js';
 import { truncateCodePoints, truncateUtf16 } from './text.js';
 import { formatExpiry } from './bigFiles.js';
@@ -55,6 +56,8 @@ export interface ControlPanelDeps {
   logout?: () => Promise<{ endedOnMax: boolean }>;
   /** «📢 Подписаться» / «➕ Вступить»: a joined group or channel gets its topic at once (sync.ts openJoinedChat). */
   openJoinedChat?: (chat: MaxLinkChat) => Promise<{ ok: boolean; error?: string; topicName: string; chatLink?: string }>;
+  /** «📜 История»: how far back a topic filled from scratch reaches (days, 0 = all) — settings.json via sync.ts. */
+  historyDepth?: { get: () => number; set: (days: number) => Promise<void> };
 }
 
 export interface PauseControl {
@@ -405,7 +408,7 @@ export function logoutConfirmView(phone: string, back: { text: string; data: str
   };
 }
 /** «⚙️ Система» — exported for the bridge that comes back from «🔁 Перезапустить мост» (server/app.ts), with `note` under the title. */
-export function systemView(paused: boolean, note?: string): View {
+export function systemView(paused: boolean, note?: string, historyDays?: number): View {
   const pauseBtn = paused
     ? Markup.button.callback('▶️ Возобновить MAX', 'tlmx_panel:resume')
     : Markup.button.callback('⏸ Пауза MAX', 'tlmx_panel:pause');
@@ -415,9 +418,22 @@ export function systemView(paused: boolean, note?: string): View {
       [Markup.button.callback('📊 Статус', 'tlmx_panel:status')],
       [pauseBtn, Markup.button.callback('⬆️ Обновление', 'tlmx_panel:update')],
       [Markup.button.callback('🔄 Пересинхронизация', 'tlmx_panel:resync'), Markup.button.callback('📋 Команды', 'tlmx_panel:help')],
+      ...(historyDays != null ? [[Markup.button.callback(`📜 История: ${historyDaysLabel(historyDays)}`, 'tlmx_panel:history')]] : []),
       [Markup.button.callback('🔁 Перезапустить мост', 'tlmx_panel:restart')],
       [Markup.button.callback('◀️ Назад', 'tlmx_panel:root')],
     ]).reply_markup,
+  };
+}
+
+/** «📜 История»: the depth of a topic filled from scratch, the current one ticked. */
+export function historyDepthView(current: number): View {
+  return {
+    text: [
+      `📜 История: ${historyDaysLabel(current)}`,
+      'Сколько переписки переносить в тему, которая заполняется с нуля: новый чат, восстановленная тема, /reboot. Уже заполненные темы это не трогает.',
+      'Telegram пускает около 20 сообщений в минуту — большой чат за всю историю заливается часами.',
+    ].join('\n\n'),
+    markup: { inline_keyboard: [...historyChoiceKeyboard(current, 'tlmx_panel:history:'), [Markup.button.callback('◀️ Назад', 'tlmx_panel:system')]] },
   };
 }
 function restartConfirmView(): View {
@@ -442,10 +458,10 @@ function pauseView(): View {
 }
 
 export function wireControlPanel(deps: ControlPanelDeps): void {
-  const { bot, targetGroupId, max, getActivePhone, triggerFullResync, leaves, startDialog, resolveContactName, getStatus, pause, files, resendToMax, offerStore, restart, logout, openJoinedChat } = deps;
+  const { bot, targetGroupId, max, getActivePhone, triggerFullResync, leaves, startDialog, resolveContactName, getStatus, pause, files, resendToMax, offerStore, restart, logout, openJoinedChat, historyDepth } = deps;
   const card = (f: StoredFile, link?: string): View => fileCardView(f, files!, link, Boolean(resendToMax));
   const root = (): View => rootView(getActivePhone(), pause.until());
-  const system = (): View => systemView(pause.until() != null);
+  const system = (note?: string): View => systemView(pause.until() != null, note, historyDepth?.get());
 
   const edit = (ctx: Context, view: View) =>
     ctx.editMessageText(view.text, { reply_markup: view.markup }).catch((err) => {
@@ -566,6 +582,20 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
   bot.action('tlmx_panel:system', async (ctx) => {
     await ctx.answerCbQuery();
     await edit(ctx, system());
+  });
+  bot.action('tlmx_panel:history', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    if (historyDepth) await edit(ctx, historyDepthView(historyDepth.get()));
+  });
+  bot.action(/^tlmx_panel:history:(\d+)$/, async (ctx) => {
+    const days = Number(ctx.match[1]);
+    if (!historyDepth || !HISTORY_DAY_CHOICES.includes(days as (typeof HISTORY_DAY_CHOICES)[number])) {
+      await ctx.answerCbQuery().catch(() => {});
+      return;
+    }
+    await historyDepth.set(days);
+    await ctx.answerCbQuery(`📜 ${historyDaysLabel(days)}`).catch(() => {});
+    await edit(ctx, system(`📜 История для новых тем: ${historyDaysLabel(days)}.`));
   });
   bot.action('tlmx_panel:pause', async (ctx) => {
     await ctx.answerCbQuery();

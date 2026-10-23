@@ -35,6 +35,9 @@ export interface MaxAttachment {
   // `videoType: 1` is a round video message ("кружочек", Telegram's sendVideoNote); `0` an
   // ordinary video. Confirmed live 2026-08-13 — only videoType tells them apart, not the dimensions.
   videoType?: number;
+  // The video as shown (rotation applied) — MAX web takes its aspect from these.
+  width?: number;
+  height?: number;
   // POLL
   title?: string;
   answers?: Array<{ text?: string; answerId?: unknown; count?: number }>;
@@ -83,6 +86,20 @@ export interface DownloadedAttachment {
   buffer: Buffer;
   filename: string;
   kind: 'photo' | 'document' | 'video' | 'video_note' | 'voice' | 'sticker';
+  /** A video's size as MAX shows it — passed to sendVideo (videoDimensions). */
+  width?: number;
+  height?: number;
+}
+
+/**
+ * sendVideo's width/height from MAX's attach: without them Telegram took a vertical phone video's
+ * shape wrong and showed it squashed (GitHub #4, on 1.3.7). Nothing when MAX gave no sane size.
+ * Pure + exported for unit testing.
+ */
+export function videoDimensions(att: { width?: unknown; height?: unknown }): { width: number; height: number } | Record<string, never> {
+  const width = Number(att.width);
+  const height = Number(att.height);
+  return Number.isInteger(width) && Number.isInteger(height) && width > 0 && height > 0 && width <= 10_000 && height <= 10_000 ? { width, height } : {};
 }
 
 export interface DownloadContext {
@@ -448,7 +465,7 @@ async function downloadAttachmentOrThrow(att: MaxAttachment, ctx: DownloadContex
     for (const mp4Key of mp4Keys) {
       try {
         const buffer = await downloadUrl(urls[mp4Key] as string);
-        return { buffer, filename: `video_${String(videoId)}.mp4`, kind: att.videoType === 1 ? 'video_note' : 'video' };
+        return { buffer, filename: `video_${String(videoId)}.mp4`, kind: att.videoType === 1 ? 'video_note' : 'video', ...videoDimensions(att) };
       } catch (err) {
         if (!(err instanceof DownloadMissError)) throw err;
         miss = err;
