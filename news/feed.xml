@@ -6,7 +6,14 @@
   <atom:link href="https://telemax.svnest.ru/news/feed.xml" rel="self" type="application/rss+xml"/>
   <description>Что нового в Telemax — бесплатном мосте MAX ↔ Telegram с открытым кодом</description>
   <language>ru</language>
-  <lastBuildDate>Fri, 16 Oct 2026 09:00:00 GMT</lastBuildDate>
+  <lastBuildDate>Fri, 23 Oct 2026 09:00:00 GMT</lastBuildDate>
+  <item>
+    <title>Telemax 1.3.12: История за нужный срок и ровное вертикальное видео</title>
+    <link>https://telemax.svnest.ru/news/#v1.3.12</link>
+    <guid isPermaLink="false">telemax-1.3.12</guid>
+    <pubDate>Fri, 23 Oct 2026 09:00:00 GMT</pubDate>
+    <description><![CDATA[<ul><li><b>Сколько истории переносить</b> — в днях: перед первой заливкой (первая синхронизация, <code>/reboot</code>) бот спрашивает в группе — 1 день, 7 дней, 30 дней или всю. Поменять потом — <code>/panel</code> → ⚙️ Система → «📜 История». Мост больше не листает годы переписки ради старых сообщений, а тема начинается с пометки, за какой срок в ней история. Уже заполненные темы это не трогает; новые чаты и восстановленные темы берут выбранную глубину — по умолчанию 7 дней. Спасибо AlexHighTower за идею (GitHub #4)</li><li><b>Вертикальное видео из MAX больше не сплющивается в Telegram</b> — мост передаёт ему размеры видео (GitHub #4)</li><li>Видео и голосовые из Telegram больше не теряются, если MAX обрабатывает их дольше 15 секунд: мост ждёт до нескольких минут, смотря по размеру</li><li>Если большие файлы не работают, потому что на сервере нет автообновления (мост ставили без <code>setup.sh</code> или не от root), бот объясняет причину и что сделать</li></ul>]]></description>
+  </item>
   <item>
     <title>Telemax 1.3.11: Авторы в группах и время у сообщений из истории</title>
     <link>https://telemax.svnest.ru/news/#v1.3.11</link>
@@ -209,13 +216,6 @@
     <guid isPermaLink="false">telemax-0.5.0</guid>
     <pubDate>Sat, 05 Sep 2026 09:00:00 GMT</pubDate>
     <description><![CDATA[<ul><li><b>Лицензия:</b> код открыт под GNU AGPL-3.0 (файл LICENSE, раздел в README). Закрытое коммерческое использование — по отдельной лицензии; правообладатель Zergont</li><li><b>Защита сервера:</b> <code>install.sh</code> предлагает поставить Fail2ban (по умолчанию — да) — бан подбора пароля по SSH, IP вашей сессии установки в белом списке, работает и на минимальных Ubuntu без auth.log</li></ul>]]></description>
-  </item>
-  <item>
-    <title>Telemax 0.4.10: Правки с отметкой времени</title>
-    <link>https://telemax.svnest.ru/news/#v0.4.10</link>
-    <guid isPermaLink="false">telemax-0.4.10</guid>
-    <pubDate>Sat, 29 Aug 2026 09:00:00 GMT</pubDate>
-    <description><![CDATA[<ul><li><b>Пометка правок из MAX в Telegram:</b> ✏️ с временем (МСК по умолчанию, TZ в <code>.env</code>) — Telegram не показывает «изменено» у бот-правок; заодно правка группового сообщения больше не теряет авторский префикс</li><li><b>README:</b> команда установки с резервного зеркала (когда GitHub недоступен)</li></ul>]]></description>
   </item>
 </channel>
 </rss>
