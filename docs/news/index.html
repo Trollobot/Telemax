@@ -4,13 +4,13 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Новости Telemax — что нового в мосте MAX ↔ Telegram</title>
-<meta name="description" content="Что нового в Telemax: все версии моста MAX ↔ Telegram по-человечески. Последняя — 1.3.12 от 23 октября 2026: История за нужный срок и ровное вертикальное видео.">
+<meta name="description" content="Что нового в Telemax: все версии моста MAX ↔ Telegram по-человечески. Последняя — 1.3.13 от 26 октября 2026: Вход в MAX переживает сбои MAX, меньше ложных тревог.">
 <link rel="canonical" href="https://telemax.svnest.ru/news/">
 <link rel="alternate" type="application/rss+xml" title="Новости Telemax" href="https://telemax.svnest.ru/news/feed.xml">
 <meta property="og:type" content="website">
 <meta property="og:locale" content="ru_RU">
 <meta property="og:site_name" content="Telemax">
-<meta property="og:title" content="Новости Telemax — История за нужный срок и ровное вертикальное видео">
+<meta property="og:title" content="Новости Telemax — Вход в MAX переживает сбои MAX, меньше ложных тревог">
 <meta property="og:description" content="Все версии моста MAX ↔ Telegram: что появилось и что починили.">
 <meta property="og:url" content="https://telemax.svnest.ru/news/">
 <meta property="og:image" content="https://telemax.svnest.ru/og.png">
@@ -24,6 +24,16 @@
   "url": "https://telemax.svnest.ru/news/",
   "inLanguage": "ru",
   "blogPost": [
+    {
+      "@type": "BlogPosting",
+      "headline": "Telemax 1.3.13: Вход в MAX переживает сбои MAX, меньше ложных тревог",
+      "datePublished": "2026-10-26",
+      "url": "https://telemax.svnest.ru/news/#v1.3.13",
+      "author": {
+        "@type": "Organization",
+        "name": "Telemax"
+      }
+    },
     {
       "@type": "BlogPosting",
       "headline": "Telemax 1.3.12: История за нужный срок и ровное вертикальное видео",
@@ -330,18 +340,28 @@
     <h1>Что нового в Telemax</h1>
     <p class="lead">Каждая версия моста — коротко и по-человечески. О новой версии бот сам скажет в группе, а обновиться можно одной кнопкой «Обновить» в <code>/version</code>.</p>
     <div class="actions">
-      <a class="btn btn-primary" href="#v1.3.12">📜 Версия 1.3.12</a>
+      <a class="btn btn-primary" href="#v1.3.13">🔐 Версия 1.3.13</a>
       <a class="btn btn-ghost" href="feed.xml">📡 RSS-лента</a>
       <a class="btn btn-ghost" href="../#how">Как установить</a>
     </div>
     <div class="facts">
-      <span class="fact">Последняя версия — <b>1.3.12</b>, 23 октября 2026</span>
-      <span class="fact"><b>40</b> версий с 22 августа 2026</span>
+      <span class="fact">Последняя версия — <b>1.3.13</b>, 26 октября 2026</span>
+      <span class="fact"><b>41</b> версий с 22 августа 2026</span>
     </div>
   </div>
 
   <div class="feed">
     <div class="month"><h2 class="mh">Октябрь 2026</h2>
+      <article class="rel" id="v1.3.13">
+        <div class="meta"><a class="ver" href="#v1.3.13" title="Ссылка на эту новость">v1.3.13</a><time datetime="2026-10-26">26 октября</time></div>
+        <h3><span class="em" aria-hidden="true">🔐</span> Вход в MAX переживает сбои MAX, меньше ложных тревог</h3>
+        <ul>
+          <li><b>Мост больше не сбрасывает вход в MAX из-за сбоя на стороне самого MAX.</b> Раньше краткий сбой его серверов (так было 26 октября) мост принимал за отказ сессии и просил войти заново по СМС. Теперь сессия сохраняется, а мост переподключается сам; войти заново он попросит, только если MAX прямо ответил, что сессия больше не действует</li>
+          <li>Сообщения, которые не удалось сразу доставить в Telegram (сбой прокси, DNS), мост тихо догружает сам — в группу больше не приходит «⚠️ Не удаётся доставить…» на каждый мгновенный сбой. Предупреждение будет, только если Telegram недоступен дольше 5 минут. Спасибо AlexHighTower за вопрос (GitHub #5)</li>
+          <li><b>Фото, видео и файлы из Telegram в MAX:</b> если MAX не ответил на загрузку, мост сам пробует ещё раз, а если и это не помогло — пишет понятно («MAX не ответил на загрузку фото — отправьте ещё раз») вместо технического «Timed out waiting for…»</li>
+          <li>Если обновление отклонено из-за правок в файлах на сервере, бот называет эти файлы</li>
+        </ul>
+      </article>
       <article class="rel" id="v1.3.12">
         <div class="meta"><a class="ver" href="#v1.3.12" title="Ссылка на эту новость">v1.3.12</a><time datetime="2026-10-23">23 октября</time></div>
         <h3><span class="em" aria-hidden="true">📜</span> История за нужный срок и ровное вертикальное видео</h3>
