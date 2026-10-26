@@ -6,7 +6,14 @@
   <atom:link href="https://telemax.svnest.ru/news/feed.xml" rel="self" type="application/rss+xml"/>
   <description>Что нового в Telemax — бесплатном мосте MAX ↔ Telegram с открытым кодом</description>
   <language>ru</language>
-  <lastBuildDate>Fri, 23 Oct 2026 09:00:00 GMT</lastBuildDate>
+  <lastBuildDate>Mon, 26 Oct 2026 09:00:00 GMT</lastBuildDate>
+  <item>
+    <title>Telemax 1.3.13: Вход в MAX переживает сбои MAX, меньше ложных тревог</title>
+    <link>https://telemax.svnest.ru/news/#v1.3.13</link>
+    <guid isPermaLink="false">telemax-1.3.13</guid>
+    <pubDate>Mon, 26 Oct 2026 09:00:00 GMT</pubDate>
+    <description><![CDATA[<ul><li><b>Мост больше не сбрасывает вход в MAX из-за сбоя на стороне самого MAX.</b> Раньше краткий сбой его серверов (так было 26 октября) мост принимал за отказ сессии и просил войти заново по СМС. Теперь сессия сохраняется, а мост переподключается сам; войти заново он попросит, только если MAX прямо ответил, что сессия больше не действует</li><li>Сообщения, которые не удалось сразу доставить в Telegram (сбой прокси, DNS), мост тихо догружает сам — в группу больше не приходит «⚠️ Не удаётся доставить…» на каждый мгновенный сбой. Предупреждение будет, только если Telegram недоступен дольше 5 минут. Спасибо AlexHighTower за вопрос (GitHub #5)</li><li><b>Фото, видео и файлы из Telegram в MAX:</b> если MAX не ответил на загрузку, мост сам пробует ещё раз, а если и это не помогло — пишет понятно («MAX не ответил на загрузку фото — отправьте ещё раз») вместо технического «Timed out waiting for…»</li><li>Если обновление отклонено из-за правок в файлах на сервере, бот называет эти файлы</li></ul>]]></description>
+  </item>
   <item>
     <title>Telemax 1.3.12: История за нужный срок и ровное вертикальное видео</title>
     <link>https://telemax.svnest.ru/news/#v1.3.12</link>
@@ -209,13 +216,6 @@
     <guid isPermaLink="false">telemax-0.5.1</guid>
     <pubDate>Sat, 05 Sep 2026 09:00:00 GMT</pubDate>
     <description><![CDATA[<ul><li><b>Fail2ban при установке:</b> исправлена мёртвая тюрьма sshd из 0.5.0 — ставится python3-systemd (без него backend systemd не стартует), успех проверяется по самой тюрьме, а не по службе; если Fail2ban уже стоял без модуля — доставит и перезапустит</li></ul>]]></description>
-  </item>
-  <item>
-    <title>Telemax 0.5.0: Открытая лицензия и защита сервера</title>
-    <link>https://telemax.svnest.ru/news/#v0.5.0</link>
-    <guid isPermaLink="false">telemax-0.5.0</guid>
-    <pubDate>Sat, 05 Sep 2026 09:00:00 GMT</pubDate>
-    <description><![CDATA[<ul><li><b>Лицензия:</b> код открыт под GNU AGPL-3.0 (файл LICENSE, раздел в README). Закрытое коммерческое использование — по отдельной лицензии; правообладатель Zergont</li><li><b>Защита сервера:</b> <code>install.sh</code> предлагает поставить Fail2ban (по умолчанию — да) — бан подбора пароля по SSH, IP вашей сессии установки в белом списке, работает и на минимальных Ubuntu без auth.log</li></ul>]]></description>
   </item>
 </channel>
 </rss>
