@@ -703,7 +703,7 @@ export class MaxClient extends EventEmitter {
           : `type=${typeof payload}`;
       const serverCode = (payload as { error?: unknown } | null)?.error;
       throw new MaxServerError(
-        `${describeAuthError(payload, 'LOGIN was rejected — the session token is no longer valid')} (dir=0x${dir.toString(16)}, ${shape})`,
+        `${describeAuthError(payload, 'LOGIN was rejected — the session token is no longer valid')} (dir=0x${dir.toString(16)}${typeof serverCode === 'string' ? `, code=${serverCode.slice(0, 60)}` : ''}, ${shape})`,
         OPCODES.LOGIN,
         typeof serverCode === 'string' ? serverCode : undefined,
       );

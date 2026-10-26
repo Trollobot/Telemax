@@ -67,6 +67,22 @@ export interface MaxSessionDeps {
 // the token: those reconnect with backoff (resumeBackoff) and never wipe the session.
 const MAX_RESUME_REJECTIONS = 3;
 const RESUME_RETRY_DELAY_MS = 5_000;
+// MAX refusing the resume for some reason of its own (not «the session is no good»): the session is
+// kept and retried with backoff — but not forever, should that be a rejection worded in a way
+// isSessionRejection does not know: after this long the session is given up on after all.
+const REFUSAL_GIVE_UP_MS = 6 * 3600_000;
+
+/**
+ * MAX's word that the saved session is no good: «Ошибка входа. Пожалуйста, авторизируйтесь снова»
+ * (11 installs, one at a time, in October 2026), or an error code about the token. Anything else MAX
+ * answers a resume LOGIN with is MAX having trouble: «Ошибка загрузки. Попробуйте перезапустить
+ * приложение» hit 3 installs within a minute on 2026-10-26 — deleting their sessions made the owners
+ * log in again by SMS. Pure + exported for unit testing.
+ */
+export function isSessionRejection(err: { message?: string; serverCode?: string }): boolean {
+  if (/token|unauthori[sz]ed|session\.(expired|invalid)/i.test(err.serverCode ?? '')) return true;
+  return /авториз|войдите снова|выполните вход|сесси[яи] (устарел|истекл|недействительн|завершен)/i.test(err.message ?? '');
+}
 // Bounds how long an auth chain (START_AUTH -> CHECK_CODE -> LOGIN) defers a pending resume
 // retry: an abandoned /login flow must not end the retries.
 const AUTH_CHAIN_TTL_MS = 10 * 60_000;
@@ -111,6 +127,8 @@ export class MaxSessionController {
   // The MAX outage behind a «❌ Потеряна связь» notice: when it began and what the client said
   // first. Reported anonymously on recovery (noteUp) — while it lasts, the network is down anyway.
   private outageStartedAt: number | null = null;
+  // When MAX began refusing the resume for a reason not about the session (see isSessionRejection).
+  private refusedSince: number | null = null;
   private outageCause: string | null = null;
   private lastClientError: { at: number; message: string } | null = null;
 
@@ -233,24 +251,33 @@ export class MaxSessionController {
   /** The resume LOGIN threw while still current — see MAX_RESUME_REJECTIONS for which failures count. */
   private async onResumeFailed(err: unknown): Promise<void> {
     const msg = err instanceof Error ? err.message : String(err);
-    if (!isMaxServerError(err)) {
-      // Timeout (an undecodable answer too): nothing is known about the token, the session stays.
-      // This loop (reconnect, INIT OK, LOGIN times out) never emits 'disconnected', so the outage
-      // notice is armed here.
+    // MAX answered, but not «the session is no good»: MAX is having trouble — the session stays.
+    const refused = isMaxServerError(err) && !isSessionRejection(err);
+    if (refused && this.refusedSince == null) {
+      this.refusedSince = Date.now();
+      void this.deps.reportError?.({ kind: 'internal', step: 'max-refused-resume', error: msg });
+    }
+    const givingUp = refused && this.refusedSince != null && Date.now() - this.refusedSince >= REFUSAL_GIVE_UP_MS;
+    if (!isMaxServerError(err) || (refused && !givingUp)) {
+      // Timeout (an undecodable answer too), or a refusal not about the token: nothing is known
+      // against the session, it stays. This loop (reconnect, INIT OK, LOGIN fails) never emits
+      // 'disconnected', so the outage notice is armed here.
       const delay = this.resumeBackoff.next();
-      logger.warn(`Resume login did not complete (not a rejection), reconnecting in ${Math.round(delay / 1000)}s: ${msg}`);
+      logger.warn(`Resume login did not complete (${refused ? 'MAX refused, not about the session — kept' : 'not a rejection'}), reconnecting in ${Math.round(delay / 1000)}s: ${msg}`);
       this.armResumeRetry(delay);
       this.armDownNotice();
       return;
     }
-    this.resumeRejections += 1;
-    if (this.resumeRejections < MAX_RESUME_REJECTIONS) {
+    if (givingUp) logger.warn(`MAX has refused the resume for ${Math.round(REFUSAL_GIVE_UP_MS / 3600_000)} h — giving the session up`);
+    else this.resumeRejections += 1;
+    if (!givingUp && this.resumeRejections < MAX_RESUME_REJECTIONS) {
       // The socket stays up after a rejected LOGIN (no 'disconnected'): reconnect a fresh one and let 'ready' retry.
       logger.warn(`Resume login rejected (attempt ${this.resumeRejections}/${MAX_RESUME_REJECTIONS}), reconnecting to retry: ${msg}`);
       this.armResumeRetry(RESUME_RETRY_DELAY_MS);
       return;
     }
     this.resumeRejections = 0;
+    this.refusedSince = null;
     logger.warn('Saved session was rejected after retries, clearing it:', msg);
     // lastKnownPhone deliberately kept — see its declaration.
     this.session = null;
@@ -286,6 +313,7 @@ export class MaxSessionController {
     this.setState('loggedIn'); // a pending resume retry must not reconnect over this socket
     this.authChainStartedAt = null;
     this.resumeRejections = 0;
+    this.refusedSince = null;
     this.resumeBackoff.reset();
     this.lastLoginAt = Date.now();
     this.noteUp(); // with a session, "MAX is up" means a LOGIN went through, not just INIT

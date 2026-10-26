@@ -663,6 +663,35 @@ export async function sendAttachments(
 
 /** How long a Telegram message waits for MAX to come back before its send fails (see the TG -> MAX handler). */
 const MAX_RECONNECT_WAIT_MS = 30_000;
+/** What the bridge was waiting for when MAX kept silent, for sendFailureText («MAX не ответил на загрузку фото»). */
+const MAX_WAITED_FOR: Record<string, string> = {
+  PHOTO_UPLOAD: 'загрузку фото',
+  VIDEO_UPLOAD: 'загрузку видео',
+  FILE_UPLOAD: 'загрузку файла',
+  STICKER_UPLOAD: 'загрузку стикера',
+  MSG_SEND: 'отправку сообщения',
+};
+
+/** How long Telegram may stay unreachable before the group is told — shorter blips are redelivered silently. */
+const TG_UNREACHABLE_NOTICE_MS = 5 * 60_000;
+
+/**
+ * No answer from Telegram at all — a proxy refusing, DNS, a timeout — or its own 5xx: the message is
+ * redelivered by the catch-up. Not a refusal by Telegram (rights, a bad request), which is news at
+ * once. Pure + exported for unit testing.
+ */
+export function isTelegramUnreachable(err: unknown): boolean {
+  const code = (err as { response?: { error_code?: unknown } } | null)?.response?.error_code;
+  if (typeof code === 'number') return code >= 500;
+  return isTransientNetworkError(err);
+}
+
+/** The cause of an unreachable Telegram in a few words: node-fetch's «…, reason: Socks5 proxy rejected connection» → that reason. Pure + exported for unit testing. */
+export function unreachableReason(err: unknown): string {
+  const message = String((err as Error | null)?.message ?? err);
+  const reason = /reason: (.+)$/.exec(message)?.[1];
+  return truncateUtf16((reason ?? networkFailureName(err)) || message, 120);
+}
 
 /**
  * The topic's line for a message that did not go to MAX — what happened, in words, not
@@ -682,6 +711,10 @@ export function sendFailureText(err: unknown, downSince?: number | null, now = D
     const name = networkFailureName(err);
     return `⚠️ Не отправлено: сервер MAX не ответил${name ? ` (${name})` : ''}. Отправьте ещё раз через минуту.`;
   }
+  // «Timed out waiting for 0x0050 [PHOTO_UPLOAD]» / «… for the video-ready push»: MAX kept silent.
+  const timedOut = /^Timed out waiting for (?:0x[0-9a-f]+ \[([A-Z_]+)\]|the (video|audio)-ready push)/i.exec(message);
+  if (timedOut?.[2]) return `⚠️ Не отправлено: MAX не успел обработать ${timedOut[2] === 'video' ? 'видео' : 'голосовое'} — отправьте ещё раз.`;
+  if (timedOut) return `⚠️ Не отправлено: MAX не ответил на ${MAX_WAITED_FOR[timedOut[1] ?? ''] ?? 'запрос'} — отправьте ещё раз.`;
   return `⚠️ Не удалось отправить в MAX: ${message}`;
 }
 
@@ -2440,6 +2473,9 @@ export function wireBridge({
     return name;
   }
 
+  // Since when Telegram has given no answer to a live delivery (see sendToTopic); null while it does.
+  let tgUnreachableSince: number | null = null;
+
   /**
    * Runs `send` against the chat's topic — inside the chat's queue, after openTopic. If the topic
    * was deleted out from under us, restores it (ChatCatchUp.restoreTopic) — without this, deleting
@@ -2449,12 +2485,24 @@ export function wireBridge({
   async function sendToTopic(chatId: unknown, topicId: number, send: (topicId: number) => Promise<void>): Promise<void> {
     try {
       await send(topicId);
+      tgUnreachableSince = null;
     } catch (err) {
       if (!isThreadNotFound(err)) {
-        reportBridgeError(
-          'tg-deliver',
-          `⚠️ Не удаётся доставить сообщение в Telegram: ${(err as Error).message}. Проверьте права бота и связь с Telegram.`,
-        );
+        if (isTelegramUnreachable(err)) {
+          // No answer from Telegram (a proxy refusing, DNS): the catch-up redelivers the message, so a
+          // blip is no news — «⚠️ Не удаётся доставить…» on every one alarmed for nothing (GitHub #5).
+          // Only an outage that lasts is told, once Telegram takes messages again.
+          tgUnreachableSince ??= Date.now();
+          const mins = Math.floor((Date.now() - tgUnreachableSince) / 60_000);
+          if (Date.now() - tgUnreachableSince >= TG_UNREACHABLE_NOTICE_MS) {
+            reportBridgeError(
+              'tg-unreachable',
+              `⚠️ Telegram не отвечает мосту уже ${mins} мин (${unreachableReason(err)}). Сообщения из MAX не теряются — мост доставит их, когда связь вернётся. Если это надолго — проверьте прокси и сеть сервера.`,
+            );
+          }
+        } else {
+          reportBridgeError('tg-deliver', `⚠️ Не удаётся доставить сообщение в Telegram: ${telegramErrorText(err)}. Проверьте права бота в группе.`);
+        }
         throw err;
       }
       // No re-send: the triggering message is part of the history the restore replays.

@@ -13,7 +13,7 @@ import type { Telegraf } from 'telegraf';
 // the npm package's types are nominally incompatible with @types/node's bundled
 // undici-types copy behind the global — same class at runtime either way.
 import { FormData } from 'undici';
-import type { MaxClient } from '../max/client.js';
+import { MaxConnectionLostError, type MaxClient } from '../max/client.js';
 import { maxFetch, maxFetchBig } from '../max/ca.js';
 import { createLogger } from '../logger.js';
 import { networkFailureName } from './attachments.js';
@@ -48,6 +48,27 @@ async function postToMax(url: string, init: Parameters<typeof maxFetch>[1]): Ret
  */
 export function uploadReadyTimeoutMs(bytes: number): number {
   return Math.min(5 * 60_000, 60_000 + Math.ceil(Math.max(0, bytes) / 1_048_576) * 3000);
+}
+
+/** How long a second ask for an upload slot waits for the MAX connection to come back. */
+const SLOT_RETRY_LOGIN_WAIT_MS = 30_000;
+
+/**
+ * An upload slot from MAX, asked once more when MAX gave no answer in time or the connection dropped
+ * meanwhile — nothing is uploaded yet, so a second ask is safe. An album's two photos both timed out
+ * waiting for PHOTO_UPLOAD on a user's 1.3.12 (2026-10-26) while MAX was silent; one more ask after
+ * the reconnect would have carried them.
+ */
+async function uploadSlot<T>(max: MaxClient, ask: () => Promise<T>): Promise<T> {
+  try {
+    return await ask();
+  } catch (err) {
+    const message = String((err as Error | null)?.message ?? err);
+    if (!message.startsWith('Timed out waiting for 0x') && !(err instanceof MaxConnectionLostError)) throw err;
+    logger.info(`MAX gave no upload slot (${message}) — asking once more`);
+    await max.waitForLogin(SLOT_RETRY_LOGIN_WAIT_MS);
+    return ask();
+  }
 }
 
 async function fetchTelegramFile(bot: Telegraf, fileId: string): Promise<Buffer> {
@@ -106,7 +127,7 @@ function contentDispositionFor(filename: string): string {
 }
 
 async function uploadPhotoToMax(max: MaxClient, buffer: Buffer): Promise<{ _type: 'PHOTO'; photoToken: string }> {
-  const { url } = await max.requestPhotoUpload();
+  const { url } = await uploadSlot(max, () => max.requestPhotoUpload());
   const form = new FormData();
   form.append('file', new Blob([buffer], { type: 'image/jpeg' }), 'photo.jpg');
   const res = await postToMax(url, {
@@ -128,7 +149,7 @@ async function uploadPhotoToMax(max: MaxClient, buffer: Buffer): Promise<{ _type
 }
 
 async function uploadFileToMax(max: MaxClient, buffer: Buffer, filename: string): Promise<{ _type: 'FILE'; fileId: unknown }> {
-  const slot = await max.requestFileUpload();
+  const slot = await uploadSlot(max, () => max.requestFileUpload());
   const res = await postToMax(slot.url, {
     method: 'POST',
     headers: {
@@ -154,7 +175,7 @@ async function uploadFileToMax(max: MaxClient, buffer: Buffer, filename: string)
  * pass through memory. Same slot, headers and Content-Range shape as the buffered version.
  */
 export async function uploadFileFromDiskToMax(max: MaxClient, filePath: string, size: number, filename: string): Promise<{ _type: 'FILE'; fileId: unknown }> {
-  const slot = await max.requestFileUpload();
+  const slot = await uploadSlot(max, () => max.requestFileUpload());
   const res = await maxFetchBig(slot.url, {
     method: 'POST',
     headers: {
@@ -189,7 +210,7 @@ export async function uploadFileFromDiskToMax(max: MaxClient, filePath: string, 
  * attach type it ends up in.
  */
 async function uploadVoiceToMax(max: MaxClient, buffer: Buffer, filename: string, duration: number): Promise<{ _type: 'AUDIO'; audioId: unknown; token: string; duration: number }> {
-  const slot = await max.requestVoiceUploadSlot();
+  const slot = await uploadSlot(max, () => max.requestVoiceUploadSlot());
   // Keyed on this slot's id: the voice's audioId IS the slot's videoId (see above).
   const readyPromise = max.waitForAudioReady(slot.videoId, uploadReadyTimeoutMs(buffer.length)); // start listening before the POST so the push can't arrive unheard
   // If the POST throws first, this wait must not turn into an unhandled rejection later (a false
@@ -219,7 +240,7 @@ async function uploadVideoToMax(
   filename: string,
   contentType = 'video/mp4',
 ): Promise<{ _type: 'VIDEO'; videoId: unknown; token: string }> {
-  const slot = await max.requestVideoUpload();
+  const slot = await uploadSlot(max, () => max.requestVideoUpload());
   const readyPromise = max.waitForVideoReady(slot.videoId, uploadReadyTimeoutMs(buffer.length)); // start listening before the POST so the push can't arrive unheard
   // If the POST throws first, this wait must not turn into an unhandled rejection later (a false
   // "internal bridge error"); the await below still sees its outcome.

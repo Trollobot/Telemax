@@ -318,8 +318,11 @@ STEP="применение обновления"
 # it is a no-op), and a failed build/start then wiped the edits with rollback's reset --hard
 # (review 2026-09-27, shell-r3.3#1). fileMode off: a lost exec bit is no edit.
 if ! git -c core.fileMode=false diff --quiet HEAD --; then
-  report_failure "$STEP" "local edits in the working tree"
-  notify "❌ Обновление отклонено: в исходниках есть локальные правки (git status покажет, какие). Рабочая версия НЕ тронута.${REPORT_NOTE}"
+  # Named, not «git status покажет»: the owner fixes it from the message alone (10 refused updates
+  # on 6 installs by 2026-10-26). Repo paths only — public, nothing of the owner's.
+  EDITED=$(git -c core.fileMode=false diff --name-only HEAD -- | head -5 | tr '\n' ' ' | sed 's/ $//')
+  report_failure "$STEP" "local edits in the working tree: ${EDITED}"
+  notify "❌ Обновление отклонено: на сервере вручную изменены файлы моста — ${EDITED}. Обновление стёрло бы эти правки. Перенесите нужное к себе (настройки — в .env), верните файлы командой git checkout -- ${EDITED} в папке моста и нажмите «Обновить» ещё раз. Рабочая версия НЕ тронута.${REPORT_NOTE}"
   exit 1
 fi
 if ! git merge --ff-only "$CANDIDATE" >/dev/null 2>&1; then

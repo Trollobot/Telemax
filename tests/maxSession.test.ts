@@ -4,7 +4,7 @@ import { MaxServerError } from '../src/max/client.js';
 import { OPCODES } from '../src/max/opcodes.js';
 import { configureErrorReporter } from '../src/bridge/errorReporter.js';
 import { MaxAuthUnavailableError } from '../src/bridge/maxAuthFlow.js';
-import { MaxSessionController } from '../src/server/maxSession.js';
+import { isSessionRejection, MaxSessionController } from '../src/server/maxSession.js';
 import type { MaxSession } from '../src/store/sessionStore.js';
 
 // The transitions that bit us before the controller existed: a pause that kept reconnecting, /kill
@@ -79,6 +79,31 @@ describe('MaxSessionController — resume retries', () => {
     }
     expect(store.clear).not.toHaveBeenCalled();
     expect(ctl.status().connected).toBe(false);
+  });
+
+  it('MAX refusing for a reason of its own keeps the session — reported once, retried with backoff — and gives up only after 6 h', async () => {
+    const { ctl, client, store, postReauthNotice, reportError } = setup();
+    const trouble = () => new MaxServerError('Ошибка загрузки Попробуйте перезапустить приложение (dir=0x3, keys=[error,localizedMessage,title,description])', OPCODES.LOGIN);
+    for (let n = 0; n < 5; n += 1) {
+      await failedResume(client, trouble());
+      expect(ctl.state).toBe('resumeRetry');
+      await vi.advanceTimersByTimeAsync(60_000);
+    }
+    expect(store.clear).not.toHaveBeenCalled(); // 2026-10-26: 3 installs lost a live session to this
+    expect(postReauthNotice).not.toHaveBeenCalled();
+    expect(reportError).toHaveBeenCalledExactlyOnceWith({ kind: 'internal', step: 'max-refused-resume', error: expect.stringMatching(/^Ошибка загрузки/) });
+    await vi.advanceTimersByTimeAsync(6 * 3600_000);
+    await failedResume(client, trouble());
+    expect(store.clear).toHaveBeenCalledTimes(1);
+    expect(postReauthNotice).toHaveBeenCalledTimes(1);
+  });
+
+  it('tells MAX trouble from a dead session', () => {
+    expect(isSessionRejection({ message: 'Ошибка входа. Пожалуйста, авторизируйтесь снова (dir=0x3, keys=[error,message,localizedMessage,title])' })).toBe(true);
+    expect(isSessionRejection({ message: 'Сессия устарела' })).toBe(true);
+    expect(isSessionRejection({ message: 'x', serverCode: 'login.token' })).toBe(true);
+    expect(isSessionRejection({ message: 'Ошибка загрузки Попробуйте перезапустить приложение (dir=0x3, keys=[error,localizedMessage,title,description])' })).toBe(false);
+    expect(isSessionRejection({ message: 'LOGIN was rejected — the session token is no longer valid (dir=0x3, type=undefined)' })).toBe(false);
   });
 
   it('the third server rejection wipes the session and asks the group to re-auth', async () => {

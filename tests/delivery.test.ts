@@ -18,7 +18,9 @@ import {
   MessageLinkStore,
   renderPollAsText,
   sendAttachments,
+  isTelegramUnreachable,
   sendFailureText,
+  unreachableReason,
   sendTextPieces,
 } from '../src/bridge/sync.js';
 import { MaxUnavailableError, TransientDownloadError } from '../src/bridge/transient.js';
@@ -411,6 +413,21 @@ describe('partial delivery', () => {
     const timeout = Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error('x'), { code: 'UND_ERR_CONNECT_TIMEOUT' }) });
     expect(sendFailureText(timeout)).toBe('⚠️ Не отправлено: сервер MAX не ответил (таймаут). Отправьте ещё раз через минуту.');
     expect(sendFailureText(new Error('chat.denied'))).toBe('⚠️ Не удалось отправить в MAX: chat.denied');
+    // MAX kept silent — an album's photos on a user's 1.3.12.
+    expect(sendFailureText(new Error('Timed out waiting for 0x0050 [PHOTO_UPLOAD]'))).toBe('⚠️ Не отправлено: MAX не ответил на загрузку фото — отправьте ещё раз.');
+    expect(sendFailureText(new Error('Timed out waiting for 0x0099 [SOMETHING]'))).toBe('⚠️ Не отправлено: MAX не ответил на запрос — отправьте ещё раз.');
+    expect(sendFailureText(new Error('Timed out waiting for the video-ready push'))).toBe('⚠️ Не отправлено: MAX не успел обработать видео — отправьте ещё раз.');
+  });
+
+  it('tells Telegram not answering (redelivered later) from Telegram refusing (news at once)', () => {
+    const proxy = Object.assign(new Error('request to https://api.telegram.org/bot[REDACTED]/sendPhoto failed, reason: Socks5 proxy rejected connection - Failure'), { name: 'FetchError' });
+    expect(isTelegramUnreachable(proxy)).toBe(true);
+    expect(unreachableReason(proxy)).toBe('Socks5 proxy rejected connection - Failure');
+    const dns = Object.assign(new Error('request to https://api.telegram.org/bot[REDACTED]/sendMessage failed, reason: getaddrinfo EAI_AGAIN api.telegram.org'), { name: 'FetchError', code: 'EAI_AGAIN' });
+    expect(isTelegramUnreachable(dns)).toBe(true);
+    expect(isTelegramUnreachable(Object.assign(new Error('502'), { response: { error_code: 502, description: 'Bad Gateway' } }))).toBe(true);
+    expect(isTelegramUnreachable(Object.assign(new Error('403'), { response: { error_code: 403, description: 'Forbidden: bot was kicked' } }))).toBe(false);
+    expect(isTelegramUnreachable(Object.assign(new Error('400'), { response: { error_code: 400, description: 'Bad Request: not enough rights' } }))).toBe(false);
   });
 
   it('a placeholder says why: the download miss, or Telegram refusing the attachment', async () => {
