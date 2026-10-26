@@ -195,11 +195,15 @@ fi
 # newest signed release tag sitting on the fetched commit (empty if there is none / it doesn't verify).
 CANDIDATE=""
 SIGNED_TAG=""
+# Why the last try_source said no — in the report and the owner's message (a 1.3.11 install retried
+# «no signed release on GitHub or the mirror» 7 times on 2026-10-26 and nobody could tell why).
+TRY_WHY=""
 try_source() {
   local url="$1" label="$2" tag
   echo "[update] $(date -u +%Y-%m-%dT%H:%M:%SZ) fetching main from ${label}..."
   if ! git fetch "$url" main >/dev/null 2>&1; then
     echo "[update] ${label}: недоступен"
+    TRY_WHY="unreachable"
     return 1
   fi
   CANDIDATE=$(git rev-parse FETCH_HEAD)
@@ -223,8 +227,10 @@ try_source() {
   if [ -z "$tag" ]; then
     if [ "$seen" = "1" ]; then
       echo "[update] ${label}: ни один тег на входящей версии не подписан корректно"
+      TRY_WHY="tag-unsigned"
     else
       echo "[update] ${label}: на входящей версии нет тега релиза"
+      TRY_WHY="no-release-tag"
     fi
     return 1
   fi
@@ -235,6 +241,7 @@ try_source() {
   # the current releases.) Require the candidate to contain what we already have.
   if ! git merge-base --is-ancestor "$PREV_HEAD" "$CANDIDATE" 2>/dev/null; then
     echo "[update] ${label}: там версия старее установленной или история разошлась — не подходит"
+    TRY_WHY="history-diverged"
     return 1
   fi
   SIGNED_TAG="$tag"
@@ -246,12 +253,23 @@ try_source() {
 # signed tag at HEAD wedged updates forever — the mirror, which did have the release, was never even
 # tried. Fall back on the RESULT (no verified release here), not merely on a network error.
 STEP="получение обновления"
+# A try_source verdict in the owner's words.
+why_ru() {
+  case "$1" in
+    unreachable) echo "недоступен" ;;
+    tag-unsigned) echo "подпись релиза не прошла проверку" ;;
+    no-release-tag) echo "там нет подписанного релиза" ;;
+    history-diverged) echo "ваша копия разошлась с официальной — свои коммиты или установка из форка; обновляйтесь вручную" ;;
+    *) echo "$1" ;;
+  esac
+}
 if ! try_source origin "GitHub"; then
+  WHY_GITHUB="$TRY_WHY"
   echo "[update] пробую резервное зеркало: ${MIRROR_GIT_URL}"
   if ! try_source "$MIRROR_GIT_URL" "зеркало"; then
     STEP="проверка подписи релиза"
-    report_failure "$STEP" "no signed release on GitHub or the mirror"
-    notify "❌ Обновление отклонено: ни на GitHub, ни на зеркале нет корректно подписанного релиза. Рабочая версия НЕ тронута.${REPORT_NOTE}"
+    report_failure "$STEP" "no signed release on GitHub or the mirror (GitHub: ${WHY_GITHUB}; mirror: ${TRY_WHY})"
+    notify "❌ Обновление отклонено: ни на GitHub, ни на зеркале нет подходящего подписанного релиза (GitHub: $(why_ru "$WHY_GITHUB"); зеркало: $(why_ru "$TRY_WHY")). Рабочая версия НЕ тронута.${REPORT_NOTE}"
     exit 1
   fi
 fi
