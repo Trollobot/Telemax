@@ -4,13 +4,13 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Новости Telemax — что нового в мосте MAX ↔ Telegram</title>
-<meta name="description" content="Что нового в Telemax: все версии моста MAX ↔ Telegram по-человечески. Последняя — 1.3.13 от 26 октября 2026: Вход в MAX переживает сбои MAX, меньше ложных тревог.">
+<meta name="description" content="Что нового в Telemax: все версии моста MAX ↔ Telegram по-человечески. Последняя — 1.3.14 от 28 октября 2026: Мост сразу просит войти заново, если вход в MAX больше не действует.">
 <link rel="canonical" href="https://telemax.svnest.ru/news/">
 <link rel="alternate" type="application/rss+xml" title="Новости Telemax" href="https://telemax.svnest.ru/news/feed.xml">
 <meta property="og:type" content="website">
 <meta property="og:locale" content="ru_RU">
 <meta property="og:site_name" content="Telemax">
-<meta property="og:title" content="Новости Telemax — Вход в MAX переживает сбои MAX, меньше ложных тревог">
+<meta property="og:title" content="Новости Telemax — Мост сразу просит войти заново, если вход в MAX больше не действует">
 <meta property="og:description" content="Все версии моста MAX ↔ Telegram: что появилось и что починили.">
 <meta property="og:url" content="https://telemax.svnest.ru/news/">
 <meta property="og:image" content="https://telemax.svnest.ru/og.png">
@@ -24,6 +24,16 @@
   "url": "https://telemax.svnest.ru/news/",
   "inLanguage": "ru",
   "blogPost": [
+    {
+      "@type": "BlogPosting",
+      "headline": "Telemax 1.3.14: Мост сразу просит войти заново, если вход в MAX больше не действует",
+      "datePublished": "2026-10-28",
+      "url": "https://telemax.svnest.ru/news/#v1.3.14",
+      "author": {
+        "@type": "Organization",
+        "name": "Telemax"
+      }
+    },
     {
       "@type": "BlogPosting",
       "headline": "Telemax 1.3.13: Вход в MAX переживает сбои MAX, меньше ложных тревог",
@@ -213,16 +223,6 @@
         "@type": "Organization",
         "name": "Telemax"
       }
-    },
-    {
-      "@type": "BlogPosting",
-      "headline": "Telemax 1.0.0: Версия 1.0: несколько мостов на одном сервере",
-      "datePublished": "2026-09-21",
-      "url": "https://telemax.svnest.ru/news/#v1.0.0",
-      "author": {
-        "@type": "Organization",
-        "name": "Telemax"
-      }
     }
   ]
 }
@@ -340,18 +340,25 @@
     <h1>Что нового в Telemax</h1>
     <p class="lead">Каждая версия моста — коротко и по-человечески. О новой версии бот сам скажет в группе, а обновиться можно одной кнопкой «Обновить» в <code>/version</code>.</p>
     <div class="actions">
-      <a class="btn btn-primary" href="#v1.3.13">🔐 Версия 1.3.13</a>
+      <a class="btn btn-primary" href="#v1.3.14">🔑 Версия 1.3.14</a>
       <a class="btn btn-ghost" href="feed.xml">📡 RSS-лента</a>
       <a class="btn btn-ghost" href="../#how">Как установить</a>
     </div>
     <div class="facts">
-      <span class="fact">Последняя версия — <b>1.3.13</b>, 26 октября 2026</span>
-      <span class="fact"><b>41</b> версий с 22 августа 2026</span>
+      <span class="fact">Последняя версия — <b>1.3.14</b>, 28 октября 2026</span>
+      <span class="fact"><b>42</b> версий с 22 августа 2026</span>
     </div>
   </div>
 
   <div class="feed">
     <div class="month"><h2 class="mh">Октябрь 2026</h2>
+      <article class="rel" id="v1.3.14">
+        <div class="meta"><a class="ver" href="#v1.3.14" title="Ссылка на эту новость">v1.3.14</a><time datetime="2026-10-28">28 октября</time></div>
+        <h3><span class="em" aria-hidden="true">🔑</span> Мост сразу просит войти заново, если вход в MAX больше не действует</h3>
+        <ul>
+          <li><b>Если MAX больше не принимает вход</b> — например, сменили пароль или закрыли сессии на телефоне, — мост сразу просит войти заново. В 1.3.13 такой отказ иногда принимался за сбой на стороне MAX: мост переподключался и писал о потере связи вместо того, чтобы попросить новый вход</li>
+        </ul>
+      </article>
       <article class="rel" id="v1.3.13">
         <div class="meta"><a class="ver" href="#v1.3.13" title="Ссылка на эту новость">v1.3.13</a><time datetime="2026-10-26">26 октября</time></div>
         <h3><span class="em" aria-hidden="true">🔐</span> Вход в MAX переживает сбои MAX, меньше ложных тревог</h3>

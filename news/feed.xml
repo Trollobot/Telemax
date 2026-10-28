@@ -6,7 +6,14 @@
   <atom:link href="https://telemax.svnest.ru/news/feed.xml" rel="self" type="application/rss+xml"/>
   <description>Что нового в Telemax — бесплатном мосте MAX ↔ Telegram с открытым кодом</description>
   <language>ru</language>
-  <lastBuildDate>Mon, 26 Oct 2026 09:00:00 GMT</lastBuildDate>
+  <lastBuildDate>Wed, 28 Oct 2026 09:00:00 GMT</lastBuildDate>
+  <item>
+    <title>Telemax 1.3.14: Мост сразу просит войти заново, если вход в MAX больше не действует</title>
+    <link>https://telemax.svnest.ru/news/#v1.3.14</link>
+    <guid isPermaLink="false">telemax-1.3.14</guid>
+    <pubDate>Wed, 28 Oct 2026 09:00:00 GMT</pubDate>
+    <description><![CDATA[<ul><li><b>Если MAX больше не принимает вход</b> — например, сменили пароль или закрыли сессии на телефоне, — мост сразу просит войти заново. В 1.3.13 такой отказ иногда принимался за сбой на стороне MAX: мост переподключался и писал о потере связи вместо того, чтобы попросить новый вход</li></ul>]]></description>
+  </item>
   <item>
     <title>Telemax 1.3.13: Вход в MAX переживает сбои MAX, меньше ложных тревог</title>
     <link>https://telemax.svnest.ru/news/#v1.3.13</link>
@@ -209,13 +216,6 @@
     <guid isPermaLink="false">telemax-0.5.2</guid>
     <pubDate>Mon, 07 Sep 2026 09:00:00 GMT</pubDate>
     <description><![CDATA[<ul><li><b>Группы:</b> сообщение о выходе/добавлении участника теперь называет человека, показывает его MAX ID и даёт кнопку «✍️» — открыть с ним личку в один тап (раньше вышедший исчезал из ростера, и написать ему из Telegram было нельзя)</li><li><b>Панель:</b> поиск контакта «🆔 По ID» — любой MAX ID из карточки группы или сообщения о выходе можно вставить и начать чат</li></ul>]]></description>
-  </item>
-  <item>
-    <title>Telemax 0.5.1: Fail2ban чинится сам</title>
-    <link>https://telemax.svnest.ru/news/#v0.5.1</link>
-    <guid isPermaLink="false">telemax-0.5.1</guid>
-    <pubDate>Sat, 05 Sep 2026 09:00:00 GMT</pubDate>
-    <description><![CDATA[<ul><li><b>Fail2ban при установке:</b> исправлена мёртвая тюрьма sshd из 0.5.0 — ставится python3-systemd (без него backend systemd не стартует), успех проверяется по самой тюрьме, а не по службе; если Fail2ban уже стоял без модуля — доставит и перезапустит</li></ul>]]></description>
   </item>
 </channel>
 </rss>
