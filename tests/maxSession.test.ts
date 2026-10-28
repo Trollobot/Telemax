@@ -102,6 +102,10 @@ describe('MaxSessionController — resume retries', () => {
     expect(isSessionRejection({ message: 'Ошибка входа. Пожалуйста, авторизируйтесь снова (dir=0x3, keys=[error,message,localizedMessage,title])' })).toBe(true);
     expect(isSessionRejection({ message: 'Сессия устарела' })).toBe(true);
     expect(isSessionRejection({ message: 'x', serverCode: 'login.token' })).toBe(true);
+    // 2026-10-27: a real rejection 1.3.13 took for MAX trouble.
+    expect(isSessionRejection({ message: 'FAIL_WRONG_PASSWORD (dir=0x3, code=login.cred, keys=[error,message])', serverCode: 'login.cred' })).toBe(true);
+    expect(isSessionRejection({ message: 'FAIL_WRONG_PASSWORD (dir=0x3, keys=[error,message])' })).toBe(true);
+    expect(isSessionRejection({ message: 'x', serverCode: 'login.cred' })).toBe(true);
     expect(isSessionRejection({ message: 'Ошибка загрузки Попробуйте перезапустить приложение (dir=0x3, keys=[error,localizedMessage,title,description])' })).toBe(false);
     expect(isSessionRejection({ message: 'LOGIN was rejected — the session token is no longer valid (dir=0x3, type=undefined)' })).toBe(false);
   });

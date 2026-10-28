@@ -80,8 +80,10 @@ const REFUSAL_GIVE_UP_MS = 6 * 3600_000;
  * log in again by SMS. Pure + exported for unit testing.
  */
 export function isSessionRejection(err: { message?: string; serverCode?: string }): boolean {
-  if (/token|unauthori[sz]ed|session\.(expired|invalid)/i.test(err.serverCode ?? '')) return true;
-  return /авториз|войдите снова|выполните вход|сесси[яи] (устарел|истекл|недействительн|завершен)/i.test(err.message ?? '');
+  // `login.cred` + «FAIL_WRONG_PASSWORD» (2026-10-27, a 1.3.13 install): the credentials behind the
+  // token are no longer valid — a real rejection that 1.3.13 missed and kept retrying for hours.
+  if (/token|cred|password|unauthori[sz]ed|session\.(expired|invalid)/i.test(err.serverCode ?? '')) return true;
+  return /авториз|войдите снова|выполните вход|сесси[яи] (устарел|истекл|недействительн|завершен)|WRONG_PASSWORD|FAIL_LOGIN/i.test(err.message ?? '');
 }
 // Bounds how long an auth chain (START_AUTH -> CHECK_CODE -> LOGIN) defers a pending resume
 // retry: an abandoned /login flow must not end the retries.
