@@ -18,6 +18,10 @@ data/
 *_debug.*
 crash_*.json
 
+# the owner's own Docker settings — Compose merges it into docker-compose.yml by itself, and an
+# update must never see it as an edit of the bridge's files (see README)
+docker-compose.override.yml
+
 # deploy artifacts / local tooling — not part of the published project
 *.tar.gz
 .claude/

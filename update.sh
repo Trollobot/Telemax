@@ -276,6 +276,15 @@ fi
 
 # What commit is ACTUALLY running? The bridge bakes GIT_COMMIT into its image, so this is the only
 # honest answer — the git tree alone isn't one.
+running_image() {
+  # The image the running container was started from; empty when nothing runs.
+  local cid
+  cid=$(docker compose ps -q --status running 2>/dev/null | head -1) || cid=""
+  [ -n "$cid" ] || return 0
+  docker inspect --format '{{.Image}}' "$cid" 2>/dev/null || true
+  return 0
+}
+
 deployed_commit() {
   local cid out
   cid=$(docker compose ps -q 2>/dev/null | head -1) || cid=""
@@ -340,7 +349,10 @@ if ! git -c core.fileMode=false diff --quiet HEAD --; then
   # on 6 installs by 2026-10-26). Repo paths only — public, nothing of the owner's.
   EDITED=$(git -c core.fileMode=false diff --name-only HEAD -- | head -5 | tr '\n' ' ' | sed 's/ $//')
   report_failure "$STEP" "local edits in the working tree: ${EDITED}"
-  notify "❌ Обновление отклонено: на сервере вручную изменены файлы моста — ${EDITED}. Обновление стёрло бы эти правки. Перенесите нужное к себе (настройки — в .env), верните файлы командой git checkout -- ${EDITED} в папке моста и нажмите «Обновить» ещё раз. Рабочая версия НЕ тронута.${REPORT_NOTE}"
+  # docker-compose.yml is the one people edit (2026-10-28): its changes belong in the override file.
+  OVERRIDE_HINT=""
+  case " $EDITED " in *" docker-compose.yml "*) OVERRIDE_HINT=" Свои правки docker-compose.yml держите в docker-compose.override.yml — Docker подхватит его сам, а обновления его не трогают (см. README)." ;; esac
+  notify "❌ Обновление отклонено: на сервере вручную изменены файлы моста — ${EDITED}. Обновление стёрло бы эти правки. Перенесите нужное к себе (настройки — в .env), верните файлы командой git checkout -- ${EDITED} в папке моста и нажмите «Обновить» ещё раз.${OVERRIDE_HINT} Рабочая версия НЕ тронута.${REPORT_NOTE}"
   exit 1
 fi
 if ! git merge --ff-only "$CANDIDATE" >/dev/null 2>&1; then
@@ -371,7 +383,18 @@ rollback() {
   git reset --hard "$PREV_HEAD" >/dev/null 2>&1 || true
   rm -f data/update-completed
   local rc=0
-  GIT_COMMIT=$(git rev-parse HEAD) docker compose up -d --build >/dev/null 2>&1 || rc=$?
+  if [ -n "${ROLLBACK_IMAGE:-}" ] && [ -n "${COMPOSE_IMAGE:-}" ] && docker image inspect "$ROLLBACK_IMAGE" >/dev/null 2>&1; then
+    # The very image that ran before the update, tagged back — nothing to download (see ROLLBACK_IMAGE).
+    { docker tag "$ROLLBACK_IMAGE" "$COMPOSE_IMAGE" && GIT_COMMIT=$(git rev-parse HEAD) docker compose up -d --no-build; } >/dev/null 2>&1 || rc=$?
+  else
+    GIT_COMMIT=$(git rev-parse HEAD) docker compose up -d --build >/dev/null 2>&1 || rc=$?
+  fi
+  # Compose may complain while the container that ran before still runs — a failed BUILD never
+  # touches it. That is the previous version up, whatever the exit code.
+  if [ "$rc" -ne 0 ] && [ -n "${ROLLBACK_IMAGE:-}" ] && [ "$(running_image)" = "$ROLLBACK_IMAGE" ]; then
+    echo "[update] прежняя версия работает (контейнер не трогали)"
+    rc=0
+  fi
   # A running commit off the release line (deployed by hand from another branch) is rebuilt, but the
   # tree goes back to the release it was on: left on that commit, every later update was refused as a
   # diverged history (review 2026-09-27, shell-r3.2#1). The next run then retries the rebuild.
@@ -382,9 +405,11 @@ rollback() {
     docker image prune -f >/dev/null 2>&1 || true
     return 0
   fi
-  echo "[update] ОТКАТ НЕ УДАЛСЯ — мост может быть остановлен"
+  local state="мост остановлен"
+  [ -z "$(running_image)" ] || state="контейнер запущен, но не на прежней версии"
+  echo "[update] ОТКАТ НЕ УДАЛСЯ — ${state}"
   report_failure "откат" "rollback failed: the previous version did not come back up"
-  notify "⚠️ Откат на прежнюю версию не удался — мост может быть остановлен. Нужен ручной запуск на сервере: cd $(pwd) && docker compose up -d --build${REPORT_NOTE}"
+  notify "⚠️ Откат на прежнюю версию не удался — ${state}. Нужен ручной запуск на сервере: cd $(pwd) && docker compose up -d --build${REPORT_NOTE}"
   return 1
 }
 # From here until the liveness check passes, the ERR trap rolls back too (see on_error).
@@ -407,6 +432,13 @@ if [ -f .env ] && ! grep -q '^COMPOSE_PROJECT_NAME=' .env; then
   echo "[update] зафиксировал имя проекта Docker: $(compose_name_from_dir)"
 fi
 
+# What runs now, so a rollback can put exactly it back — no rebuild, no network. Rebuilding the old
+# version needs the same apt/npm downloads a failed build just could not make: a 1.3.11 install
+# (2026-10-28) rebuilt into the same apt-get failure and reported «the previous version did not come
+# back up» while its untouched container was still running.
+ROLLBACK_IMAGE=$(running_image)
+COMPOSE_IMAGE=$(docker compose config --images 2>/dev/null | head -1) || COMPOSE_IMAGE=""
+
 STEP="сборка образа"
 echo "[update] building (GIT_COMMIT=$(git rev-parse --short HEAD))..."
 # The build output is kept so the failure notice can say WHY: «cat update.log» is beyond most users.
@@ -416,6 +448,17 @@ if ! GIT_COMMIT=$(git rev-parse HEAD) docker compose build 2>&1 | tee "$BUILD_LO
   if grep -qi 'no space left on device' "$BUILD_LOG"; then
     WHY="на диске кончилось место (свободно $(free_mb) МБ). Освободите его: docker builder prune -af — и нажмите «Обновить» ещё раз"
     report_failure "$STEP" "no space left on device"
+  # The raw «failed to solve: process …» line told the owner nothing (2026-10-27/28: npm ci on a
+  # 1.3.12 install, apt-get on a 1.3.11 one) — both are the server failing to download.
+  elif grep -q 'failed to solve: process "/bin/sh -c apt-get' "$BUILD_LOG"; then
+    WHY="сервер не смог скачать системные пакеты Debian (deb.debian.org) — проверьте, что у него есть интернет и работает DNS, и нажмите «Обновить» ещё раз"
+    report_failure "$STEP" "apt-get failed: Debian packages not downloaded"
+  elif grep -q 'failed to solve: process "/bin/sh -c npm' "$BUILD_LOG"; then
+    WHY="сервер не смог скачать пакеты Node.js (registry.npmjs.org) — проверьте, что у него есть интернет и работает DNS, и нажмите «Обновить» ещё раз"
+    report_failure "$STEP" "npm failed: packages not downloaded"
+  elif grep -qiE 'exit code: 137|signal: killed' "$BUILD_LOG"; then
+    WHY="сборке не хватило памяти (свободно $(awk '/MemAvailable/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || echo '?') МБ) — остановите лишнее на сервере или добавьте swap и нажмите «Обновить» ещё раз"
+    report_failure "$STEP" "build killed: out of memory"
   else
     WHY=$(grep -E 'ERROR|failed to solve' "$BUILD_LOG" | tail -1 | cut -c1-300) || WHY=""
     report_failure "$STEP" "${WHY:-build failed, no ERROR line in the output}"
