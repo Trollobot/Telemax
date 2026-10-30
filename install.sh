@@ -201,7 +201,11 @@ discover_installs() {
     if [ -n "$d" ] && [ -f "$d/docker-compose.yml" ] && [ -f "$d/update-watcher.sh" ]; then printf '%s\n' "$d"; fi
   done
 }
-install_version() { sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' "$1/package.json" 2>/dev/null | head -1; }
+install_version() {
+  # The VERSION file since 1.3.15 (package.json there says 0.0.0); package.json for older installs.
+  if [ -s "$1/VERSION" ]; then tr -d '[:space:]' < "$1/VERSION"; return 0; fi
+  sed -n 's/.*"version": *"\([^"]*\)".*/\1/p' "$1/package.json" 2>/dev/null | head -1
+}
 install_status() {
   if [ ! -f "$1/.env" ]; then printf '⚙️ не настроен'; return 0; fi
   # Container names live under the compose project name — setup.sh writes it into .env

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { parseChangelogMd, assembleChangelog, isNewerVersion } from '../src/bridge/version.js';
+import { readFileSync } from 'node:fs';
+import { parseChangelogMd, assembleChangelog, isNewerVersion, getAppVersion } from '../src/bridge/version.js';
 
 const SAMPLE = `# Changelog
 
@@ -77,5 +78,12 @@ describe('isNewerVersion (the one updateAvailable rule for GitHub and the mirror
   it('never reports an update when either side is not a version', () => {
     expect(isNewerVersion('9.9.9', 'unknown')).toBe(false);
     expect(isNewerVersion('garbage', '1.0.0')).toBe(false);
+  });
+});
+
+describe('getAppVersion', () => {
+  it('reads the VERSION file — package.json stays at 0.0.0 so npm layers stay cached between releases', () => {
+    expect(getAppVersion()).toBe(readFileSync('VERSION', 'utf8').trim());
+    expect(JSON.parse(readFileSync('package.json', 'utf8')).version).toBe('0.0.0');
   });
 });

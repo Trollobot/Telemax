@@ -41,6 +41,9 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 COPY --from=build /app/dist ./dist
 COPY entrypoint.sh ./
+# The release version (src/bridge/version.ts) — kept out of package.json, so the npm layers above
+# stay cached from one release to the next.
+COPY VERSION ./
 # Baked in from the host's git checkout at build time (docker-compose.yml passes it through from
 # $GIT_COMMIT) — the runtime image has no .git of its own (excluded via .dockerignore), so this is
 # the only way /version can know what commit is actually running vs what's latest upstream.

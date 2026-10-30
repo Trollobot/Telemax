@@ -15,7 +15,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-VERSION=$(node -p "require('./package.json').version")
+# The VERSION file since 1.3.15 (package.json stays at 0.0.0 so npm layers stay cached).
+VERSION=$(tr -d '[:space:]' < VERSION 2>/dev/null || true)
+[ -n "$VERSION" ] || VERSION=$(node -p "require('./package.json').version")
 TAG="v${VERSION}"
 
 MIRROR_SSH="${MIRROR_SSH:-root@zergont-gate.duckdns.org}"

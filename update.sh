@@ -110,7 +110,9 @@ report_failure() {
   id=$(head -c 64 data/install-id 2>/dev/null | tr -d '[:space:]') || id=""
   [ -n "$id" ] || return 0
   # The version that was running, not the one a failed merge may have left in the tree.
-  ver=$(git show "${PREV_HEAD:-HEAD}:package.json" 2>/dev/null | sed -n 's/^ *"version": *"\([^"]*\)".*/\1/p' | head -1) || ver=""
+  # The VERSION file since 1.3.15 (package.json then says 0.0.0); package.json for older commits.
+  ver=$(git show "${PREV_HEAD:-HEAD}:VERSION" 2>/dev/null | tr -d '[:space:]') || ver=""
+  [ -n "$ver" ] || ver=$(git show "${PREV_HEAD:-HEAD}:package.json" 2>/dev/null | sed -n 's/^ *"version": *"\([^"]*\)".*/\1/p' | head -1) || ver=""
   [ -n "$ver" ] || ver=$(sed -n 's/^ *"version": *"\([^"]*\)".*/\1/p' package.json 2>/dev/null | head -1) || ver=""
   os_name=$(sed -n 's/^PRETTY_NAME="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' /etc/os-release 2>/dev/null | head -1) || os_name=""
   mem=$(free -m 2>/dev/null | awk '/^Mem:/ {print $7}') || mem=""
@@ -323,6 +325,11 @@ HEAVY_REBUILD=0
 if ! git diff --quiet "$PREV_HEAD" "$CANDIDATE" -- Dockerfile 2>/dev/null; then
   HEAVY_REBUILD=1
   NEED_MB="${UPDATE_MIN_FREE_MB:-3000}"
+elif git diff --quiet "$PREV_HEAD" "$CANDIDATE" -- package.json package-lock.json 2>/dev/null; then
+  # Neither the Dockerfile nor the dependencies changed: every heavy layer comes from the cache and
+  # the update adds a few MB (the version lives in VERSION since 1.3.15) — 1500 MB stopped a
+  # 1077-MB-free install for nothing (2026-10-24).
+  NEED_MB="${UPDATE_MIN_FREE_MB:-500}"
 fi
 FREE_MB=$(free_mb)
 if [ -n "$FREE_MB" ] && [ "$FREE_MB" -lt "$NEED_MB" ]; then
@@ -334,7 +341,10 @@ fi
 if [ -n "$FREE_MB" ] && [ "$FREE_MB" -lt "$NEED_MB" ]; then
   echo "[update] мало места: свободно ${FREE_MB} МБ, нужно ${NEED_MB} МБ"
   report_failure "$STEP" "low disk: ${FREE_MB} MB free, ${NEED_MB} MB needed"
-  notify "❌ Обновление отложено: на диске свободно ${FREE_MB} МБ, для сборки нужно не меньше ${NEED_MB} МБ. Освободите место на сервере (docker builder prune -af удалит кэш прошлых сборок) и нажмите «Обновить» ещё раз. Рабочая версия НЕ тронута.${REPORT_NOTE}"
+  # Animated stickers (chromium + ffmpeg) are ~900 MB of the image: on a small disk that is the lever.
+  SLIM_HINT=""
+  [ "$(env_flag STICKERS)" = "slim" ] || SLIM_HINT=" На маленьком сервере можно отказаться от анимированных стикеров: STICKERS=slim в .env — образ станет меньше примерно на 900 МБ (стикеры будут приходить картинкой)."
+  notify "❌ Обновление отложено: на диске свободно ${FREE_MB} МБ, для сборки нужно не меньше ${NEED_MB} МБ. Освободите место на сервере (docker builder prune -af удалит кэш прошлых сборок) и нажмите «Обновить» ещё раз.${SLIM_HINT} Рабочая версия НЕ тронута.${REPORT_NOTE}"
   exit 1
 fi
 echo "[update] свободно на диске: ${FREE_MB:-?} МБ"

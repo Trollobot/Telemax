@@ -29,17 +29,28 @@ export interface VersionStatus {
 }
 
 let cachedVersion: string | null = null;
-/** The release version this build reports — read from package.json, which is baked into the
- * runtime image (the Dockerfile COPYs it). Works for EVERY build regardless of GIT_COMMIT, so a
- * plain `docker compose up --build` (not via setup.sh) still gets update checks and a real
- * version instead of "dev". */
+/**
+ * The release version this build reports — the VERSION file, baked into the runtime image (the
+ * Dockerfile COPYs it). Works for EVERY build regardless of GIT_COMMIT, so a plain
+ * `docker compose up --build` (not via setup.sh) still gets update checks and a real version.
+ * Not package.json since 1.3.15: a version bump there changed package.json and package-lock.json on
+ * every release, which re-ran `npm ci` (both stages) on every update — a fresh download of every
+ * npm package and ~400 MB of disk each time (measured 2026-10-30). package.json stays at 0.0.0; it
+ * is still read for a tree from before that.
+ */
 export function getAppVersion(): string {
   if (cachedVersion) return cachedVersion;
+  try {
+    const fromFile = readFileSync(path.join(process.cwd(), 'VERSION'), 'utf8').trim();
+    if (/^\d+\.\d+\.\d+/.test(fromFile)) return (cachedVersion = fromFile);
+  } catch {
+    // An image or tree from before the VERSION file — package.json below.
+  }
   try {
     const pkg = JSON.parse(readFileSync(path.join(process.cwd(), 'package.json'), 'utf8')) as { version?: unknown };
     cachedVersion = typeof pkg.version === 'string' && pkg.version ? pkg.version : 'unknown';
   } catch (err) {
-    logger.error('Failed to read version from package.json', err);
+    logger.error('Failed to read the version from VERSION or package.json', err);
     cachedVersion = 'unknown';
   }
   return cachedVersion;
