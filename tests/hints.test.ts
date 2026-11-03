@@ -11,8 +11,9 @@ describe('the bridge admin in the bot DM', () => {
     expect(adminDmHintText('')).toMatch(/в группе моста:/);
   });
 
-  it('gets a members link to the supergroup', () => {
-    expect(bridgeGroupLink('-1003919540013')).toBe('https://t.me/c/3919540013');
+  it('gets a members link to the supergroup that Telegram opens — at the pinned panel, else the first message', () => {
+    expect(bridgeGroupLink('-1003919540013', 4321)).toBe('https://t.me/c/3919540013/4321');
+    expect(bridgeGroupLink('-1003919540013')).toBe('https://t.me/c/3919540013/1');
   });
 });
 

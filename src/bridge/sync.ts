@@ -924,9 +924,11 @@ export function adminDmHintText(groupTitle: string): string {
   ].join('\n');
 }
 
-/** A members' link to the bridge's supergroup: https://t.me/c/<id without -100>. */
-export function bridgeGroupLink(groupId: string): string {
-  return `https://t.me/c/${groupId.replace(/^-100/, '')}`;
+/** A members' link to the bridge's supergroup: https://t.me/c/<id without -100>/<message>. Telegram
+ * opens a private group's link only with a message in it — the bare t.me/c/<id> did nothing
+ * (2026-11-03) — so it points at the pinned panel, or the group's first message without a pin. */
+export function bridgeGroupLink(groupId: string, messageId?: number): string {
+  return `https://t.me/c/${groupId.replace(/^-100/, '')}/${messageId ?? 1}`;
 }
 
 /** What a channel's card shows, from the cached chat (CHATS_LIST or the CHAT_JOIN answer). */
@@ -1873,17 +1875,16 @@ export function wireBridge({
   // The bridge's own admin writing to the bot's DM is told where the bridge lives instead of getting
   // the outsiders' bug-report redirect: a user typed /panel, /info, /broadcast here and got «пишите в
   // баг-бот» every time, and took the bridge for broken (2026-10-13). Only /login works in the DM.
-  let bridgeGroupTitle: string | undefined;
   async function adminDmHint(ctx: Context): Promise<boolean> {
     const userId = ctx.from?.id;
     if (userId == null || !ctx.message || !(await isGroupAdmin(userId).catch(() => false))) return false;
-    if (bridgeGroupTitle === undefined) {
-      const chat = await bot.telegram.getChat(targetGroupId).catch(() => undefined);
-      bridgeGroupTitle = chat && 'title' in chat ? chat.title : '';
-    }
+    // Asked every time: the pin (the panel, which the link opens at) can change.
+    const chat = await bot.telegram.getChat(targetGroupId).catch(() => undefined);
+    const title = chat && 'title' in chat ? chat.title : '';
+    const pinned = chat && 'pinned_message' in chat ? chat.pinned_message?.message_id : undefined;
     await ctx
-      .reply(adminDmHintText(bridgeGroupTitle), {
-        reply_markup: Markup.inlineKeyboard([[Markup.button.url('➡️ Открыть группу моста', bridgeGroupLink(targetGroupId))]]).reply_markup,
+      .reply(adminDmHintText(title), {
+        reply_markup: Markup.inlineKeyboard([[Markup.button.url('➡️ Открыть группу моста', bridgeGroupLink(targetGroupId, pinned))]]).reply_markup,
       })
       .catch((err) => logger.error('Failed to send the admin DM hint', err));
     return true;
