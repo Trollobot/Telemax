@@ -15,6 +15,7 @@ import { RetryBackoff } from '../bridge/catchUp.js';
 import { isStaleCallbackQuery, isTransientTelegramError } from '../bridge/transient.js';
 import { configureErrorReporter, reportBridgeError } from '../bridge/errorReporter.js';
 import { getAppVersion } from '../bridge/version.js';
+import { BUGREPORT_BOT_DESCRIPTION, isBugReportInboxEnabled } from '../bridge/bugReports.js';
 import { noteBoot, reportError } from '../bridge/telemetry.js';
 import { createLogger } from '../logger.js';
 import { config } from './config.js';
@@ -510,6 +511,28 @@ const BOT_COMMANDS = [
   { command: 'kill', description: 'Разлогинить MAX и стереть все данные (необратимо)' },
 ];
 
+/**
+ * The "/" menu only where the commands work. It used to be set for every chat, so anyone who opened
+ * the bot in a DM saw /logout, /version, /help… — the bridge answers those only in its group, and on
+ * the maintainer's bot they came in as bug reports (2026-11-03). Groups get the full list; a
+ * private chat none, except the bridge group's admins, whose DM is where /login runs. A DM menu for
+ * an admin who never opened the bot's DM is refused by Telegram — fine, the hint there names /login.
+ */
+async function publishCommandMenu(bot: Telegraf): Promise<void> {
+  const failed = (what: string) => (err: unknown) => logger.error(`Failed to set bot commands (${what})`, err);
+  await bot.telegram.deleteMyCommands().catch(failed('clear the old every-chat menu'));
+  await bot.telegram.setMyCommands(BOT_COMMANDS, { scope: { type: 'all_group_chats' } }).catch(failed('groups'));
+  const admins = await bot.telegram.getChatAdministrators(config.targetTelegramGroup).catch(() => []);
+  for (const a of admins) {
+    if (a.user.is_bot) continue;
+    await bot.telegram
+      .setMyCommands(ADMIN_DM_COMMANDS, { scope: { type: 'chat', chat_id: a.user.id } })
+      .catch((err) => logger.debug(`No DM menu for admin ${a.user.id} (never opened the bot's DM?)`, err));
+  }
+}
+
+const ADMIN_DM_COMMANDS = [{ command: 'login', description: 'Войти в MAX (номер + SMS)' }];
+
 const UPDATE_COMPLETED_MARKER = path.join(process.cwd(), '.data', 'update-completed');
 
 /**
@@ -694,8 +717,10 @@ async function launchTelegramBotWithRetry(bot: Telegraf, attempt = 0): Promise<v
   // Best-effort, once per launch: the profile description (a constant — see buildBotDescription)
   // lists the command surface, how deletion works and the platform-level gap a user could
   // otherwise spend time re-discovering (Telegram's poll widget can't receive a MAX-side vote).
-  bot.telegram.setMyDescription(buildBotDescription()).catch((err) => logger.error('Failed to set bot description', err));
-  bot.telegram.setMyCommands(BOT_COMMANDS).catch((err) => logger.error('Failed to set bot commands', err));
+  // Where the maintainer's bug-report inbox is on, the profile is the feedback bot's (BUGREPORT_BOT_DESCRIPTION).
+  const description = isBugReportInboxEnabled() ? BUGREPORT_BOT_DESCRIPTION : buildBotDescription();
+  bot.telegram.setMyDescription(description).catch((err) => logger.error('Failed to set bot description', err));
+  void publishCommandMenu(bot);
   void reportIfJustUpdated(bot);
   void reportIfJustRestarted(bot);
   // SessionStore parked an unreadable session file (corrupt, or encrypted with a different

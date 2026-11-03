@@ -19,6 +19,25 @@ export function isBugReportInboxEnabled(env: NodeJS.ProcessEnv = process.env): b
   return !!raw?.trim() && parseEnvBool(raw) !== false;
 }
 
+/** The bot's profile description where the inbox is on — shown to anyone who opens the bot before
+ * /start. The bridge's own description («Мост MAX ↔ Telegram…» + its commands) made people take the
+ * feedback bot for a bridge to use: they pressed /logout, /version, /help and those came in as
+ * reports (2026-11-03). */
+export const BUGREPORT_BOT_DESCRIPTION = `Бот обратной связи Telemax — моста MAX ↔ Telegram.
+
+Нашли баг или есть вопрос? Нажмите «Старт» и опишите проблему одним сообщением, можно со скриншотом. Ответ разработчика придёт сюда.
+
+Это не ваш мост: команды моста (/help, /panel, /version…) работают в вашем собственном боте, в группе вашего моста. Поставить мост: telemax.svnest.ru`;
+
+export const COMMAND_IN_INBOX_REPLY =
+  '🤖 Это бот обратной связи Telemax, а не ваш мост. Команды (/help, /panel, /version, /logout…) работают в вашем собственном боте — в группе вашего моста.\n\nЗдесь опишите проблему словами, можно со скриншотом — передам разработчику.';
+
+/** A slash command (not /start, which has its own greeting): the bridge's commands pressed by someone
+ * who took the feedback bot for their bridge — answered, never relayed as a report. Exported for tests. */
+export function isCommandNotReport(text: string | undefined): boolean {
+  return !!text && /^\/[A-Za-z]/.test(text.trim()) && !text.trim().startsWith('/start');
+}
+
 // Keep an open DM from flooding the maintainer's group: at most RATE_LIMIT messages per
 // window per reporter. In-memory only — a restart resets it, which is fine.
 const RATE_LIMIT = 5;
@@ -111,6 +130,10 @@ export function createBugReports(deps: BugReportsDeps): BugReports {
       await ctx
         .reply('👋 Это Telemax. Опишите проблему одним сообщением — можно со скриншотом. Я передам разработчику, ответ придёт сюда.')
         .catch(() => {});
+      return;
+    }
+    if (isCommandNotReport(msg.text)) {
+      await ctx.reply(COMMAND_IN_INBOX_REPLY).catch(() => {});
       return;
     }
     if (rateLimited(chatId)) {
