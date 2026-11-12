@@ -137,7 +137,6 @@ export function createBigFiles({ bot, max, targetGroupId, fileShare, onSentToMax
       .map((f) => [Markup.button.callback(`${f.direction === 'max2tg' ? '⬇️' : f.direction === 'stored' ? '📦' : '⬆️'} ${truncateUtf16(f.name, 40)} · ${formatBytes(f.size)}`, PUT + f.id)]);
   const SERVER_NOTE = '\n\nИли отправьте сюда файл, который уже лежит на сервере, — загружать его заново не придётся:';
   const uploadRows = (url: string, token: string) => [[Markup.button.url('📤 Загрузить файл', url)], [Markup.button.callback('✖️ Отменить', CANCEL + token)]];
-  const uploadKeyboard = (url: string, token: string) => Markup.inlineKeyboard(uploadRows(url, token));
   /** The way back to «📁 Файлы» for everything the file exchange draws in the panel message. */
   const TO_FILES = [Markup.button.callback('◀️ К файлам', 'tlmx_panel:files')];
 

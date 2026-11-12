@@ -59,7 +59,6 @@ let chatSync: ChatCatchUp | null = null;
 // «📜 Сколько истории перенести?» (sync.ts) — asked before a sync that fills every chat from scratch.
 let askHistoryDepth: (() => Promise<number>) | null = null;
 let historyQuestionDue: (() => boolean) | null = null;
-let tgActive = false;
 // LOGIN's embedded chat list is capped at chatsCount (<=50) and, live, has also
 // been observed to just omit chats a later resumed-session LOGIN included —
 // cachedChats gets replaced with the real, fully-paginated CHATS_LIST result
@@ -452,8 +451,8 @@ async function startServer(): Promise<void> {
 
 // getUpdates only allows one active poller per bot token (a second instance — even a
 // throwaway debug script — gets a 409 and knocks the first one off), so a launch
-// failure here is often transient. Retry with backoff instead of leaving tgActive
-// stuck false until someone notices and restarts the process by hand.
+// failure here is often transient. Retry with backoff instead of leaving the bot
+// down until someone notices and restarts the process by hand.
 const TELEGRAM_RETRY_DELAYS_MS = [2_000, 5_000, 15_000, 30_000, 60_000];
 
 // Shown in the bot's Telegram profile (Bot API 512-char limit on setMyDescription).
@@ -688,7 +687,6 @@ async function reportIfJustRestarted(bot_: Telegraf): Promise<void> {
 }
 
 function retryTelegramLaunch(bot: Telegraf, attempt: number, reason: unknown): void {
-  tgActive = false;
   const idx = Math.min(attempt, TELEGRAM_RETRY_DELAYS_MS.length - 1);
   const delay = TELEGRAM_RETRY_DELAYS_MS[idx] as number;
   logger.error(`Telegram bot stopped, retrying in ${delay}ms:`, reason instanceof Error ? reason.message : reason);
@@ -699,7 +697,7 @@ function retryTelegramLaunch(bot: Telegraf, attempt: number, reason: unknown): v
  * `bot.launch()` does NOT resolve once the bot is up — it awaits the polling loop
  * internally and only settles when the bot stops or hits an unrecoverable error.
  * Treating `.then()` as "now active" (as both prototype versions did) means
- * `tgActive` can never become true during normal operation. `getMe()` resolves
+ * the bot never counts as up during normal operation. `getMe()` resolves
  * as soon as the token/connection are good, so that's the actual readiness signal;
  * `launch()` is fired after and only awaited for its rejection/stop outcome.
  */
@@ -711,7 +709,6 @@ async function launchTelegramBotWithRetry(bot: Telegraf, attempt = 0): Promise<v
     return;
   }
 
-  tgActive = true;
   logger.info('Telegram bot active');
 
   // Best-effort, once per launch: the profile description (a constant — see buildBotDescription)

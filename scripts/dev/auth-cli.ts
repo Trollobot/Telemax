@@ -10,7 +10,7 @@
  * (any tool/editor works — the script polls for it).
  */
 import 'dotenv/config';
-import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rm } from 'node:fs/promises';
 import path from 'node:path';
 import { MaxClient } from '../../src/max/client.js';
 import { SessionStore } from '../../src/store/sessionStore.js';
