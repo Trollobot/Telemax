@@ -924,6 +924,16 @@ export function adminDmHintText(groupTitle: string): string {
   ].join('\n');
 }
 
+/** «Обновить» on the portable Windows build: there the update is a new archive unpacked over the folder. */
+export const PORTABLE_UPDATE_TEXT = [
+  'ℹ️ Портативная версия обновляется вручную:',
+  '1. Скачайте новый архив: https://telemax.svnest.ru/windows/',
+  '2. Закройте Telemax: значок возле часов → «Выход».',
+  '3. Распакуйте архив поверх этой папки и запустите Telemax.cmd.',
+  '',
+  'Настройки, темы и вход в MAX сохранятся.',
+].join('\n');
+
 /** A members' link to the bridge's supergroup: https://t.me/c/<id without -100>/<message>. Telegram
  * opens a private group's link only with a message in it — the bare t.me/c/<id> did nothing
  * (2026-11-03) — so it points at the pinned panel, or the group's first message without a pin. */
@@ -3071,6 +3081,12 @@ export function wireBridge({
     if ((await markerActive(UPDATE_REQUESTED_MARKER)) || (await markerActive(UPDATE_IN_PROGRESS_MARKER))) {
       await ctx.answerCbQuery('Обновление уже идёт');
       await ctx.editMessageText('⏳ Обновление уже запущено — дождитесь сообщения о завершении.', back).catch(() => {});
+      return;
+    }
+    // The portable Windows build (src/portable) has no updater yet: a new archive goes over the folder.
+    if (process.env.TELEMAX_PORTABLE) {
+      await ctx.answerCbQuery('Обновление — вручную');
+      await ctx.editMessageText(PORTABLE_UPDATE_TEXT, back).catch(() => {});
       return;
     }
     // The marker is consumed only by the host dispatcher (absent when setup.sh ran without root):

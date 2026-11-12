@@ -35,3 +35,6 @@ max-protocol-full.md
 # needed to run/deploy the app, just an old manual test
 scripts/dev/test-bridge-telegram.ts
 *.pid
+
+# the portable Windows build (scripts/build-portable.mjs)
+build/

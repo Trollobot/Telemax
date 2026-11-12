@@ -165,6 +165,12 @@ export const NO_AUTO_UPDATE_TEXT = explain(
   'службу больших файлов запускает автообновление — его ставит ./setup.sh, запущенный от root. Без него служба не поднимается, а сам мост её запустить не может',
   'в папке моста на сервере выполните sudo ./setup.sh — он поставит автообновление, и большие файлы заработают. Мост, поставленный вручную через docker compose без setup.sh, автообновления не получит — тогда выключите большие файлы: FILES=off в .env',
 );
+/** The portable Windows build (src/portable): no files service next to it, and a home PC rarely has what it needs anyway. */
+export const PORTABLE_NO_FILES_TEXT = explain(
+  'в портативной версии для Windows большие файлы по ссылкам не работают',
+  `${WHY_PAGE}, а для неё нужен сервер с белым IP-адресом и открытыми портами 80 и 443 — у домашнего компьютера их обычно нет`,
+  'обычные файлы ходят как всегда. Для больших поставьте мост на сервер (VPS) — туда можно перенести эту же папку с настройками',
+);
 
 export class FileShare {
   readonly dir: string;
@@ -446,7 +452,7 @@ export class FileShare {
         if (!(await this.watcherAlive())) {
           return {
             ok: false,
-            reason: NO_AUTO_UPDATE_TEXT,
+            reason: process.env.TELEMAX_PORTABLE ? PORTABLE_NO_FILES_TEXT : NO_AUTO_UPDATE_TEXT,
           };
         }
       }

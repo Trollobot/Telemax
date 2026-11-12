@@ -20,7 +20,9 @@ import { noteBoot, reportError } from '../bridge/telemetry.js';
 import { createLogger } from '../logger.js';
 import { config } from './config.js';
 import { MaxSessionController } from './maxSession.js';
-import { getTelegramProxyAgent, initTelegramProxy } from '../telegram/proxy.js';
+import { getTelegramProxyAgent, initTelegramProxy, redactProxyUrl } from '../telegram/proxy.js';
+import { startStatusFile } from '../bridge/statusFile.js';
+import { maskPhone } from '../bridge/status.js';
 
 const logger = createLogger('server');
 
@@ -59,6 +61,14 @@ let chatSync: ChatCatchUp | null = null;
 // «📜 Сколько истории перенести?» (sync.ts) — asked before a sync that fills every chat from scratch.
 let askHistoryDepth: (() => Promise<number>) | null = null;
 let historyQuestionDue: (() => boolean) | null = null;
+// Whether Telegram answers — for the portable build's status file (bridge/statusFile.ts) only: down
+// until the first getMe, and again while launches or long polls keep failing.
+let telegramState: { ok: boolean; since: number; error?: string } = { ok: false, since: Date.now() };
+function setTelegramState(ok: boolean, error?: unknown): void {
+  const text = error == null ? undefined : error instanceof Error ? error.message : String(error);
+  if (telegramState.ok === ok && telegramState.error === text) return;
+  telegramState = { ok, since: telegramState.ok === ok ? telegramState.since : Date.now(), ...(text ? { error: text } : {}) };
+}
 // LOGIN's embedded chat list is capped at chatsCount (<=50) and, live, has also
 // been observed to just omit chats a later resumed-session LOGIN included —
 // cachedChats gets replaced with the real, fully-paginated CHATS_LIST result
@@ -347,6 +357,17 @@ async function startServer(): Promise<void> {
 
   await settingsStore.load().catch((err) => logger.error('Failed to read .data/settings.json — the defaults apply', err));
   maxSession.start(await sessionStore.load());
+  startStatusFile(() => {
+    const st = maxSession.status();
+    const proxy = (process.env.TELEGRAM_PROXY ?? '').trim();
+    return {
+      at: Date.now(),
+      pid: process.pid,
+      version: getAppVersion(),
+      max: { state: maxSession.state, phone: maskPhone(maxSession.lastKnownPhone), lastLoginAt: st.lastLoginAt, downSince: st.downSince, pausedUntil: maxSession.pausedUntil },
+      telegram: { configured: config.telegramEnabled, ...telegramState, ...(proxy ? { proxy: redactProxyUrl(proxy) } : {}) },
+    };
+  });
 
   // Build the Telegram proxy agent (TELEGRAM_PROXY from .env) before the bot is
   // built — Telegraf binds its agent at construction time, so this has to run
@@ -447,6 +468,11 @@ async function startServer(): Promise<void> {
   };
   process.once('SIGTERM', () => shutdown('SIGTERM'));
   process.once('SIGINT', () => shutdown('SIGINT'));
+  // The portable launcher (src/portable) starts the bridge with an IPC channel: Windows has no
+  // SIGTERM to deliver, so it asks for the same clean stop with a message.
+  process.on('message', (m) => {
+    if (m === 'shutdown') shutdown('the launcher');
+  });
 }
 
 // getUpdates only allows one active poller per bot token (a second instance — even a
@@ -618,9 +644,21 @@ function watchPolling(bot_: Telegraf): void {
     const longPoll = method === 'getUpdates' && Number((payload as { timeout?: unknown } | null)?.timeout) > 0;
     if (!longPoll) return (callApi as (m: string, p: unknown, e?: unknown) => Promise<unknown>)(method, payload, extra);
     pollInFlightSince = Date.now();
-    return (callApi as (m: string, p: unknown, e?: unknown) => Promise<unknown>)(method, payload, extra).finally(() => {
-      pollInFlightSince = null;
-    });
+    return (callApi as (m: string, p: unknown, e?: unknown) => Promise<unknown>)(method, payload, extra)
+      .then(
+        (updates) => {
+          setTelegramState(true);
+          return updates;
+        },
+        (err: unknown) => {
+          // A poll cut on purpose (the watchdog, a stop) says nothing about Telegram.
+          if ((err as { name?: string } | null)?.name !== 'AbortError') setTelegramState(false, err);
+          throw err;
+        },
+      )
+      .finally(() => {
+        pollInFlightSince = null;
+      });
   }) as typeof bot_.telegram.callApi;
   setInterval(() => {
     if (pollInFlightSince == null || Date.now() - pollInFlightSince < POLL_STALL_MS) return;
@@ -687,6 +725,7 @@ async function reportIfJustRestarted(bot_: Telegraf): Promise<void> {
 }
 
 function retryTelegramLaunch(bot: Telegraf, attempt: number, reason: unknown): void {
+  setTelegramState(false, reason);
   const idx = Math.min(attempt, TELEGRAM_RETRY_DELAYS_MS.length - 1);
   const delay = TELEGRAM_RETRY_DELAYS_MS[idx] as number;
   logger.error(`Telegram bot stopped, retrying in ${delay}ms:`, reason instanceof Error ? reason.message : reason);
@@ -709,6 +748,7 @@ async function launchTelegramBotWithRetry(bot: Telegraf, attempt = 0): Promise<v
     return;
   }
 
+  setTelegramState(true);
   logger.info('Telegram bot active');
 
   // Best-effort, once per launch: the profile description (a constant — see buildBotDescription)
