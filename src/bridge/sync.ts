@@ -927,7 +927,7 @@ export function adminDmHintText(groupTitle: string): string {
 /** «Обновить» on the portable Windows build: there the update is a new archive unpacked over the folder. */
 export const PORTABLE_UPDATE_TEXT = [
   'ℹ️ Портативная версия обновляется вручную:',
-  '1. Скачайте новый архив: https://telemax.svnest.ru/windows/',
+  '1. Скачайте новый архив: https://github.com/Trollobot/Telemax/releases',
   '2. Закройте Telemax: значок возле часов → «Выход».',
   '3. Распакуйте архив поверх этой папки и запустите Telemax.cmd.',
   '',

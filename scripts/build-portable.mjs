@@ -81,7 +81,10 @@ if (nodeArg === 'local') {
 
 step('certs, VERSION, Windows files');
 copyDir('certs', path.join(stage, 'certs'));
-cpSync('VERSION', path.join(stage, 'VERSION'));
+// «+win» marks the portable build wherever the version shows: on its page, in /version, and in
+// the anonymous ping — the only way to tell Windows installs from servers in the statistics
+// without sending anything new (the ping carries the install id and the version, nothing else).
+writeFileSync(path.join(stage, 'VERSION'), `${version}+win\n`, 'utf8');
 cpSync('LICENSE', path.join(stage, 'LICENSE.txt'));
 // cmd.exe wants CRLF; PowerShell 5.1 and Notepad want a BOM to read UTF-8 Cyrillic as such.
 const crlf = (text) => text.replace(/\r?\n/g, '\r\n');
