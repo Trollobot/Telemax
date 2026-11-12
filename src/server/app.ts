@@ -473,6 +473,8 @@ async function startServer(): Promise<void> {
   process.on('message', (m) => {
     if (m === 'shutdown') shutdown('the launcher');
   });
+  // The launcher itself was killed: a bridge left behind would fight the next one for the bot.
+  process.once('disconnect', () => shutdown('the launcher is gone'));
 }
 
 // getUpdates only allows one active poller per bot token (a second instance — even a

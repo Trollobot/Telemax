@@ -52,9 +52,6 @@ $script:launcherStartedAt = Get-Date
 $script:exiting = $false
 
 function Start-Launcher {
-  # Старый номер порта не годится: программа запишет тот, который заняла сейчас.
-  Remove-Item $portFile -Force -ErrorAction SilentlyContinue
-  $script:port = $null
   $psi = New-Object Diagnostics.ProcessStartInfo
   $psi.FileName = $node
   $psi.Arguments = '"' + $entry + '"'
@@ -184,27 +181,31 @@ function Set-State([string]$level, [string]$summary) {
   $script:level = $level
 }
 
+# Отвечает ли программа. Номер порта она пишет в файл при каждом запуске — читаем его заново,
+# пока ответа нет: порт мог смениться.
+function Get-Status {
+  if (Test-Path $portFile) { $script:port = (Get-Content $portFile -Raw).Trim() }
+  if (-not $script:port) { return $null }
+  try { return (Invoke-Api '/api/status' $false) } catch { return $null }
+}
+
 function Update-State {
   if ($script:exiting) { return }
-  if ($script:launcher -eq $null -or $script:launcher.HasExited) {
-    # Программа закрылась сама — запускаем снова (но не чаще раза в 5 секунд).
-    if (((Get-Date) - $script:launcherStartedAt).TotalSeconds -ge 5) {
+  $s = Get-Status
+  if ($s -eq $null) {
+    $sinceStart = ((Get-Date) - $script:launcherStartedAt).TotalSeconds
+    $dead = ($script:launcher -eq $null -or $script:launcher.HasExited)
+    if ($dead -and $sinceStart -ge 5) {
+      # Программа закрылась сама — запускаем снова (но не чаще раза в 5 секунд).
       $script:launcherRestarts++
       Write-TrayLog 'launcher is not running — starting it again'
       Start-Launcher
+    } elseif (-not $dead -and $sinceStart -ge 60) {
+      # Процесс есть, а ответа нет уже минуту — завис. Снимаем; следующий опрос запустит заново.
+      Write-TrayLog 'launcher does not answer — killing it'
+      try { $script:launcher.Kill() } catch { }
     }
-    Set-State 'wait' 'Telemax: запускается…'
-    return
-  }
-  if (-not $script:port) {
-    if (Test-Path $portFile) { $script:port = (Get-Content $portFile -Raw).Trim() }
-    if (-not $script:port) { Set-State 'wait' 'Telemax: запускается…'; return }
-  }
-  try {
-    $s = Invoke-Api '/api/status' $false
-  } catch {
-    if (((Get-Date) - $script:launcherStartedAt).TotalSeconds -lt 20) { Set-State 'wait' 'Telemax: запускается…' }
-    else { Set-State 'bad' 'Telemax: программа не отвечает' }
+    if ($sinceStart -lt 20) { Set-State 'wait' 'Telemax: запускается…' } else { Set-State 'bad' 'Telemax: программа не отвечает' }
     return
   }
   Set-State ([string]$s.health.level) ([string]$s.health.summary)
@@ -229,6 +230,9 @@ $itemExit.Add_Click({
   # Мосту нужно несколько секунд, чтобы закрыть соединения и дописать файлы.
   if ($script:launcher -ne $null -and -not $script:launcher.HasExited) {
     if (-not $script:launcher.WaitForExit(12000)) { try { $script:launcher.Kill() } catch { } }
+  } else {
+    # Программу запускал не этот значок (см. ниже) — ждём, пока она перестанет отвечать.
+    for ($i = 0; $i -lt 24 -and (Get-Status) -ne $null; $i++) { Start-Sleep -Milliseconds 500 }
   }
   $tray.Visible = $false
   $tray.Dispose()
@@ -242,7 +246,9 @@ $timer.Add_Tick({
 })
 
 try {
-  Start-Launcher
+  # Программа могла остаться от прошлого значка (его закрыли через диспетчер задач): тогда она уже
+  # отвечает, и вторую запускать нельзя — два моста на одном боте мешают друг другу.
+  if ((Get-Status) -eq $null) { Start-Launcher } else { Write-TrayLog 'found a running launcher — using it' }
   $timer.Start()
   $tray.ShowBalloonTip(4000, 'Telemax запущен', 'Значок возле часов показывает связь. Двойной щелчок — панель.', [Windows.Forms.ToolTipIcon]::Info)
   [Windows.Forms.Application]::Run()

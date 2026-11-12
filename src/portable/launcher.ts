@@ -221,7 +221,7 @@ function createServer(port: number): http.Server {
       if (!isAllowedRequest(method, req.headers, port)) return sendJson(res, 403, fail('forbidden'));
       if (method === 'GET') {
         if (url === '/') return send(res, 200, PAGE_HTML, 'text/html');
-        if (url === '/api/ping') return sendJson(res, 200, { ok: true, telemax: true, version });
+        if (url === '/api/ping') return sendJson(res, 200, { ok: true, telemax: true, version, root: ROOT });
         if (url === '/api/status') return sendJson(res, 200, await apiStatus());
         if (url === '/api/log') return sendJson(res, 200, { ok: true, lines: log.tail() });
         return sendJson(res, 404, fail('not found'));
@@ -236,13 +236,14 @@ function createServer(port: number): http.Server {
   });
 }
 
-/** Whether a Telemax launcher already answers on this port (a second start of the same folder, or another copy). */
-async function isOurs(port: number): Promise<boolean> {
+/** The folder of the Telemax launcher that already answers on this port, or null when it is something else. */
+async function telemaxAt(port: number): Promise<string | null> {
   try {
     const res = await fetch(`http://127.0.0.1:${port}/api/ping`, { signal: AbortSignal.timeout(1500) });
-    return ((await res.json()) as { telemax?: boolean }).telemax === true;
+    const ping = (await res.json()) as { telemax?: boolean; root?: string };
+    return ping.telemax === true ? (ping.root ?? '') : null;
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -263,7 +264,14 @@ async function main(): Promise<void> {
   for (; port < first + 10; port += 1) {
     server = await listen(port);
     if (server) break;
-    if (await isOurs(port)) log.note(`port ${port} is taken by another Telemax — trying the next one`);
+    const other = await telemaxAt(port);
+    // The same folder twice would be two bridges on one bot, each knocking the other off Telegram.
+    // The one already running stays (it kept its port in PORT_FILE for the tray icon to find).
+    if (other === ROOT) {
+      log.note(`already running from this folder (port ${port}) — this second start steps aside`);
+      process.exit(0);
+    }
+    if (other != null) log.note(`port ${port} is taken by a Telemax from another folder — trying the next one`);
   }
   if (!server) throw new Error(`не удалось занять порт для страницы (пробовал ${first}–${first + 9})`);
   writeFileSync(PORT_FILE, String(port), 'utf8');
