@@ -6,7 +6,14 @@
   <atom:link href="https://telemax.svnest.ru/news/feed.xml" rel="self" type="application/rss+xml"/>
   <description>Что нового в Telemax — бесплатном мосте MAX ↔ Telegram с открытым кодом</description>
   <language>ru</language>
-  <lastBuildDate>Tue, 03 Nov 2026 09:00:00 GMT</lastBuildDate>
+  <lastBuildDate>Thu, 12 Nov 2026 09:00:00 GMT</lastBuildDate>
+  <item>
+    <title>Telemax 1.3.17: Мост представляется свежей версией MAX — 26.39</title>
+    <link>https://telemax.svnest.ru/news/#v1.3.17</link>
+    <guid isPermaLink="false">telemax-1.3.17</guid>
+    <pubDate>Thu, 12 Nov 2026 09:00:00 GMT</pubDate>
+    <description><![CDATA[<ul><li>Мост представляется MAX свежей версией клиента (26.39.0)</li></ul>]]></description>
+  </item>
   <item>
     <title>Telemax 1.3.16: Меню команд — только там, где они работают</title>
     <link>https://telemax.svnest.ru/news/#v1.3.16</link>
@@ -209,13 +216,6 @@
     <guid isPermaLink="false">telemax-0.6.1</guid>
     <pubDate>Fri, 11 Sep 2026 09:00:00 GMT</pubDate>
     <description><![CDATA[<ul><li><b><code>setup.sh</code>:</b> поиск группы больше не молчит при ошибке Telegram — показывает её текст; при 409 объясняет, что у бота уже запущен другой экземпляр с тем же токеном (старый сервер/контейнер), при 401 — что дело в токене; перед поиском снимает случайно оставленный webhook; подсказка про то, что бот без прав администратора ваших сообщений не видит</li></ul>]]></description>
-  </item>
-  <item>
-    <title>Telemax 0.6.0: Статус сервера и поиск по контакту из Telegram</title>
-    <link>https://telemax.svnest.ru/news/#v0.6.0</link>
-    <guid isPermaLink="false">telemax-0.6.0</guid>
-    <pubDate>Fri, 11 Sep 2026 09:00:00 GMT</pubDate>
-    <description><![CDATA[<ul><li><b>Пульт:</b> кнопка «📊 Статус» — версия, аптайм, состояние MAX и Telegram, когда прошли последние сообщения в каждую сторону, диск/RAM/нагрузка сервера, доступность обновления</li><li><b>Пульт:</b> поделитесь в общей теме группы контактом из Telegram — бот найдёт его в MAX по номеру и предложит начать чат (автоматически сопоставлять с вашей книгой контактов Telegram бот не может — Bot API не даёт такого доступа)</li><li><b>Установка (<code>setup.sh</code>):</b> проверка токена с показом имени бота, ручной ввод id группы, проверка группы — темы включены, бот администратор с «Управлением темами» — с понятным списком того, чего не хватает</li><li><b>Установка (<code>install.sh</code>):</b> лог в /var/log/telemax-install.log, предварительная проверка сервера (ОС, диск, RAM, сеть, время), ожидание фонового обновления apt, запасной путь установки Docker</li><li><b><code>/kill</code>:</b> честно про сессию — завершить её на стороне MAX снаружи нельзя; после <code>/kill</code> завершите её в приложении MAX (Настройки → Устройства)</li></ul>]]></description>
   </item>
 </channel>
 </rss>
