@@ -399,6 +399,10 @@ async function startServer(): Promise<void> {
         auth: {
           getLastKnownPhone: () => maxSession.lastKnownPhone,
           requestSms: (phone) => maxSession.requestSms(phone),
+          callOutStatus: () => maxSession.callOutStatus(),
+          finishTrack: () => maxSession.finishTrack(),
+          startQr: (refresh) => maxSession.startQr(refresh),
+          qrStatus: () => maxSession.qrStatus(),
           verifyCode: (code) => maxSession.verifyCode(code),
           checkPassword: (password) => maxSession.checkPassword(password),
         },

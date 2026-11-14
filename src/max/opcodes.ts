@@ -6,6 +6,17 @@ export const OPCODES = {
   PING: 0x0001,
   INIT: 0x0006,
   START_AUTH: 0x0011,
+  // Sign-in confirmed by a phone call instead of an SMS code (MAX web, 2026-11): START_AUTH answers with
+  // callOutParams {trackId, pollingInterval, expiresAt}; AUTH_CALLOUT_STATUS {trackId} is polled for
+  // {status: 0 waiting | 1 number to call ready | 2 confirmed | 3 expired, callNumber}; then
+  // AUTH_TRACK_LOGIN {trackId} answers like CHECK_CODE (login token, or a passwordChallenge).
+  // QR sign-in (MAX web): AUTH_QR_CREATE {} -> {trackId, qrLink, expiresAt, pollingInterval, ttl};
+  // AUTH_QR_STATUS {trackId} -> {status: {loginAvailable, expiresAt, ttl}}; once loginAvailable,
+  // AUTH_TRACK_LOGIN {trackId} as below. The qrLink is scanned (or opened) in the MAX app.
+  AUTH_QR_CREATE: 0x0120,
+  AUTH_QR_STATUS: 0x0121,
+  AUTH_TRACK_LOGIN: 0x0123,
+  AUTH_CALLOUT_STATUS: 0x0126,
   CHECK_CODE: 0x0012,
   LOGIN: 0x0013,
   // Read from MAX's web client 2026-10-13 (its «Выйти»: `send(20, {pushToken})`, pushToken = its

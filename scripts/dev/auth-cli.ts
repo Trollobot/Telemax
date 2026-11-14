@@ -78,7 +78,8 @@ async function main(): Promise<void> {
   console.log('Connected and initialized.');
 
   console.log(`Requesting SMS code for ${phone} ...`);
-  const authToken = await client.requestSms(phone);
+  const { token: authToken, callOut } = await client.requestSms(phone);
+  if (callOut) console.log(`MAX wants a phone call instead of an SMS (trackId ${mask(callOut.trackId)}) — the bot flow handles that, this script does not.`);
   console.log('Got auth_token:', mask(authToken));
 
   const code = await waitForFile(CODE_FILE, 'SMS code');

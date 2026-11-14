@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { MaxServerError } from '../src/max/client.js';
+import { MaxServerError, type CallOutParams } from '../src/max/client.js';
 import { OPCODES } from '../src/max/opcodes.js';
 import { configureErrorReporter } from '../src/bridge/errorReporter.js';
 import { MaxAuthUnavailableError } from '../src/bridge/maxAuthFlow.js';
@@ -24,7 +24,11 @@ class FakeClient extends EventEmitter {
   });
   disconnect = vi.fn();
   login = vi.fn<(token: string) => Promise<{ sessionToken: string; payload: unknown }>>();
-  requestSms = vi.fn(async () => 'auth-token');
+  requestSms = vi.fn(async (): Promise<{ token: string; callOut?: CallOutParams }> => ({ token: 'auth-token' }));
+  callOutStatus = vi.fn(async () => ({ status: 0 }));
+  finishTrackLogin = vi.fn();
+  createQr = vi.fn();
+  qrStatus = vi.fn();
   verifyCode = vi.fn(async () => ({ status: 'ok' as const, loginToken: 'login-token' }));
   checkPassword = vi.fn(async () => 'login-token');
   logout = vi.fn(async () => {});
@@ -392,5 +396,19 @@ describe('MAX outage reports', () => {
     await settle();
     expect(reportError).toHaveBeenCalledWith({ kind: 'internal', step: 'max-down', error: 'MAX unreachable ~3 min: ping-timeout' });
     expect(ctl.state).toBe('ready');
+  });
+});
+
+describe('MaxSessionController — /login throttling', () => {
+  it('refuses a second code request for the same number within a minute, and drops the request after 5 wrong codes', async () => {
+    const { ctl, client } = setup(null);
+    client.autoReady = true;
+    client.verifyCode.mockRejectedValue(new Error('Код не подтверждён'));
+    await ctl.requestSms('+79999999999');
+    await expect(ctl.requestSms('+79999999999')).rejects.toThrow(/подождите \d+ с/);
+    for (let i = 0; i < 4; i++) await expect(ctl.verifyCode('000000')).rejects.toThrow(/Код не подтверждён/);
+    await expect(ctl.verifyCode('000000')).rejects.toBeInstanceOf(MaxAuthUnavailableError);
+    await expect(ctl.verifyCode('000000')).rejects.toThrow(/устарел/);
+    expect(client.verifyCode).toHaveBeenCalledTimes(5);
   });
 });
