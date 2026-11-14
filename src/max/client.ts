@@ -7,7 +7,7 @@ import { OPCODES, DIR, formatOpcode } from './opcodes.js';
 import { MAX_TLS_CA } from './ca.js';
 import { toMaxReaction } from './reactions.js';
 import { findAuthToken, findLongToken, describeAuthError, extractPasswordChallenge, type PasswordChallenge } from './tokens.js';
-import { createLogger, redactSecrets } from '../logger.js';
+import { createLogger } from '../logger.js';
 
 const logger = createLogger('max-client');
 
@@ -708,7 +708,9 @@ export class MaxClient extends EventEmitter {
     logger.info(`START_AUTH answered ${dir === DIR.ERR ? 'with an error' : 'ok'}: {${shape}}`);
     // How else MAX offers to deliver the code (a call instead of SMS): not secret, shown whole.
     const callOut = (payload as Record<string, unknown> | undefined)?.callOutParams;
-    if (callOut !== undefined) logger.info(`START_AUTH callOutParams: ${JSON.stringify(redactSecrets(callOut), (_k, v) => (typeof v === 'bigint' ? Number(v) : v))}`);
+    // Field names and numbers only: trackId is the handle to this sign-in.
+    if (callOut && typeof callOut === 'object')
+      logger.info(`START_AUTH callOutParams: {${Object.entries(callOut as Record<string, unknown>).map(([k, v]) => (typeof v === 'number' || typeof v === 'bigint' ? `${k}=${v}` : k)).join(', ')}}`);
     if (dir === DIR.ERR || !token) {
       throw new Error(describeAuthError(payload, 'START_AUTH did not return an auth token'));
     }
