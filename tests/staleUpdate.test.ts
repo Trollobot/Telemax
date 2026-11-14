@@ -17,3 +17,17 @@ describe('staleTelegramUpdate', () => {
   });
 });
 
+
+describe('STALE_TELEGRAM_MINUTES', () => {
+  const now = 1_800_000_000_000;
+  const old = { message: { date: Math.floor((now - 30 * 60_000) / 1000) } };
+  it('defaults to 10 minutes, takes a number, and off relays everything', async () => {
+    const { staleTelegramUpdate, staleCutoffMs } = await import('../src/bridge/sync.js');
+    expect(staleCutoffMs({})).toBe(600_000);
+    expect(staleCutoffMs({ STALE_TELEGRAM_MINUTES: '60' })).toBe(3_600_000);
+    expect(staleCutoffMs({ STALE_TELEGRAM_MINUTES: 'garbage' })).toBe(600_000);
+    expect(staleTelegramUpdate(old, now, {})).not.toBeNull();
+    expect(staleTelegramUpdate(old, now, { STALE_TELEGRAM_MINUTES: '60' })).toBeNull();
+    for (const v of ['off', '0', 'false', 'no']) expect(staleTelegramUpdate(old, now, { STALE_TELEGRAM_MINUTES: v })).toBeNull();
+  });
+});

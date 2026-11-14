@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { parseEnvBool } from '../env.js';
 import { rm, stat, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { Markup, type Context, type Telegraf } from 'telegraf';
@@ -1875,7 +1876,7 @@ export function wireBridge({
 
   // Telegram keeps updates for 24 h while the bridge is down (a dead tunnel, a restart loop). Without
   // this, everything typed meanwhile reached MAX in one burst hours later, as if just written. A message
-  // or edit older than STALE_TELEGRAM_UPDATE_MS is not relayed; the topic is told so it can be resent.
+  // or edit older than the cutoff (staleCutoffMs, STALE_TELEGRAM_MINUTES) is not relayed; the topic is told so it can be resent.
   bot.use(async (ctx, next) => {
     const stale = staleTelegramUpdate(ctx.update as StaleCheckUpdate, Date.now());
     if (!stale) return next();
@@ -4574,8 +4575,18 @@ export async function syncAllChatsToTelegram(
   }
 }
 
-/** Telegram→MAX updates older than this at arrival are not relayed (see the middleware in wireBridge). */
-const STALE_TELEGRAM_UPDATE_MS = 10 * 60_000;
+/**
+ * Telegram→MAX updates older than this at arrival are not relayed (see the middleware in wireBridge).
+ * STALE_TELEGRAM_MINUTES sets the minutes (default 10); off/0 relays everything, however late.
+ * Exported for tests.
+ */
+export function staleCutoffMs(env: NodeJS.ProcessEnv = process.env): number | null {
+  const raw = (env.STALE_TELEGRAM_MINUTES ?? '').trim();
+  if (!raw) return 10 * 60_000;
+  if (parseEnvBool(raw) === false) return null;
+  const minutes = Number(raw);
+  return Number.isFinite(minutes) && minutes > 0 ? minutes * 60_000 : 10 * 60_000;
+}
 
 type StaleCheckUpdate = {
   message?: { date?: number };
@@ -4584,11 +4595,13 @@ type StaleCheckUpdate = {
 };
 
 /** A message, edit or reaction that waited too long in Telegram's queue (the bridge was down). Exported for tests. */
-export function staleTelegramUpdate(update: StaleCheckUpdate, now: number): { what: 'message' | 'edit' | 'reaction'; minutes: number } | null {
+export function staleTelegramUpdate(update: StaleCheckUpdate, now: number, env: NodeJS.ProcessEnv = process.env): { what: 'message' | 'edit' | 'reaction'; minutes: number } | null {
+  const cutoff = staleCutoffMs(env);
+  if (cutoff == null) return null;
   const sentAt = update.message?.date ?? update.edited_message?.edit_date ?? update.edited_message?.date ?? update.message_reaction?.date;
   if (!sentAt) return null;
   const age = now - sentAt * 1000;
-  if (age < STALE_TELEGRAM_UPDATE_MS) return null;
+  if (age < cutoff) return null;
   const what = update.message ? 'message' : update.edited_message ? 'edit' : 'reaction';
   return { what, minutes: Math.round(age / 60_000) };
 }
