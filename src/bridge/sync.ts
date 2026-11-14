@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { parseEnvBool } from '../env.js';
 import { rm, stat, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { Markup, type Context, type Telegraf } from 'telegraf';
@@ -971,6 +972,11 @@ export function historyLimitNotice(limit: number, channel = false): string {
 /** A catch-up also delivers the live message that set it off: only a message at least this old at delivery is «late». */
 const LATE_MIN_AGE_MS = 5 * 60_000;
 
+/** QUIET_HISTORY=off (0/false/no) lets history and catch-up ring like new messages. Default: quiet. Exported for tests. */
+export function quietHistoryEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return parseEnvBool(env.QUIET_HISTORY) !== false;
+}
+
 /** A message delivered at least LATE_MIN_AGE_MS after it was sent in MAX (history fill, catch-up). Exported for tests. */
 export function isLateDelivery(time: unknown, now: number = Date.now()): boolean {
   const ms = Number(time);
@@ -1429,7 +1435,7 @@ export class ChatCatchUp {
       const stamp = lateTimeStamp(msg.time);
       // History and catch-up arrive silently: a fill of hundreds of old messages must not ring the
       // phone hundreds of times. A message still fresh (the live one that set off a catch-up) rings.
-      const quiet = isLateDelivery(msg.time);
+      const quiet = quietHistoryEnabled() && isLateDelivery(msg.time);
       // An author line alone (a photo without a caption) ends in its own line break already.
       if (stamp && text) text = text.endsWith('\n') ? `${text}${stamp}` : `${text}\n${stamp}`;
       const abortKey = `${String(chatId)}:${String(msg.id ?? msg.time)}`;

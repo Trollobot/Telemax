@@ -56,3 +56,13 @@ describe('quiet sends (history and catch-up)', () => {
     expect(isLateDelivery('garbage', now)).toBe(false);
   });
 });
+
+
+describe('QUIET_HISTORY', () => {
+  it('is on unless switched off', async () => {
+    const { quietHistoryEnabled } = await import('../src/bridge/sync.js');
+    expect(quietHistoryEnabled({})).toBe(true);
+    expect(quietHistoryEnabled({ QUIET_HISTORY: 'on' })).toBe(true);
+    for (const v of ['off', '0', 'false', 'no']) expect(quietHistoryEnabled({ QUIET_HISTORY: v })).toBe(false);
+  });
+});
