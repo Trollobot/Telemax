@@ -88,6 +88,39 @@ docker compose up -d --build
 
 Так не будет автообновления: его ставит только `setup.sh`, запущенный от root. Без него не работают и большие файлы — их службу запускает автообновление, поэтому добавьте в `.env` строку `FILES=off`. Обновлять такой мост — вручную: `git pull`, затем `docker compose up -d --build`.
 
+### Готовый образ: без сборки и без скриптов на хосте
+
+Каждый подписанный релиз собирается в образ `ghcr.io/trollobot/telemax` (`latest` и `X.Y.Z` — с анимированными стикерами, `slim` и `X.Y.Z-slim` — без них; amd64 и arm64). Подпись тега проверяется перед сборкой тем же ключом из `allowed_signers`. Нужен только Docker: ни git, ни `setup.sh`, ни root-таймера, ни 2–3 ГБ на пересборку. Секреты — в файлах, а не в переменных окружения, состояние — в томе Docker, контейнер без root и без лишних прав:
+
+```yaml
+services:
+  telemax:
+    image: ghcr.io/trollobot/telemax:latest
+    restart: unless-stopped
+    user: node
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    environment:
+      TARGET_TELEGRAM_GROUP: "-100…"
+      TELEGRAM_BOT_TOKEN_FILE: /run/secrets/telegram_bot_token
+      MAX_SESSION_KEY_FILE: /run/secrets/max_session_key
+      FILES: "off"
+    secrets: [telegram_bot_token, max_session_key]
+    volumes:
+      - telemax-data:/app/.data
+volumes:
+  telemax-data:
+secrets:
+  telegram_bot_token:
+    file: ./secrets/telegram_bot_token
+  max_session_key:
+    file: ./secrets/max_session_key   # openssl rand -hex 32 > secrets/max_session_key
+```
+
+Обновление — `docker compose pull && docker compose up -d` (или Watchtower / Renovate). Кнопка «Обновить» в `/version` при такой установке ничего не делает — её обслуживает только таймер `setup.sh`. Большие файлы (`FILES`) требуют службы на хосте, поэтому здесь выключены.
+
 **Свои настройки Docker** — порты, тома, сеть, лимиты памяти — не вписывайте в `docker-compose.yml`: обновление откажется ставиться поверх правок в файлах моста. Положите их в `docker-compose.override.yml` рядом с ним — Docker Compose сам добавит его к основному файлу, а обновления его не трогают. Например:
 
 ```yaml
@@ -196,7 +229,7 @@ docker compose restart      # перезапуск
 docker compose down         # остановка
 ```
 
-Все состояние (сессия MAX, привязка чатов к темам) лежит в `./data` на хосте — бэкап этой папки достаточен для переноса на другой сервер.
+Все состояние (сессия MAX, привязка чатов к темам) лежит в `./data` на хосте — бэкап этой папки достаточен для переноса на другой сервер. При установке из готового образа состояние хранится в томе Docker `telemax-data` (`docker run --rm -v telemax-data:/d alpine tar c /d > telemax-data.tar` — бэкап).
 
 ## Изменение настроек после установки
 
@@ -283,6 +316,8 @@ cd /opt/telemax && (umask 077; grep -v '^TELEGRAM_PROXY=' .env > .env.tmp && pri
 ## Обновление
 
 Раз в сутки (в случайное время) бот сам проверяет на GitHub, не вышел ли новый **релиз** (тег версии новее текущей), и если да — присылает в группу сообщение с кнопками **«Обновить»** / **«Позже»**. То же самое можно спросить в любой момент командой `/version`. Проверка идёт по версии из `package.json` и тегам GitHub (semver), поэтому работает для любой сборки — в том числе собранной напрямую, без `GIT_COMMIT`.
+
+Установка из готового образа (см. [«Готовый образ»](#готовый-образ-без-сборки-и-без-скриптов-на-хосте)) обновляется без всего описанного ниже: `docker compose pull && docker compose up -d`, или автоматически через Watchtower или Renovate. Кнопка «Обновить» на ней ничего не делает.
 
 Технически апдейт устроен так: сам контейнер с ботом ничего не обновляет и не перезапускает — у него нет и не будет доступа ни к докеру, ни к хосту (это осознанный выбор: код, который разбирает сообщения из MAX/Telegram, не должен иметь возможность управлять сервером). Вместо этого:
 
