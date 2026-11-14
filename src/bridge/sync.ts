@@ -1875,6 +1875,29 @@ export function wireBridge({
     }
   });
 
+  // RELAY=admins: only the group's admins speak for the MAX account. By default (unset) every member's
+  // messages, edits and reactions in a topic go to MAX in the owner's name — fine for a group shared on
+  // purpose, wrong the moment an invite link leaks. Admin status is cached for a minute per user.
+  const relayAdminsOnly = (process.env.RELAY ?? '').trim().toLowerCase() === 'admins';
+  const adminSeen = new Map<number, { admin: boolean; at: number }>();
+  bot.use(async (ctx, next) => {
+    if (!relayAdminsOnly) return next();
+    const actor = relayActor(ctx.update as RelayUpdate, targetGroupId);
+    if (actor.kind === 'none') return next();
+    if (actor.kind === 'anonymous-admin') return next();
+    if (actor.kind === 'unknown') return; // no sender — fail closed
+    const userId = actor.userId;
+    if (userId === ctx.botInfo?.id) return next();
+    const cached = adminSeen.get(userId);
+    let admin = cached && Date.now() - cached.at < 60_000 ? cached.admin : undefined;
+    if (admin === undefined) {
+      admin = await isGroupAdmin(userId).catch(() => false);
+      adminSeen.set(userId, { admin, at: Date.now() });
+    }
+    if (admin) return next();
+    logger.info(`RELAY=admins: not relaying a ${actor.what} from non-admin ${userId}`);
+  });
+
   // The bridge's own admin writing to the bot's DM is told where the bridge lives instead of getting
   // the outsiders' bug-report redirect: a user typed /panel, /info, /broadcast here and got «пишите в
   // баг-бот» every time, and took the bridge for broken (2026-10-13). Only /login works in the DM.
@@ -4552,4 +4575,29 @@ export async function syncAllChatsToTelegram(
       if (!onChatError(mapping.maxChatId, err)) return;
     }
   }
+}
+
+type RelayUpdate = {
+  message?: { from?: { id: number }; sender_chat?: { id: number } };
+  edited_message?: { from?: { id: number }; sender_chat?: { id: number } };
+  message_reaction?: { user?: { id: number }; actor_chat?: { id: number } };
+};
+
+/**
+ * Who a group update would speak for in MAX (RELAY=admins). `none`: not a message, edit or reaction —
+ * not this gate's business. `anonymous-admin`: posted as the bridge group itself, which only its
+ * admins can do. `unknown`: no sender at all (fail closed). Exported for tests.
+ */
+export function relayActor(
+  update: RelayUpdate,
+  targetGroupId: string,
+): { kind: 'none' } | { kind: 'anonymous-admin' } | { kind: 'unknown' } | { kind: 'user'; userId: number; what: 'message' | 'edit' | 'reaction' } {
+  const msg = update.message ?? update.edited_message;
+  const reaction = update.message_reaction;
+  if (!msg && !reaction) return { kind: 'none' };
+  const actorChat = msg?.sender_chat ?? reaction?.actor_chat;
+  if (actorChat && String(actorChat.id) === targetGroupId) return { kind: 'anonymous-admin' };
+  const userId = msg?.from?.id ?? reaction?.user?.id;
+  if (userId == null) return { kind: 'unknown' };
+  return { kind: 'user', userId, what: reaction ? 'reaction' : update.edited_message ? 'edit' : 'message' };
 }
