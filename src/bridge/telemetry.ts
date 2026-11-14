@@ -11,17 +11,16 @@ const logger = createLogger('telemetry');
 // Anonymous install counter. Once a day (piggybacked on the version-check tick) each install
 // sends a random per-install UUID + its version to the project's endpoint, so live installs
 // can be counted. NO phone numbers, NO IPs stored, NO personal data — just a random id and a
-// version string. On by default; opt out with TELEMETRY=off (documented in the README, not in
-// the bot's /help). The endpoint is a DDNS hostname, not a hardcoded IP, so it can move.
+// version string. OFF by default: sent only with an explicit TELEMETRY=on (documented in the README). The endpoint is a DDNS hostname, not a hardcoded IP, so it can move.
 const TELEMETRY_URL = 'https://zergont-gate.duckdns.org/ping';
 const DATA_DIR = path.join(process.cwd(), '.data');
 const INSTALL_ID_FILE = path.join(DATA_DIR, 'install-id');
 const PING_TIMEOUT_MS = 8000;
 
-/** Opted out: TELEMETRY set to off/0/false/no, or NO_TELEMETRY to 1/true/yes/on (parseEnvBool). Anything
- * else — unset, or a value outside both sets — leaves the default: on. Exported for tests. */
+/** Opt-in: on only with TELEMETRY set to 1/true/yes/on (parseEnvBool) and NO_TELEMETRY not set to an on
+ * value. Anything else — unset, off, or a value outside both sets — leaves the default: off. Exported for tests. */
 export function isTelemetryDisabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  return parseEnvBool(env.TELEMETRY) === false || parseEnvBool(env.NO_TELEMETRY) === true;
+  return parseEnvBool(env.TELEMETRY) !== true || parseEnvBool(env.NO_TELEMETRY) === true;
 }
 
 let cachedId: string | null = null;
@@ -69,7 +68,7 @@ export function createTelemetry(): Telemetry {
 
 // --- Anonymous error reports ---------------------------------------------------------------------
 // The maintainer cannot see a user's server, and «cat update.log» is beyond most users — so a
-// failure is reported the same anonymous way the ping is, and TELEMETRY=off silences both.
+// failure is reported the same anonymous way the ping is, and both stay off unless TELEMETRY=on.
 const REPORT_URL = 'https://zergont-gate.duckdns.org/report';
 const BOOTS_FILE = path.join(DATA_DIR, 'boots.json');
 const DAY_MS = 24 * 60 * 60 * 1000;
