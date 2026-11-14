@@ -1815,7 +1815,25 @@ export function wireBridge({
       // A broadcast's group or channel: readers' messages there go nowhere (only the «закрепил» line of
       // a «📌» pin is looked at). And no reject for the service message of the bot being added — the
       // chat picker does exactly that before it says which chat.
-      if (await broadcasts.isTarget(ctx.chat.id).catch(() => false)) {
+      // A broadcast group upgraded to a supergroup: Telegram's first message in the new chat names the
+      // old id. Move the broadcasts over BEFORE the check below, or the bot would leave its own target.
+      const migratedFrom = (ctx.message as { migrate_from_chat_id?: number } | undefined)?.migrate_from_chat_id;
+      if (migratedFrom != null) {
+        const moved = await broadcasts.retarget(migratedFrom, ctx.chat.id).catch((err) => {
+          logger.error('Broadcast: following a group upgrade failed', err);
+          return 0;
+        });
+        if (moved) logger.info(`Broadcast: ${moved} broadcast(s) followed chat ${migratedFrom} → ${ctx.chat.id} (upgraded to a supergroup)`);
+      }
+      let isTarget: boolean;
+      try {
+        isTarget = await broadcasts.isTarget(ctx.chat.id);
+      } catch (err) {
+        // Can't tell: do nothing here at all — never leave a chat on a guess.
+        logger.error('Broadcast: could not read the broadcast list', err);
+        return;
+      }
+      if (isTarget) {
         await broadcasts.onTargetUpdate(ctx).catch((err) => logger.error('Broadcast: update from a place failed', err));
         return;
       }
@@ -1833,9 +1851,12 @@ export function wireBridge({
       const m = ctx.message as { new_chat_members?: unknown; left_chat_member?: unknown; group_chat_created?: unknown; supergroup_chat_created?: unknown; migrate_to_chat_id?: unknown; migrate_from_chat_id?: unknown } | undefined;
       if (m && (m.new_chat_members || m.left_chat_member || m.group_chat_created || m.supergroup_chat_created || m.migrate_to_chat_id || m.migrate_from_chat_id)) return;
       if (ctx.callbackQuery) {
-        ctx.answerCbQuery('Не вы меня создали.').catch(() => {});
-      } else {
-        ctx.reply('Не вы меня создали — идите в жопу.').catch(() => {});
+        ctx.answerCbQuery('Это не ваш мост.').catch(() => {});
+      } else if (ctx.chat.type === 'group' || ctx.chat.type === 'supergroup') {
+        // Anyone can add a bot to their group. Answering every message there made it spammable and
+        // easy to fingerprint; it just leaves instead (broadcast places were handled above).
+        logger.info(`Leaving chat ${ctx.chat.id}: not the bridge group and not a broadcast place`);
+        ctx.leaveChat().catch((err: unknown) => logger.warn(`Could not leave chat ${ctx.chat?.id}`, err));
       }
       return;
     }
@@ -1870,6 +1891,50 @@ export function wireBridge({
     } else {
       await ctx.reply('Управлять ботом может только администратор группы.').catch(() => {});
     }
+  });
+
+  // RELAY=admins: only the group's admins speak for the MAX account. By default (unset) every member's
+  // messages, edits and reactions in a topic go to MAX in the owner's name — fine for a group shared on
+  // purpose, wrong the moment an invite link leaks. Admin status is cached for a minute per user.
+  const relayAdminsOnly = (process.env.RELAY ?? '').trim().toLowerCase() === 'admins';
+  const adminSeen = new Map<number, { admin: boolean; at: number }>();
+  bot.use(async (ctx, next) => {
+    if (!relayAdminsOnly) return next();
+    const actor = relayActor(ctx.update as RelayUpdate, targetGroupId);
+    if (actor.kind === 'none') return next();
+    if (actor.kind === 'anonymous-admin') return next();
+    if (actor.kind === 'unknown') return; // no sender — fail closed
+    const userId = actor.userId;
+    if (userId === ctx.botInfo?.id) return next();
+    const cached = adminSeen.get(userId);
+    let admin = cached && Date.now() - cached.at < 60_000 ? cached.admin : undefined;
+    if (admin === undefined) {
+      let checked: boolean | null = null;
+      try {
+        checked = await isGroupAdmin(userId);
+      } catch (err) {
+        logger.warn(`RELAY=admins: could not check whether ${userId} is an admin`, err);
+      }
+      if (checked === null) {
+        // Fail closed, but never remember a failure (an admin's messages would be dropped for a
+        // minute) and say so — the sender can simply resend.
+        const msg = ctx.message as { message_id?: number; message_thread_id?: number } | undefined;
+        if (msg?.message_id != null) {
+          await bot.telegram
+            .sendMessage(targetGroupId, '⚠️ Не удалось проверить, администратор ли вы, — сообщение не отправлено в MAX. Отправьте ещё раз.', {
+              message_thread_id: msg.message_thread_id,
+              reply_parameters: { message_id: msg.message_id, allow_sending_without_reply: true },
+            } as Parameters<typeof bot.telegram.sendMessage>[2])
+            .catch(() => {});
+        }
+        return;
+      }
+      admin = checked;
+      if (adminSeen.size >= 500) adminSeen.clear();
+      adminSeen.set(userId, { admin, at: Date.now() });
+    }
+    if (admin) return next();
+    logger.info(`RELAY=admins: not relaying a ${actor.what} from non-admin ${userId}`);
   });
 
   // The bridge's own admin writing to the bot's DM is told where the bridge lives instead of getting
@@ -4549,4 +4614,29 @@ export async function syncAllChatsToTelegram(
       if (!onChatError(mapping.maxChatId, err)) return;
     }
   }
+}
+
+type RelayUpdate = {
+  message?: { from?: { id: number }; sender_chat?: { id: number } };
+  edited_message?: { from?: { id: number }; sender_chat?: { id: number } };
+  message_reaction?: { user?: { id: number }; actor_chat?: { id: number } };
+};
+
+/**
+ * Who a group update would speak for in MAX (RELAY=admins). `none`: not a message, edit or reaction —
+ * not this gate's business. `anonymous-admin`: posted as the bridge group itself, which only its
+ * admins can do. `unknown`: no sender at all (fail closed). Exported for tests.
+ */
+export function relayActor(
+  update: RelayUpdate,
+  targetGroupId: string,
+): { kind: 'none' } | { kind: 'anonymous-admin' } | { kind: 'unknown' } | { kind: 'user'; userId: number; what: 'message' | 'edit' | 'reaction' } {
+  const msg = update.message ?? update.edited_message;
+  const reaction = update.message_reaction;
+  if (!msg && !reaction) return { kind: 'none' };
+  const actorChat = msg?.sender_chat ?? reaction?.actor_chat;
+  if (actorChat && String(actorChat.id) === targetGroupId) return { kind: 'anonymous-admin' };
+  const userId = msg?.from?.id ?? reaction?.user?.id;
+  if (userId == null) return { kind: 'unknown' };
+  return { kind: 'user', userId, what: reaction ? 'reaction' : update.edited_message ? 'edit' : 'message' };
 }

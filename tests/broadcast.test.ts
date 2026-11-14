@@ -345,3 +345,17 @@ describe('switching a broadcast on', () => {
     expect((await store.forChat('100')).map((b) => [b.targetChatId, b.targetType, b.targetTitle])).toEqual([[-800, 'channel', 'Новости']]);
   });
 });
+
+describe('BroadcastStore.retarget (group upgraded to a supergroup)', () => {
+  it('moves every broadcast of the old chat id to the new one', async () => {
+    const store = await tempStore();
+    const b = (id: string, targetChatId: number): Broadcast => ({ id, maxChatId: '1', targetChatId, targetTitle: 't', targetType: 'group', since: 0, cursor: 0 });
+    await store.add(b('a', -100));
+    await store.add(b('b', -100));
+    await store.add(b('c', -200));
+    expect(await store.retarget(-100, -1009)).toBe(2);
+    expect(await store.isTarget(-100)).toBe(false);
+    expect(await store.isTarget(-1009)).toBe(true);
+    expect(await store.retarget(-555, -1)).toBe(0);
+  });
+});
