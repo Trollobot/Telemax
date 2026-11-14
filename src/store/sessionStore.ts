@@ -1,5 +1,5 @@
 import { randomBytes, createCipheriv, createDecipheriv } from 'node:crypto';
-import { mkdir, readFile, rename, writeFile, unlink } from 'node:fs/promises';
+import { mkdir, readFile, rename, rm, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { createLogger } from '../logger.js';
 
@@ -72,6 +72,7 @@ export class SessionStore {
       await mkdir(path.dirname(this.filePath), { recursive: true, mode: 0o700 });
       const tmpPath = `${this.filePath}.tmp`;
       // 0600: the file is the MAX account's session — only the bridge's own user may read it.
+      await rm(tmpPath, { force: true }); // a leftover .tmp would keep its old (wider) mode through writeFile
       await writeFile(tmpPath, JSON.stringify(encoded), { encoding: 'utf8', mode: 0o600 });
       await rename(tmpPath, this.filePath);
     });
