@@ -1909,7 +1909,28 @@ export function wireBridge({
     const cached = adminSeen.get(userId);
     let admin = cached && Date.now() - cached.at < 60_000 ? cached.admin : undefined;
     if (admin === undefined) {
-      admin = await isGroupAdmin(userId).catch(() => false);
+      let checked: boolean | null = null;
+      try {
+        checked = await isGroupAdmin(userId);
+      } catch (err) {
+        logger.warn(`RELAY=admins: could not check whether ${userId} is an admin`, err);
+      }
+      if (checked === null) {
+        // Fail closed, but never remember a failure (an admin's messages would be dropped for a
+        // minute) and say so — the sender can simply resend.
+        const msg = ctx.message as { message_id?: number; message_thread_id?: number } | undefined;
+        if (msg?.message_id != null) {
+          await bot.telegram
+            .sendMessage(targetGroupId, '⚠️ Не удалось проверить, администратор ли вы, — сообщение не отправлено в MAX. Отправьте ещё раз.', {
+              message_thread_id: msg.message_thread_id,
+              reply_parameters: { message_id: msg.message_id, allow_sending_without_reply: true },
+            } as Parameters<typeof bot.telegram.sendMessage>[2])
+            .catch(() => {});
+        }
+        return;
+      }
+      admin = checked;
+      if (adminSeen.size >= 500) adminSeen.clear();
       adminSeen.set(userId, { admin, at: Date.now() });
     }
     if (admin) return next();
