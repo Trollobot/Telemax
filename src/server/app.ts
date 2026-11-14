@@ -2,6 +2,7 @@ import dns from 'node:dns';
 import { Telegraf } from 'telegraf';
 import path from 'node:path';
 import { healthSnapshot } from './health.js';
+import { existsSync } from 'node:fs';
 import { readFile, unlink, writeFile } from 'node:fs/promises';
 import { MaxClient, type MaxMessageEvent, type MaxContactInfo } from '../max/client.js';
 import { DIR, OPCODES } from '../max/opcodes.js';
@@ -347,7 +348,9 @@ async function startServer(): Promise<void> {
   });
 
   await settingsStore.load().catch((err) => logger.error('Failed to read .data/settings.json — the defaults apply', err));
-  maxSession.start(await sessionStore.load());
+  const savedSession = await sessionStore.load();
+  noSessionAtBoot = savedSession == null;
+  maxSession.start(savedSession);
 
   // Build the Telegram proxy agent (TELEGRAM_PROXY from .env) before the bot is
   // built — Telegraf binds its agent at construction time, so this has to run
@@ -555,6 +558,8 @@ async function reportIfJustUpdated(bot: Telegraf): Promise<void> {
 }
 
 const WELCOME_SENT_MARKER = path.join(process.cwd(), '.data', 'welcome-sent');
+/** Started without a saved MAX session — see the re-auth reminder at Telegram launch. */
+let noSessionAtBoot = false;
 
 /**
  * On launch, verify the bot can actually reach the configured group and give the
@@ -751,6 +756,9 @@ async function launchTelegramBotWithRetry(bot: Telegraf, attempt = 0): Promise<v
   // is up but unauthenticated, so say so in the group with the same re-auth prompt a rejected
   // session gets; otherwise it just sits there silently doing nothing.
   if (sessionStore.corruptedOnLoad) maxSession.notifyReauthNeeded();
+  // No session at all on an install that was set up before (the welcome went out): a rejected session
+  // whose notice never reached Telegram, then a restart, used to leave the bridge silent for good.
+  else if (noSessionAtBoot && existsSync(WELCOME_SENT_MARKER)) maxSession.notifyReauthNeeded();
   void announceGroupReadyOnce(bot);
 
   // message_reaction and poll_answer are opt-in — Telegram omits them from the default update set unless
