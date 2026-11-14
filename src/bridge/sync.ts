@@ -1389,7 +1389,8 @@ export class ChatCatchUp {
       }
       const forwarded = await resolveForwardContent(max, chats, msg.link, chatId, msg.id, profiles, myAccountId);
       let text = forwarded ? forwarded.text : msg.text;
-      const taken = takeKeyboard(forwarded ? forwarded.attaches : Array.isArray(msg.attaches) ? (msg.attaches as MaxAttachment[]) : [], chatId);
+      const rawAttaches = forwarded ? forwarded.attaches : Array.isArray(msg.attaches) ? (msg.attaches as MaxAttachment[]) : [];
+      const taken = takeKeyboard(rawAttaches, (await keyboardFromBot(rawAttaches, forwarded ? undefined : (msg as { sender?: unknown }).sender, max, profiles)) ? chatId : undefined);
       let attaches = taken.attaches;
       const keyboard = taken.keyboard;
       // MAX's link preview (SHARE) becomes text — see absorbShares.
@@ -1871,6 +1872,28 @@ export function wireBridge({
       await ctx.reply('Управлять ботом может только администратор группы.').catch(() => {});
     }
   });
+
+  // Telegram keeps updates for 24 h while the bridge is down (a dead tunnel, a restart loop). Without
+  // this, everything typed meanwhile reached MAX in one burst hours later, as if just written. A message
+  // or edit older than STALE_TELEGRAM_UPDATE_MS is not relayed; the topic is told so it can be resent.
+  bot.use(async (ctx, next) => {
+    const stale = staleTelegramUpdate(ctx.update as StaleCheckUpdate, Date.now());
+    if (!stale) return next();
+    logger.warn(`Not relaying a ${stale.what} that reached the bot ${stale.minutes} min late`);
+    const msg = (ctx.message ?? ctx.editedMessage) as ({ message_id?: number; message_thread_id?: number } & Record<string, unknown>) | undefined;
+    // Only for something a person wrote — a late service message (topic events, joins, pins) just goes.
+    const content = ['text', 'caption', 'photo', 'video', 'document', 'voice', 'audio', 'sticker', 'animation', 'video_note', 'contact', 'location', 'poll'];
+    if (msg?.message_id != null && content.some((k) => k in msg)) {
+      await bot.telegram
+        .sendMessage(
+          targetGroupId,
+          `⏳ Не отправлено в MAX: ${stale.what === 'edit' ? 'правка дошла' : 'сообщение дошло'} до моста с опозданием на ${stale.minutes} мин (мост был недоступен). Если ещё актуально — отправьте заново.`,
+          { message_thread_id: msg.message_thread_id, reply_parameters: { message_id: msg.message_id, allow_sending_without_reply: true } } as Parameters<typeof bot.telegram.sendMessage>[2],
+        )
+        .catch(() => {});
+    }
+  });
+
 
   // The bridge's own admin writing to the bot's DM is told where the bridge lives instead of getting
   // the outsiders' bug-report redirect: a user typed /panel, /info, /broadcast here and got «пишите в
@@ -2620,7 +2643,7 @@ export function wireBridge({
       attaches = forwarded.attaches;
     }
     // The keyboard leaves the attaches here: it is no message of its own (see sendKeyboardAlone).
-    const taken = takeKeyboard(attaches, chatId);
+    const taken = takeKeyboard(attaches, (await keyboardFromBot(attaches, forwarded ? undefined : (message as { sender?: unknown }).sender, max, getContactProfiles())) ? chatId : undefined);
     attaches = taken.attaches;
     const keyboard = taken.keyboard;
     // MAX's link preview (SHARE) becomes text — see absorbShares.
@@ -4549,4 +4572,43 @@ export async function syncAllChatsToTelegram(
       if (!onChatError(mapping.maxChatId, err)) return;
     }
   }
+}
+
+/** Telegram→MAX updates older than this at arrival are not relayed (see the middleware in wireBridge). */
+const STALE_TELEGRAM_UPDATE_MS = 10 * 60_000;
+
+type StaleCheckUpdate = {
+  message?: { date?: number };
+  edited_message?: { edit_date?: number; date?: number };
+  message_reaction?: { date?: number };
+};
+
+/** A message, edit or reaction that waited too long in Telegram's queue (the bridge was down). Exported for tests. */
+export function staleTelegramUpdate(update: StaleCheckUpdate, now: number): { what: 'message' | 'edit' | 'reaction'; minutes: number } | null {
+  const sentAt = update.message?.date ?? update.edited_message?.edit_date ?? update.edited_message?.date ?? update.message_reaction?.date;
+  if (!sentAt) return null;
+  const age = now - sentAt * 1000;
+  if (age < STALE_TELEGRAM_UPDATE_MS) return null;
+  const what = update.message ? 'message' : update.edited_message ? 'edit' : 'reaction';
+  return { what, minutes: Math.round(age / 60_000) };
+}
+
+/**
+ * Whether a message's keyboard may get buttons that ACT as the account owner — a CALLBACK or MESSAGE
+ * button (sends a payload or the button text in the owner's name), a contact or location request.
+ * Only a MAX bot's keyboard does: any other sender's buttons stay inert, or a stranger could plant a
+ * button that, tapped in Telegram, says something as you. A forwarded keyboard never acts (sender
+ * undefined); an unknown profile fails closed. Looks the sender up only when there is a keyboard.
+ */
+async function keyboardFromBot(
+  attaches: readonly unknown[],
+  sender: unknown,
+  max: Pick<MaxClient, 'getContactInfo'>,
+  profiles: Map<number, ContactProfile>,
+): Promise<boolean> {
+  if (!attaches.some((a) => (a as { _type?: unknown } | null)?._type === 'INLINE_KEYBOARD')) return false;
+  const id = Number(sender);
+  if (!Number.isFinite(id) || id === 0) return false;
+  const p = (await resolveProfile(max, id, 'keyboard sender', profiles)) as MaxContactInfo | undefined;
+  return Array.isArray(p?.options) && p.options.includes('BOT');
 }

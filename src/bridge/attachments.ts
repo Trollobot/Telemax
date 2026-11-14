@@ -199,10 +199,11 @@ async function downloadUrl(url: string): Promise<Buffer> {
       logger.error(`downloadUrl refused ${declared} bytes (limit ${MAX_DOWNLOAD_BYTES}) for ${url}`);
       throw new DownloadMissError(TOO_BIG_WHY);
     }
-    const buf = Buffer.from(await res.arrayBuffer());
-    // Header can lie or be absent — check what actually arrived too.
-    if (buf.byteLength > MAX_DOWNLOAD_BYTES) {
-      logger.error(`downloadUrl got ${buf.byteLength} bytes, over the ${MAX_DOWNLOAD_BYTES} limit, for ${url}`);
+    // Header can lie or be absent: the body is read with the cap enforced as it arrives, not after
+    // a whole (possibly endless) body sits in memory.
+    const buf = await readCapped(res.body, MAX_DOWNLOAD_BYTES);
+    if (!buf) {
+      logger.error(`downloadUrl got more than the ${MAX_DOWNLOAD_BYTES}-byte limit`);
       throw new DownloadMissError(TOO_BIG_WHY);
     }
     return buf;
@@ -629,9 +630,9 @@ export function maxKeyboardToTelegram(att: unknown, chatId?: unknown): InlineKey
       } else if (b?.type === 'OPEN_APP' && miniAppLink(b)) {
         // A mini-app can't run inside Telegram, but its public deep link opens it in MAX.
         buttons.push({ text, url: miniAppLink(b)! });
-      } else if (b?.type === 'REQUEST_GEO_LOCATION') {
+      } else if (chatId != null && b?.type === 'REQUEST_GEO_LOCATION') {
         buttons.push({ text, callback_data: KEYBOARD_GEO });
-      } else if (b?.type === 'REQUEST_CONTACT') {
+      } else if (chatId != null && b?.type === 'REQUEST_CONTACT') {
         buttons.push({ text, callback_data: KEYBOARD_CONTACT });
       } else {
         buttons.push({ text, callback_data: KEYBOARD_NA });
@@ -672,4 +673,23 @@ export function takeKeyboard<T>(attaches: readonly T[], chatId?: unknown): { att
   let keyboard: InlineKeyboardMarkup | undefined;
   for (const a of attaches) if (isKeyboard(a)) keyboard ??= maxKeyboardToTelegram(a, chatId);
   return { attaches: attaches.filter((a) => !isKeyboard(a)), keyboard };
+}
+
+/** A response body read up to `limit` bytes; null (and the stream cancelled) once it would go past. Exported for tests. */
+export async function readCapped(body: ReadableStream<Uint8Array> | null, limit: number): Promise<Buffer | null> {
+  if (!body) return Buffer.alloc(0);
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  const reader = body.getReader();
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > limit) {
+      await reader.cancel().catch(() => {});
+      return null;
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks, total);
 }
