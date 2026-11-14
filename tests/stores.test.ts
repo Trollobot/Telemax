@@ -94,6 +94,25 @@ describe('ChatMapStore', () => {
     await rm(dir, { recursive: true, force: true });
   });
 
+  it('parks a corrupt file, restores from .bak, and keeps working', async () => {
+    const first = new ChatMapStore(filePath);
+    await first.upsert({ maxChatId: 1, telegramTopicId: 10, createdAt: 'a' }); // first write also refreshes .bak
+    await writeFile(filePath, '[{"maxChatId": "1", "telegr', 'utf8'); // truncated
+    const store = new ChatMapStore(filePath);
+    expect((await store.getByMaxChatId(1))?.telegramTopicId).toBe(10);
+    expect(existsSync(`${filePath}.broken`)).toBe(true);
+    await store.upsert({ maxChatId: 2, telegramTopicId: 20, createdAt: 'b' });
+    expect(JSON.parse(await readFile(filePath, 'utf8'))).toHaveLength(2);
+    expect((await stat(filePath)).mode & 0o777).toBe(0o600);
+  });
+
+  it('starts empty, without throwing, when the file is corrupt and there is no .bak', async () => {
+    await writeFile(filePath, 'not json', 'utf8');
+    const store = new ChatMapStore(filePath);
+    expect(await store.getByMaxChatId(1)).toBeUndefined();
+    expect(existsSync(`${filePath}.broken`)).toBe(true);
+  });
+
   it('normalizes maxChatId to a decimal string on upsert', async () => {
     const store = new ChatMapStore(filePath);
     await store.upsert({ maxChatId: 123456789012345n, telegramTopicId: 5, createdAt: 'now' });
