@@ -2226,7 +2226,7 @@ export function wireBridge({
   const VERSION_CHECK_MAX_MS = 28 * 60 * 60 * 1000;
   scheduleVersionCheck();
 
-  // Anonymous install counter (opt out with TELEMETRY=off). Pinged once shortly after boot so
+  // Anonymous install counter (opt-in: TELEMETRY=on). Pinged once shortly after boot so
   // a fresh install registers without waiting up to a day, then on every version-check tick.
   const telemetry = createTelemetry();
   setTimeout(() => void telemetry.ping(), 60_000).unref();

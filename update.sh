@@ -92,9 +92,9 @@ free_mb() {
 }
 
 # Anonymous failure report to the maintainer: «cat update.log» is beyond most users, and without it
-# nobody learns why updates fail. Same endpoint family, same install id and same opt-out as the
-# bridge's daily ping (src/bridge/telemetry.ts): TELEMETRY=off/0/false/no or NO_TELEMETRY=1/true/yes/on
-# in .env. Carries the step, a short reason and the host's versions/free space — nothing from .env.
+# nobody learns why updates fail. Same endpoint family, same install id and same opt-in as the
+# bridge's daily ping (src/bridge/telemetry.ts): only with TELEMETRY=1/true/yes/on in .env, and never
+# with NO_TELEMETRY=1/true/yes/on. Carries the step, a short reason and the host's versions/free space — nothing from .env.
 REPORT_URL="https://zergont-gate.duckdns.org/report"
 # Appended to the user's notice once a report was actually attempted.
 REPORT_NOTE=""
@@ -105,7 +105,7 @@ json_num() { case "$2" in ''|*[!0-9]*) ;; *) printf ',"%s":%s' "$1" "$2" ;; esac
 report_failure() {
   local id ver os_name mem body
   [ -f data/install-id ] || return 0
-  case "$(env_flag TELEMETRY)" in 0|false|off|no) return 0 ;; esac
+  case "$(env_flag TELEMETRY)" in 1|true|yes|on) ;; *) return 0 ;; esac
   case "$(env_flag NO_TELEMETRY)" in 1|true|yes|on) return 0 ;; esac
   id=$(head -c 64 data/install-id 2>/dev/null | tr -d '[:space:]') || id=""
   [ -n "$id" ] || return 0

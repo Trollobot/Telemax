@@ -80,7 +80,7 @@ describe('reportError', () => {
   });
 
   it('posts the anonymous payload and nothing else', async () => {
-    vi.stubEnv('TELEMETRY', '');
+    vi.stubEnv('TELEMETRY', 'on');
     vi.stubEnv('NO_TELEMETRY', '');
     await reportError({ kind: 'internal', step: 'unhandledRejection', error: new Error('boom 12345678\nsecond line') });
     expect(fetchMock).toHaveBeenCalledTimes(1);
@@ -102,7 +102,7 @@ describe('reportError', () => {
     await reportError({ kind: 'fatal', error: 'no start' });
     expect(fetchMock).not.toHaveBeenCalled();
 
-    vi.stubEnv('TELEMETRY', '');
+    vi.stubEnv('TELEMETRY', 'on');
     fetchMock.mockRejectedValueOnce(new Error('network down'));
     await expect(reportError({ kind: 'fatal', error: 'no start' })).resolves.toBeUndefined();
   });

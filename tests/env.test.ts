@@ -14,17 +14,17 @@ describe('parseEnvBool', () => {
   });
 });
 
-describe('isTelemetryDisabled (default on)', () => {
-  it('is on when nothing is set, or set to something unrecognised', () => {
-    expect(isTelemetryDisabled({})).toBe(false);
-    expect(isTelemetryDisabled({ TELEMETRY: 'on' })).toBe(false);
-    expect(isTelemetryDisabled({ TELEMETRY: 'whatever', NO_TELEMETRY: 'whatever' })).toBe(false);
-    expect(isTelemetryDisabled({ NO_TELEMETRY: '0' })).toBe(false);
+describe('isTelemetryDisabled (default off, opt-in)', () => {
+  it('is off when nothing is set, or set to off or something unrecognised', () => {
+    expect(isTelemetryDisabled({})).toBe(true);
+    expect(isTelemetryDisabled({ TELEMETRY: 'whatever', NO_TELEMETRY: 'whatever' })).toBe(true);
+    for (const v of ['off', '0', 'false', 'no', 'OFF', '']) expect(isTelemetryDisabled({ TELEMETRY: v })).toBe(true);
   });
 
-  it('keeps every opt-out spelling it accepted before', () => {
-    for (const v of ['off', '0', 'false', 'no', 'OFF']) expect(isTelemetryDisabled({ TELEMETRY: v })).toBe(true);
-    for (const v of ['1', 'true', 'yes', 'on', 'YES']) expect(isTelemetryDisabled({ NO_TELEMETRY: v })).toBe(true);
+  it('is on only with an explicit TELEMETRY on-value, and NO_TELEMETRY still wins', () => {
+    for (const v of ['1', 'true', 'yes', 'on', 'YES']) expect(isTelemetryDisabled({ TELEMETRY: v })).toBe(false);
+    expect(isTelemetryDisabled({ TELEMETRY: 'on', NO_TELEMETRY: '0' })).toBe(false);
+    expect(isTelemetryDisabled({ TELEMETRY: 'on', NO_TELEMETRY: 'yes' })).toBe(true);
   });
 });
 
