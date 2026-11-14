@@ -4,6 +4,7 @@ import { RetryBackoff } from '../bridge/catchUp.js';
 import { MaxAuthUnavailableError } from '../bridge/maxAuthFlow.js';
 import { reportBridgeError, resetErrorKey } from '../bridge/errorReporter.js';
 import { maskPhone } from '../bridge/status.js';
+import { isTransientMaxError } from '../bridge/transient.js';
 import { createLogger } from '../logger.js';
 
 const logger = createLogger('max-session');
@@ -89,6 +90,9 @@ export function isSessionRejection(err: { message?: string; serverCode?: string 
   if (/token|cred|password|unauthori[sz]ed|session\.(expired|invalid)/i.test(err.serverCode ?? '')) return true;
   return /авториз|войдите снова|выполните вход|сесси[яи] (устарел|истекл|недействительн|завершен)|WRONG_PASSWORD|FAIL_LOGIN/i.test(err.message ?? '');
 }
+const CODE_REQUEST_COOLDOWN_MS = 60_000;
+const CODE_ATTEMPTS = 5;
+
 // Bounds how long an auth chain (START_AUTH -> CHECK_CODE -> LOGIN) defers a pending resume
 // retry: an abandoned /login flow must not end the retries.
 const AUTH_CHAIN_TTL_MS = 10 * 60_000;
@@ -119,6 +123,10 @@ export class MaxSessionController {
   private pendingAuthToken: string | null = null;
   /** Set when verifyCode() comes back password_required — cleared only on a successful login, since the trackId survives a wrong password and can be retried (confirmed live 2026-08-14). */
   private pendingPasswordTrackId: string | null = null;
+  /** When a code was last requested per number — at most one request a minute, so /login can't be turned into an SMS cannon. */
+  private readonly codeRequestedAt = new Map<string, number>();
+  /** Wrong codes on the current request; the request is dropped after CODE_ATTEMPTS. */
+  private codeFailures = 0;
   /** A call-out or QR sign-in in progress: the track to poll and finish (AUTH_TRACK_LOGIN). */
   private pendingTrackId: string | null = null;
   private authChainStartedAt: number | null = null;
@@ -357,6 +365,11 @@ export class MaxSessionController {
   async requestSms(rawPhone: string): Promise<{ callOut: CallOutParams } | undefined> {
     const phone = rawPhone.replace(/[^\d+]/g, '');
     if (!phone) throw new Error('Пустой номер телефона');
+    const last = this.codeRequestedAt.get(phone);
+    const left = last == null ? 0 : CODE_REQUEST_COOLDOWN_MS - (Date.now() - last);
+    if (left > 0) throw new MaxAuthUnavailableError(`Код на этот номер уже запрошен — подождите ${Math.ceil(left / 1000)} с и повторите /login.`);
+    this.codeRequestedAt.set(phone, Date.now());
+    this.codeFailures = 0;
     await this.prepareAuthSocket();
     // An auth chain now runs on this socket: a pending resume retry defers itself (armResumeRetry)
     // but is NOT ended — it is the only thing that reconnects after a failed resume LOGIN, and
@@ -432,7 +445,16 @@ export class MaxSessionController {
 
   async verifyCode(code: string): Promise<{ ok: true } | { passwordRequired: true; hint: string | null }> {
     if (!this.pendingAuthToken) throw new MaxAuthUnavailableError('Код уже использован или устарел — начните заново: /login');
-    const verified = await this.deps.client.verifyCode(this.pendingAuthToken, code);
+    let verified: VerifyCodeResult;
+    try {
+      verified = await this.deps.client.verifyCode(this.pendingAuthToken, code);
+    } catch (err) {
+      if (!isTransientMaxError(err) && ++this.codeFailures >= CODE_ATTEMPTS) {
+        this.pendingAuthToken = null;
+        throw new MaxAuthUnavailableError(`${CODE_ATTEMPTS} неверных кодов подряд — запрос кода сброшен. Начните заново: /login`);
+      }
+      throw err;
+    }
     if (verified.status === 'password_required') {
       this.pendingPasswordTrackId = verified.challenge.trackId;
       return { passwordRequired: true, hint: verified.challenge.hint ?? null };

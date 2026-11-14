@@ -398,3 +398,17 @@ describe('MAX outage reports', () => {
     expect(ctl.state).toBe('ready');
   });
 });
+
+describe('MaxSessionController — /login throttling', () => {
+  it('refuses a second code request for the same number within a minute, and drops the request after 5 wrong codes', async () => {
+    const { ctl, client } = setup(null);
+    client.autoReady = true;
+    client.verifyCode.mockRejectedValue(new Error('Код не подтверждён'));
+    await ctl.requestSms('+79999999999');
+    await expect(ctl.requestSms('+79999999999')).rejects.toThrow(/подождите \d+ с/);
+    for (let i = 0; i < 4; i++) await expect(ctl.verifyCode('000000')).rejects.toThrow(/Код не подтверждён/);
+    await expect(ctl.verifyCode('000000')).rejects.toBeInstanceOf(MaxAuthUnavailableError);
+    await expect(ctl.verifyCode('000000')).rejects.toThrow(/устарел/);
+    expect(client.verifyCode).toHaveBeenCalledTimes(5);
+  });
+});
