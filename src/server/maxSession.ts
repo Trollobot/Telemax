@@ -351,12 +351,15 @@ export class MaxSessionController {
     // but is NOT ended — it is the only thing that reconnects after a failed resume LOGIN, and
     // ending it left the bridge on that dead socket when the user abandoned the flow.
     this.authChainStartedAt = Date.now();
+    logger.info(`/login: requesting a MAX code for ${maskPhone(phone)}`);
     try {
       this.pendingAuthToken = await this.deps.client.requestSms(phone);
     } catch (err) {
       this.authChainStartedAt = null;
+      logger.warn(`/login: MAX refused the code request for ${maskPhone(phone)}: ${(err as Error).message}`);
       throw err;
     }
+    logger.info(`/login: MAX accepted the code request for ${maskPhone(phone)} — the code is MAX's to deliver now`);
     this.pendingPhone = phone;
   }
 

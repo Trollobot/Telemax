@@ -7,6 +7,9 @@ import { OPCODES, DIR, formatOpcode } from './opcodes.js';
 import { MAX_TLS_CA } from './ca.js';
 import { toMaxReaction } from './reactions.js';
 import { findAuthToken, findLongToken, describeAuthError, extractPasswordChallenge, type PasswordChallenge } from './tokens.js';
+import { createLogger } from '../logger.js';
+
+const logger = createLogger('max-client');
 
 export type VerifyCodeResult = { status: 'ok'; loginToken: string } | { status: 'password_required'; challenge: PasswordChallenge };
 
@@ -646,6 +649,15 @@ export class MaxClient extends EventEmitter {
   async requestSms(phone: string): Promise<string> {
     const { dir, payload } = await this.request(OPCODES.START_AUTH, { phone, type: 'START_AUTH' });
     const token = findAuthToken(payload);
+    // What MAX said about the code — field names plus numeric/boolean values (code length, resend
+    // timeout, attempts left…). Strings are left out: one of them is the auth token.
+    const shape =
+      payload && typeof payload === 'object'
+        ? Object.entries(payload as Record<string, unknown>)
+            .map(([k, v]) => (typeof v === 'number' || typeof v === 'boolean' ? `${k}=${v}` : k))
+            .join(', ')
+        : typeof payload;
+    logger.info(`START_AUTH answered ${dir === DIR.ERR ? 'with an error' : 'ok'}: {${shape}}`);
     if (dir === DIR.ERR || !token) {
       throw new Error(describeAuthError(payload, 'START_AUTH did not return an auth token'));
     }
