@@ -1,6 +1,7 @@
 import dns from 'node:dns';
 import { Telegraf } from 'telegraf';
 import path from 'node:path';
+import { healthSnapshot } from './health.js';
 import { readFile, unlink, writeFile } from 'node:fs/promises';
 import { MaxClient, type MaxMessageEvent, type MaxContactInfo } from '../max/client.js';
 import { DIR, OPCODES } from '../max/opcodes.js';
@@ -411,6 +412,7 @@ async function startServer(): Promise<void> {
       }));
       chatSync.setRetryHandler(scheduleCatchUpRetry);
       watchPolling(bot);
+      startHealthHeartbeat();
       launchTelegramBotWithRetry(bot);
       // Route throttled operator error notices (MAX down, delivery failures, internal
       // errors) to the target group. Captured in a const so the closure keeps the
@@ -606,6 +608,8 @@ const POLL_STALL_MS = 120_000;
 const POLL_RESTALL_WINDOW_MS = 10 * 60_000;
 let pollInFlightSince: number | null = null;
 let lastPollRelaunchAt = 0;
+/** When a long poll last came back fine — Telegram is reachable (the health heartbeat below). */
+let lastPollOkAt = 0;
 
 /**
  * Notes when a polling getUpdates goes out and when it settles — the watchdog's only signal. Only the
@@ -618,9 +622,14 @@ function watchPolling(bot_: Telegraf): void {
     const longPoll = method === 'getUpdates' && Number((payload as { timeout?: unknown } | null)?.timeout) > 0;
     if (!longPoll) return (callApi as (m: string, p: unknown, e?: unknown) => Promise<unknown>)(method, payload, extra);
     pollInFlightSince = Date.now();
-    return (callApi as (m: string, p: unknown, e?: unknown) => Promise<unknown>)(method, payload, extra).finally(() => {
-      pollInFlightSince = null;
-    });
+    return (callApi as (m: string, p: unknown, e?: unknown) => Promise<unknown>)(method, payload, extra)
+      .then((r) => {
+        lastPollOkAt = Date.now();
+        return r;
+      })
+      .finally(() => {
+        pollInFlightSince = null;
+      });
   }) as typeof bot_.telegram.callApi;
   setInterval(() => {
     if (pollInFlightSince == null || Date.now() - pollInFlightSince < POLL_STALL_MS) return;
@@ -643,6 +652,23 @@ function watchPolling(bot_: Telegraf): void {
     // After the stopped loop's own short getUpdates (offset sync): two at once get a 409 from Telegram.
     setTimeout(() => void launchTelegramBotWithRetry(bot_), 5_000);
   }, 30_000).unref();
+}
+
+// --- Health heartbeat ------------------------------------------------------------------------------
+// The bridge has no port to probe, and its own warnings travel through the same Telegram connection
+// that may be the thing that is down. Every 30 s it writes .data/health.json (what it sees) and, only
+// while it really relays — MAX logged in AND a Telegram long poll answered within 3 minutes — touches
+// .data/heartbeat. A container healthcheck on the heartbeat's age (or any outside monitor reading
+// health.json) then notices a dead tunnel, a lost MAX session or a deaf Telegram connection.
+const HEALTH_DIR = path.join(process.cwd(), '.data');
+function startHealthHeartbeat(): void {
+  const beat = async (): Promise<void> => {
+    const snap = healthSnapshot({ maxState: maxSession.state, maxLoggedIn: max.isLoggedIn, lastPollOkAt, telegramEnabled: config.telegramEnabled, now: Date.now() });
+    await writeFile(path.join(HEALTH_DIR, 'health.json'), `${JSON.stringify(snap)}\n`).catch(() => {});
+    if (snap.ok) await writeFile(path.join(HEALTH_DIR, 'heartbeat'), `${snap.at}\n`).catch(() => {});
+  };
+  void beat();
+  setInterval(() => void beat(), 30_000).unref();
 }
 
 /** Ends the process for Docker (restart: unless-stopped) to start it again — the panel's «Перезапустить» and the watchdog's last resort. */
