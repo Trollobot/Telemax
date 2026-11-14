@@ -255,6 +255,10 @@ export class MaxClient extends EventEmitter {
   private readonly opts: ResolvedOptions;
   private socket: tls.TLSSocket | null = null;
   private buffer = Buffer.alloc(0);
+  private pendingChunks: Buffer[] = [];
+  private pendingBytes = 0;
+  /** Bytes the parser needs in hand before a join of the pending chunks can produce a frame. */
+  private bytesWanted = FRAME_HEADER_SIZE;
   private seq = 1;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -287,6 +291,9 @@ export class MaxClient extends EventEmitter {
     this.clearReconnectTimer();
     this.teardownSocket();
     this.buffer = Buffer.alloc(0);
+    this.pendingChunks = [];
+    this.pendingBytes = 0;
+    this.bytesWanted = FRAME_HEADER_SIZE;
     this.seq = 1;
     this.readyAt = null;
     this.authed = false;
@@ -317,7 +324,14 @@ export class MaxClient extends EventEmitter {
     );
 
     this.socket.on('data', (data: Buffer) => {
-      this.buffer = Buffer.concat([this.buffer, data]);
+      // Chunks are only joined once a whole frame can be there: joining on every chunk copied a big
+      // frame over and over (quadratic in its size, up to the 16 MB frame limit).
+      this.pendingChunks.push(data);
+      this.pendingBytes += data.length;
+      if (this.buffer.length + this.pendingBytes < this.bytesWanted) return;
+      this.buffer = Buffer.concat([this.buffer, ...this.pendingChunks]);
+      this.pendingChunks = [];
+      this.pendingBytes = 0;
       this.drainBuffer();
     });
 
@@ -425,6 +439,7 @@ export class MaxClient extends EventEmitter {
   }
 
   private drainBuffer(): void {
+    this.bytesWanted = FRAME_HEADER_SIZE;
     while (this.buffer.length >= FRAME_HEADER_SIZE) {
       let header;
       try {
@@ -441,7 +456,10 @@ export class MaxClient extends EventEmitter {
       }
 
       const total = FRAME_HEADER_SIZE + header.payloadLength;
-      if (this.buffer.length < total) return; // wait for more data
+      if (this.buffer.length < total) {
+        this.bytesWanted = total; // wait for more data — the 'data' handler joins chunks only then
+        return;
+      }
 
       const rawPayload = this.buffer.subarray(FRAME_HEADER_SIZE, total);
       this.buffer = this.buffer.subarray(total);
