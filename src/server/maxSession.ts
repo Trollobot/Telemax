@@ -368,7 +368,6 @@ export class MaxSessionController {
     const last = this.codeRequestedAt.get(phone);
     const left = last == null ? 0 : CODE_REQUEST_COOLDOWN_MS - (Date.now() - last);
     if (left > 0) throw new MaxAuthUnavailableError(`Код на этот номер уже запрошен — подождите ${Math.ceil(left / 1000)} с и повторите /login.`);
-    this.codeRequestedAt.set(phone, Date.now());
     this.codeFailures = 0;
     await this.prepareAuthSocket();
     // An auth chain now runs on this socket: a pending resume retry defers itself (armResumeRetry)
@@ -384,6 +383,7 @@ export class MaxSessionController {
       logger.warn(`/login: MAX refused the code request for ${maskPhone(phone)}: ${(err as Error).message}`);
       throw err;
     }
+    this.codeRequestedAt.set(phone, Date.now()); // only once MAX has really sent something
     this.pendingAuthToken = started.token;
     this.pendingTrackId = started.callOut?.trackId ?? null;
     this.pendingPhone = phone;
@@ -555,6 +555,8 @@ export class MaxSessionController {
     this.pendingPhone = '';
     this.pendingAuthToken = null;
     this.pendingPasswordTrackId = null;
+    this.pendingTrackId = null;
+    this.authChainStartedAt = null;
   }
 
   /**

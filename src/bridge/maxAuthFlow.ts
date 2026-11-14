@@ -100,7 +100,17 @@ export function createMaxAuthFlow(opts: {
     return f;
   }
 
+  /** Another admin's chat with a sign-in in progress: the MAX side holds one auth chain at a time. */
+  function busyElsewhere(chatId: number): boolean {
+    for (const id of flows.keys()) if (id !== chatId && freshFlow(id)) return true;
+    return false;
+  }
+
   async function begin(ctx: Context, chatId: number): Promise<void> {
+    if (busyElsewhere(chatId)) {
+      await ctx.reply('⏳ Вход в MAX уже идёт у другого администратора группы — дождитесь его или попробуйте через 10 минут.');
+      return;
+    }
     const phone = auth.getLastKnownPhone();
     setFlow(chatId, 'confirm');
     const byPhone = phone
@@ -144,7 +154,10 @@ export function createMaxAuthFlow(opts: {
   async function watchQr(ctx: Context, chatId: number, pollingInterval: number): Promise<void> {
     const MAX_CODES = 5;
     const interval = Math.min(Math.max(pollingInterval, 1000), 10_000);
-    const stillWaiting = (): boolean => freshFlow(chatId)?.step === 'qr';
+    // This watcher's own flow: a /cancel, a new /login or a second tap on «QR» replaces the object, and
+    // every await below re-checks it — a poll already in flight must not finish a cancelled login.
+    const mine = flows.get(chatId);
+    const stillWaiting = (): boolean => mine !== undefined && flows.get(chatId) === mine && freshFlow(chatId) === mine;
     let codes = 1;
     let failures = 0;
     while (stillWaiting()) {
@@ -161,6 +174,7 @@ export function createMaxAuthFlow(opts: {
         await ctx.reply(`❌ Не удалось узнать у MAX, подтверждён ли вход: ${(err as Error).message}\nНачните заново: /login`).catch(() => {});
         return;
       }
+      if (!stillWaiting()) return;
       if (st.loginAvailable) {
         await finishTrackThen(ctx, chatId, '📷 Вход подтверждён в приложении.');
         return;
@@ -185,19 +199,22 @@ export function createMaxAuthFlow(opts: {
 
   /** The common end of a call-out or QR sign-in. */
   async function finishTrackThen(ctx: Context, chatId: number, confirmed: string): Promise<void> {
+    let result: Awaited<ReturnType<MaxAuthCallbacks['finishTrack']>>;
     try {
-      const result = await auth.finishTrack();
-      if ('passwordRequired' in result) {
-        setFlow(chatId, 'password');
-        const hint = result.hint ? `\nПодсказка: ${result.hint}` : '';
-        await ctx.reply(`🔐 ${confirmed} На аккаунте включён пароль (2FA).${hint}\nПришлите пароль — я удалю ваше сообщение сразу после проверки.`);
-      } else {
-        flows.delete(chatId);
-        await announceAuthed(ctx);
-      }
+      result = await auth.finishTrack();
     } catch (err) {
       flows.delete(chatId);
       await ctx.reply(`❌ ${(err as Error).message}`).catch(() => {});
+      return;
+    }
+    // MAX has answered: a Telegram hiccup below is no login failure.
+    if ('passwordRequired' in result) {
+      setFlow(chatId, 'password');
+      const hint = result.hint ? `\nПодсказка: ${result.hint}` : '';
+      await ctx.reply(`🔐 ${confirmed} На аккаунте включён пароль (2FA).${hint}\nПришлите пароль — я удалю ваше сообщение сразу после проверки.`).catch((err) => logger.warn('Could not ask for the 2FA password', err));
+    } else {
+      flows.delete(chatId);
+      await announceAuthed(ctx).catch((err) => logger.warn('Logged in, but could not say so in Telegram', err));
     }
   }
 
@@ -242,7 +259,8 @@ export function createMaxAuthFlow(opts: {
    */
   async function watchCallOut(ctx: Context, chatId: number, pollingInterval: number): Promise<void> {
     const interval = Math.min(Math.max(pollingInterval, 1000), 10_000);
-    const stillCalling = (): boolean => freshFlow(chatId)?.step === 'call';
+    const mine = flows.get(chatId); // see watchQr
+    const stillCalling = (): boolean => mine !== undefined && flows.get(chatId) === mine && freshFlow(chatId) === mine;
     let shown = '';
     let failures = 0;
     while (stillCalling()) {
@@ -259,6 +277,7 @@ export function createMaxAuthFlow(opts: {
         await ctx.reply(`❌ Не удалось узнать у MAX, прошёл ли звонок: ${(err as Error).message}\nНачните заново: /login`).catch(() => {});
         return;
       }
+      if (!stillCalling()) return;
       if (st.status === 1 && st.callNumber && st.callNumber !== shown) {
         const again = shown !== '';
         shown = st.callNumber;

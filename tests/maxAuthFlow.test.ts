@@ -186,3 +186,40 @@ describe('maxAuthFlow — QR sign-in', () => {
     expect(pick.replies.at(-1)).toContain('/login');
   });
 });
+
+describe('maxAuthFlow — races', () => {
+  it('a /cancel that lands while a QR poll is in flight does not finish the login', async () => {
+    let release: (v: { loginAvailable: boolean; ttl: number }) => void = () => {};
+    const finishTrack = vi.fn(async (): Promise<{ ok: true }> => ({ ok: true }));
+    const flow = createMaxAuthFlow({
+      targetGroupId: '-100',
+      wait: async () => {},
+      auth: {
+        getLastKnownPhone: () => '',
+        requestSms: async () => {},
+        verifyCode: async () => ({ ok: true }),
+        checkPassword: async () => {},
+        callOutStatus: async () => ({ status: 0 }),
+        finishTrack,
+        startQr: async () => ({ qrLink: 'https://max.ru/:auth/x', pollingInterval: 5000, ttl: 120000 }),
+        qrStatus: () => new Promise((resolve) => (release = resolve)),
+      },
+    });
+    await flow.handlePrivate(fakeCtx({ text: '/login' }).ctx);
+    await flow.handlePrivate(fakeCtx({ data: 'maxauth:qr' }).ctx);
+    await new Promise((r) => setTimeout(r, 10)); // the poll is now waiting on qrStatus
+    await flow.handlePrivate(fakeCtx({ text: '/cancel' }).ctx);
+    release({ loginAvailable: true, ttl: 1000 });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(finishTrack).not.toHaveBeenCalled();
+  });
+
+  it('a second admin cannot start a sign-in while another one is in progress', async () => {
+    const flow = flowWith(async () => {});
+    await flow.handlePrivate(fakeCtx({ text: '/login' }).ctx); // chat 7
+    const other = fakeCtx({ text: '/login' });
+    (other.ctx as unknown as { chat: { id: number } }).chat = { id: 99 };
+    await flow.handlePrivate(other.ctx);
+    expect(other.replies[0]).toContain('у другого администратора');
+  });
+});
