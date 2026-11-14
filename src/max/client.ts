@@ -99,9 +99,8 @@ export interface MaxClientOptions {
   host?: string;
   sni?: string;
   /**
-   * The INIT deviceId; a random one when unset. Nothing passes it today: the id saved into the
-   * session is never read back, and MAX accepts the resumed token under a new id anyway —
-   * deliberately left so until reusing the saved id is verified live.
+   * The INIT deviceId; a random one when unset. The session controller switches to the id saved with
+   * the session (useDeviceId) before its first INIT, so a restart is not a new device in MAX.
    */
   deviceId?: string;
   reconnect?: boolean;
@@ -251,7 +250,17 @@ interface ResolvedOptions {
 const PRE_LOGIN_OPCODES = new Set<number>([OPCODES.INIT, OPCODES.PING, OPCODES.START_AUTH, OPCODES.CHECK_CODE, OPCODES.CHECK_PASSWORD, OPCODES.LOGIN]);
 
 export class MaxClient extends EventEmitter {
-  readonly deviceId: string;
+  private deviceId_: string;
+
+  /** The INIT deviceId — what MAX lists under «Устройства». */
+  get deviceId(): string {
+    return this.deviceId_;
+  }
+
+  /** Presents this id from the next INIT on (no argument: a fresh random one). */
+  useDeviceId(id?: string): void {
+    this.deviceId_ = id && /^\d{6,40}$/.test(id) ? id : randomDeviceId();
+  }
   private readonly opts: ResolvedOptions;
   private socket: tls.TLSSocket | null = null;
   private buffer = Buffer.alloc(0);
@@ -273,7 +282,7 @@ export class MaxClient extends EventEmitter {
   constructor(options: MaxClientOptions = {}) {
     super();
     this.on('message', (event: MaxMessageEvent) => this.dispatch(event));
-    this.deviceId = options.deviceId ?? randomDeviceId();
+    this.deviceId_ = options.deviceId ?? randomDeviceId();
     this.opts = {
       host: options.host ?? DEFAULT_HOST,
       sni: options.sni ?? DEFAULT_SNI,

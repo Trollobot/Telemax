@@ -37,6 +37,7 @@ export type MaxSessionState =
 /** What the controller needs from MaxClient (a narrow slice so tests can fake it). */
 export interface SessionClient {
   readonly deviceId: string;
+  useDeviceId?(id?: string): void;
   connect(): void;
   disconnect(): void;
   on(event: 'ready' | 'disconnected', listener: () => void): unknown;
@@ -133,6 +134,8 @@ export class MaxSessionController {
   private refusedSince: number | null = null;
   private outageCause: string | null = null;
   private lastClientError: { at: number; message: string } | null = null;
+  private usingSavedDeviceId = false;
+  private outageDetail = '';
 
   constructor(private readonly deps: MaxSessionDeps) {}
 
@@ -163,6 +166,12 @@ export class MaxSessionController {
   start(session: MaxSession | null): void {
     this.session = session;
     if (session) this.lastKnownPhone_ = session.phone;
+    // The device MAX registered at login, not a new random one per restart (each showed up as one
+    // more device in MAX's «Устройства»). Dropped again if MAX rejects a resume under it.
+    if (session?.deviceId && this.deps.client.useDeviceId) {
+      this.deps.client.useDeviceId(session.deviceId);
+      this.usingSavedDeviceId = true;
+    }
     this.deps.client.on('ready', () => this.onReady());
     this.deps.client.on('disconnected', () => this.onDisconnected());
     // The client says why a socket died just before 'disconnected' (a missed PING, a reset…).
@@ -260,6 +269,12 @@ export class MaxSessionController {
       void this.deps.reportError?.({ kind: 'internal', step: 'max-refused-resume', error: msg });
     }
     const givingUp = refused && this.refusedSince != null && Date.now() - this.refusedSince >= REFUSAL_GIVE_UP_MS;
+    if (this.usingSavedDeviceId && isMaxServerError(err) && !refused) {
+      // Rejected under the saved device id: the retries below go out under a fresh one, as before.
+      this.usingSavedDeviceId = false;
+      this.deps.client.useDeviceId?.();
+      logger.warn('Resume rejected under the saved device id — retrying under a new one');
+    }
     if (!isMaxServerError(err) || (refused && !givingUp)) {
       // Timeout (an undecodable answer too), or a refusal not about the token: nothing is known
       // against the session, it stays. This loop (reconnect, INIT OK, LOGIN fails) never emits
@@ -514,6 +529,7 @@ export class MaxSessionController {
       this.outageStartedAt = Date.now();
       const recent = this.lastClientError && Date.now() - this.lastClientError.at < 10_000 ? this.lastClientError.message : '';
       this.outageCause = outageCause(recent);
+      this.outageDetail = this.outageCause === 'other' ? outageDetailText(recent) : '';
     }
     if (this.downTimer != null || this.downReported) return;
     this.downTimer = setTimeout(() => {
@@ -521,7 +537,10 @@ export class MaxSessionController {
       this.downReported = true;
       // Every reported loss gets its «✅»: 'max-up' has its own cooldown, which would swallow a second recovery within 10 minutes.
       resetErrorKey('max-up');
-      reportBridgeError('max-down', '❌ Потеряна связь с MAX. Пытаюсь переподключиться…');
+      // MAX's own words when it refused (e.g. «Приложение устарело» on a refused INIT) — without them
+      // the notice read like a network blip and the fix (MAX_APP_VERSION) was a guess.
+      const why = this.outageDetail ? `\nMAX ответил: «${this.outageDetail}»${/устарел|обнов|outdated|version/i.test(this.outageDetail) ? '\nВероятно, MAX требует более новую версию приложения — см. README, «Если что-то не работает» (MAX_APP_VERSION).' : ''}` : '';
+      reportBridgeError('max-down', `❌ Потеряна связь с MAX. Пытаюсь переподключиться…${why}`);
     }, MAX_DOWN_NOTICE_MS);
   }
 
@@ -553,6 +572,16 @@ export function outageCause(message: string): string {
   if (/etimedout|timed out|timeout/.test(m)) return 'connect-timeout';
   if (/econnreset|epipe|socket hang up|reset/.test(m)) return 'connection-reset';
   return 'other';
+}
+
+/** A server's refusal text as shown in the group: one line, no long tokens or digit runs, at most 160 chars. Exported for tests. */
+export function outageDetailText(message: string): string {
+  return message
+    .split('\n')[0]!
+    .replace(/[A-Za-z0-9_-]{24,}/g, '…')
+    .replace(/\d{7,}/g, '#')
+    .trim()
+    .slice(0, 160);
 }
 
 /** The anonymous outage report: how long MAX was out of reach and how it started — no addresses, no ids. */
