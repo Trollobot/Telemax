@@ -1,5 +1,5 @@
 import { randomBytes, createCipheriv, createDecipheriv } from 'node:crypto';
-import { mkdir, readFile, rename, writeFile, unlink } from 'node:fs/promises';
+import { mkdir, readFile, rename, rm, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { createLogger } from '../logger.js';
 
@@ -69,9 +69,11 @@ export class SessionStore {
     // curable only by deleting the file over SSH.
     // Queued with no await before it, mkdir included: a clear() called after this save must land after it.
     const run = this.writeQueue.then(async () => {
-      await mkdir(path.dirname(this.filePath), { recursive: true });
+      await mkdir(path.dirname(this.filePath), { recursive: true, mode: 0o700 });
       const tmpPath = `${this.filePath}.tmp`;
-      await writeFile(tmpPath, JSON.stringify(encoded), 'utf8');
+      // 0600: the file is the MAX account's session — only the bridge's own user may read it.
+      await rm(tmpPath, { force: true }); // a leftover .tmp would keep its old (wider) mode through writeFile
+      await writeFile(tmpPath, JSON.stringify(encoded), { encoding: 'utf8', mode: 0o600 });
       await rename(tmpPath, this.filePath);
     });
     // Keep the queue moving even if this write failed, so one bad write can't wedge every later one.
@@ -94,8 +96,12 @@ export class SessionStore {
     const key = loadKey();
     try {
       const { iv, authTag, ciphertext } = JSON.parse(raw) as EncryptedFile;
-      const decipher = createDecipheriv(ALGO, key, Buffer.from(iv, 'base64'));
-      decipher.setAuthTag(Buffer.from(authTag, 'base64'));
+      // A full 16-byte tag only: GCM in Node otherwise accepts tags as short as 4 bytes, and with a
+      // 32-bit tag a file forged without the key passes once in 2^32 tries.
+      const decipher = createDecipheriv(ALGO, key, Buffer.from(iv, 'base64'), { authTagLength: 16 });
+      const tag = Buffer.from(authTag, 'base64');
+      if (tag.length !== 16) throw new Error(`session file auth tag is ${tag.length} bytes, expected 16`);
+      decipher.setAuthTag(tag);
       const plaintext = Buffer.concat([decipher.update(Buffer.from(ciphertext, 'base64')), decipher.final()]);
       return JSON.parse(plaintext.toString('utf8')) as MaxSession;
     } catch (err) {

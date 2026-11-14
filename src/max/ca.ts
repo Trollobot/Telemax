@@ -56,7 +56,64 @@ const maxDispatcher = new Agent({ connect: { ca: MAX_TLS_CA } });
  * with it while plain-TCP traffic kept working.
  */
 export function maxFetch(url: string, init: RequestInit = {}): Promise<Response> {
-  return undiciFetch(url, { ...init, dispatcher: maxDispatcher });
+  return fetchMaxHost(url, init, maxDispatcher);
+}
+
+/**
+ * The domains MAX serves files, photos, video and upload slots from (VK group infrastructure). The URLs
+ * come out of MAX payloads, so this list — not the payload — decides where the state-CA trust and the
+ * request (with a Telegram upload in its body, for upload slots) may go. A host outside it is refused
+ * and logged by name: extend the list if a legitimate MAX host shows up there.
+ */
+export const MAX_HOST_SUFFIXES = ['oneme.ru', 'max.ru', 'okcdn.ru', 'mycdn.me', 'vkuser.net', 'userapi.com', 'vk.com', 'vk.me', 'ok.ru'];
+
+/** Exported for tests. */
+/**
+ * MAX_HOST_SUFFIXES_EXTRA: more domains for MAX_HOST_SUFFIXES, comma-separated (e.g. a new CDN domain
+ * MAX starts using before a release lists it — the refusal in the log names it). Exported for tests.
+ */
+export function extraMaxHostSuffixes(env: NodeJS.ProcessEnv = process.env): string[] {
+  return (env.MAX_HOST_SUFFIXES_EXTRA ?? '')
+    .split(',')
+    .map((s) => s.trim().toLowerCase().replace(/^\.+/, ''))
+    .filter((s) => /^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(s));
+}
+
+export function isMaxHost(url: string, env: NodeJS.ProcessEnv = process.env): boolean {
+  let u: URL;
+  try {
+    u = new URL(url);
+  } catch {
+    return false;
+  }
+  if (u.protocol !== 'https:') return false;
+  const host = u.hostname.toLowerCase();
+  return [...MAX_HOST_SUFFIXES, ...extraMaxHostSuffixes(env)].some((s) => host === s || host.endsWith(`.${s}`));
+}
+
+const MAX_REDIRECTS = 5;
+
+/** fetch through a MAX dispatcher, following redirects by hand so every hop is checked against MAX_HOST_SUFFIXES. */
+async function fetchMaxHost(url: string, init: RequestInit, dispatcher: Agent): Promise<Response> {
+  let current = url;
+  for (let hop = 0; ; hop++) {
+    if (!isMaxHost(current)) {
+      let host = '[unparseable]';
+      try {
+        host = new URL(current).host;
+      } catch {
+        // keep the placeholder
+      }
+      logger.warn(`Refused a non-MAX URL (host ${host}${hop ? `, after ${hop} redirect(s)` : ''}) — not fetched with MAX's trust. If MAX really serves files from there: MAX_HOST_SUFFIXES_EXTRA`);
+      throw new Error(`not a MAX host: ${host}`);
+    }
+    const res = await undiciFetch(current, { ...init, dispatcher, redirect: 'manual' });
+    const location = res.status >= 300 && res.status < 400 ? res.headers.get('location') : null;
+    if (!location) return res;
+    if (hop >= MAX_REDIRECTS) throw new Error('too many redirects from a MAX host');
+    await res.body?.cancel().catch(() => {});
+    current = new URL(location, current).toString();
+  }
 }
 
 // Gigabyte transfers (fileShare.ts): the defaults (5 min to the response headers) are fine for a
@@ -65,5 +122,5 @@ const maxBigDispatcher = new Agent({ connect: { ca: MAX_TLS_CA }, headersTimeout
 
 /** maxFetch for streamed multi-gigabyte up/downloads — same trust set, longer timeouts. */
 export function maxFetchBig(url: string, init: RequestInit = {}): Promise<Response> {
-  return undiciFetch(url, { ...init, dispatcher: maxBigDispatcher });
+  return fetchMaxHost(url, init, maxBigDispatcher);
 }

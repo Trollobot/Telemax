@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -261,6 +261,22 @@ describe('SessionStore.clear', () => {
     await store.clear();
     for (const file of [filePath, `${filePath}.tmp`, `${filePath}.broken`]) expect(existsSync(file)).toBe(false);
     await expect(store.clear()).resolves.toBeUndefined();
+  });
+
+  it('writes the session file readable by its owner only', async () => {
+    const store = new SessionStore(filePath);
+    await store.save(session);
+    expect((await stat(filePath)).mode & 0o777).toBe(0o600);
+  });
+
+  it('refuses a file whose GCM tag was cut short (forgeable without the key) and parks it', async () => {
+    const store = new SessionStore(filePath);
+    await store.save(session);
+    const file = JSON.parse(await readFile(filePath, 'utf8')) as { authTag: string };
+    file.authTag = Buffer.from(file.authTag, 'base64').subarray(0, 4).toString('base64');
+    await writeFile(filePath, JSON.stringify(file), 'utf8');
+    expect(await store.load()).toBeNull();
+    expect(existsSync(`${filePath}.broken`)).toBe(true);
   });
 });
 
