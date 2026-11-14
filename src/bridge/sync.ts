@@ -1833,9 +1833,12 @@ export function wireBridge({
       const m = ctx.message as { new_chat_members?: unknown; left_chat_member?: unknown; group_chat_created?: unknown; supergroup_chat_created?: unknown; migrate_to_chat_id?: unknown; migrate_from_chat_id?: unknown } | undefined;
       if (m && (m.new_chat_members || m.left_chat_member || m.group_chat_created || m.supergroup_chat_created || m.migrate_to_chat_id || m.migrate_from_chat_id)) return;
       if (ctx.callbackQuery) {
-        ctx.answerCbQuery('Не вы меня создали.').catch(() => {});
-      } else {
-        ctx.reply('Не вы меня создали — идите в жопу.').catch(() => {});
+        ctx.answerCbQuery('Это не ваш мост.').catch(() => {});
+      } else if (ctx.chat.type === 'group' || ctx.chat.type === 'supergroup') {
+        // Anyone can add a bot to their group. Answering every message there made it spammable and
+        // easy to fingerprint; it just leaves instead (broadcast places were handled above).
+        logger.info(`Leaving chat ${ctx.chat.id}: not the bridge group and not a broadcast place`);
+        ctx.leaveChat().catch((err: unknown) => logger.warn(`Could not leave chat ${ctx.chat?.id}`, err));
       }
       return;
     }
