@@ -1815,7 +1815,25 @@ export function wireBridge({
       // A broadcast's group or channel: readers' messages there go nowhere (only the «закрепил» line of
       // a «📌» pin is looked at). And no reject for the service message of the bot being added — the
       // chat picker does exactly that before it says which chat.
-      if (await broadcasts.isTarget(ctx.chat.id).catch(() => false)) {
+      // A broadcast group upgraded to a supergroup: Telegram's first message in the new chat names the
+      // old id. Move the broadcasts over BEFORE the check below, or the bot would leave its own target.
+      const migratedFrom = (ctx.message as { migrate_from_chat_id?: number } | undefined)?.migrate_from_chat_id;
+      if (migratedFrom != null) {
+        const moved = await broadcasts.retarget(migratedFrom, ctx.chat.id).catch((err) => {
+          logger.error('Broadcast: following a group upgrade failed', err);
+          return 0;
+        });
+        if (moved) logger.info(`Broadcast: ${moved} broadcast(s) followed chat ${migratedFrom} → ${ctx.chat.id} (upgraded to a supergroup)`);
+      }
+      let isTarget: boolean;
+      try {
+        isTarget = await broadcasts.isTarget(ctx.chat.id);
+      } catch (err) {
+        // Can't tell: do nothing here at all — never leave a chat on a guess.
+        logger.error('Broadcast: could not read the broadcast list', err);
+        return;
+      }
+      if (isTarget) {
         await broadcasts.onTargetUpdate(ctx).catch((err) => logger.error('Broadcast: update from a place failed', err));
         return;
       }
