@@ -28,6 +28,7 @@ class FakeClient extends EventEmitter {
   verifyCode = vi.fn(async () => ({ status: 'ok' as const, loginToken: 'login-token' }));
   checkPassword = vi.fn(async () => 'login-token');
   logout = vi.fn(async () => {});
+  useDeviceId = vi.fn();
 }
 
 function setup(session: MaxSession | null = SESSION) {
@@ -392,5 +393,20 @@ describe('MAX outage reports', () => {
     await settle();
     expect(reportError).toHaveBeenCalledWith({ kind: 'internal', step: 'max-down', error: 'MAX unreachable ~3 min: ping-timeout' });
     expect(ctl.state).toBe('ready');
+  });
+});
+describe('MaxSessionController — device id', () => {
+  it('presents the device id saved with the session, and drops it after a rejection under it', async () => {
+    const { client } = setup({ ...SESSION, deviceId: '123456789012345678' });
+    expect(client.useDeviceId).toHaveBeenCalledWith('123456789012345678');
+    await failedResume(client, REJECTED());
+    expect(client.useDeviceId).toHaveBeenLastCalledWith();
+  });
+});
+describe('outageDetailText', () => {
+  it('keeps MAX\'s refusal readable and strips anything token- or number-like', async () => {
+    const { outageDetailText } = await import('../src/server/maxSession.js');
+    expect(outageDetailText('Приложение устарело. Обновите MAX\nstack')).toBe('Приложение устарело. Обновите MAX');
+    expect(outageDetailText('bad token AbCdEfGhIjKlMnOpQrStUvWxYz012345 for 79991234567')).toBe('bad token … for #');
   });
 });
