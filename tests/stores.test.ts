@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -92,6 +92,25 @@ describe('ChatMapStore', () => {
 
   afterEach(async () => {
     await rm(dir, { recursive: true, force: true });
+  });
+
+  it('parks a corrupt file, restores from .bak, and keeps working', async () => {
+    const first = new ChatMapStore(filePath);
+    await first.upsert({ maxChatId: 1, telegramTopicId: 10, createdAt: 'a' }); // first write also refreshes .bak
+    await writeFile(filePath, '[{"maxChatId": "1", "telegr', 'utf8'); // truncated
+    const store = new ChatMapStore(filePath);
+    expect((await store.getByMaxChatId(1))?.telegramTopicId).toBe(10);
+    expect(existsSync(`${filePath}.broken`)).toBe(true);
+    await store.upsert({ maxChatId: 2, telegramTopicId: 20, createdAt: 'b' });
+    expect(JSON.parse(await readFile(filePath, 'utf8'))).toHaveLength(2);
+    expect((await stat(filePath)).mode & 0o777).toBe(0o600);
+  });
+
+  it('starts empty, without throwing, when the file is corrupt and there is no .bak', async () => {
+    await writeFile(filePath, 'not json', 'utf8');
+    const store = new ChatMapStore(filePath);
+    expect(await store.getByMaxChatId(1)).toBeUndefined();
+    expect(existsSync(`${filePath}.broken`)).toBe(true);
   });
 
   it('normalizes maxChatId to a decimal string on upsert', async () => {

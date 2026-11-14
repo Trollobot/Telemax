@@ -1472,6 +1472,10 @@ export class ChatCatchUp {
         logger.error(`Failed to backfill MAX message ${String(msg.id)} in chat ${String(chatId)}`, err);
         const partial = buildLinkIds(sent, []);
         if (partial && msg.id != null) messageLinks.add({ maxChatId: chatId, maxMessageId: msg.id, ...partial });
+        // Skipped for good — say so in the topic, or the message just isn't there and nobody knows.
+        await bot.telegram
+          .sendMessage(groupId, refusedStubText(msg.time, err), { message_thread_id: topicId })
+          .catch((stubErr) => logger.warn('Could not post the «not relayed» note either', stubErr));
       }
       await chatMapStore.advanceHistoryCursor(chatId, msg.time);
     }
@@ -1979,11 +1983,15 @@ export function wireBridge({
 
   // Big files through links (fileShare.ts / bigFiles.ts): Telegram's bot limits are 20 MB down and
   // 50 MB up, MAX takes 4 GB.
-  const fileShare = new FileShare(path.join(process.cwd(), '.data'), fileShareOptionsFromEnv());
-  void fileShare
-    .init()
-    .then(() => fileShare.startBackground())
-    .catch((err) => logger.error('Big-file storage failed to start', err));
+  const fileShareOptions = fileShareOptionsFromEnv();
+  const fileShare = new FileShare(path.join(process.cwd(), '.data'), fileShareOptions);
+  // FILES=off: no .data/files, no index rewritten every 10 minutes — the feature is simply absent.
+  if (fileShareOptions.enabled) {
+    void fileShare
+      .init()
+      .then(() => fileShare.startBackground())
+      .catch((err) => logger.error('Big-file storage failed to start', err));
+  }
   const bigFiles = createBigFiles({
     bot,
     max,
@@ -4549,4 +4557,12 @@ export async function syncAllChatsToTelegram(
       if (!onChatError(mapping.maxChatId, err)) return;
     }
   }
+}
+
+/** The note left in a topic where Telegram refused a MAX message for good. Exported for tests. */
+export function refusedStubText(time: unknown, err: unknown, tz: string = process.env.TZ || 'Europe/Moscow'): string {
+  const ms = Number(time);
+  const when = Number.isFinite(ms) && ms > 0 ? new Date(ms).toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit', timeZone: tz }) : 'неизвестно когда';
+  const reason = String((err as { description?: unknown })?.description ?? (err as Error)?.message ?? '').split('\n')[0]!.slice(0, 120);
+  return `⚠️ Сообщение из MAX (${when}) не удалось переслать сюда — Telegram отказал${reason ? `: ${reason}` : ''}. Оно есть в MAX.`;
 }

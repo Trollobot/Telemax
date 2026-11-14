@@ -394,3 +394,17 @@ describe('MAX outage reports', () => {
     expect(ctl.state).toBe('ready');
   });
 });
+describe('MaxSessionController — re-auth notice', () => {
+  it('retries a notice that Telegram did not take, and stops once logged in again', async () => {
+    const { ctl, client, postReauthNotice } = setup(null);
+    postReauthNotice.mockRejectedValueOnce(new Error('ETIMEDOUT'));
+    ctl.notifyReauthNeeded();
+    await settle();
+    expect(postReauthNotice).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(postReauthNotice).toHaveBeenCalledTimes(2);
+    ctl.notifyReauthNeeded(); // already told
+    expect(postReauthNotice).toHaveBeenCalledTimes(2);
+    void client;
+  });
+});
