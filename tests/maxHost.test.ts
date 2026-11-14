@@ -12,3 +12,15 @@ describe('isMaxHost', () => {
     }
   });
 });
+
+
+describe('MAX_HOST_SUFFIXES_EXTRA', () => {
+  it('adds valid domains (and their subdomains) only, https still required', async () => {
+    const { isMaxHost, extraMaxHostSuffixes } = await import('../src/max/ca.js');
+    const env = { MAX_HOST_SUFFIXES_EXTRA: ' newcdn.example , .other.net, not a host, 10, ' };
+    expect(extraMaxHostSuffixes(env)).toEqual(['newcdn.example', 'other.net']);
+    expect(isMaxHost('https://v1.newcdn.example/x', env)).toBe(true);
+    expect(isMaxHost('https://v1.newcdn.example/x', {})).toBe(false);
+    expect(isMaxHost('http://v1.newcdn.example/x', env)).toBe(false);
+  });
+});

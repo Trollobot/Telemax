@@ -68,7 +68,18 @@ export function maxFetch(url: string, init: RequestInit = {}): Promise<Response>
 export const MAX_HOST_SUFFIXES = ['oneme.ru', 'max.ru', 'okcdn.ru', 'mycdn.me', 'vkuser.net', 'userapi.com', 'vk.com', 'vk.me', 'ok.ru'];
 
 /** Exported for tests. */
-export function isMaxHost(url: string): boolean {
+/**
+ * MAX_HOST_SUFFIXES_EXTRA: more domains for MAX_HOST_SUFFIXES, comma-separated (e.g. a new CDN domain
+ * MAX starts using before a release lists it — the refusal in the log names it). Exported for tests.
+ */
+export function extraMaxHostSuffixes(env: NodeJS.ProcessEnv = process.env): string[] {
+  return (env.MAX_HOST_SUFFIXES_EXTRA ?? '')
+    .split(',')
+    .map((s) => s.trim().toLowerCase().replace(/^\.+/, ''))
+    .filter((s) => /^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(s));
+}
+
+export function isMaxHost(url: string, env: NodeJS.ProcessEnv = process.env): boolean {
   let u: URL;
   try {
     u = new URL(url);
@@ -77,7 +88,7 @@ export function isMaxHost(url: string): boolean {
   }
   if (u.protocol !== 'https:') return false;
   const host = u.hostname.toLowerCase();
-  return MAX_HOST_SUFFIXES.some((s) => host === s || host.endsWith(`.${s}`));
+  return [...MAX_HOST_SUFFIXES, ...extraMaxHostSuffixes(env)].some((s) => host === s || host.endsWith(`.${s}`));
 }
 
 const MAX_REDIRECTS = 5;
@@ -93,7 +104,7 @@ async function fetchMaxHost(url: string, init: RequestInit, dispatcher: Agent): 
       } catch {
         // keep the placeholder
       }
-      logger.warn(`Refused a non-MAX URL (host ${host}${hop ? `, after ${hop} redirect(s)` : ''}) — not fetched with MAX's trust`);
+      logger.warn(`Refused a non-MAX URL (host ${host}${hop ? `, after ${hop} redirect(s)` : ''}) — not fetched with MAX's trust. If MAX really serves files from there: MAX_HOST_SUFFIXES_EXTRA`);
       throw new Error(`not a MAX host: ${host}`);
     }
     const res = await undiciFetch(current, { ...init, dispatcher, redirect: 'manual' });
