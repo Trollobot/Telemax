@@ -27,6 +27,8 @@ class FakeClient extends EventEmitter {
   requestSms = vi.fn(async (): Promise<{ token: string; callOut?: CallOutParams }> => ({ token: 'auth-token' }));
   callOutStatus = vi.fn(async () => ({ status: 0 }));
   finishTrackLogin = vi.fn();
+  createQr = vi.fn();
+  qrStatus = vi.fn();
   verifyCode = vi.fn(async () => ({ status: 'ok' as const, loginToken: 'login-token' }));
   checkPassword = vi.fn(async () => 'login-token');
   logout = vi.fn(async () => {});

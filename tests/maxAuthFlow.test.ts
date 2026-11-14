@@ -17,6 +17,10 @@ function fakeCtx(update: { text?: string; data?: string }) {
       replies.push(text);
       return {};
     }),
+    replyWithPhoto: vi.fn(async (photo: { source: Buffer }, extra: { caption?: string; reply_markup?: { inline_keyboard: { url?: string }[][] } }) => {
+      replies.push(`[photo ${photo.source.subarray(1, 4).toString()}] ${extra.caption ?? ''} ${extra.reply_markup?.inline_keyboard[0]?.[0]?.url ?? ''}`);
+      return {};
+    }),
     answerCbQuery: vi.fn(async () => true),
     deleteMessage: vi.fn(async () => true),
   };
@@ -32,7 +36,9 @@ function flowWith(requestSms: (phone: string) => Promise<void>) {
       verifyCode: async () => ({ ok: true }),
       checkPassword: async () => {},
       callOutStatus: async () => ({ status: 0 }),
-      finishCallOut: async () => ({ ok: true }),
+      finishTrack: async () => ({ ok: true }),
+      startQr: async () => ({ qrLink: 'https://max.ru/:auth/x', pollingInterval: 5000, ttl: 120000 }),
+      qrStatus: async () => ({ loginAvailable: false, ttl: 1 }),
     },
   });
 }
@@ -65,7 +71,7 @@ describe('maxAuthFlow — requestSms refusals', () => {
 describe('maxAuthFlow — sign-in confirmed by a phone call (callOutParams)', () => {
   function callOutFlow(statuses: { status: number; callNumber?: string }[], finish: () => Promise<{ ok: true } | { passwordRequired: true; hint: string | null }>) {
     const queue = [...statuses];
-    const finishCallOut = vi.fn(finish);
+    const finishTrack = vi.fn(finish);
     const flow = createMaxAuthFlow({
       targetGroupId: '-100',
       wait: async () => {},
@@ -75,15 +81,17 @@ describe('maxAuthFlow — sign-in confirmed by a phone call (callOutParams)', ()
         verifyCode: async () => ({ ok: true }),
         checkPassword: async () => {},
         callOutStatus: async () => queue.shift() ?? { status: 0 },
-        finishCallOut,
+        finishTrack,
+        startQr: async () => ({ qrLink: 'https://max.ru/:auth/x', pollingInterval: 5000, ttl: 120000 }),
+        qrStatus: async () => ({ loginAvailable: false, ttl: 1 }),
       },
     });
-    return { flow, finishCallOut };
+    return { flow, finishTrack };
   }
   const settle = () => new Promise((resolve) => setTimeout(resolve, 20));
 
   it('shows the number to call once, then finishes the login when MAX confirms the call', async () => {
-    const { flow, finishCallOut } = callOutFlow(
+    const { flow, finishTrack } = callOutFlow(
       [{ status: 0 }, { status: 1, callNumber: '79585383960' }, { status: 1, callNumber: '79585383960' }, { status: 2 }],
       async () => ({ ok: true }),
     );
@@ -93,7 +101,7 @@ describe('maxAuthFlow — sign-in confirmed by a phone call (callOutParams)', ()
     await settle();
     expect(phone.replies[0]).toContain('звонком');
     expect(phone.replies.filter((r) => r.includes('+79585383960'))).toHaveLength(1);
-    expect(finishCallOut).toHaveBeenCalledTimes(1);
+    expect(finishTrack).toHaveBeenCalledTimes(1);
     expect(phone.replies.at(-1)).toContain('✅ MAX авторизован');
     expect(await flow.handlePrivate(fakeCtx({ text: 'hello' }).ctx)).toBe(false); // flow over
   });
@@ -115,7 +123,7 @@ describe('maxAuthFlow — sign-in confirmed by a phone call (callOutParams)', ()
     await expired.flow.handlePrivate(phone.ctx);
     await settle();
     expect(phone.replies.at(-1)).toContain('/login');
-    expect(expired.finishCallOut).not.toHaveBeenCalled();
+    expect(expired.finishTrack).not.toHaveBeenCalled();
   });
 
   it('parses callOutParams (int64 as bigint) and formats the number', () => {
@@ -124,5 +132,57 @@ describe('maxAuthFlow — sign-in confirmed by a phone call (callOutParams)', ()
     expect(parseCallOutParams({ pollingInterval: 1 })).toBeUndefined();
     expect(formatCallNumber('79585383960')).toBe('+79585383960');
     expect(formatCallNumber('+79585383960')).toBe('+79585383960');
+  });
+});
+
+describe('maxAuthFlow — QR sign-in', () => {
+  function qrFlow(statuses: { loginAvailable: boolean; ttl: number }[]) {
+    const queue = [...statuses];
+    let n = 0;
+    const startQr = vi.fn(async () => ({ qrLink: `https://max.ru/:auth/code${++n}`, pollingInterval: 5000, ttl: 120000 }));
+    const finishTrack = vi.fn(async (): Promise<{ ok: true }> => ({ ok: true }));
+    const flow = createMaxAuthFlow({
+      targetGroupId: '-100',
+      wait: async () => {},
+      auth: {
+        getLastKnownPhone: () => '',
+        requestSms: async () => {},
+        verifyCode: async () => ({ ok: true }),
+        checkPassword: async () => {},
+        callOutStatus: async () => ({ status: 0 }),
+        finishTrack,
+        startQr,
+        qrStatus: async () => queue.shift() ?? { loginAvailable: false, ttl: 0 },
+      },
+    });
+    return { flow, startQr, finishTrack };
+  }
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 20));
+
+  it('sends the QR as a PNG with an «open in MAX» link, refreshes an expired code, and logs in once confirmed', async () => {
+    const { flow, startQr, finishTrack } = qrFlow([{ loginAvailable: false, ttl: 60000 }, { loginAvailable: false, ttl: 0 }, { loginAvailable: true, ttl: 50000 }]);
+    const start = fakeCtx({ text: '/login' });
+    await flow.handlePrivate(start.ctx);
+    expect(start.replies[0]).toContain('QR');
+    const pick = fakeCtx({ data: 'maxauth:qr' });
+    await flow.handlePrivate(pick.ctx);
+    await settle();
+    expect(pick.replies[0]).toMatch(/^\[photo PNG\].*https:\/\/max\.ru\/:auth\/code1$/);
+    expect(pick.replies[1]).toMatch(/^\[photo PNG\] 🔄 Новый код[\s\S]*code2$/);
+    expect(startQr).toHaveBeenCalledTimes(2);
+    expect(startQr).toHaveBeenLastCalledWith(true);
+    expect(finishTrack).toHaveBeenCalledTimes(1);
+    expect(pick.replies.at(-1)).toContain('✅ MAX авторизован');
+  });
+
+  it('gives up after five expired codes', async () => {
+    const { flow, startQr, finishTrack } = qrFlow([]);
+    await flow.handlePrivate(fakeCtx({ text: '/login' }).ctx);
+    const pick = fakeCtx({ data: 'maxauth:qr' });
+    await flow.handlePrivate(pick.ctx);
+    await settle();
+    expect(startQr).toHaveBeenCalledTimes(5);
+    expect(finishTrack).not.toHaveBeenCalled();
+    expect(pick.replies.at(-1)).toContain('/login');
   });
 });

@@ -27,16 +27,28 @@ export interface CallOutStatus {
   callNumber?: string;
 }
 
-/** Exported for tests. Numbers may arrive as bigint (msgpack int64). */
+export interface QrLogin {
+  trackId: string;
+  /** What the QR code encodes (https://max.ru/:auth/…) — scanned, or opened, in the MAX app. */
+  qrLink: string;
+  pollingInterval: number;
+  /** How long the code stays valid, ms. */
+  ttl: number;
+}
+
+/** msgpack int64 arrives as bigint. */
+const toNumber = (v: unknown): number => (typeof v === 'number' ? v : typeof v === 'bigint' ? Number(v) : 0);
+
+/** Exported for tests. */
 export function parseCallOutParams(raw: unknown): CallOutParams | undefined {
   if (!raw || typeof raw !== 'object') return undefined;
   const r = raw as Record<string, unknown>;
   if (typeof r.trackId !== 'string' || !r.trackId) return undefined;
-  const num = (v: unknown): number => (typeof v === 'number' ? v : typeof v === 'bigint' ? Number(v) : 0);
-  return { trackId: r.trackId, pollingInterval: num(r.pollingInterval) || 5000, expiresAt: num(r.expiresAt) };
+  return { trackId: r.trackId, pollingInterval: toNumber(r.pollingInterval) || 5000, expiresAt: toNumber(r.expiresAt) };
 }
 
-export type VerifyCodeResult = { status: 'ok'; loginToken: string } | { status: 'password_required'; challenge: PasswordChallenge };
+/** `phone` only when the answer names the account's number (a QR sign-in has no number of its own). */
+export type VerifyCodeResult = { status: 'ok'; loginToken: string; phone?: string } | { status: 'password_required'; challenge: PasswordChallenge };
 
 export interface MaxMessageEvent {
   dir: number;
@@ -276,7 +288,18 @@ interface ResolvedOptions {
 }
 
 /** What may go out on a socket before its LOGIN OK (MaxClient.authed). */
-const PRE_LOGIN_OPCODES = new Set<number>([OPCODES.INIT, OPCODES.PING, OPCODES.START_AUTH, OPCODES.CHECK_CODE, OPCODES.CHECK_PASSWORD, OPCODES.LOGIN]);
+const PRE_LOGIN_OPCODES = new Set<number>([
+  OPCODES.INIT,
+  OPCODES.PING,
+  OPCODES.START_AUTH,
+  OPCODES.CHECK_CODE,
+  OPCODES.CHECK_PASSWORD,
+  OPCODES.LOGIN,
+  OPCODES.AUTH_QR_CREATE,
+  OPCODES.AUTH_QR_STATUS,
+  OPCODES.AUTH_TRACK_LOGIN,
+  OPCODES.AUTH_CALLOUT_STATUS,
+]);
 
 export class MaxClient extends EventEmitter {
   readonly deviceId: string;
@@ -704,11 +727,37 @@ export class MaxClient extends EventEmitter {
     return { status, callNumber: typeof p.callNumber === 'string' && p.callNumber ? p.callNumber : undefined };
   }
 
-  /** Finishes a confirmed call-out sign-in: answers exactly like verifyCode (login token or a password challenge). */
+  /** Starts a QR sign-in (see OPCODES.AUTH_QR_CREATE): the link to show as a QR code and the track to poll. */
+  async createQr(): Promise<QrLogin> {
+    const { dir, payload } = await this.request(OPCODES.AUTH_QR_CREATE, {});
+    const p = (payload ?? {}) as Record<string, unknown>;
+    if (dir === DIR.ERR || typeof p.trackId !== 'string' || typeof p.qrLink !== 'string') {
+      throw new Error(describeAuthError(payload, 'MAX не выдал QR-код для входа'));
+    }
+    return { trackId: p.trackId, qrLink: p.qrLink, pollingInterval: toNumber(p.pollingInterval) || 5000, ttl: toNumber(p.ttl) };
+  }
+
+  /** Polls a QR sign-in: whether the code was confirmed in the MAX app, and how long it stays valid (ms). */
+  async qrStatus(trackId: string): Promise<{ loginAvailable: boolean; ttl: number }> {
+    const { dir, payload } = await this.request(OPCODES.AUTH_QR_STATUS, { trackId });
+    const p = (payload ?? {}) as Record<string, unknown>;
+    if (dir === DIR.ERR) {
+      if (p.error === 'track.not.found') return { loginAvailable: false, ttl: 0 };
+      throw new Error(describeAuthError(payload, 'AUTH_QR_STATUS failed'));
+    }
+    const status = (p.status ?? {}) as Record<string, unknown>;
+    return { loginAvailable: status.loginAvailable === true, ttl: toNumber(status.ttl) };
+  }
+
+  /** Finishes a confirmed call-out or QR sign-in: answers like verifyCode (login token or a password challenge). */
   async finishTrackLogin(trackId: string): Promise<VerifyCodeResult> {
     const { dir, payload } = await this.request(OPCODES.AUTH_TRACK_LOGIN, { trackId });
     const token = findLongToken(payload);
-    if (dir !== DIR.ERR && token) return { status: 'ok', loginToken: token };
+    if (dir !== DIR.ERR && token) {
+      const raw = (payload as { profile?: { contact?: { phone?: unknown } } } | undefined)?.profile?.contact?.phone;
+      const phone = typeof raw === 'number' || typeof raw === 'bigint' ? `+${raw}` : typeof raw === 'string' && raw ? raw : undefined;
+      return { status: 'ok', loginToken: token, phone };
+    }
     const challenge = extractPasswordChallenge(payload);
     if (challenge) return { status: 'password_required', challenge };
     throw new Error(describeAuthError(payload, 'MAX не выдал вход после подтверждения звонком — начните заново: /login'));

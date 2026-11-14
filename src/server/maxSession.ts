@@ -1,4 +1,4 @@
-import { isMaxServerError, type CallOutParams, type CallOutStatus, type VerifyCodeResult } from '../max/client.js';
+import { isMaxServerError, type CallOutParams, type CallOutStatus, type QrLogin, type VerifyCodeResult } from '../max/client.js';
 import type { MaxSession } from '../store/sessionStore.js';
 import { RetryBackoff } from '../bridge/catchUp.js';
 import { MaxAuthUnavailableError } from '../bridge/maxAuthFlow.js';
@@ -47,6 +47,8 @@ export interface SessionClient {
   requestSms(phone: string): Promise<{ token: string; callOut?: CallOutParams }>;
   verifyCode(authToken: string, code: string): Promise<VerifyCodeResult>;
   callOutStatus(trackId: string): Promise<CallOutStatus>;
+  createQr(): Promise<QrLogin>;
+  qrStatus(trackId: string): Promise<{ loginAvailable: boolean; ttl: number }>;
   finishTrackLogin(trackId: string): Promise<VerifyCodeResult>;
   checkPassword(trackId: string, password: string): Promise<string>;
   logout(): Promise<void>;
@@ -117,8 +119,8 @@ export class MaxSessionController {
   private pendingAuthToken: string | null = null;
   /** Set when verifyCode() comes back password_required — cleared only on a successful login, since the trackId survives a wrong password and can be retried (confirmed live 2026-08-14). */
   private pendingPasswordTrackId: string | null = null;
-  /** START_AUTH asked for a phone call instead of an SMS code: the track to poll and finish. */
-  private pendingCallOutTrackId: string | null = null;
+  /** A call-out or QR sign-in in progress: the track to poll and finish (AUTH_TRACK_LOGIN). */
+  private pendingTrackId: string | null = null;
   private authChainStartedAt: number | null = null;
   private resumeRejections = 0;
   private readonly resumeBackoff = new RetryBackoff(RESUME_RETRY_DELAY_MS, 60_000);
@@ -337,9 +339,8 @@ export class MaxSessionController {
 
   // --- /login: the Telegram flow (maxAuthFlow.ts) drives these three — the only way to log in ---
 
-  async requestSms(rawPhone: string): Promise<{ callOut: CallOutParams } | undefined> {
-    const phone = rawPhone.replace(/[^\d+]/g, '');
-    if (!phone) throw new Error('Пустой номер телефона');
+  /** The socket an auth chain runs on: a fresh one when not logged in; refused while paused or offline. */
+  private async prepareAuthSocket(): Promise<void> {
     if (!this.session) {
       // A FRESH socket first: one left over from a rejected session refuses START_AUTH with
       // «Недопустимое состояние сессии» (hit live 2026-08-18). A pause ends here, timer included,
@@ -351,6 +352,12 @@ export class MaxSessionController {
     } else if (this.state_ === 'connecting' || this.state_ === 'stopped') {
       throw new MaxAuthUnavailableError('Нет связи с MAX — подождите минуту и повторите /login.');
     }
+  }
+
+  async requestSms(rawPhone: string): Promise<{ callOut: CallOutParams } | undefined> {
+    const phone = rawPhone.replace(/[^\d+]/g, '');
+    if (!phone) throw new Error('Пустой номер телефона');
+    await this.prepareAuthSocket();
     // An auth chain now runs on this socket: a pending resume retry defers itself (armResumeRetry)
     // but is NOT ended — it is the only thing that reconnects after a failed resume LOGIN, and
     // ending it left the bridge on that dead socket when the user abandoned the flow.
@@ -365,7 +372,7 @@ export class MaxSessionController {
       throw err;
     }
     this.pendingAuthToken = started.token;
-    this.pendingCallOutTrackId = started.callOut?.trackId ?? null;
+    this.pendingTrackId = started.callOut?.trackId ?? null;
     this.pendingPhone = phone;
     if (started.callOut) {
       logger.info(`/login: MAX wants ${maskPhone(phone)} to confirm by a phone call, not an SMS code`);
@@ -377,21 +384,48 @@ export class MaxSessionController {
 
   /** Polls the pending call-out sign-in (see OPCODES.AUTH_CALLOUT_STATUS). */
   async callOutStatus(): Promise<CallOutStatus> {
-    if (!this.pendingCallOutTrackId) throw new MaxAuthUnavailableError('Подтверждение звонком уже завершено или устарело — начните заново: /login');
-    return this.deps.client.callOutStatus(this.pendingCallOutTrackId);
+    if (!this.pendingTrackId) throw new MaxAuthUnavailableError('Подтверждение звонком уже завершено или устарело — начните заново: /login');
+    return this.deps.client.callOutStatus(this.pendingTrackId);
   }
 
-  /** After the call is confirmed (status 2): the same outcome as verifyCode. */
-  async finishCallOut(): Promise<{ ok: true } | { passwordRequired: true; hint: string | null }> {
-    if (!this.pendingCallOutTrackId) throw new MaxAuthUnavailableError('Подтверждение звонком уже завершено или устарело — начните заново: /login');
-    const verified = await this.deps.client.finishTrackLogin(this.pendingCallOutTrackId);
-    this.pendingCallOutTrackId = null;
+  /** Starts a QR sign-in: the link to show as a QR code. Replaces any sign-in in progress. */
+  async startQr(refresh = false): Promise<{ qrLink: string; pollingInterval: number; ttl: number }> {
+    // A refresh (the previous code expired) stays on the socket the chain already runs on.
+    if (!refresh) await this.prepareAuthSocket();
+    this.authChainStartedAt = Date.now();
+    let qr: QrLogin;
+    try {
+      qr = await this.deps.client.createQr();
+    } catch (err) {
+      this.authChainStartedAt = null;
+      logger.warn(`/login: MAX refused a QR code: ${(err as Error).message}`);
+      throw err;
+    }
+    this.pendingTrackId = qr.trackId;
+    this.pendingAuthToken = null;
+    this.pendingPhone = '';
+    logger.info('/login: QR sign-in started');
+    return { qrLink: qr.qrLink, pollingInterval: qr.pollingInterval, ttl: qr.ttl };
+  }
+
+  /** Polls the pending QR sign-in: confirmed in the MAX app yet, and ms left before the code expires. */
+  async qrStatus(): Promise<{ loginAvailable: boolean; ttl: number }> {
+    if (!this.pendingTrackId) throw new MaxAuthUnavailableError('Вход по QR-коду уже завершён или устарел — начните заново: /login');
+    return this.deps.client.qrStatus(this.pendingTrackId);
+  }
+
+  /** A confirmed call-out or QR sign-in: the same outcome as verifyCode. */
+  async finishTrack(): Promise<{ ok: true } | { passwordRequired: true; hint: string | null }> {
+    if (!this.pendingTrackId) throw new MaxAuthUnavailableError('Вход уже завершён или устарел — начните заново: /login');
+    const verified = await this.deps.client.finishTrackLogin(this.pendingTrackId);
+    this.pendingTrackId = null;
     if (verified.status === 'password_required') {
       this.pendingPasswordTrackId = verified.challenge.trackId;
       return { passwordRequired: true, hint: verified.challenge.hint ?? null };
     }
     this.pendingAuthToken = null;
-    logger.info(`/login: call confirmed for ${maskPhone(this.pendingPhone)}`);
+    if (verified.phone) this.pendingPhone = verified.phone;
+    logger.info(`/login: sign-in confirmed${this.pendingPhone ? ` for ${maskPhone(this.pendingPhone)}` : ''}`);
     await this.completeLogin(verified.loginToken);
     return { ok: true };
   }

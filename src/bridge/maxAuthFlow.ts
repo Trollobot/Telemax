@@ -1,6 +1,7 @@
 import { Markup, type Context } from 'telegraf';
 import { createLogger } from '../logger.js';
 import { maskPhone } from './status.js';
+import { qrPng } from './qr.js';
 import { isTransientMaxError } from './transient.js';
 
 const logger = createLogger('maxauth');
@@ -13,8 +14,12 @@ export interface MaxAuthCallbacks {
   requestSms: (phone: string) => Promise<void | { callOut: { pollingInterval: number } }>;
   /** A pending call-out sign-in: 0 waiting, 1 number to call ready, 2 confirmed, 3 expired. */
   callOutStatus: () => Promise<{ status: number; callNumber?: string }>;
-  /** Completes a confirmed call-out sign-in — the same outcome as verifyCode. */
-  finishCallOut: () => Promise<{ ok: true } | { passwordRequired: true; hint: string | null }>;
+  /** Completes a confirmed call-out or QR sign-in — the same outcome as verifyCode. */
+  finishTrack: () => Promise<{ ok: true } | { passwordRequired: true; hint: string | null }>;
+  /** Starts a QR sign-in (refresh: a new code on the same chain after the last one expired). */
+  startQr: (refresh?: boolean) => Promise<{ qrLink: string; pollingInterval: number; ttl: number }>;
+  /** A pending QR sign-in: confirmed in the MAX app yet, and ms before the code expires. */
+  qrStatus: () => Promise<{ loginAvailable: boolean; ttl: number }>;
   /** CHECK_CODE: completes the login, or reports that a 2FA password is still required. */
   verifyCode: (code: string) => Promise<{ ok: true } | { passwordRequired: true; hint: string | null }>;
   /** CHECK_PASSWORD: completes a 2FA login. */
@@ -44,7 +49,7 @@ export interface MaxAuthFlow {
   handlePrivate: (ctx: Context) => Promise<boolean>;
 }
 
-type Step = 'confirm' | 'phone' | 'code' | 'call' | 'password';
+type Step = 'confirm' | 'phone' | 'code' | 'call' | 'qr' | 'password';
 interface Flow {
   step: Step;
   at: number;
@@ -97,17 +102,102 @@ export function createMaxAuthFlow(opts: {
 
   async function begin(ctx: Context, chatId: number): Promise<void> {
     const phone = auth.getLastKnownPhone();
-    if (phone) {
-      setFlow(chatId, 'confirm');
-      await ctx.reply(
-        `🔐 Авторизация MAX.\nВойти с номером ${maskPhone(phone)}?`,
-        Markup.inlineKeyboard([
-          [Markup.button.callback('✅ Да', 'maxauth:yes'), Markup.button.callback('✏️ Другой номер', 'maxauth:other')],
-        ]),
-      );
-    } else {
-      setFlow(chatId, 'phone');
-      await ctx.reply('🔐 Авторизация MAX.\nПришлите номер телефона MAX в формате +7XXXXXXXXXX.');
+    setFlow(chatId, 'confirm');
+    const byPhone = phone
+      ? [Markup.button.callback(`📱 С номером ${maskPhone(phone)}`, 'maxauth:yes'), Markup.button.callback('✏️ Другой номер', 'maxauth:other')]
+      : [Markup.button.callback('📱 По номеру телефона', 'maxauth:other')];
+    await ctx.reply(
+      '🔐 Авторизация MAX. Как войти?\n\n📷 QR-код — подтвердите вход в приложении MAX, где вы уже вошли.\n📱 По номеру — MAX пришлёт код по SMS или попросит позвонить.\n\nМожно и просто прислать номер в формате +7XXXXXXXXXX.',
+      Markup.inlineKeyboard([[Markup.button.callback('📷 QR-код', 'maxauth:qr')], byPhone]),
+    );
+  }
+
+  const QR_CAPTION =
+    '📷 Отсканируйте этот код в приложении MAX, где вы уже вошли (там, где MAX предлагает подключить устройство или сканировать QR). ' +
+    'Если MAX стоит на этом же телефоне — нажмите кнопку под кодом. Код действует около 2 минут, я обновлю его сам. Отмена — /cancel.';
+
+  async function sendQr(ctx: Context, link: string, refreshed: boolean): Promise<void> {
+    await ctx.replyWithPhoto(
+      { source: qrPng(link) },
+      { caption: refreshed ? `🔄 Новый код.\n${QR_CAPTION}` : QR_CAPTION, ...Markup.inlineKeyboard([[Markup.button.url('Открыть в MAX', link)]]) },
+    );
+  }
+
+  async function startQrThen(ctx: Context, chatId: number): Promise<void> {
+    try {
+      const qr = await auth.startQr();
+      setFlow(chatId, 'qr');
+      await sendQr(ctx, qr.qrLink, false);
+      void watchQr(ctx, chatId, qr.pollingInterval);
+    } catch (err) {
+      if (await replyKnownError(ctx, chatId, err)) return;
+      flows.delete(chatId);
+      await ctx.reply(`❌ ${(err as Error).message}\nНачните заново: /login`);
+    }
+  }
+
+  /**
+   * Drives a QR sign-in in the background: polls until the code is confirmed in the MAX app (finish the
+   * login, or ask for the 2FA password), shows a fresh code when one expires (a few times, then gives
+   * up), and stops as soon as the flow is cancelled, replaced or stale.
+   */
+  async function watchQr(ctx: Context, chatId: number, pollingInterval: number): Promise<void> {
+    const MAX_CODES = 5;
+    const interval = Math.min(Math.max(pollingInterval, 1000), 10_000);
+    const stillWaiting = (): boolean => freshFlow(chatId)?.step === 'qr';
+    let codes = 1;
+    let failures = 0;
+    while (stillWaiting()) {
+      await wait(interval);
+      if (!stillWaiting()) return;
+      let st: { loginAvailable: boolean; ttl: number };
+      try {
+        st = await auth.qrStatus();
+        failures = 0;
+      } catch (err) {
+        if (isTransientMaxError(err) && ++failures < 5) continue;
+        flows.delete(chatId);
+        logger.warn('QR sign-in: status poll failed', err);
+        await ctx.reply(`❌ Не удалось узнать у MAX, подтверждён ли вход: ${(err as Error).message}\nНачните заново: /login`).catch(() => {});
+        return;
+      }
+      if (st.loginAvailable) {
+        await finishTrackThen(ctx, chatId, '📷 Вход подтверждён в приложении.');
+        return;
+      }
+      if (st.ttl > 0) continue;
+      if (codes >= MAX_CODES) {
+        flows.delete(chatId);
+        await ctx.reply('⌛ QR-код так и не подтвердили. Начните заново: /login').catch(() => {});
+        return;
+      }
+      try {
+        const qr = await auth.startQr(true);
+        codes++;
+        if (stillWaiting()) await sendQr(ctx, qr.qrLink, true);
+      } catch (err) {
+        flows.delete(chatId);
+        await ctx.reply(`❌ ${(err as Error).message}\nНачните заново: /login`).catch(() => {});
+        return;
+      }
+    }
+  }
+
+  /** The common end of a call-out or QR sign-in. */
+  async function finishTrackThen(ctx: Context, chatId: number, confirmed: string): Promise<void> {
+    try {
+      const result = await auth.finishTrack();
+      if ('passwordRequired' in result) {
+        setFlow(chatId, 'password');
+        const hint = result.hint ? `\nПодсказка: ${result.hint}` : '';
+        await ctx.reply(`🔐 ${confirmed} На аккаунте включён пароль (2FA).${hint}\nПришлите пароль — я удалю ваше сообщение сразу после проверки.`);
+      } else {
+        flows.delete(chatId);
+        await announceAuthed(ctx);
+      }
+    } catch (err) {
+      flows.delete(chatId);
+      await ctx.reply(`❌ ${(err as Error).message}`).catch(() => {});
     }
   }
 
@@ -179,20 +269,7 @@ export function createMaxAuthFlow(opts: {
           )
           .catch(() => {});
       } else if (st.status === 2) {
-        try {
-          const result = await auth.finishCallOut();
-          if ('passwordRequired' in result) {
-            setFlow(chatId, 'password');
-            const hint = result.hint ? `\nПодсказка: ${result.hint}` : '';
-            await ctx.reply(`🔐 Звонок подтверждён. На аккаунте включён пароль (2FA).${hint}\nПришлите пароль — я удалю ваше сообщение сразу после проверки.`);
-          } else {
-            flows.delete(chatId);
-            await announceAuthed(ctx);
-          }
-        } catch (err) {
-          flows.delete(chatId);
-          await ctx.reply(`❌ ${(err as Error).message}`).catch(() => {});
-        }
+        await finishTrackThen(ctx, chatId, 'Звонок подтверждён.');
         return;
       } else if (st.status === 3) {
         flows.delete(chatId);
@@ -220,6 +297,10 @@ export function createMaxAuthFlow(opts: {
       return;
     }
     await ctx.answerCbQuery().catch(() => {});
+    if (data === 'maxauth:qr') {
+      await startQrThen(ctx, chatId);
+      return;
+    }
     if (data === 'maxauth:other') {
       setFlow(chatId, 'phone');
       await ctx.reply('Пришлите номер телефона MAX в формате +7XXXXXXXXXX.');
@@ -235,7 +316,7 @@ export function createMaxAuthFlow(opts: {
 
     // Inline confirm buttons (only ever sent by this flow, so they're always ours).
     const cbData = (ctx.callbackQuery as { data?: string } | undefined)?.data;
-    if (cbData === 'maxauth:yes' || cbData === 'maxauth:other') {
+    if (cbData === 'maxauth:yes' || cbData === 'maxauth:other' || cbData === 'maxauth:qr') {
       await handleConfirmButton(ctx, chatId, cbData, userId);
       return true;
     }
@@ -272,6 +353,9 @@ export function createMaxAuthFlow(opts: {
     switch (flow.step) {
       case 'call':
         await ctx.reply('📞 Жду звонка на номер выше — я сам увижу, что он прошёл. Отмена — /cancel.');
+        return true;
+      case 'qr':
+        await ctx.reply('📷 Жду подтверждения QR-кода в приложении MAX — я сам увижу, что вход подтверждён. Отмена — /cancel.');
         return true;
       case 'confirm': // user typed instead of tapping — treat it as a fresh number
       case 'phone':
