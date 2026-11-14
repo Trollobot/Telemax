@@ -59,10 +59,17 @@ describe('loadFileEnv (NAME_FILE → NAME)', () => {
   });
 
   it('keeps an explicitly set variable and ignores an empty _FILE', () => {
-    const env: NodeJS.ProcessEnv = { TELEGRAM_BOT_TOKEN: 'direct', TELEGRAM_BOT_TOKEN_FILE: '/run/secrets/token', X_FILE: '' };
+    const env: NodeJS.ProcessEnv = { TELEGRAM_BOT_TOKEN: 'direct', TELEGRAM_BOT_TOKEN_FILE: '/run/secrets/token', TELEGRAM_PROXY_FILE: '' };
     loadFileEnv(env, read);
     expect(env.TELEGRAM_BOT_TOKEN).toBe('direct');
-    expect(env.X).toBeUndefined();
+    expect(env.TELEGRAM_PROXY).toBeUndefined();
+  });
+
+  it('reads only the known secret names, never an unrelated *_FILE', () => {
+    const env: NodeJS.ProcessEnv = { SSL_CERT_FILE: '/nope', COMPOSE_FILE: '/run/secrets/token' };
+    expect(() => loadFileEnv(env, read)).not.toThrow();
+    expect(env.SSL_CERT).toBeUndefined();
+    expect(env.COMPOSE).toBeUndefined();
   });
 
   it('throws on a configured but unreadable file', () => {

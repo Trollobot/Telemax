@@ -16,6 +16,10 @@ export function parseEnvBool(raw: string | undefined): boolean | undefined {
   return undefined;
 }
 
+/** The settings that may come from a file. A fixed list: an unrelated *_FILE in the environment
+ * (SSL_CERT_FILE, COMPOSE_FILE…) must not be read in — or stop the start when its file is missing. */
+export const SECRET_FILE_VARS = ['TELEGRAM_BOT_TOKEN', 'MAX_SESSION_KEY', 'TELEGRAM_PROXY', 'TARGET_TELEGRAM_GROUP'] as const;
+
 /**
  * Docker-secrets convention (as in the postgres/mysql images): NAME_FILE=/run/secrets/name fills
  * NAME from that file, trailing newline trimmed — so a token or key need not sit in .env or in the
@@ -23,9 +27,10 @@ export function parseEnvBool(raw: string | undefined): boolean | undefined {
  * configured but missing must stop the start, not silently run without it.
  */
 export function loadFileEnv(env: NodeJS.ProcessEnv = process.env, read = (p: string) => readFileSync(p, 'utf8')): void {
-  for (const [key, file] of Object.entries(env)) {
-    if (!key.endsWith('_FILE') || !file?.trim()) continue;
-    const name = key.slice(0, -'_FILE'.length);
+  for (const name of SECRET_FILE_VARS) {
+    const key = `${name}_FILE`;
+    const file = env[key];
+    if (!file?.trim()) continue;
     if (env[name]) continue;
     try {
       env[name] = read(file.trim()).replace(/\r?\n$/, '');
