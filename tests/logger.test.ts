@@ -59,3 +59,12 @@ describe('jsonStringify', () => {
     expect(jsonStringify({ id: 123n })).toBe('{"id":"123n"}');
   });
 });
+
+describe('safeUrl / redactSecrets on links', () => {
+  it('keeps scheme, host and path, drops the query that carries the CDN access token', async () => {
+    const { safeUrl, redactSecrets } = await import('../src/logger.js');
+    expect(safeUrl('https://i.oneme.ru/i?r=SECRETTOKEN&fn=x')).toBe('https://i.oneme.ru/i?…');
+    expect(safeUrl('not a url')).toBe('[unparseable url]');
+    expect(redactSecrets({ baseUrl: 'https://vd1.okcdn.ru/?sig=abc', n: 1 })).toEqual({ baseUrl: 'https://vd1.okcdn.ru/?…', n: 1 });
+  });
+});

@@ -111,12 +111,12 @@ describe('describeTokenShape', () => {
   it('masks the value: length, 4 chars at each end, character classes', () => {
     const value = 'Ab12' + ':|'.repeat(300) + 'Zz89';
     const shape = describeTokenShape(value);
-    expect(shape).toBe('length=608, starts "Ab12…", ends "…Zz89", classes: lower upper digit, other chars: ":|"');
+    expect(shape).toBe('length=608, classes: lower upper digit, other chars: ":|"');
     expect(shape).not.toContain(':|:|:|');
   });
 
   it('reports a value with no letters or digits', () => {
-    expect(describeTokenShape('----')).toBe('length=4, starts "----…", ends "…----", classes: none, other chars: "-"');
+    expect(describeTokenShape('----')).toBe('length=4, classes: none, other chars: "-"');
   });
 });
 
