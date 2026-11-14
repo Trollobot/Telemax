@@ -87,8 +87,11 @@ function runFfmpeg(args: string[]): Promise<void> {
 /** Renders a .tgs buffer (raw or gzip-compressed) to a short WebM (VP9) video buffer. */
 export async function renderTgsToWebm(tgsBuffer: Buffer): Promise<Buffer> {
   const lottieJson = parseLottieJson(tgsBuffer);
-  const width = lottieJson.w || 512;
-  const height = lottieJson.h || 512;
+  // From the sticker file itself: numbers within reason only — a string would land unescaped in the
+  // page's style attribute, a huge number would ask Chromium for gigabytes.
+  const dim = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) && v > 0 && v <= 2048 ? Math.round(v) : 512);
+  const width = dim(lottieJson.w);
+  const height = dim(lottieJson.h);
   const nativeFr = lottieJson.fr || 60;
   const ip = lottieJson.ip ?? 0;
   const op = lottieJson.op ?? ip + nativeFr * 3;
