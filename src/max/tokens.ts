@@ -43,8 +43,8 @@ export function couldBeToken(value: string, length = SESSION_TOKEN_LENGTH): bool
 }
 
 /**
- * A masked, log-safe description of a fallback candidate — length, first/last 4 characters and
- * the character classes it uses — so the real alphabet can be captured from the logs.
+ * A log-safe description of a fallback candidate — its length and the character classes it uses,
+ * no characters of the token itself — so the real alphabet can be captured from the logs.
  */
 export function describeTokenShape(value: string): string {
   const classes: string[] = [];
