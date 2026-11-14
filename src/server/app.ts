@@ -399,6 +399,8 @@ async function startServer(): Promise<void> {
         auth: {
           getLastKnownPhone: () => maxSession.lastKnownPhone,
           requestSms: (phone) => maxSession.requestSms(phone),
+          callOutStatus: () => maxSession.callOutStatus(),
+          finishCallOut: () => maxSession.finishCallOut(),
           verifyCode: (code) => maxSession.verifyCode(code),
           checkPassword: (password) => maxSession.checkPassword(password),
         },

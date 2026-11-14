@@ -9,8 +9,12 @@ const logger = createLogger('maxauth');
 export interface MaxAuthCallbacks {
   /** Last phone we authenticated with ('' if none) — lets the flow offer a one-tap re-auth. */
   getLastKnownPhone: () => string;
-  /** START_AUTH: send the SMS. Throws with a human-readable message on failure. */
-  requestSms: (phone: string) => Promise<void>;
+  /** START_AUTH: send the SMS — or, when MAX wants a phone call instead, return its call-out offer. Throws with a human-readable message on failure. */
+  requestSms: (phone: string) => Promise<void | { callOut: { pollingInterval: number } }>;
+  /** A pending call-out sign-in: 0 waiting, 1 number to call ready, 2 confirmed, 3 expired. */
+  callOutStatus: () => Promise<{ status: number; callNumber?: string }>;
+  /** Completes a confirmed call-out sign-in — the same outcome as verifyCode. */
+  finishCallOut: () => Promise<{ ok: true } | { passwordRequired: true; hint: string | null }>;
   /** CHECK_CODE: completes the login, or reports that a 2FA password is still required. */
   verifyCode: (code: string) => Promise<{ ok: true } | { passwordRequired: true; hint: string | null }>;
   /** CHECK_PASSWORD: completes a 2FA login. */
@@ -40,7 +44,7 @@ export interface MaxAuthFlow {
   handlePrivate: (ctx: Context) => Promise<boolean>;
 }
 
-type Step = 'confirm' | 'phone' | 'code' | 'password';
+type Step = 'confirm' | 'phone' | 'code' | 'call' | 'password';
 interface Flow {
   step: Step;
   at: number;
@@ -50,8 +54,19 @@ interface Flow {
 // be swallowed as auth input instead of becoming a bug report). Ten minutes is plenty for an SMS.
 const FLOW_TTL_MS = 10 * 60_000;
 
-export function createMaxAuthFlow(opts: { targetGroupId: string; auth: MaxAuthCallbacks }): MaxAuthFlow {
+/** A number as MAX sends it (sometimes without «+») in the international form. Exported for tests. */
+export function formatCallNumber(raw: string): string {
+  return /^[+8]/.test(raw) ? raw : `+${raw}`;
+}
+
+export function createMaxAuthFlow(opts: {
+  targetGroupId: string;
+  auth: MaxAuthCallbacks;
+  /** Pause between call-out polls; overridable for tests. */
+  wait?: (ms: number) => Promise<void>;
+}): MaxAuthFlow {
   const { targetGroupId, auth } = opts;
+  const wait = opts.wait ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const flows = new Map<number, Flow>();
 
   async function isGroupAdmin(ctx: Context, userId: number): Promise<boolean> {
@@ -98,7 +113,13 @@ export function createMaxAuthFlow(opts: { targetGroupId: string; auth: MaxAuthCa
 
   async function requestSmsThen(ctx: Context, chatId: number, phone: string): Promise<void> {
     try {
-      await auth.requestSms(phone);
+      const started = await auth.requestSms(phone);
+      if (started && 'callOut' in started) {
+        setFlow(chatId, 'call');
+        await ctx.reply('📞 MAX подтверждает этот вход не кодом из SMS, а звонком: вы звоните с телефона, на который зарегистрирован аккаунт, на номер, который даст MAX. Запрашиваю номер…');
+        void watchCallOut(ctx, chatId, started.callOut.pollingInterval);
+        return;
+      }
       setFlow(chatId, 'code');
       await ctx.reply('📲 Код отправлен по SMS. Пришлите его сюда одним сообщением.');
     } catch (err) {
@@ -122,6 +143,63 @@ export function createMaxAuthFlow(opts: { targetGroupId: string; auth: MaxAuthCa
     logger.warn('MAX auth step failed on the connection', err);
     await ctx.reply('❌ MAX не ответил — пришлите ещё раз или /cancel.');
     return true;
+  }
+
+  /**
+   * Drives a call-out sign-in in the background: polls MAX until it gives the number to call (shown,
+   * and shown again if MAX changes it), then until the call is confirmed (finish the login, or ask for
+   * the 2FA password) or the offer expires. Stops as soon as the flow is cancelled, replaced or stale.
+   */
+  async function watchCallOut(ctx: Context, chatId: number, pollingInterval: number): Promise<void> {
+    const interval = Math.min(Math.max(pollingInterval, 1000), 10_000);
+    const stillCalling = (): boolean => freshFlow(chatId)?.step === 'call';
+    let shown = '';
+    let failures = 0;
+    while (stillCalling()) {
+      await wait(interval);
+      if (!stillCalling()) return;
+      let st: { status: number; callNumber?: string };
+      try {
+        st = await auth.callOutStatus();
+        failures = 0;
+      } catch (err) {
+        if (isTransientMaxError(err) && ++failures < 5) continue;
+        flows.delete(chatId);
+        logger.warn('Call-out sign-in: status poll failed', err);
+        await ctx.reply(`❌ Не удалось узнать у MAX, прошёл ли звонок: ${(err as Error).message}\nНачните заново: /login`).catch(() => {});
+        return;
+      }
+      if (st.status === 1 && st.callNumber && st.callNumber !== shown) {
+        const again = shown !== '';
+        shown = st.callNumber;
+        await ctx
+          .reply(
+            `📞 ${again ? 'MAX сменил номер. ' : ''}Позвоните с телефона аккаунта MAX на ${formatCallNumber(st.callNumber)}. ` +
+              'Если ответит робот — следуйте его подсказкам. Я сам увижу, что звонок прошёл. Отмена — /cancel.',
+          )
+          .catch(() => {});
+      } else if (st.status === 2) {
+        try {
+          const result = await auth.finishCallOut();
+          if ('passwordRequired' in result) {
+            setFlow(chatId, 'password');
+            const hint = result.hint ? `\nПодсказка: ${result.hint}` : '';
+            await ctx.reply(`🔐 Звонок подтверждён. На аккаунте включён пароль (2FA).${hint}\nПришлите пароль — я удалю ваше сообщение сразу после проверки.`);
+          } else {
+            flows.delete(chatId);
+            await announceAuthed(ctx);
+          }
+        } catch (err) {
+          flows.delete(chatId);
+          await ctx.reply(`❌ ${(err as Error).message}`).catch(() => {});
+        }
+        return;
+      } else if (st.status === 3) {
+        flows.delete(chatId);
+        await ctx.reply('⌛ Время на звонок вышло. Начните заново: /login').catch(() => {});
+        return;
+      }
+    }
   }
 
   async function announceAuthed(ctx: Context): Promise<void> {
@@ -192,6 +270,9 @@ export function createMaxAuthFlow(opts: { targetGroupId: string; auth: MaxAuthCa
     }
 
     switch (flow.step) {
+      case 'call':
+        await ctx.reply('📞 Жду звонка на номер выше — я сам увижу, что он прошёл. Отмена — /cancel.');
+        return true;
       case 'confirm': // user typed instead of tapping — treat it as a fresh number
       case 'phone':
         await requestSmsThen(ctx, chatId, text);

@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { MaxServerError } from '../src/max/client.js';
+import { MaxServerError, type CallOutParams } from '../src/max/client.js';
 import { OPCODES } from '../src/max/opcodes.js';
 import { configureErrorReporter } from '../src/bridge/errorReporter.js';
 import { MaxAuthUnavailableError } from '../src/bridge/maxAuthFlow.js';
@@ -24,7 +24,9 @@ class FakeClient extends EventEmitter {
   });
   disconnect = vi.fn();
   login = vi.fn<(token: string) => Promise<{ sessionToken: string; payload: unknown }>>();
-  requestSms = vi.fn(async () => 'auth-token');
+  requestSms = vi.fn(async (): Promise<{ token: string; callOut?: CallOutParams }> => ({ token: 'auth-token' }));
+  callOutStatus = vi.fn(async () => ({ status: 0 }));
+  finishTrackLogin = vi.fn();
   verifyCode = vi.fn(async () => ({ status: 'ok' as const, loginToken: 'login-token' }));
   checkPassword = vi.fn(async () => 'login-token');
   logout = vi.fn(async () => {});

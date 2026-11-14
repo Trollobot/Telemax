@@ -11,6 +11,31 @@ import { createLogger, redactSecrets } from '../logger.js';
 
 const logger = createLogger('max-client');
 
+/** START_AUTH's offer to confirm the sign-in by a phone call instead of an SMS code (see OPCODES.AUTH_CALLOUT_STATUS). */
+export interface CallOutParams {
+  trackId: string;
+  /** How often MAX wants to be polled, ms. */
+  pollingInterval: number;
+  /** Epoch ms after which the offer is gone (0 when MAX did not say). */
+  expiresAt: number;
+}
+
+export interface CallOutStatus {
+  /** 0 waiting, 1 number to call is ready, 2 call confirmed, 3 expired. */
+  status: number;
+  /** The number to call from the account's phone (status 1). */
+  callNumber?: string;
+}
+
+/** Exported for tests. Numbers may arrive as bigint (msgpack int64). */
+export function parseCallOutParams(raw: unknown): CallOutParams | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.trackId !== 'string' || !r.trackId) return undefined;
+  const num = (v: unknown): number => (typeof v === 'number' ? v : typeof v === 'bigint' ? Number(v) : 0);
+  return { trackId: r.trackId, pollingInterval: num(r.pollingInterval) || 5000, expiresAt: num(r.expiresAt) };
+}
+
 export type VerifyCodeResult = { status: 'ok'; loginToken: string } | { status: 'password_required'; challenge: PasswordChallenge };
 
 export interface MaxMessageEvent {
@@ -646,7 +671,7 @@ export class MaxClient extends EventEmitter {
     return run;
   }
 
-  async requestSms(phone: string): Promise<string> {
+  async requestSms(phone: string): Promise<{ token: string; callOut?: CallOutParams }> {
     const { dir, payload } = await this.request(OPCODES.START_AUTH, { phone, type: 'START_AUTH' });
     const token = findAuthToken(payload);
     // What MAX said about the code — field names plus numeric/boolean values (code length, resend
@@ -660,11 +685,33 @@ export class MaxClient extends EventEmitter {
     logger.info(`START_AUTH answered ${dir === DIR.ERR ? 'with an error' : 'ok'}: {${shape}}`);
     // How else MAX offers to deliver the code (a call instead of SMS): not secret, shown whole.
     const callOut = (payload as Record<string, unknown> | undefined)?.callOutParams;
-    if (callOut !== undefined) logger.info(`START_AUTH callOutParams: ${JSON.stringify(redactSecrets(callOut))}`);
+    if (callOut !== undefined) logger.info(`START_AUTH callOutParams: ${JSON.stringify(redactSecrets(callOut), (_k, v) => (typeof v === 'bigint' ? Number(v) : v))}`);
     if (dir === DIR.ERR || !token) {
       throw new Error(describeAuthError(payload, 'START_AUTH did not return an auth token'));
     }
-    return token;
+    return { token, callOut: parseCallOutParams(callOut) };
+  }
+
+  /** Polls a call-out sign-in (see OPCODES.AUTH_CALLOUT_STATUS). An unknown track is reported as expired. */
+  async callOutStatus(trackId: string): Promise<CallOutStatus> {
+    const { dir, payload } = await this.request(OPCODES.AUTH_CALLOUT_STATUS, { trackId });
+    const p = (payload ?? {}) as Record<string, unknown>;
+    if (dir === DIR.ERR) {
+      if (p.error === 'track.not.found') return { status: 3 };
+      throw new Error(describeAuthError(payload, 'AUTH_CALLOUT_STATUS failed'));
+    }
+    const status = typeof p.status === 'number' ? p.status : 0;
+    return { status, callNumber: typeof p.callNumber === 'string' && p.callNumber ? p.callNumber : undefined };
+  }
+
+  /** Finishes a confirmed call-out sign-in: answers exactly like verifyCode (login token or a password challenge). */
+  async finishTrackLogin(trackId: string): Promise<VerifyCodeResult> {
+    const { dir, payload } = await this.request(OPCODES.AUTH_TRACK_LOGIN, { trackId });
+    const token = findLongToken(payload);
+    if (dir !== DIR.ERR && token) return { status: 'ok', loginToken: token };
+    const challenge = extractPasswordChallenge(payload);
+    if (challenge) return { status: 'password_required', challenge };
+    throw new Error(describeAuthError(payload, 'MAX не выдал вход после подтверждения звонком — начните заново: /login'));
   }
 
   /**
