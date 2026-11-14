@@ -19,6 +19,7 @@ import { BUGREPORT_BOT_DESCRIPTION, isBugReportInboxEnabled } from '../bridge/bu
 import { noteBoot, reportError } from '../bridge/telemetry.js';
 import { createLogger } from '../logger.js';
 import { config } from './config.js';
+import { installQuietSends } from '../telegram/quiet.js';
 import { MaxSessionController } from './maxSession.js';
 import { getTelegramProxyAgent, initTelegramProxy } from '../telegram/proxy.js';
 
@@ -745,7 +746,9 @@ async function launchTelegramBotWithRetry(bot: Telegraf, attempt = 0): Promise<v
 function createBotSafely(token: string): Telegraf | null {
   try {
     const agent = getTelegramProxyAgent();
-    return new Telegraf(token, agent ? { telegram: { agent } } : undefined);
+    const bot = new Telegraf(token, agent ? { telegram: { agent } } : undefined);
+    installQuietSends(bot.telegram as unknown as Parameters<typeof installQuietSends>[0]);
+    return bot;
   } catch (err) {
     logger.error('Failed to create Telegram bot:', err);
     return null;

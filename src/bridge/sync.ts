@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { parseEnvBool } from '../env.js';
 import { rm, stat, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { Markup, type Context, type Telegraf } from 'telegraf';
@@ -10,6 +11,7 @@ import { cursorToMs, type ChatMapStore } from '../store/chatMapStore.js';
 import type { SettingsStore } from '../store/settingsStore.js';
 import { DEFAULT_HISTORY_DAYS, HISTORY_DAY_CHOICES, historyChoiceKeyboard, historyDaysLabel, historyDaysNotice, historyQuestionText } from './history.js';
 import { ensureTopicForMaxChat, clampTopicTitle } from '../telegram/bot.js';
+import { quietlyIf } from '../telegram/quiet.js';
 import {
   downloadMaxAttachment,
   describeAttachment,
@@ -970,6 +972,17 @@ export function historyLimitNotice(limit: number, channel = false): string {
 /** A catch-up also delivers the live message that set it off: only a message at least this old at delivery is «late». */
 const LATE_MIN_AGE_MS = 5 * 60_000;
 
+/** QUIET_HISTORY=off (0/false/no) lets history and catch-up ring like new messages. Default: quiet. Exported for tests. */
+export function quietHistoryEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return parseEnvBool(env.QUIET_HISTORY) !== false;
+}
+
+/** A message delivered at least LATE_MIN_AGE_MS after it was sent in MAX (history fill, catch-up). Exported for tests. */
+export function isLateDelivery(time: unknown, now: number = Date.now()): boolean {
+  const ms = Number(time);
+  return Number.isFinite(ms) && ms > 0 && now - ms >= LATE_MIN_AGE_MS;
+}
+
 /**
  * «🕓 10.09.2026, 11:27» — the MAX time of a message delivered late (a history fill, a catch-up
  * after downtime), in TZ (МСК by default); undefined for a fresh one or with BACKFILL_TIME=off.
@@ -978,8 +991,8 @@ const LATE_MIN_AGE_MS = 5 * 60_000;
  */
 export function lateTimeStamp(time: unknown, env: NodeJS.ProcessEnv = process.env, now: number = Date.now()): string | undefined {
   if ((env.BACKFILL_TIME ?? '').trim().toLowerCase() === 'off') return undefined;
+  if (!isLateDelivery(time, now)) return undefined;
   const ms = Number(time);
-  if (!Number.isFinite(ms) || ms <= 0 || now - ms < LATE_MIN_AGE_MS) return undefined;
   const when = new Date(ms).toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit', timeZone: env.TZ || 'Europe/Moscow' });
   return `🕓 ${when}`;
 }
@@ -1420,6 +1433,9 @@ export class ChatCatchUp {
       // Delivered late: its MAX time at the end (lateTimeStamp). A bare photo of a 1:1 gets none — a
       // text message of its own for just the time would be noise.
       const stamp = lateTimeStamp(msg.time);
+      // History and catch-up arrive silently: a fill of hundreds of old messages must not ring the
+      // phone hundreds of times. A message still fresh (the live one that set off a catch-up) rings.
+      const quiet = quietHistoryEnabled() && isLateDelivery(msg.time);
       // An author line alone (a photo without a caption) ends in its own line break already.
       if (stamp && text) text = text.endsWith('\n') ? `${text}${stamp}` : `${text}\n${stamp}`;
       const abortKey = `${String(chatId)}:${String(msg.id ?? msg.time)}`;
@@ -1430,7 +1446,7 @@ export class ChatCatchUp {
         let textIds: number[] = [];
         let attachIds: number[] = [];
         if (text) {
-          textIds = await sendTextPieces(bot, groupId, topicId, text, { replyMarkup: joinMarkups(memberMarkup, keyboard), paceMs, sent, maxMessageId: msg.id });
+          textIds = await quietlyIf(quiet, () => sendTextPieces(bot, groupId, topicId, text, { replyMarkup: joinMarkups(memberMarkup, keyboard), paceMs, sent, maxMessageId: msg.id }));
         }
         if (attaches.length > 0) {
           phase = 'attachments';
@@ -1440,13 +1456,13 @@ export class ChatCatchUp {
             throwOnTransient: !lastTry,
           };
           // withFloodRetry lives INSIDE sendAttachments, around each single send (see the NOTE there).
-          attachIds = await sendAttachments(bot, groupId, topicId, attaches, downloadCtx, undefined, paceMs, sent, lastTry);
+          attachIds = await quietlyIf(quiet, () => sendAttachments(bot, groupId, topicId, attaches, downloadCtx, undefined, paceMs, sent, lastTry));
         }
         // A broadcast copies the attachments, not a lone keyboard message.
         const mediaIds = [...attachIds];
         if (keyboard && textIds.length === 0) {
           phase = 'text';
-          attachIds.push(...(await sendKeyboardAlone(bot, groupId, topicId, keyboard, { paceMs, sent, maxMessageId: msg.id })));
+          attachIds.push(...(await quietlyIf(quiet, () => sendKeyboardAlone(bot, groupId, topicId, keyboard, { paceMs, sent, maxMessageId: msg.id }))));
         }
         const linkIds = buildLinkIds(textIds, attachIds);
         if (linkIds && msg.id != null) {
