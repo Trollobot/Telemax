@@ -4,13 +4,13 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Новости Telemax — что нового в мосте MAX ↔ Telegram</title>
-<meta name="description" content="Что нового в Telemax: все версии моста MAX ↔ Telegram по-человечески. Последняя — 1.3.17 от 12 ноября 2026: Мост представляется свежей версией MAX — 26.39.">
+<meta name="description" content="Что нового в Telemax: все версии моста MAX ↔ Telegram по-человечески. Последняя — 1.4.0 от 16 ноября 2026: Защита моста, стикеры снова работают, MAX 26.40.">
 <link rel="canonical" href="https://telemax.svnest.ru/news/">
 <link rel="alternate" type="application/rss+xml" title="Новости Telemax" href="https://telemax.svnest.ru/news/feed.xml">
 <meta property="og:type" content="website">
 <meta property="og:locale" content="ru_RU">
 <meta property="og:site_name" content="Telemax">
-<meta property="og:title" content="Новости Telemax — Мост представляется свежей версией MAX — 26.39">
+<meta property="og:title" content="Новости Telemax — Защита моста, стикеры снова работают, MAX 26.40">
 <meta property="og:description" content="Все версии моста MAX ↔ Telegram: что появилось и что починили.">
 <meta property="og:url" content="https://telemax.svnest.ru/news/">
 <meta property="og:image" content="https://telemax.svnest.ru/og.png">
@@ -24,6 +24,16 @@
   "url": "https://telemax.svnest.ru/news/",
   "inLanguage": "ru",
   "blogPost": [
+    {
+      "@type": "BlogPosting",
+      "headline": "Telemax 1.4.0: Защита моста, стикеры снова работают, MAX 26.40",
+      "datePublished": "2026-11-16",
+      "url": "https://telemax.svnest.ru/news/#v1.4.0",
+      "author": {
+        "@type": "Organization",
+        "name": "Telemax"
+      }
+    },
     {
       "@type": "BlogPosting",
       "headline": "Telemax 1.3.17: Мост представляется свежей версией MAX — 26.39",
@@ -213,16 +223,6 @@
         "@type": "Organization",
         "name": "Telemax"
       }
-    },
-    {
-      "@type": "BlogPosting",
-      "headline": "Telemax 1.2.0: Кнопки ботов MAX заработали в Telegram",
-      "datePublished": "2026-10-05",
-      "url": "https://telemax.svnest.ru/news/#v1.2.0",
-      "author": {
-        "@type": "Organization",
-        "name": "Telemax"
-      }
     }
   ]
 }
@@ -340,18 +340,34 @@
     <h1>Что нового в Telemax</h1>
     <p class="lead">Каждая версия моста — коротко и по-человечески. О новой версии бот сам скажет в группе, а обновиться можно одной кнопкой «Обновить» в <code>/version</code>.</p>
     <div class="actions">
-      <a class="btn btn-primary" href="#v1.3.17">🆙 Версия 1.3.17</a>
+      <a class="btn btn-primary" href="#v1.4.0">🛡 Версия 1.4.0</a>
       <a class="btn btn-ghost" href="feed.xml">📡 RSS-лента</a>
       <a class="btn btn-ghost" href="../#how">Как установить</a>
     </div>
     <div class="facts">
-      <span class="fact">Последняя версия — <b>1.3.17</b>, 12 ноября 2026</span>
-      <span class="fact"><b>45</b> версий с 22 августа 2026</span>
+      <span class="fact">Последняя версия — <b>1.4.0</b>, 16 ноября 2026</span>
+      <span class="fact"><b>46</b> версий с 22 августа 2026</span>
     </div>
   </div>
 
   <div class="feed">
     <div class="month"><h2 class="mh">Ноябрь 2026</h2>
+      <article class="rel major" id="v1.4.0">
+        <div class="meta"><a class="ver" href="#v1.4.0" title="Ссылка на эту новость">v1.4.0</a><time datetime="2026-11-16">16 ноября</time><span class="tag big">Крупное обновление</span></div>
+        <h3><span class="em" aria-hidden="true">🛡</span> Защита моста, стикеры снова работают, MAX 26.40</h3>
+        <ul>
+          <li><b>Анимированные стикеры из Telegram снова уходят в MAX.</b> С недавними версиями Chromium стикер не отправлялся, и бот писал «Не удалось отправить в MAX»</li>
+          <li>Мост представляется MAX свежей версией клиента (26.40.2)</li>
+          <li><b>Защита от вредных данных со стороны сервера MAX:</b> размер распаковываемых данных ограничен, такой пакет больше не может уронить или подвесить мост</li>
+          <li>Файл с сессией MAX и остальные файлы моста теперь доступны только самому мосту; проверка шифрования файла сессии стала строже</li>
+          <li>Анимированные стикеры рисуются без выполнения кода из файла стикера и без доступа в сеть</li>
+          <li>В журнал больше не попадают рабочие ссылки на файлы MAX и части токена</li>
+          <li><b>Мост сверяет ссылки на файлы со списком адресов MAX.</b> Пока незнакомый адрес только отмечается в журнале; отказ включается настройкой <code>MAX_HOST_CHECK=enforce</code></li>
+          <li>Обновлены зависимости</li>
+          <li><b>Это обновление тяжелее обычного:</b> пакеты Node.js скачиваются заново, нужно около 1,5 ГБ свободного места</li>
+          <li><b>Защитные правки этого выпуска прислал sadontsev</b> — спасибо!</li>
+        </ul>
+      </article>
       <article class="rel" id="v1.3.17">
         <div class="meta"><a class="ver" href="#v1.3.17" title="Ссылка на эту новость">v1.3.17</a><time datetime="2026-11-12">12 ноября</time></div>
         <h3><span class="em" aria-hidden="true">🆙</span> Мост представляется свежей версией MAX — 26.39</h3>
