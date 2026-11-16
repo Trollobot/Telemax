@@ -6,7 +6,14 @@
   <atom:link href="https://telemax.svnest.ru/news/feed.xml" rel="self" type="application/rss+xml"/>
   <description>Что нового в Telemax — бесплатном мосте MAX ↔ Telegram с открытым кодом</description>
   <language>ru</language>
-  <lastBuildDate>Thu, 12 Nov 2026 09:00:00 GMT</lastBuildDate>
+  <lastBuildDate>Mon, 16 Nov 2026 09:00:00 GMT</lastBuildDate>
+  <item>
+    <title>Telemax 1.4.0: Защита моста, стикеры снова работают, MAX 26.40</title>
+    <link>https://telemax.svnest.ru/news/#v1.4.0</link>
+    <guid isPermaLink="false">telemax-1.4.0</guid>
+    <pubDate>Mon, 16 Nov 2026 09:00:00 GMT</pubDate>
+    <description><![CDATA[<ul><li><b>Анимированные стикеры из Telegram снова уходят в MAX.</b> С недавними версиями Chromium стикер не отправлялся, и бот писал «Не удалось отправить в MAX»</li><li>Мост представляется MAX свежей версией клиента (26.40.2)</li><li><b>Защита от вредных данных со стороны сервера MAX:</b> размер распаковываемых данных ограничен, такой пакет больше не может уронить или подвесить мост</li><li>Файл с сессией MAX и остальные файлы моста теперь доступны только самому мосту; проверка шифрования файла сессии стала строже</li><li>Анимированные стикеры рисуются без выполнения кода из файла стикера и без доступа в сеть</li><li>В журнал больше не попадают рабочие ссылки на файлы MAX и части токена</li><li><b>Мост сверяет ссылки на файлы со списком адресов MAX.</b> Пока незнакомый адрес только отмечается в журнале; отказ включается настройкой <code>MAX_HOST_CHECK=enforce</code></li><li>Обновлены зависимости</li><li><b>Это обновление тяжелее обычного:</b> пакеты Node.js скачиваются заново, нужно около 1,5 ГБ свободного места</li><li><b>Защитные правки этого выпуска прислал sadontsev</b> — спасибо!</li></ul>]]></description>
+  </item>
   <item>
     <title>Telemax 1.3.17: Мост представляется свежей версией MAX — 26.39</title>
     <link>https://telemax.svnest.ru/news/#v1.3.17</link>
@@ -209,13 +216,6 @@
     <guid isPermaLink="false">telemax-0.6.2</guid>
     <pubDate>Fri, 11 Sep 2026 09:00:00 GMT</pubDate>
     <description><![CDATA[<ul><li><b><code>setup.sh</code>:</b> исправлен молчаливый выход первичной настройки сразу после «Сделали? Enter» на серверах без прокси для Telegram (сидел с 0.4.9 — то самое «Enter нажимаю и ничего»); найден сквозным прогоном установки с нуля</li></ul>]]></description>
-  </item>
-  <item>
-    <title>Telemax 0.6.1: Понятные ошибки при поиске группы</title>
-    <link>https://telemax.svnest.ru/news/#v0.6.1</link>
-    <guid isPermaLink="false">telemax-0.6.1</guid>
-    <pubDate>Fri, 11 Sep 2026 09:00:00 GMT</pubDate>
-    <description><![CDATA[<ul><li><b><code>setup.sh</code>:</b> поиск группы больше не молчит при ошибке Telegram — показывает её текст; при 409 объясняет, что у бота уже запущен другой экземпляр с тем же токеном (старый сервер/контейнер), при 401 — что дело в токене; перед поиском снимает случайно оставленный webhook; подсказка про то, что бот без прав администратора ваших сообщений не видит</li></ul>]]></description>
   </item>
 </channel>
 </rss>
