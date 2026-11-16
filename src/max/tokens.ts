@@ -43,8 +43,8 @@ export function couldBeToken(value: string, length = SESSION_TOKEN_LENGTH): bool
 }
 
 /**
- * A masked, log-safe description of a fallback candidate — length, first/last 4 characters and
- * the character classes it uses — so the real alphabet can be captured from the logs.
+ * A log-safe description of a fallback candidate — its length and the character classes it uses,
+ * no characters of the token itself — so the real alphabet can be captured from the logs.
  */
 export function describeTokenShape(value: string): string {
   const classes: string[] = [];
@@ -52,7 +52,8 @@ export function describeTokenShape(value: string): string {
   if (/[A-Z]/.test(value)) classes.push('upper');
   if (/[0-9]/.test(value)) classes.push('digit');
   const others = [...new Set(value.replace(/[A-Za-z0-9]/g, ''))].sort().join('');
-  return `length=${value.length}, starts "${value.slice(0, 4)}…", ends "…${value.slice(-4)}", classes: ${classes.join(' ') || 'none'}, other chars: "${others}"`;
+  // No characters of the token itself: even 8 of them narrow down a session token for whoever reads the log.
+  return `length=${value.length}, classes: ${classes.join(' ') || 'none'}, other chars: "${others}"`;
 }
 
 /**

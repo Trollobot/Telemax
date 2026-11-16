@@ -13,7 +13,7 @@ import { randomBytes } from 'node:crypto';
 import type { InlineKeyboardButton, InlineKeyboardMarkup } from 'telegraf/types';
 import type { MaxClient } from '../max/client.js';
 import { maxFetch } from '../max/ca.js';
-import { createLogger, jsonStringify, redactSecrets } from '../logger.js';
+import { createLogger, jsonStringify, redactSecrets, safeUrl } from '../logger.js';
 import { truncateUtf16 } from './text.js';
 import { isTransientHttpStatus, isTransientMaxError, isTransientNetworkError, TransientDownloadError } from './transient.js';
 
@@ -188,7 +188,7 @@ async function downloadUrl(url: string): Promise<Buffer> {
   try {
     const res = await maxFetch(url, { signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
     if (!res.ok) {
-      logger.error(`downloadUrl got non-OK response ${res.status} ${res.statusText} for ${url}`);
+      logger.error(`downloadUrl got non-OK response ${res.status} ${res.statusText} for ${safeUrl(url)}`);
       if (isTransientHttpStatus(res.status)) {
         throw new TransientDownloadError(`MAX CDN answered ${res.status}`, undefined, `не скачалось: сервер MAX ответил ошибкой ${res.status}`);
       }
@@ -196,19 +196,19 @@ async function downloadUrl(url: string): Promise<Buffer> {
     }
     const declared = Number(res.headers.get('content-length') ?? '');
     if (Number.isFinite(declared) && declared > MAX_DOWNLOAD_BYTES) {
-      logger.error(`downloadUrl refused ${declared} bytes (limit ${MAX_DOWNLOAD_BYTES}) for ${url}`);
+      logger.error(`downloadUrl refused ${declared} bytes (limit ${MAX_DOWNLOAD_BYTES}) for ${safeUrl(url)}`);
       throw new DownloadMissError(TOO_BIG_WHY);
     }
     const buf = Buffer.from(await res.arrayBuffer());
     // Header can lie or be absent — check what actually arrived too.
     if (buf.byteLength > MAX_DOWNLOAD_BYTES) {
-      logger.error(`downloadUrl got ${buf.byteLength} bytes, over the ${MAX_DOWNLOAD_BYTES} limit, for ${url}`);
+      logger.error(`downloadUrl got ${buf.byteLength} bytes, over the ${MAX_DOWNLOAD_BYTES} limit, for ${safeUrl(url)}`);
       throw new DownloadMissError(TOO_BIG_WHY);
     }
     return buf;
   } catch (err) {
     if (err instanceof TransientDownloadError || err instanceof DownloadMissError) throw err;
-    logger.error(`downloadUrl threw for ${url}`, err);
+    logger.error(`downloadUrl threw for ${safeUrl(url)}`, err);
     const name = networkFailureName(err);
     if (isTransientNetworkError(err)) {
       throw new TransientDownloadError(`MAX CDN download failed: ${(err as Error).message}`, err, `не скачалось: сервер MAX не ответил${name ? ` (${name})` : ''}`);

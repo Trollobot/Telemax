@@ -56,8 +56,25 @@ const SECRET_KEYS = new Set([
 const LONG_STRING_THRESHOLD = 512;
 
 /** Recursively redacts known secret-bearing keys (and any suspiciously long string) before logging. */
+/**
+ * A URL for the log: scheme, host and path only. MAX's CDN links carry their access token in the
+ * query string (and photo links in the path after the host's own path is appended) — a logged link
+ * is a working download link for anyone who reads the log.
+ */
+export function safeUrl(url: string): string {
+  try {
+    const u = new URL(url);
+    return `${u.protocol}//${u.host}${u.pathname.length > 40 ? `${u.pathname.slice(0, 40)}…` : u.pathname}${u.search ? '?…' : ''}`;
+  } catch {
+    return '[unparseable url]';
+  }
+}
+
 export function redactSecrets(value: unknown, seen = new Set<unknown>()): unknown {
-  if (typeof value === 'string') return value.length >= LONG_STRING_THRESHOLD ? maskString(value) : value;
+  if (typeof value === 'string') {
+    if (/^https?:\/\//i.test(value)) return safeUrl(value);
+    return value.length >= LONG_STRING_THRESHOLD ? maskString(value) : value;
+  }
   if (value === null || typeof value !== 'object') return value;
   if (seen.has(value)) return '[circular]';
   seen.add(value);
