@@ -24,3 +24,13 @@ describe('MAX_HOST_SUFFIXES_EXTRA', () => {
     expect(isMaxHost('http://v1.newcdn.example/x', env)).toBe(false);
   });
 });
+
+describe('MAX_HOST_CHECK', () => {
+  it('only warns unless told to enforce', async () => {
+    const { maxHostCheckMode } = await import('../src/max/ca.js');
+    expect(maxHostCheckMode({})).toBe('warn');
+    expect(maxHostCheckMode({ MAX_HOST_CHECK: '' })).toBe('warn');
+    expect(maxHostCheckMode({ MAX_HOST_CHECK: 'on' })).toBe('warn');
+    expect(maxHostCheckMode({ MAX_HOST_CHECK: ' Enforce ' })).toBe('enforce');
+  });
+});

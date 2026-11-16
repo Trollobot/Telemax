@@ -67,7 +67,6 @@ export function maxFetch(url: string, init: RequestInit = {}): Promise<Response>
  */
 export const MAX_HOST_SUFFIXES = ['oneme.ru', 'max.ru', 'okcdn.ru', 'mycdn.me', 'vkuser.net', 'userapi.com', 'vk.com', 'vk.me', 'ok.ru'];
 
-/** Exported for tests. */
 /**
  * MAX_HOST_SUFFIXES_EXTRA: more domains for MAX_HOST_SUFFIXES, comma-separated (e.g. a new CDN domain
  * MAX starts using before a release lists it — the refusal in the log names it). Exported for tests.
@@ -91,6 +90,19 @@ export function isMaxHost(url: string, env: NodeJS.ProcessEnv = process.env): bo
   return [...MAX_HOST_SUFFIXES, ...extraMaxHostSuffixes(env)].some((s) => host === s || host.endsWith(`.${s}`));
 }
 
+/**
+ * MAX_HOST_CHECK: `enforce` refuses a URL outside MAX_HOST_SUFFIXES. Until the list has been checked
+ * against the hosts MAX really serves files from, the default only says so in the log and fetches as
+ * before — a missing domain must not cost every install its photos and files (the photo outage of
+ * October 2026 was exactly that kind of surprise). Exported for tests.
+ */
+export function maxHostCheckMode(env: NodeJS.ProcessEnv = process.env): 'warn' | 'enforce' {
+  return (env.MAX_HOST_CHECK ?? '').trim().toLowerCase() === 'enforce' ? 'enforce' : 'warn';
+}
+
+/** Hosts already named in the log in warn mode — one line per host, not one per file. */
+const warnedHosts = new Set<string>();
+
 const MAX_REDIRECTS = 5;
 
 /** fetch through a MAX dispatcher, following redirects by hand so every hop is checked against MAX_HOST_SUFFIXES. */
@@ -104,8 +116,14 @@ async function fetchMaxHost(url: string, init: RequestInit, dispatcher: Agent): 
       } catch {
         // keep the placeholder
       }
-      logger.warn(`Refused a non-MAX URL (host ${host}${hop ? `, after ${hop} redirect(s)` : ''}) — not fetched with MAX's trust. If MAX really serves files from there: MAX_HOST_SUFFIXES_EXTRA`);
-      throw new Error(`not a MAX host: ${host}`);
+      if (maxHostCheckMode() === 'enforce') {
+        logger.warn(`Refused a non-MAX URL (host ${host}${hop ? `, after ${hop} redirect(s)` : ''}) — not fetched with MAX's trust. If MAX really serves files from there: MAX_HOST_SUFFIXES_EXTRA`);
+        throw new Error(`not a MAX host: ${host}`);
+      }
+      if (!warnedHosts.has(host)) {
+        warnedHosts.add(host);
+        logger.warn(`A MAX file URL outside the known MAX hosts (host ${host}${hop ? `, after ${hop} redirect(s)` : ''}) — fetched as before; MAX_HOST_CHECK=enforce refuses such hosts`);
+      }
     }
     const res = await undiciFetch(current, { ...init, dispatcher, redirect: 'manual' });
     const location = res.status >= 300 && res.status < 400 ? res.headers.get('location') : null;

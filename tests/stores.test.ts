@@ -263,7 +263,8 @@ describe('SessionStore.clear', () => {
     await expect(store.clear()).resolves.toBeUndefined();
   });
 
-  it('writes the session file readable by its owner only', async () => {
+  // Windows has no owner/group/other bits: stat reports 0666 whatever was asked for.
+  it.skipIf(process.platform === 'win32')('writes the session file readable by its owner only', async () => {
     const store = new SessionStore(filePath);
     await store.save(session);
     expect((await stat(filePath)).mode & 0o777).toBe(0o600);
