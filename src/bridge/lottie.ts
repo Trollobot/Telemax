@@ -43,7 +43,10 @@ const requireFromHere = createRequire(import.meta.url);
 
 let lottieScriptCache: string | null = null;
 function getLottieScript(): string {
-  lottieScriptCache ??= readFileSync(requireFromHere.resolve('lottie-web/build/player/lottie.min.js'), 'utf8');
+  // The light canvas build has no expression engine: the full build eval()s JavaScript embedded in the
+  // animation JSON (Lottie "expressions"), i.e. a sticker could run code in our Chromium. Telegram's
+  // .tgs spec forbids expressions anyway, so nothing a real sticker uses is lost.
+  lottieScriptCache ??= readFileSync(requireFromHere.resolve('lottie-web/build/player/lottie_light_canvas.min.js'), 'utf8');
   return lottieScriptCache;
 }
 
@@ -84,8 +87,11 @@ function runFfmpeg(args: string[]): Promise<void> {
 /** Renders a .tgs buffer (raw or gzip-compressed) to a short WebM (VP9) video buffer. */
 export async function renderTgsToWebm(tgsBuffer: Buffer): Promise<Buffer> {
   const lottieJson = parseLottieJson(tgsBuffer);
-  const width = lottieJson.w || 512;
-  const height = lottieJson.h || 512;
+  // From the sticker file itself: numbers within reason only — a string would land unescaped in the
+  // page's style attribute, a huge number would ask Chromium for gigabytes.
+  const dim = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) && v > 0 && v <= 2048 ? Math.round(v) : 512);
+  const width = dim(lottieJson.w);
+  const height = dim(lottieJson.h);
   const nativeFr = lottieJson.fr || 60;
   const ip = lottieJson.ip ?? 0;
   const op = lottieJson.op ?? ip + nativeFr * 3;
@@ -128,6 +134,14 @@ export async function renderTgsToWebm(tgsBuffer: Buffer): Promise<Buffer> {
       args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-gpu'],
     });
     const page = await browser.newPage();
+    // The page needs nothing from the network (lottie-web is inlined, image assets of a sticker are
+    // data: URLs). Chromium runs --no-sandbox, so give a hostile sticker no way out: every request
+    // except data: is refused — no reaching the internet, the LAN or the Docker host from here.
+    await page.setRequestInterception(true);
+    page.on('request', (req) => {
+      if (req.url().startsWith('data:')) req.continue().catch(() => {});
+      else req.abort().catch(() => {});
+    });
     await page.setViewport({ width, height, deviceScaleFactor: 1 });
     await page.setContent(html, { waitUntil: 'load' });
     await page.waitForFunction('window.__ready', { timeout: 15_000 });
