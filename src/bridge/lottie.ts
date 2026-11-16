@@ -132,6 +132,13 @@ export async function renderTgsToWebm(tgsBuffer: Buffer): Promise<Buffer> {
       executablePath: CHROMIUM_PATH,
       headless: true,
       args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-gpu'],
+      // Chromium keeps its own files under $HOME even with puppeteer's temporary profile. In the
+      // container the bridge runs as `node` with root's HOME (entrypoint.sh drops privileges, the
+      // environment stays), which it cannot write: Chromium 154+ then refuses to start («Failed to
+      // create headless user data directory container») and every animated sticker failed with
+      // «Failed to launch the browser process» (prod and test, found 2026-11-16). This render's own
+      // temporary directory is writable everywhere and is removed with the frames.
+      env: { ...process.env, HOME: tmpDir, XDG_CONFIG_HOME: tmpDir, XDG_CACHE_HOME: tmpDir },
     });
     const page = await browser.newPage();
     // The page needs nothing from the network (lottie-web is inlined, image assets of a sticker are
