@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import * as lz4 from 'lz4js';
 import { pack } from 'msgpackr';
-import { decompressPayload, encodeFrame, FRAME_HEADER_SIZE, readFrameHeader } from '../src/max/frame.js';
+import { zstdCompressSync } from 'node:zlib';
+import { decompressPayload, encodeFrame, FRAME_HEADER_SIZE, lz4BlockSize, MAX_DECOMPRESSED_BYTES, readFrameHeader } from '../src/max/frame.js';
 import { decodeFramePayload, pickObject } from '../src/max/msgpack.js';
 import { OPCODES, DIR, PROTOCOL_VERSION } from '../src/max/opcodes.js';
 
@@ -74,5 +75,36 @@ describe('decodeFramePayload + pickObject', () => {
     const buf = Buffer.concat([pack('ignored-string'), pack({ chatId: 1 })]);
     const items = decodeFramePayload(buf);
     expect(pickObject(items)).toEqual({ chatId: 1 });
+  });
+});
+
+describe('decompression caps (hostile server)', () => {
+  it('decompresses an ordinary zstd payload', () => {
+    const data = Buffer.from('{"hello":"world"}'.repeat(100));
+    expect(decompressPayload(zstdCompressSync(data), 0xff)).toEqual(data);
+  });
+
+  it('refuses a zstd bomb instead of allocating it', () => {
+    const bomb = zstdCompressSync(Buffer.alloc(MAX_DECOMPRESSED_BYTES + 1024 * 1024));
+    expect(bomb.length).toBeLessThan(64 * 1024);
+    expect(() => decompressPayload(bomb, 0xff)).toThrow(/expands past/);
+  });
+
+  it('sizes an LZ4 block exactly from its headers', () => {
+    // token 0x40: 4 literals, then a match of 4+0 at offset 4 (copies the 4 literals), then 1 trailing literal.
+    const block = Buffer.from([0x40, 0x61, 0x62, 0x63, 0x64, 0x04, 0x00, 0x10, 0x65]);
+    expect(lz4BlockSize(block)).toBe(9);
+    expect(decompressPayload(block, 1).toString()).toBe('abcdabcde');
+  });
+
+  it('rejects an LZ4 block of 0xFF length bytes quickly, without running the copy loop', () => {
+    const block = Buffer.concat([Buffer.from([0x1f, 0x61, 0x01, 0x00]), Buffer.alloc(16 * 1024 * 1024 - 4, 0xff)]);
+    const started = Date.now();
+    expect(() => decompressPayload(block, 1)).toThrow(/expands past/);
+    expect(Date.now() - started).toBeLessThan(2000);
+  });
+
+  it('rejects a truncated LZ4 block', () => {
+    expect(() => lz4BlockSize(Buffer.from([0x50, 0x61]))).toThrow(/truncated/);
   });
 });

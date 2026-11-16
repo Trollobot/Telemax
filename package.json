@@ -15,7 +15,6 @@
   },
   "dependencies": {
     "dotenv": "^17.2.3",
-    "fzstd": "^0.1.1",
     "https-proxy-agent": "^9.1.0",
     "lottie-web": "^5.13.0",
     "lz4js": "^0.2.0",

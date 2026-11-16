@@ -24,6 +24,10 @@ import { getTelegramProxyAgent, initTelegramProxy, redactProxyUrl } from '../tel
 import { startStatusFile } from '../bridge/statusFile.js';
 import { maskPhone } from '../bridge/status.js';
 
+
+// Everything the bridge writes (session, chat map, settings, link stores) is the owner's private data:
+// files 0600, directories 0700, whatever the image or volume default.
+process.umask(0o077);
 const logger = createLogger('server');
 
 // Prefer IPv4 when a host resolves to both. On dual-stack servers where IPv6 has no
