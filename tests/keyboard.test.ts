@@ -29,7 +29,7 @@ describe('maxKeyboardToTelegram', () => {
       [{ type: 'LINK', text: 'Сайт', url: 'tg://resolve?domain=x' }],
     ]);
     expect(maxKeyboardToTelegram(attach)).toEqual({
-      inline_keyboard: [[na('Да'), na('Нет')], [{ text: 'Открыть', url: 'https://max.ru/app?startapp' }], [{ text: 'Контакт', callback_data: KEYBOARD_CONTACT }, { text: 'Гео', callback_data: KEYBOARD_GEO }, na('?'), na('без типа')], [{ text: 'Сайт', url: 'tg://resolve?domain=x' }]],
+      inline_keyboard: [[na('Да'), na('Нет')], [{ text: 'Открыть', url: 'https://max.ru/app?startapp' }], [{ text: 'Контакт', callback_data: KEYBOARD_CONTACT }, { text: 'Гео', callback_data: KEYBOARD_GEO }, na('?'), na('без типа')], [na('Сайт')]], // tg:// links stay inert: a MAX bot must not hand out tg://proxy and co.
     });
   });
 

@@ -47,6 +47,20 @@ export class BroadcastStore {
     return (await this.load()).some((b) => b.targetChatId === chatId);
   }
 
+  /** A group upgraded to a supergroup gets a new id: its broadcasts follow it. Returns how many moved. */
+  async retarget(fromChatId: number, toChatId: number): Promise<number> {
+    const all = await this.load();
+    let moved = 0;
+    for (const b of all) {
+      if (b.targetChatId === fromChatId) {
+        b.targetChatId = toChatId;
+        moved++;
+      }
+    }
+    if (moved) await this.persist(all);
+    return moved;
+  }
+
   async add(b: Broadcast): Promise<void> {
     const all = await this.load();
     all.push(b);

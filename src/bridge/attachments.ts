@@ -616,7 +616,9 @@ export function maxKeyboardToTelegram(att: unknown, chatId?: unknown): InlineKey
       if (!text.trim()) continue;
       const url = str(b?.url);
       const payload = str(b?.payload);
-      if (b?.type === 'LINK' && /^(https?|tg):\/\/./i.test(url) && url.length <= 2048) {
+      // Web links only: a tg:// link from a MAX bot could offer the admin tg://proxy or tg://socks (switch
+      // Telegram's proxy) or other client actions in one tap.
+      if (b?.type === 'LINK' && /^https?:\/\/./i.test(url) && url.length <= 2048) {
         buttons.push({ text, url });
       } else if (b?.type === 'CLIPBOARD' && payload && payload.length <= 256) {
         // CopyTextButton (Bot API 7.11) is newer than telegraf's typings.

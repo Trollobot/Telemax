@@ -54,6 +54,8 @@ export interface Broadcasts {
   copyDelete(maxChatId: string, maxMessageId: unknown): void;
   /** True for a chat that receives a broadcast — the bridge leaves its updates alone. */
   isTarget(chatId: number): Promise<boolean>;
+  /** A broadcast group upgraded to a supergroup: move its broadcasts to the new id. */
+  retarget(fromChatId: number, toChatId: number): Promise<number>;
   /** An update from a broadcast's place: the «… закрепил» line Telegram adds for the bot's own pin goes away. */
   onTargetUpdate(ctx: Context): Promise<void>;
   /** The DM part of switching one on (deep link, chat picker); true when the update was ours. */
@@ -648,6 +650,7 @@ export function createBroadcasts(deps: BroadcastDeps): Broadcasts {
     copyEdit,
     copyDelete,
     isTarget: (chatId) => store.isTarget(chatId),
+    retarget: (fromChatId, toChatId) => store.retarget(fromChatId, toChatId),
     onTargetUpdate,
     handlePrivate,
     handleChat,
