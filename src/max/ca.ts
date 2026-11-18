@@ -104,10 +104,13 @@ export function maxHostCheckMode(env: NodeJS.ProcessEnv = process.env): 'warn' |
 const warnedHosts = new Set<string>();
 
 const MAX_REDIRECTS = 5;
+/** The statuses fetch follows; any other 3xx (300, 304…) is an answer, not a redirect. */
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
 /** fetch through a MAX dispatcher, following redirects by hand so every hop is checked against MAX_HOST_SUFFIXES. */
 async function fetchMaxHost(url: string, init: RequestInit, dispatcher: Agent): Promise<Response> {
   let current = url;
+  let request: RequestInit = init;
   for (let hop = 0; ; hop++) {
     if (!isMaxHost(current)) {
       let host = '[unparseable]';
@@ -125,12 +128,20 @@ async function fetchMaxHost(url: string, init: RequestInit, dispatcher: Agent): 
         logger.warn(`A MAX file URL outside the known MAX hosts (host ${host}${hop ? `, after ${hop} redirect(s)` : ''}) — fetched as before; MAX_HOST_CHECK=enforce refuses such hosts`);
       }
     }
-    const res = await undiciFetch(current, { ...init, dispatcher, redirect: 'manual' });
-    const location = res.status >= 300 && res.status < 400 ? res.headers.get('location') : null;
+    const res = await undiciFetch(current, { ...request, dispatcher, redirect: 'manual' });
+    const location = REDIRECT_STATUSES.has(res.status) ? res.headers.get('location') : null;
     if (!location) return res;
     if (hop >= MAX_REDIRECTS) throw new Error('too many redirects from a MAX host');
     await res.body?.cancel().catch(() => {});
     current = new URL(location, current).toString();
+    // What fetch itself does: 303 always, and 301/302 after a POST, go on as a plain GET — the body
+    // is not sent a second time. 307/308 repeat the request as it was.
+    const method = (request.method ?? 'GET').toUpperCase();
+    if (res.status === 303 ? method !== 'GET' && method !== 'HEAD' : (res.status === 301 || res.status === 302) && method === 'POST') {
+      const headers = new Headers(request.headers as ConstructorParameters<typeof Headers>[0]);
+      for (const h of ['content-type', 'content-length', 'content-encoding', 'content-language', 'content-location']) headers.delete(h);
+      request = { ...request, method: 'GET', body: undefined, headers: [...headers.entries()] };
+    }
   }
 }
 

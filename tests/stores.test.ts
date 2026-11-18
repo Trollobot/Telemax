@@ -103,14 +103,28 @@ describe('ChatMapStore', () => {
     expect(existsSync(`${filePath}.broken`)).toBe(true);
     await store.upsert({ maxChatId: 2, telegramTopicId: 20, createdAt: 'b' });
     expect(JSON.parse(await readFile(filePath, 'utf8'))).toHaveLength(2);
-    expect((await stat(filePath)).mode & 0o777).toBe(0o600);
+    // Windows has no owner/group/other bits.
+    if (process.platform !== 'win32') expect((await stat(filePath)).mode & 0o777).toBe(0o600);
   });
 
-  it('starts empty, without throwing, when the file is corrupt and there is no .bak', async () => {
+  it('stops, and leaves the file alone, when it is corrupt and there is no .bak', async () => {
     await writeFile(filePath, 'not json', 'utf8');
     const store = new ChatMapStore(filePath);
-    expect(await store.getByMaxChatId(1)).toBeUndefined();
-    expect(existsSync(`${filePath}.broken`)).toBe(true);
+    await expect(store.getByMaxChatId(1)).rejects.toThrow(SyntaxError);
+    // Not parked: the next start must find the same file, not an empty map.
+    expect(existsSync(`${filePath}.broken`)).toBe(false);
+    expect(await readFile(filePath, 'utf8')).toBe('not json');
+  });
+
+  it('a wipe removes the backup copies as well', async () => {
+    const store = new ChatMapStore(filePath);
+    await store.upsert({ maxChatId: 1, telegramTopicId: 10, createdAt: 'a' });
+    expect(existsSync(`${filePath}.bak`)).toBe(true);
+    await writeFile(`${filePath}.broken`, 'old', 'utf8');
+    await store.clear();
+    expect(existsSync(`${filePath}.bak`)).toBe(false);
+    expect(existsSync(`${filePath}.broken`)).toBe(false);
+    expect(JSON.parse(await readFile(filePath, 'utf8'))).toEqual([]);
   });
 
   it('normalizes maxChatId to a decimal string on upsert', async () => {

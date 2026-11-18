@@ -92,6 +92,7 @@ const maxSession = new MaxSessionController({
   client: max,
   store: sessionStore,
   onLogin: async (payload) => {
+    await unlink(LOGGED_OUT_MARKER).catch(() => {});
     applyLoginPayload(payload);
     await refreshChatsAndNames();
     void syncChatsIfPossible();
@@ -307,6 +308,7 @@ async function killMaxSession(): Promise<{ endedOnMax: boolean }> {
 /** «🚪 Выйти из MAX» / /logout: the session ends on MAX and here; topics and settings stay, /login brings it back. */
 async function logoutMax(): Promise<{ endedOnMax: boolean }> {
   const result = await maxSession.logout();
+  await writeFile(LOGGED_OUT_MARKER, new Date().toISOString(), 'utf8').catch(() => {});
   cachedChats = [];
   myAccountId = null;
   contactProfiles = new Map();
@@ -593,6 +595,11 @@ async function reportIfJustUpdated(bot: Telegraf): Promise<void> {
 const WELCOME_SENT_MARKER = path.join(process.cwd(), '.data', 'welcome-sent');
 /** Started without a saved MAX session — see the re-auth reminder at Telegram launch. */
 let noSessionAtBoot = false;
+/**
+ * Left by /logout and /kill, removed by the next login: no session at start is then the owner's own
+ * doing, and «сессия отклонена» after every restart would be both wrong and a nag.
+ */
+const LOGGED_OUT_MARKER = path.join(process.cwd(), '.data', 'logged-out');
 
 /**
  * On launch, verify the bot can actually reach the configured group and give the
@@ -801,7 +808,7 @@ async function launchTelegramBotWithRetry(bot: Telegraf, attempt = 0): Promise<v
   if (sessionStore.corruptedOnLoad) maxSession.notifyReauthNeeded();
   // No session at all on an install that was set up before (the welcome went out): a rejected session
   // whose notice never reached Telegram, then a restart, used to leave the bridge silent for good.
-  else if (noSessionAtBoot && existsSync(WELCOME_SENT_MARKER)) maxSession.notifyReauthNeeded();
+  else if (noSessionAtBoot && existsSync(WELCOME_SENT_MARKER) && !existsSync(LOGGED_OUT_MARKER)) maxSession.notifyReauthNeeded();
   void announceGroupReadyOnce(bot);
 
   // message_reaction and poll_answer are opt-in — Telegram omits them from the default update set unless

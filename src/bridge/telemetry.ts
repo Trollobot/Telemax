@@ -92,8 +92,9 @@ export interface ErrorReport {
  */
 export function scrubError(error: unknown): string {
   const raw = error instanceof Error ? `${error.name}: ${error.message}` : String(error ?? '');
-  return String(redactSecrets(raw.split('\n')[0] ?? ''))
-    .replace(/\d+:[\w-]{30,}/g, '#')
+  // The token first: redactSecrets shortens a bare link to its host and 40 characters of path, and a
+  // bot-API link cut there would keep most of the token while no longer matching the pattern below.
+  return String(redactSecrets((raw.split('\n')[0] ?? '').replace(/\d+:[\w-]{30,}/g, '#')))
     .replace(/\/\/[^/\s@]+@/g, '//#@')
     .replace(/"[^"]*"/g, '"…"')
     // A file-system error quotes its path — with the user's file name — in single quotes.

@@ -107,3 +107,13 @@ describe('reportError', () => {
     await expect(reportError({ kind: 'fatal', error: 'no start' })).resolves.toBeUndefined();
   });
 });
+
+describe('scrubError and a bare bot-API link', () => {
+  it('takes the token out before the link is shortened', async () => {
+    const { scrubError } = await import('../src/bridge/telemetry.js');
+    const token = '123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw';
+    const out = scrubError(`https://api.telegram.org/bot${token}/sendMessage?chat_id=1`);
+    expect(out).not.toContain('AAHdqTcv');
+    expect(out).toContain('api.telegram.org');
+  });
+});

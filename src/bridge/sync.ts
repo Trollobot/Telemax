@@ -4624,15 +4624,13 @@ export function refusedStubText(time: unknown, err: unknown, tz: string = proces
 
 /**
  * Telegram→MAX updates older than this at arrival are not relayed (see the middleware in wireBridge).
- * STALE_TELEGRAM_MINUTES sets the minutes (default 10); off/0 relays everything, however late.
- * Exported for tests.
+ * Off unless STALE_TELEGRAM_MINUTES names the minutes: the filter judges by the server's clock against
+ * Telegram's (a clock a few minutes fast would silence the whole direction), and it stops an admin's
+ * late command as readily as a late message — so the owner turns it on knowingly. Exported for tests.
  */
 export function staleCutoffMs(env: NodeJS.ProcessEnv = process.env): number | null {
-  const raw = (env.STALE_TELEGRAM_MINUTES ?? '').trim();
-  if (!raw) return 10 * 60_000;
-  if (parseEnvBool(raw) === false) return null;
-  const minutes = Number(raw);
-  return Number.isFinite(minutes) && minutes > 0 ? minutes * 60_000 : 10 * 60_000;
+  const minutes = Number((env.STALE_TELEGRAM_MINUTES ?? '').trim());
+  return Number.isFinite(minutes) && minutes > 0 ? minutes * 60_000 : null;
 }
 
 type StaleCheckUpdate = {

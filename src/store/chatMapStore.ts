@@ -1,4 +1,4 @@
-import { copyFile, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { reportBridgeError } from '../bridge/errorReporter.js';
 import { createLogger } from '../logger.js';
@@ -164,6 +164,11 @@ export class ChatMapStore {
   async clear(): Promise<void> {
     this.cache = [];
     await this.persist([]);
+    // The copies go too: /kill promises to leave nothing, and a later corrupt file must not bring
+    // the wiped chats back from an old .bak.
+    await rm(`${this.filePath}.bak`, { force: true }).catch(() => {});
+    await rm(`${this.filePath}.broken`, { force: true }).catch(() => {});
+    this.lastBackupAt = 0;
   }
 
   // Memoizes the in-flight first read: concurrent first accesses would each install their OWN
@@ -223,27 +228,32 @@ export class ChatMapStore {
   }
 
   /**
-   * A chat-map.json that is not JSON (a truncated write from an old version, a disk error) used to make
-   * every lookup throw — the bridge looked alive and relayed nothing. Now it is parked as .broken (never
-   * deleted) and the hourly .bak, if readable, takes its place; failing that the bridge starts with no
-   * mappings (topics are created afresh — duplicates, but it relays). Either way the owner is told.
+   * A chat-map.json that is not JSON (a truncated write from an old version, a disk error) made every
+   * lookup throw with nobody told — the bridge looked alive and relayed nothing. With a readable hourly
+   * .bak the file is parked as .broken and the copy takes its place. Without one the bridge still
+   * stops (the error goes on to the caller, the file stays where it is): starting with no mappings
+   * would create every topic anew and leave the old ones dead, which the owner must choose, not get.
+   * Either way the owner is told.
    */
   private async recoverFromCorruptFile(err: SyntaxError): Promise<ChatMapping[]> {
-    await rename(this.filePath, `${this.filePath}.broken`).catch(() => {});
-    let restored: ChatMapping[] | null = null;
+    let restored: ChatMapping[];
     try {
       restored = normalizeChatMappings(JSON.parse(await readFile(`${this.filePath}.bak`, 'utf8')));
-      await copyFile(`${this.filePath}.bak`, this.filePath);
     } catch {
-      restored = null;
+      logger.error(`chat-map.json is unreadable (${err.message}) and there is no usable .bak — not relaying until it is fixed`);
+      reportBridgeError(
+        'chat-map-corrupt',
+        '⚠️ Файл привязки чатов к темам (data/chat-map.json) повреждён, резервной копии нет — мост не пересылает сообщения, чтобы не создавать все темы заново. Что сделать: верните файл из своей копии и перезапустите мост; если копии нет — удалите файл и перезапустите, тогда темы создадутся заново.',
+      );
+      throw err;
     }
-    logger.error(`chat-map.json was unreadable (${err.message}) — parked as .broken, ${restored ? `restored ${restored.length} chats from .bak` : 'starting with no mappings'}`);
+    await rename(this.filePath, `${this.filePath}.broken`).catch(() => {});
+    await copyFile(`${this.filePath}.bak`, this.filePath);
+    logger.error(`chat-map.json was unreadable (${err.message}) — parked as .broken, restored ${restored.length} chats from .bak`);
     reportBridgeError(
       'chat-map-corrupt',
-      restored
-        ? `⚠️ Файл привязки чатов к темам был повреждён — восстановлен из резервной копии (до часа назад). Сообщения за это время могут прийти повторно.`
-        : `⚠️ Файл привязки чатов к темам был повреждён, резервной копии нет — темы будут созданы заново. Старый файл сохранён как chat-map.json.broken.`,
+      '⚠️ Файл привязки чатов к темам был повреждён — восстановлен из резервной копии (до часа назад). Сообщения за это время могут прийти повторно. Повреждённый файл сохранён как chat-map.json.broken.',
     );
-    return restored ?? [];
+    return restored;
   }
 }
