@@ -349,3 +349,20 @@ describe('MAX address book', () => {
     expect(isAddedContact({})).toBe(false);
   });
 });
+
+describe('MaxClient — frames split across many socket chunks', () => {
+  it('assembles a frame that arrives byte by byte, and two frames in one chunk', async () => {
+    const { client, socket } = connectedClient();
+    const sent = client.sendMessage(1, 'текст');
+    await new Promise((r) => setImmediate(r));
+    const frame = serverFrame(OPCODES.MSG_SEND, { message: { id: 778, attaches: [], text: 'x'.repeat(5000) } });
+    for (let i = 0; i < frame.length; i += 7) socket.emit('data', frame.subarray(i, i + 7));
+    await expect(sent).resolves.toMatchObject({ messageId: 778 });
+
+    const a = client.sendMessage(1, 'a');
+    await new Promise((r) => setImmediate(r));
+    socket.emit('data', Buffer.concat([serverFrame(OPCODES.MSG_SEND, { message: { id: 779, attaches: [] } }), serverFrame(OPCODES.PUSH_MESSAGE, { x: 1 }).subarray(0, 4)]));
+    await expect(a).resolves.toMatchObject({ messageId: 779 });
+    client.disconnect();
+  });
+});

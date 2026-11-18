@@ -29,7 +29,7 @@ describe('maxKeyboardToTelegram', () => {
       [{ type: 'LINK', text: 'Сайт', url: 'tg://resolve?domain=x' }],
     ]);
     expect(maxKeyboardToTelegram(attach)).toEqual({
-      inline_keyboard: [[na('Да'), na('Нет')], [{ text: 'Открыть', url: 'https://max.ru/app?startapp' }], [{ text: 'Контакт', callback_data: KEYBOARD_CONTACT }, { text: 'Гео', callback_data: KEYBOARD_GEO }, na('?'), na('без типа')], [{ text: 'Сайт', url: 'tg://resolve?domain=x' }]],
+      inline_keyboard: [[na('Да'), na('Нет')], [{ text: 'Открыть', url: 'https://max.ru/app?startapp' }], [na('Контакт'), na('Гео'), na('?'), na('без типа')], [{ text: 'Сайт', url: 'tg://resolve?domain=x' }]],
     });
   });
 
@@ -167,5 +167,17 @@ describe('miniAppLink', () => {
     expect(miniAppLink({ webApp: 'shop_bot' })).toBe('https://max.ru/shop_bot?startapp');
     expect(miniAppLink({ webApp: '../evil' })).toBeUndefined();
     expect(miniAppLink({ payload: 'x' })).toBeUndefined();
+  });
+  it('lets only a bot\'s keyboard act as the owner: callbacks, text buttons, contact and location requests', () => {
+    const attach = kb([
+      [{ type: 'CALLBACK', text: 'Да', payload: 'yes' }, { type: 'MESSAGE', text: 'Нет' }],
+      [{ type: 'REQUEST_CONTACT', text: 'Контакт' }, { type: 'REQUEST_GEO_LOCATION', text: 'Гео' }],
+    ]);
+    // Not from a bot (the caller passes no chat id): every acting button is inert.
+    expect(maxKeyboardToTelegram(attach)).toEqual({ inline_keyboard: [[na('Да'), na('Нет')], [na('Контакт'), na('Гео')]] });
+    // From a bot: they act.
+    const bot = maxKeyboardToTelegram(attach, 42n)!;
+    expect(bot.inline_keyboard[0]!.every((b) => 'callback_data' in b && b.callback_data !== na('x').callback_data)).toBe(true);
+    expect(bot.inline_keyboard[1]).toEqual([{ text: 'Контакт', callback_data: KEYBOARD_CONTACT }, { text: 'Гео', callback_data: KEYBOARD_GEO }]);
   });
 });
