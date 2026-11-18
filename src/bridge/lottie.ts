@@ -160,9 +160,10 @@ export async function renderTgsToWebm(tgsBuffer: Buffer): Promise<Buffer> {
         // `window`) avoids needing the "dom" lib in this project's server tsconfig.
         (globalThis as unknown as { __anim: { goToAndStop: (f: number, isFrame: boolean) => void } }).__anim.goToAndStop(frame, true);
       }, nativeFrame);
-      // omitBackground: without it Chromium paints white under the transparent page, and the sticker
-      // arrived in MAX on a white square whatever the chat's theme.
-      await page.screenshot({ path: path.join(tmpDir, `f${String(i).padStart(5, '0')}.png`) as `${string}.png`, omitBackground: true });
+      // No omitBackground, on purpose: Chromium's white backdrop stays under the frame. Transparent
+      // frames were tried (2026-11-18) — MAX drops the alpha channel of an uploaded video and the
+      // sticker arrived on a BLACK square in every theme, which reads worse than the white one.
+      await page.screenshot({ path: path.join(tmpDir, `f${String(i).padStart(5, '0')}.png`) as `${string}.png` });
     }
     await browser.close();
     browser = undefined;
