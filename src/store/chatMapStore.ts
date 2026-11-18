@@ -1,5 +1,11 @@
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { reportBridgeError } from '../bridge/errorReporter.js';
+import { createLogger } from '../logger.js';
+
+const logger = createLogger('chat-map');
+/** A known-good copy for a corrupt file to fall back to; refreshed at most this often. */
+const BACKUP_EVERY_MS = 60 * 60_000;
 
 export interface ChatMapping {
   // MAX chat ids arrive as a plain number or a BigInt (large/negative ids, seen live on channels);
@@ -172,6 +178,7 @@ export class ChatMapStore {
         this.cache = normalizeChatMappings(JSON.parse(raw));
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code === 'ENOENT') this.cache = [];
+        else if (err instanceof SyntaxError) this.cache = await this.recoverFromCorruptFile(err);
         else throw err;
       }
       return this.cache;
@@ -189,11 +196,54 @@ export class ChatMapStore {
     return run;
   }
 
+  private lastBackupAt = 0;
+
   private async writeToDisk(mappings: ChatMapping[]): Promise<void> {
-    await mkdir(path.dirname(this.filePath), { recursive: true });
-    // write-then-rename so a crash mid-write can't leave a truncated/corrupt map file
-    const tmpPath = `${this.filePath}.tmp`;
-    await writeFile(tmpPath, JSON.stringify(mappings, null, 2), 'utf8');
-    await rename(tmpPath, this.filePath);
+    try {
+      await mkdir(path.dirname(this.filePath), { recursive: true });
+      // write-then-rename so a crash mid-write can't leave a truncated/corrupt map file
+      const tmpPath = `${this.filePath}.tmp`;
+      await writeFile(tmpPath, JSON.stringify(mappings, null, 2), { encoding: 'utf8', mode: 0o600 });
+      await rename(tmpPath, this.filePath);
+      if (Date.now() - this.lastBackupAt > BACKUP_EVERY_MS) {
+        this.lastBackupAt = Date.now();
+        await copyFile(this.filePath, `${this.filePath}.bak`).catch((err) => logger.warn('Could not refresh chat-map.json.bak', err));
+      }
+    } catch (err) {
+      // Memory is already ahead of disk: after a restart everything since the last good write would be
+      // sent again. Every later write rewrites the whole file, so freeing the disk heals it — but the
+      // owner has to know (a full disk is the usual cause).
+      logger.error('Saving chat-map.json failed', err);
+      reportBridgeError(
+        'chat-map-save-failed',
+        `⚠️ Не удалось сохранить привязку чатов к темам (${(err as NodeJS.ErrnoException).code ?? (err as Error).message}). Скорее всего, кончилось место на диске. Мост работает, но после перезапуска часть сообщений придёт повторно — освободите место.`,
+      );
+      throw err;
+    }
+  }
+
+  /**
+   * A chat-map.json that is not JSON (a truncated write from an old version, a disk error) used to make
+   * every lookup throw — the bridge looked alive and relayed nothing. Now it is parked as .broken (never
+   * deleted) and the hourly .bak, if readable, takes its place; failing that the bridge starts with no
+   * mappings (topics are created afresh — duplicates, but it relays). Either way the owner is told.
+   */
+  private async recoverFromCorruptFile(err: SyntaxError): Promise<ChatMapping[]> {
+    await rename(this.filePath, `${this.filePath}.broken`).catch(() => {});
+    let restored: ChatMapping[] | null = null;
+    try {
+      restored = normalizeChatMappings(JSON.parse(await readFile(`${this.filePath}.bak`, 'utf8')));
+      await copyFile(`${this.filePath}.bak`, this.filePath);
+    } catch {
+      restored = null;
+    }
+    logger.error(`chat-map.json was unreadable (${err.message}) — parked as .broken, ${restored ? `restored ${restored.length} chats from .bak` : 'starting with no mappings'}`);
+    reportBridgeError(
+      'chat-map-corrupt',
+      restored
+        ? `⚠️ Файл привязки чатов к темам был повреждён — восстановлен из резервной копии (до часа назад). Сообщения за это время могут прийти повторно.`
+        : `⚠️ Файл привязки чатов к темам был повреждён, резервной копии нет — темы будут созданы заново. Старый файл сохранён как chat-map.json.broken.`,
+    );
+    return restored ?? [];
   }
 }

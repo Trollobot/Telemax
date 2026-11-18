@@ -85,6 +85,8 @@ export function isSessionRejection(err: { message?: string; serverCode?: string 
   if (/token|cred|password|unauthori[sz]ed|session\.(expired|invalid)/i.test(err.serverCode ?? '')) return true;
   return /авториз|войдите снова|выполните вход|сесси[яи] (устарел|истекл|недействительн|завершен)|WRONG_PASSWORD|FAIL_LOGIN/i.test(err.message ?? '');
 }
+const REAUTH_NOTICE_RETRY_MS = 60_000;
+
 // Bounds how long an auth chain (START_AUTH -> CHECK_CODE -> LOGIN) defers a pending resume
 // retry: an abandoned /login flow must not end the retries.
 const AUTH_CHAIN_TTL_MS = 10 * 60_000;
@@ -498,14 +500,20 @@ export class MaxSessionController {
 
   /** Tells the group the session was rejected (or unreadable) and offers the in-bot re-auth flow. Once per loss; a later accepted LOGIN posts «восстановлена». */
   notifyReauthNeeded(): void {
-    if (this.sessionLostReported) return;
+    if (this.sessionLostReported || this.session) return;
     this.sessionLostReported = true;
     this.deps
       .postReauthNotice(
-        '❌ MAX-сессия отклонена — нужна повторная авторизация (номер + код из SMS). ' +
+        '❌ MAX-сессия отклонена или её нет — нужна повторная авторизация (номер + код из SMS). ' +
           'Нажмите «🔐 Войти в MAX» и авторизуйтесь в личке бота (или напишите боту в личку /login). Пока переписка не пересылается.',
       )
-      .catch((err) => logger.error('Failed to send re-auth notice', err));
+      .catch((err) => {
+        // Not marked as told: Telegram may be the thing that is down right now. Try again in a minute
+        // — unless a login has happened by then (the guard above).
+        logger.error('Failed to send re-auth notice — retrying in 60 s', err);
+        this.sessionLostReported = false;
+        setTimeout(() => this.notifyReauthNeeded(), REAUTH_NOTICE_RETRY_MS).unref();
+      });
   }
 
   /** Starts the outage window unless one runs or an outage is already reported. */
