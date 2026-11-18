@@ -60,6 +60,16 @@ export const OPCODES = {
   // (2026-08-07). {count} request; PHOTO/FILE return an upload slot {url, ...ids},
   // FILE_DOWNLOAD exchanges {chatId, messageId, fileId} for a signed {url}.
   PHOTO_UPLOAD: 0x0050,
+  // Native stickers — worked out live on the test account, 2026-11-18. STICKER_UPLOAD {count: 1}
+  // answers {url}: an image upload (multipart field `file`; a PNG with alpha is taken, WebP, GIF,
+  // WebM and Lottie are not, an animated PNG becomes its first frame) that returns [{token}].
+  // STICKER_CREATE {token} turns it into the account's own sticker: {sticker: {id, width, height, url,
+  // type: 'STATIC', authorType: 'USER'}} — MAX shrinks it to 170 px. It is then sent as an attach
+  // {_type: 'STICKER', stickerId}. A created sticker also lands in the account's «недавние»:
+  // ASSETS_REMOVE {type: 'RECENT', ids: [id]} takes it out again, and the sent message keeps it.
+  STICKER_UPLOAD: 0x0051,
+  STICKER_CREATE: 0x00c1,
+  ASSETS_REMOVE: 0x0103,
   VIDEO_UPLOAD: 0x0052,
   VIDEO_PLAY: 0x0053,
   FILE_UPLOAD: 0x0057,
@@ -127,11 +137,6 @@ export const OPCODES = {
   // — supplied by the user 2026-08-10. `link.messageId` is a decimal STRING, not the usual int.
   FORWARD: 0x0046,
   MSG_GET: 0x0047,
-  // User-confirmed 2026-08-13 from their own reverse-engineering (real MAX client
-  // traffic) — a dedicated upload slot for stickers, distinct from FILE_UPLOAD/
-  // VIDEO_UPLOAD (uploading a .tgs through FILE_UPLOAD lands as a plain file
-  // attachment with an auto-generated preview, not a native rendered sticker).
-  STICKER_UPLOAD: 0x0051,
   // Not in max-protocol-full.md — inferred live on 2026-08-06 from real traffic:
   // payload {chatId, userId, mark, setAsUnread}, looks like a read-marker update.
   PUSH_READ_MARK: 0x0082,

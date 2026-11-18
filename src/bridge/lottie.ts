@@ -15,7 +15,7 @@
  */
 import { gunzipSync } from 'node:zlib';
 import { spawn } from 'node:child_process';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -82,6 +82,24 @@ function runFfmpeg(args: string[]): Promise<void> {
       else reject(new Error(`ffmpeg exited ${code}: ${stderr.slice(-2000)}`));
     });
   });
+}
+
+/**
+ * A static Telegram sticker (WebP) as a PNG with its transparency kept — the only image form MAX's
+ * sticker upload takes. ffmpeg does it; it is there in the «full» image only (the caller falls back to
+ * sending a photo when this throws — a «slim» image has no ffmpeg).
+ */
+export async function webpToPng(webp: Buffer): Promise<Buffer> {
+  const tmpDir = await mkdtemp(path.join(tmpdir(), 'stk-'));
+  try {
+    const input = path.join(tmpDir, 'in.webp');
+    const output = path.join(tmpDir, 'out.png');
+    await writeFile(input, webp);
+    await runFfmpeg(['-y', '-loglevel', 'error', '-i', input, '-frames:v', '1', '-pix_fmt', 'rgba', output]);
+    return await readFile(output);
+  } finally {
+    await rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+  }
 }
 
 /** Renders a .tgs buffer (raw or gzip-compressed) to a short WebM (VP9) video buffer. */

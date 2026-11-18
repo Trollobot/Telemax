@@ -79,3 +79,22 @@ describe('channel posts', () => {
     expect(channelCardText('Без данных')).toMatch(/^📢 Без данных\nКанал MAX\n\n/);
   });
 });
+
+describe('native MAX stickers', () => {
+  it('are on unless switched off', async () => {
+    const { nativeStickersEnabled } = await import('../src/bridge/upload.js');
+    expect(nativeStickersEnabled({})).toBe(true);
+    expect(nativeStickersEnabled({ NATIVE_STICKERS: 'off' })).toBe(false);
+    expect(nativeStickersEnabled({ NATIVE_STICKERS: '0' })).toBe(false);
+    expect(nativeStickersEnabled({ NATIVE_STICKERS: 'on' })).toBe(true);
+  });
+
+  it('reads the upload token, and MAX’s own error form', async () => {
+    const { stickerUploadToken } = await import('../src/bridge/upload.js');
+    expect(stickerUploadToken('[{"token":"AWiVZrmd3G"}]')).toBe('AWiVZrmd3G');
+    expect(() => stickerUploadToken('null&errorId=invalid.format&details=Invalid+image+format')).toThrow(/invalid\.format/);
+    expect(() => stickerUploadToken('null&errorId=server.error&details=Server+error')).toThrow(/server\.error/);
+    expect(() => stickerUploadToken('[]')).toThrow(/refused/);
+    expect(() => stickerUploadToken('')).toThrow(/refused/);
+  });
+});

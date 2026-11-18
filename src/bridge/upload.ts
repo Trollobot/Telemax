@@ -19,7 +19,8 @@ import { createLogger } from '../logger.js';
 import { networkFailureName } from './attachments.js';
 import { isConnectFailure } from './transient.js';
 import { getTelegramProxyAgent } from '../telegram/proxy.js';
-import { renderTgsToWebm } from './lottie.js';
+import { renderTgsToWebm, webpToPng } from './lottie.js';
+import { parseEnvBool } from '../env.js';
 
 const logger = createLogger('upload');
 const CONNECT_RETRY_MS = 3000;
@@ -263,7 +264,47 @@ async function uploadVideoToMax(
   return { _type: 'VIDEO', videoId: slot.videoId, token: slot.token };
 }
 
-export type UploadKind = 'photo' | 'document' | 'video' | 'voice' | 'sticker_animated';
+/** NATIVE_STICKERS=off (0/false/no): static Telegram stickers go to MAX as photos again, as before 1.4.2. Exported for tests. */
+export function nativeStickersEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return parseEnvBool(env.NATIVE_STICKERS) !== false;
+}
+
+/** The token out of MAX's answer to a sticker image upload: `[{"token":"…"}]`, or an error as `null&errorId=…&details=…`. Exported for tests. */
+export function stickerUploadToken(body: string): string {
+  try {
+    const first = (JSON.parse(body) as Array<{ token?: unknown }> | null)?.[0];
+    if (typeof first?.token === 'string' && first.token) return first.token;
+  } catch {
+    // not JSON — MAX's own error form, quoted below
+  }
+  const error = /errorId=([^&\s]+)/.exec(body)?.[1];
+  throw new Error(`Sticker upload was refused${error ? `: ${error}` : ''}`);
+}
+
+/**
+ * A PNG as the account's own MAX sticker — the attach for MSG_SEND (see OPCODES.STICKER_UPLOAD). The
+ * sticker is drawn by MAX itself, so its transparency survives; a sticker sent as a photo or as a
+ * video does not keep it.
+ */
+async function uploadStickerToMax(max: MaxClient, png: Buffer): Promise<{ _type: 'STICKER'; stickerId: unknown }> {
+  const { url } = await uploadSlot(max, () => max.requestStickerUpload());
+  const form = new FormData();
+  form.append('file', new Blob([png], { type: 'image/png' }), 'sticker.png');
+  const res = await postToMax(url, {
+    method: 'POST',
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+      Accept: '*/*',
+    },
+    body: form,
+  });
+  const body = await res.text().catch(() => '');
+  if (!res.ok) throw new Error(`Sticker upload POST failed: ${res.status} ${res.statusText}`);
+  const { stickerId } = await max.createSticker(stickerUploadToken(body));
+  return { _type: 'STICKER', stickerId };
+}
+
+export type UploadKind = 'photo' | 'document' | 'video' | 'voice' | 'sticker_animated' | 'sticker_static';
 
 /** Downloads a Telegram attachment and uploads it to MAX, returning the attach object for MSG_SEND. `duration` (seconds) is only used for 'voice'. */
 export async function uploadTelegramAttachmentToMax(
@@ -284,6 +325,8 @@ export async function uploadTelegramAttachmentToMax(
     const webm = await renderTgsToWebm(buffer);
     return uploadVideoToMax(max, webm, 'sticker.webm', 'video/webm');
   }
+
+  if (kind === 'sticker_static') return uploadStickerToMax(max, await webpToPng(buffer));
 
   let uploadBuffer = buffer;
   if (filename.endsWith('.tgs') && !(buffer[0] === 0x1f && buffer[1] === 0x8b)) {

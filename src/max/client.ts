@@ -1069,6 +1069,29 @@ export class MaxClient extends EventEmitter {
     return { url: result.url, photoIds: result.photoIds ?? [] };
   }
 
+  /** An upload slot for a sticker image — see OPCODES.STICKER_UPLOAD for the whole native-sticker flow. */
+  async requestStickerUpload(): Promise<{ url: string }> {
+    const { dir, payload } = await this.request(OPCODES.STICKER_UPLOAD, { count: 1 });
+    const url = (payload as { url?: string } | null)?.url;
+    if (dir === DIR.ERR || !url) throw new Error(describeAuthError(payload, 'STICKER_UPLOAD did not return an upload url'));
+    return { url };
+  }
+
+  /** Makes the uploaded image (its upload token) a sticker of this account; the id is what a STICKER attach carries. */
+  async createSticker(token: string): Promise<{ stickerId: unknown }> {
+    const { dir, payload } = await this.request(OPCODES.STICKER_CREATE, { token });
+    const id = (payload as { sticker?: { id?: unknown } } | null)?.sticker?.id;
+    if (dir === DIR.ERR || id == null) throw new Error(describeAuthError(payload, 'STICKER_CREATE did not return a sticker'));
+    return { stickerId: id };
+  }
+
+  /** Takes a sticker out of the account's «недавние» (a created sticker lands there). False when MAX had nothing to remove. */
+  async removeRecentSticker(stickerId: unknown): Promise<boolean> {
+    const { dir, payload } = await this.request(OPCODES.ASSETS_REMOVE, { type: 'RECENT', ids: [stickerId] });
+    if (dir === DIR.ERR) throw new Error(describeAuthError(payload, 'ASSETS_REMOVE failed'));
+    return (payload as { success?: boolean } | null)?.success === true;
+  }
+
   /** Requests an upload slot for a single video. */
   async requestVideoUpload(): Promise<{ url: string; videoId: unknown; token: string }> {
     const { dir, payload } = await this.request(OPCODES.VIDEO_UPLOAD, { count: 1, type: 0, uploaderType: 0, profile: false });

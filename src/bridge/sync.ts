@@ -35,7 +35,7 @@ import {
   type DownloadContext,
 } from './attachments.js';
 import { splitTelegramText, truncateCodePoints, truncateUtf16, MAX_TEXT_LIMIT, TELEGRAM_CAPTION_LIMIT, TELEGRAM_TEXT_LIMIT } from './text.js';
-import { uploadTelegramAttachmentToMax } from './upload.js';
+import { nativeStickersEnabled, uploadTelegramAttachmentToMax } from './upload.js';
 import { FileShare, fileShareOptionsFromEnv, TELEGRAM_BOT_DOWNLOAD_LIMIT } from './fileShare.js';
 import { createBigFiles } from './bigFiles.js';
 import { canRenderAnimatedStickers } from './lottie.js';
@@ -4069,6 +4069,41 @@ export function wireBridge({
     if (total > 1) logger.info(`TG -> MAX: message ${link.telegramMessageId} went to chat ${String(chatId)} as ${total} MAX messages (over ${MAX_TEXT_LIMIT} chars)`);
   }
 
+  // Telegram sticker (its file_unique_id) → the MAX sticker already made from it: the same sticker
+  // sent again costs no upload and makes no second copy on MAX's side. In memory only — after a
+  // restart the first use of a sticker makes it anew.
+  const nativeStickerIds = new Map<string, unknown>();
+  // Once the conversion or MAX's sticker upload has failed for a reason that will not go away on its
+  // own (no ffmpeg in a «slim» image), stop trying for this run instead of failing on every sticker.
+  let nativeStickersBroken = false;
+
+  /**
+   * A static Telegram sticker as the account's own MAX sticker: its id for a STICKER attach, or
+   * undefined when it has to go the old way (as a photo) — the feature is off, this image has no
+   * ffmpeg, or MAX refused. Never throws: a sticker must not be lost to this.
+   */
+  async function nativeSticker(sticker: { file_id: string; file_unique_id?: string }): Promise<unknown> {
+    if (!nativeStickersEnabled() || nativeStickersBroken) return undefined;
+    const known = sticker.file_unique_id ? nativeStickerIds.get(sticker.file_unique_id) : undefined;
+    if (known != null) return known;
+    try {
+      const made = await uploadTelegramAttachmentToMax(bot, max, sticker.file_id, 'sticker_static');
+      if (sticker.file_unique_id) {
+        if (nativeStickerIds.size >= 500) nativeStickerIds.clear();
+        nativeStickerIds.set(sticker.file_unique_id, made.stickerId);
+      }
+      return made.stickerId;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException | null)?.code === 'ENOENT') {
+        nativeStickersBroken = true;
+        logger.info('No ffmpeg in this image — static stickers go to MAX as photos');
+      } else {
+        logger.warn(`A native MAX sticker could not be made (${(err as Error)?.message ?? String(err)}) — sending it as a photo`);
+      }
+      return undefined;
+    }
+  }
+
   bot.on('message', async (ctx) => {
     const topicId = ctx.message.message_thread_id;
     if (!topicId) return;
@@ -4101,7 +4136,7 @@ export function wireBridge({
     const video = (ctx.message as { video?: { file_id: string; file_name?: string } }).video;
     const videoNote = (ctx.message as { video_note?: { file_id: string } }).video_note;
     const voice = (ctx.message as { voice?: { file_id: string; duration?: number } }).voice;
-    const sticker = (ctx.message as { sticker?: { file_id: string; is_animated?: boolean; is_video?: boolean; thumbnail?: { file_id: string } } }).sticker;
+    const sticker = (ctx.message as { sticker?: { file_id: string; file_unique_id?: string; is_animated?: boolean; is_video?: boolean; thumbnail?: { file_id: string } } }).sticker;
     const poll = (ctx.message as { poll?: { id: string; question: string; options: Array<{ text: string }>; is_anonymous: boolean; allows_multiple_answers: boolean } }).poll;
     const location = (ctx.message as { location?: { latitude: number; longitude: number } }).location;
     const contact = (ctx.message as { contact?: { phone_number: string; first_name: string; last_name?: string } }).contact;
@@ -4271,6 +4306,8 @@ export function wireBridge({
       }
 
       let attach: Record<string, unknown> | null = null;
+      // Set when the attach is a native MAX sticker made for this message (see nativeSticker).
+      let nativeStickerId: unknown;
       const largestPhoto = photo?.[photo.length - 1];
       if (largestPhoto) {
         attach = await uploadTelegramAttachmentToMax(bot, max, largestPhoto.file_id, 'photo');
@@ -4289,9 +4326,9 @@ export function wireBridge({
         // No MAX audio-track attach is known — the file pipeline delivers it as a playable file.
         attach = await uploadTelegramAttachmentToMax(bot, max, audio.file_id, 'document', audio.file_name ?? 'audio.mp3');
       } else if (sticker) {
-        // No MAX-side sticker-upload opcode. Static webp goes through the PHOTO pipeline (confirmed
-        // live 2026-08-13), video stickers (webm) through VIDEO_UPLOAD, animated (tgs/Lottie) are
-        // rendered to a WebM first (lottie.ts) — MAX's own animated stickers arrive as VIDEO attaches.
+        // A static sticker becomes a native MAX sticker (transparent, drawn by MAX itself) — see
+        // nativeSticker below; MAX takes only still images there, so video stickers (webm) go through
+        // VIDEO_UPLOAD and animated ones (tgs/Lottie) are rendered to a WebM first (lottie.ts).
         if (sticker.is_video) {
           attach = await uploadTelegramAttachmentToMax(bot, max, sticker.file_id, 'video', 'sticker.webm');
         } else if (sticker.is_animated) {
@@ -4302,7 +4339,8 @@ export function wireBridge({
             attach = await uploadTelegramAttachmentToMax(bot, max, sticker.thumbnail.file_id, 'photo');
           }
         } else {
-          attach = await uploadTelegramAttachmentToMax(bot, max, sticker.file_id, 'photo');
+          nativeStickerId = await nativeSticker(sticker);
+          attach = nativeStickerId != null ? { _type: 'STICKER', stickerId: nativeStickerId } : await uploadTelegramAttachmentToMax(bot, max, sticker.file_id, 'photo');
         }
       }
       if (!attach) {
@@ -4321,7 +4359,26 @@ export function wireBridge({
         return;
       }
 
-      const { cid, messageId, time } = await max.sendMessage(mapping.maxChatId, caption, [attach], replyLink);
+      let sent: Awaited<ReturnType<typeof max.sendMessage>>;
+      try {
+        sent = await max.sendMessage(mapping.maxChatId, caption, [attach], replyLink);
+      } catch (err) {
+        if (nativeStickerId == null || !sticker) throw err;
+        // MAX would not take the sticker (a remembered one it has since dropped, a rule that changed):
+        // the photo way, as before 1.4.2. A refused send costs the connection — wait for it first.
+        logger.warn(`Native sticker ${String(nativeStickerId)} was refused (${(err as Error)?.message ?? String(err)}) — sending it as a photo`);
+        if (sticker.file_unique_id) nativeStickerIds.delete(sticker.file_unique_id);
+        nativeStickerId = undefined;
+        await max.waitForLogin(MAX_RECONNECT_WAIT_MS);
+        attach = await uploadTelegramAttachmentToMax(bot, max, sticker.file_id, 'photo');
+        sent = await max.sendMessage(mapping.maxChatId, caption, [attach], replyLink);
+      }
+      const { cid, messageId, time } = sent;
+      // A sticker made for this send sits in the account's «недавние» now — out it goes, or every
+      // forwarded sticker would pile up there. The message keeps its sticker.
+      if (nativeStickerId != null) {
+        void max.removeRecentSticker(nativeStickerId).catch((err) => logger.warn('Could not take the sticker out of MAX «недавние»', err));
+      }
       rememberOutgoingSend(mapping.maxChatId, cid, time);
       messageLinks.add({ maxChatId: mapping.maxChatId, maxMessageId: messageId, telegramMessageId: ctx.message.message_id, telegramTopicId: topicId, outgoing: true });
       copyToBroadcasts(messageId, time);
