@@ -6,7 +6,14 @@
   <atom:link href="https://telemax.svnest.ru/news/feed.xml" rel="self" type="application/rss+xml"/>
   <description>Что нового в Telemax — бесплатном мосте MAX ↔ Telegram с открытым кодом</description>
   <language>ru</language>
-  <lastBuildDate>Mon, 16 Nov 2026 09:00:00 GMT</lastBuildDate>
+  <lastBuildDate>Wed, 18 Nov 2026 09:00:00 GMT</lastBuildDate>
+  <item>
+    <title>Telemax 1.4.1: История без звука и мост, который не молчит при сбоях</title>
+    <link>https://telemax.svnest.ru/news/#v1.4.1</link>
+    <guid isPermaLink="false">telemax-1.4.1</guid>
+    <pubDate>Wed, 18 Nov 2026 09:00:00 GMT</pubDate>
+    <description><![CDATA[<ul><li><b>История и догрузка после простоя приходят в Telegram без звука:</b> сообщения старше 5 минут не звенят. Вернуть звук — <code>QUIET_HISTORY=off</code></li><li>Если сообщение о потере сессии MAX не дошло до Telegram, мост повторяет его, пока оно не дойдёт. Раньше после такого сбоя и перезапуска мост молчал</li><li><b>Привязка чатов к темам получает резервную копию раз в час.</b> Если файл повреждён, мост берёт копию и сообщает об этом; если копии нет — останавливается и пишет, что сделать</li><li>Если Telegram окончательно отказался принять сообщение из MAX, в теме остаётся пометка об этом</li><li><b>Мост пишет файл со своим состоянием (data/health.json)</b> — его можно проверять снаружи, пример в README</li><li>Кнопки, которые действуют от вашего имени, работают только в сообщениях ботов MAX</li><li>Скачивание файла из MAX обрывается, как только он превысил предел, а большие пакеты от MAX принимаются быстрее</li><li><b>По желанию:</b> не пересылать в MAX то, что дошло из Telegram с большим опозданием (<code>STALE_TELEGRAM_MINUTES</code>)</li><li><b>Правки этого выпуска прислал sadontsev</b> — спасибо!</li></ul>]]></description>
+  </item>
   <item>
     <title>Telemax 1.4.0: Защита моста, стикеры снова работают, MAX 26.40</title>
     <link>https://telemax.svnest.ru/news/#v1.4.0</link>
@@ -209,13 +216,6 @@
     <guid isPermaLink="false">telemax-0.6.3</guid>
     <pubDate>Fri, 11 Sep 2026 09:00:00 GMT</pubDate>
     <description><![CDATA[<ul><li><b>Пульт и «📊 Статус» честно показывают, что вход в MAX ещё не выполнен:</b> 🔴 «не авторизован — <code>/login</code>» вместо зелёного кружка, который на свежей установке читался как «всё в порядке»</li><li>«🔄 Пересинхронизация» без входа не запускается, а объясняет, что сначала нужен <code>/login</code> — после входа синхронизация идёт сама</li></ul>]]></description>
-  </item>
-  <item>
-    <title>Telemax 0.6.2: Исправлена настройка на серверах без прокси</title>
-    <link>https://telemax.svnest.ru/news/#v0.6.2</link>
-    <guid isPermaLink="false">telemax-0.6.2</guid>
-    <pubDate>Fri, 11 Sep 2026 09:00:00 GMT</pubDate>
-    <description><![CDATA[<ul><li><b><code>setup.sh</code>:</b> исправлен молчаливый выход первичной настройки сразу после «Сделали? Enter» на серверах без прокси для Telegram (сидел с 0.4.9 — то самое «Enter нажимаю и ничего»); найден сквозным прогоном установки с нуля</li></ul>]]></description>
   </item>
 </channel>
 </rss>

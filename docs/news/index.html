@@ -4,13 +4,13 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Новости Telemax — что нового в мосте MAX ↔ Telegram</title>
-<meta name="description" content="Что нового в Telemax: все версии моста MAX ↔ Telegram по-человечески. Последняя — 1.4.0 от 16 ноября 2026: Защита моста, стикеры снова работают, MAX 26.40.">
+<meta name="description" content="Что нового в Telemax: все версии моста MAX ↔ Telegram по-человечески. Последняя — 1.4.1 от 18 ноября 2026: История без звука и мост, который не молчит при сбоях.">
 <link rel="canonical" href="https://telemax.svnest.ru/news/">
 <link rel="alternate" type="application/rss+xml" title="Новости Telemax" href="https://telemax.svnest.ru/news/feed.xml">
 <meta property="og:type" content="website">
 <meta property="og:locale" content="ru_RU">
 <meta property="og:site_name" content="Telemax">
-<meta property="og:title" content="Новости Telemax — Защита моста, стикеры снова работают, MAX 26.40">
+<meta property="og:title" content="Новости Telemax — История без звука и мост, который не молчит при сбоях">
 <meta property="og:description" content="Все версии моста MAX ↔ Telegram: что появилось и что починили.">
 <meta property="og:url" content="https://telemax.svnest.ru/news/">
 <meta property="og:image" content="https://telemax.svnest.ru/og.png">
@@ -24,6 +24,16 @@
   "url": "https://telemax.svnest.ru/news/",
   "inLanguage": "ru",
   "blogPost": [
+    {
+      "@type": "BlogPosting",
+      "headline": "Telemax 1.4.1: История без звука и мост, который не молчит при сбоях",
+      "datePublished": "2026-11-18",
+      "url": "https://telemax.svnest.ru/news/#v1.4.1",
+      "author": {
+        "@type": "Organization",
+        "name": "Telemax"
+      }
+    },
     {
       "@type": "BlogPosting",
       "headline": "Telemax 1.4.0: Защита моста, стикеры снова работают, MAX 26.40",
@@ -213,16 +223,6 @@
         "@type": "Organization",
         "name": "Telemax"
       }
-    },
-    {
-      "@type": "BlogPosting",
-      "headline": "Telemax 1.2.1: Боты и каналы MAX снова находятся по нику",
-      "datePublished": "2026-10-05",
-      "url": "https://telemax.svnest.ru/news/#v1.2.1",
-      "author": {
-        "@type": "Organization",
-        "name": "Telemax"
-      }
     }
   ]
 }
@@ -340,18 +340,33 @@
     <h1>Что нового в Telemax</h1>
     <p class="lead">Каждая версия моста — коротко и по-человечески. О новой версии бот сам скажет в группе, а обновиться можно одной кнопкой «Обновить» в <code>/version</code>.</p>
     <div class="actions">
-      <a class="btn btn-primary" href="#v1.4.0">🛡 Версия 1.4.0</a>
+      <a class="btn btn-primary" href="#v1.4.1">🔕 Версия 1.4.1</a>
       <a class="btn btn-ghost" href="feed.xml">📡 RSS-лента</a>
       <a class="btn btn-ghost" href="../#how">Как установить</a>
     </div>
     <div class="facts">
-      <span class="fact">Последняя версия — <b>1.4.0</b>, 16 ноября 2026</span>
-      <span class="fact"><b>46</b> версий с 22 августа 2026</span>
+      <span class="fact">Последняя версия — <b>1.4.1</b>, 18 ноября 2026</span>
+      <span class="fact"><b>47</b> версий с 22 августа 2026</span>
     </div>
   </div>
 
   <div class="feed">
     <div class="month"><h2 class="mh">Ноябрь 2026</h2>
+      <article class="rel" id="v1.4.1">
+        <div class="meta"><a class="ver" href="#v1.4.1" title="Ссылка на эту новость">v1.4.1</a><time datetime="2026-11-18">18 ноября</time></div>
+        <h3><span class="em" aria-hidden="true">🔕</span> История без звука и мост, который не молчит при сбоях</h3>
+        <ul>
+          <li><b>История и догрузка после простоя приходят в Telegram без звука:</b> сообщения старше 5 минут не звенят. Вернуть звук — <code>QUIET_HISTORY=off</code></li>
+          <li>Если сообщение о потере сессии MAX не дошло до Telegram, мост повторяет его, пока оно не дойдёт. Раньше после такого сбоя и перезапуска мост молчал</li>
+          <li><b>Привязка чатов к темам получает резервную копию раз в час.</b> Если файл повреждён, мост берёт копию и сообщает об этом; если копии нет — останавливается и пишет, что сделать</li>
+          <li>Если Telegram окончательно отказался принять сообщение из MAX, в теме остаётся пометка об этом</li>
+          <li><b>Мост пишет файл со своим состоянием (data/health.json)</b> — его можно проверять снаружи, пример в README</li>
+          <li>Кнопки, которые действуют от вашего имени, работают только в сообщениях ботов MAX</li>
+          <li>Скачивание файла из MAX обрывается, как только он превысил предел, а большие пакеты от MAX принимаются быстрее</li>
+          <li><b>По желанию:</b> не пересылать в MAX то, что дошло из Telegram с большим опозданием (<code>STALE_TELEGRAM_MINUTES</code>)</li>
+          <li><b>Правки этого выпуска прислал sadontsev</b> — спасибо!</li>
+        </ul>
+      </article>
       <article class="rel major" id="v1.4.0">
         <div class="meta"><a class="ver" href="#v1.4.0" title="Ссылка на эту новость">v1.4.0</a><time datetime="2026-11-16">16 ноября</time><span class="tag big">Крупное обновление</span></div>
         <h3><span class="em" aria-hidden="true">🛡</span> Защита моста, стикеры снова работают, MAX 26.40</h3>
