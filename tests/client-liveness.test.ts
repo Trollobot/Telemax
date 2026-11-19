@@ -83,6 +83,8 @@ describe('half-open detection', () => {
   it('a PING still unanswered at the next tick destroys the socket instead of sending another', () => {
     const { internals, destroy, sent } = withFakeSocket();
     internals.ping();
+    // A whole interval later (a PING younger than the probe wait is left to the probe).
+    (internals as unknown as { lastPingSentAt: number }).lastPingSentAt = Date.now() - 50_000;
     internals.ping();
     expect(destroy).toHaveBeenCalledTimes(1);
     const err = destroy.mock.calls[0]?.[0] as Error & { code?: string };

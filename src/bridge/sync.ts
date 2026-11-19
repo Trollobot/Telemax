@@ -706,6 +706,9 @@ export function sendFailureText(err: unknown, downSince?: number | null, now = D
     const mins = downSince != null ? Math.floor((now - downSince) / 60_000) : 0;
     return `⚠️ Не отправлено: нет связи с MAX${mins >= 1 ? ` уже ${mins} мин` : ''} — сервер не может до него достучаться. Отправьте ещё раз, когда связь вернётся.`;
   }
+  if ((err as Error | null)?.name === 'MaxSendUnconfirmedError') {
+    return '⚠️ MAX не ответил на отправку, и проверить, дошло ли сообщение, не удалось — посмотрите в MAX, прежде чем отправлять ещё раз.';
+  }
   if ((err as Error | null)?.name === 'MaxConnectionLostError') {
     return '⚠️ Связь с MAX оборвалась во время отправки — проверьте в MAX, дошло ли сообщение, прежде чем отправлять ещё раз.';
   }

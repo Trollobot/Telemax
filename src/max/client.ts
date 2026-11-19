@@ -7,6 +7,9 @@ import { OPCODES, DIR, formatOpcode } from './opcodes.js';
 import { MAX_TLS_CA } from './ca.js';
 import { toMaxReaction } from './reactions.js';
 import { findAuthToken, findLongToken, describeAuthError, extractPasswordChallenge, type PasswordChallenge } from './tokens.js';
+import { createLogger } from '../logger.js';
+
+const logger = createLogger('max-client');
 
 export type VerifyCodeResult = { status: 'ok'; loginToken: string } | { status: 'password_required'; challenge: PasswordChallenge };
 
@@ -182,6 +185,74 @@ export class MaxConnectionLostError extends Error {
     super(`MaxClient connection lost while waiting for ${what}: ${reason}`, { cause });
     this.name = 'MaxConnectionLostError';
   }
+}
+
+/**
+ * MAX did not answer a send, and whether the message got there could not be told: MAX did not come
+ * back in time, or its history said neither yes nor no. The sender is asked to look in MAX before
+ * sending again — «не отправлено» could make a duplicate, «отправлено» could lose a message.
+ */
+export class MaxSendUnconfirmedError extends Error {
+  constructor(cause?: unknown) {
+    super(`MAX did not confirm the send, and its history could not tell whether it arrived${cause instanceof Error ? ` (${cause.message})` : ''}`, { cause });
+    this.name = 'MaxSendUnconfirmedError';
+  }
+}
+
+// The unanswered-send check (sendMessage). A connection that let a request go unanswered gets a
+// PING of its own and this long to answer it before it is taken for dead — not the 50-100 s the
+// regular ping needs to notice (a send failed live 78 s before the reconnect, prod, 2026-11-19).
+const PROBE_TIMEOUT_MS = 10_000;
+// How long a send waits for MAX to come back before it gives up on knowing whether it arrived.
+const SEND_CHECK_LOGIN_WAIT_MS = 60_000;
+// History is read in pages this small, newest first, and never past the chat's last message known
+// from before the send: ours, if it got there, is among the first few even in a busy chat.
+const SEND_CHECK_PAGE = 3;
+const SEND_CHECK_MAX_PAGES = 5;
+// With no message of the chat seen yet (a fresh start), the boundary is the send's own moment, less
+// this much for a host clock ahead of MAX's.
+const SEND_CHECK_CLOCK_SLACK_MS = 2 * 60_000;
+// CHAT_HISTORY returns what is older than `from` in MAX server time: start ahead of the local clock
+// (the same trick as bridge/sync.ts historyStartTime).
+const SEND_CHECK_FROM_AHEAD_MS = 15 * 60_000;
+
+/** MSG_SEND's answer: the echoed message. `time` is its MAX server timestamp, raw — the chat's history cursor (liveCursorTime). */
+function sentAnswer({ dir, payload }: MaxMessageEvent): { messageId: unknown; attaches: unknown[]; time: unknown } {
+  const message = (payload as { message?: { id?: unknown; attaches?: unknown[]; time?: unknown } } | null)?.message;
+  if (dir === DIR.ERR) throw new Error(describeAuthError(payload, 'MSG_SEND failed'));
+  return { messageId: message?.id, attaches: message?.attaches ?? [], time: message?.time };
+}
+
+/** A request that went out and got no answer — the message may or may not be in MAX. */
+function isUnansweredSend(err: unknown): boolean {
+  return err instanceof MaxConnectionLostError || /^Timed out waiting for 0x0040\b/.test(String((err as Error | null)?.message ?? ''));
+}
+
+/**
+ * Walks a chat's history newest-first looking for our message by its `cid`. 'absent' once it is past
+ * `knownBefore` (the newest message of the chat known from before the send: ours would be newer) or
+ * the chat ran out; 'unknown' when `maxPages` ran out first. Exported for tests.
+ */
+export async function lookForSent(
+  fetchPage: (from: number) => Promise<MaxHistoryMessage[]>,
+  cid: number,
+  knownBefore: number,
+  from: number,
+  maxPages = SEND_CHECK_MAX_PAGES,
+): Promise<{ found: MaxHistoryMessage } | 'absent' | 'unknown'> {
+  for (let i = 0; i < maxPages; i++) {
+    const page = await fetchPage(from);
+    if (page.length === 0) return 'absent';
+    let oldest = from;
+    for (const m of page) {
+      if (m.cid != null && Number(m.cid) === cid) return { found: m };
+      const time = Number(m.time);
+      if (time < oldest) oldest = time;
+    }
+    if (oldest <= knownBefore || !(oldest < from)) return 'absent';
+    from = oldest;
+  }
+  return 'unknown';
 }
 
 /**
@@ -423,9 +494,51 @@ export class MaxClient extends EventEmitter {
    * a FIN): the kernel would keep retransmitting for 15+ minutes before 'close'. Destroy the socket
    * instead — 'error' fails the in-flight requests, 'close' runs the usual reconnect path.
    */
+  // The probe in progress (probeConnection), shared by every request that went unanswered meanwhile.
+  private probe: Promise<void> | null = null;
+
+  /**
+   * A request went unanswered: is the connection alive? A PING of its own, now; no answer within
+   * PROBE_TIMEOUT_MS drops the socket the way the regular ping does (reconnect, in-flight requests
+   * fail). Resolves when that is decided either way.
+   */
+  probeConnection(): Promise<void> {
+    if (this.probe) return this.probe;
+    const socket = this.socket;
+    if (!socket || !this.authed) return Promise.resolve();
+    this.probe = new Promise<void>((resolve) => {
+      const done = () => {
+        clearTimeout(timer);
+        this.off('pong', done);
+        this.probe = null;
+        resolve();
+      };
+      const timer = setTimeout(() => {
+        if (this.socket === socket) {
+          socket.destroy(
+            Object.assign(new Error(`MAX did not answer PING for ${PROBE_TIMEOUT_MS / 1000}s after an unanswered request — connection is dead, reconnecting`), {
+              code: 'ETIMEDOUT',
+            }),
+          );
+        }
+        done();
+      }, PROBE_TIMEOUT_MS);
+      this.on('pong', done);
+      this.lastPingSentAt ??= Date.now();
+      try {
+        this.send(OPCODES.PING);
+      } catch {
+        done();
+      }
+    });
+    return this.probe;
+  }
+
   private ping(): void {
     if (this.lastPingSentAt !== null) {
       const silentMs = Date.now() - this.lastPingSentAt;
+      // A probe PING (probeConnection) still within its own wait: its timer decides, not this one.
+      if (silentMs < PROBE_TIMEOUT_MS) return;
       this.lastPingSentAt = null;
       // code ETIMEDOUT: the failed in-flight requests classify as transient (bridge/transient.ts).
       const err = Object.assign(new Error(`MAX did not answer PING for ${Math.round(silentMs / 1000)}s — connection is dead, reconnecting`), {
@@ -503,9 +616,26 @@ export class MaxClient extends EventEmitter {
         this.authed = true;
         this.emit('authed');
       }
-      if (header.opcode === OPCODES.PING) this.lastPingSentAt = null;
+      if (header.opcode === OPCODES.PING) {
+        this.lastPingSentAt = null;
+        this.emit('pong');
+      }
+      this.noteChatTime(event);
       this.emit('message', event);
     }
+  }
+
+  // Newest MAX message time seen per chat (pushes and our own sends) — where an unanswered send's
+  // history check may stop (lookForSent's knownBefore).
+  private readonly chatTimes = new Map<string, number>();
+
+  private noteChatTime(event: MaxMessageEvent): void {
+    if (event.dir === DIR.ERR || (event.opcode !== OPCODES.PUSH_MESSAGE && event.opcode !== OPCODES.MSG_SEND)) return;
+    const p = event.payload as { chatId?: unknown; message?: { time?: unknown } } | null;
+    const time = Number(p?.message?.time);
+    if (p?.chatId == null || !Number.isFinite(time)) return;
+    const key = String(p.chatId);
+    if (time > (this.chatTimes.get(key) ?? 0)) this.chatTimes.set(key, time);
   }
 
   /** True while the socket is up and logged in — what send() needs past the handshake. */
@@ -658,6 +788,10 @@ export class MaxClient extends EventEmitter {
     });
     // Keep the chain alive on failure so the next request still runs.
     this.requestChains.set(opcode, run.catch(() => undefined));
+    // Unanswered: find out now whether the connection is dead, not 50-100 s later at the regular ping.
+    run.catch((err: unknown) => {
+      if (String((err as Error | null)?.message ?? '').startsWith('Timed out waiting for 0x')) void this.probeConnection();
+    });
     return run;
   }
 
@@ -750,15 +884,61 @@ export class MaxClient extends EventEmitter {
     // The OUTGOING reply link is {type, messageId, chatId}; the INCOMING one carries `message`
     // instead (two shapes, confirmed 2026-08-16). messageId is the quoted message's BigInt id.
     const link = replyTo ? { type: 'REPLY', messageId: replyTo.messageId, chatId: toChatId(replyTo.chatId) } : null;
-    const { dir, payload } = await this.request(OPCODES.MSG_SEND, {
+    const body = {
       chatId: toChatId(chatId),
       message: { text, cid: BigInt(cid), elements: [], attaches, link },
       notify: true,
-    });
-    const responseMessage = (payload as { message?: { id?: unknown; attaches?: unknown[]; time?: unknown } } | null)?.message;
-    if (dir === DIR.ERR) throw new Error(describeAuthError(payload, 'MSG_SEND failed'));
-    // `time` is the echoed message's MAX server timestamp, raw — the chat's history cursor (liveCursorTime).
-    return { cid, messageId: responseMessage?.id, attaches: responseMessage?.attaches ?? [], time: responseMessage?.time };
+    };
+    const knownBefore = this.chatTimes.get(String(chatId)) ?? Date.now() - SEND_CHECK_CLOCK_SLACK_MS;
+    try {
+      return { cid, ...sentAnswer(await this.request(OPCODES.MSG_SEND, body)) };
+    } catch (err) {
+      if (!isUnansweredSend(err)) throw err;
+      return { cid, ...(await this.recoverUnansweredSend(chatId, cid, body, knownBefore, err)) };
+    }
+  }
+
+  /**
+   * MSG_SEND got no answer (a timeout, or the socket died under it): the message may be in MAX or
+   * not. Once MAX is back, its history says which — by our `cid`, a few messages at a time and no
+   * further back than the chat's last message known from before the send. There: it is the answer.
+   * Not there: sent once more (the same cid, the attaches already uploaded). Either way the sender
+   * sees nothing. Undecided: MaxSendUnconfirmedError — look in MAX before sending again.
+   */
+  private async recoverUnansweredSend(
+    chatId: unknown,
+    cid: number,
+    body: unknown,
+    knownBefore: number,
+    err: unknown,
+  ): Promise<{ messageId: unknown; attaches: unknown[]; time: unknown }> {
+    logger.warn(`MAX did not answer a send (cid ${cid}) — checking the chat's history once MAX is back`);
+    // Paused by the user, or a client that never reconnects (tests, tools): nothing to wait for.
+    if (this.closedByUser || !this.opts.reconnect) throw err;
+    await this.probeConnection();
+    if (!(await this.waitForLogin(SEND_CHECK_LOGIN_WAIT_MS))) throw new MaxSendUnconfirmedError(err);
+    let result: Awaited<ReturnType<typeof lookForSent>>;
+    try {
+      result = await lookForSent((from) => this.getChatHistory(chatId, from, SEND_CHECK_PAGE), cid, knownBefore, Date.now() + SEND_CHECK_FROM_AHEAD_MS);
+    } catch (historyErr) {
+      logger.warn(`The history check of an unanswered send (cid ${cid}) failed: ${(historyErr as Error)?.message ?? String(historyErr)}`);
+      throw new MaxSendUnconfirmedError(err);
+    }
+    if (result === 'unknown') {
+      logger.warn(`Unanswered send (cid ${cid}): not among the last ${SEND_CHECK_PAGE * SEND_CHECK_MAX_PAGES} messages, and the chat's last known one not reached — undecided`);
+      throw new MaxSendUnconfirmedError(err);
+    }
+    if (result !== 'absent') {
+      logger.info(`Unanswered send (cid ${cid}) is in MAX after all — not sent again`);
+      return { messageId: result.found.id, attaches: result.found.attaches ?? [], time: result.found.time };
+    }
+    logger.info(`Unanswered send (cid ${cid}) never reached MAX — sending it again`);
+    try {
+      return sentAnswer(await this.request(OPCODES.MSG_SEND, body));
+    } catch (againErr) {
+      if (isUnansweredSend(againErr)) throw new MaxSendUnconfirmedError(againErr);
+      throw againErr;
+    }
   }
 
   /**
