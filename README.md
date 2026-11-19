@@ -83,6 +83,8 @@ cd Telemax
 cp .env.example .env
 # впишите TELEGRAM_BOT_TOKEN и TARGET_TELEGRAM_GROUP, ключ шифрования сгенерируйте:
 # openssl rand -hex 32   -> MAX_SESSION_KEY
+# (или держите секреты в файлах: TELEGRAM_BOT_TOKEN_FILE=/путь/к/файлу, MAX_SESSION_KEY_FILE=… —
+#  см. «Безопасность»)
 docker compose up -d --build
 ```
 
@@ -189,6 +191,24 @@ FILES_LISTEN=          # локальный порт службы для ваш�
 **Анимированные стикеры** (режим `full`) рендерятся в headless Chromium. Страница получает только JSON стикера. Lottie подключается в сборке без движка expressions, так что JavaScript из файла стикера не выполняется. Любой сетевой запрос со страницы, кроме `data:`, отклоняется: рендер не может обратиться ни в интернет, ни в локальную сеть, ни к Docker-хосту. Если Chromium на сервере не нужен совсем, выберите режим `slim`: анимированные стикеры тогда уходят статичной картинкой.
 
 По желанию мост может не пересылать в MAX то, что дошло до него из Telegram с большим опозданием (мост был недоступен, Telegram копит сообщения до суток): `STALE_TELEGRAM_MINUTES=10` в `.env` — и всё, что старше 10 минут, в MAX не уйдёт, а в теме появится пометка «отправьте заново». По умолчанию выключено — пересылается всё. Под правило попадают и команды, а часы сервера должны идти точно.
+
+**Секреты в файлах.** Токен бота и ключ шифрования сессии (`MAX_SESSION_KEY`) по умолчанию лежат в `.env` — в той же папке, что и `./data` с зашифрованной сессией, то есть ключ хранится рядом с тем, что он шифрует, и уходит в любой бэкап папки вместе с ней. Вместо значения можно указать файл: у токена бота, ключа сессии, прокси Telegram и id группы есть вариант с суффиксом `_FILE`: `TELEGRAM_BOT_TOKEN_FILE`, `MAX_SESSION_KEY_FILE`, `TELEGRAM_PROXY_FILE`, `TARGET_TELEGRAM_GROUP_FILE` (соглашение Docker secrets, как в образах postgres/mysql). Пример `docker-compose.override.yml`:
+
+```yaml
+services:
+  telemax:
+    environment:
+      TELEGRAM_BOT_TOKEN_FILE: /run/secrets/telegram_bot_token
+      MAX_SESSION_KEY_FILE: /run/secrets/max_session_key
+    secrets: [telegram_bot_token, max_session_key]
+secrets:
+  telegram_bot_token:
+    file: /root/telemax-secrets/telegram_bot_token
+  max_session_key:
+    file: /root/telemax-secrets/max_session_key
+```
+
+Строки `TELEGRAM_BOT_TOKEN=` и `MAX_SESSION_KEY=` в `.env` тогда оставьте пустыми. Если заданы и переменная, и `_FILE`, побеждает переменная. Если файл не читается, мост не запустится и назовёт причину. Так секреты не видны и в `docker inspect`.
 
 Сертификаты российского государственного УЦ (нужны только потому, что через них выпущен TLS-сертификат самого MAX) доверяются **только** соединениям с серверами MAX: ссылки на скачивание и загрузку файлов сверяются со списком доменов MAX (`MAX_HOST_SUFFIXES` в `src/max/ca.ts`), каждый редирект тоже. Пока ссылка на незнакомый домен только отмечается в журнале; `MAX_HOST_CHECK=enforce` в `.env` включает отказ таким ссылкам (свои домены добавляются через `MAX_HOST_SUFFIXES_EXTRA`) — запросы к Telegram, GitHub и всему остальному проверяются исключительно по стандартному набору корневых сертификатов Mozilla (подробнее — `certs/README.md`).
 

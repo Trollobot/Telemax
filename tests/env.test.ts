@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseEnvBool } from '../src/env.js';
+import { loadFileEnv, parseEnvBool } from '../src/env.js';
 import { isTelemetryDisabled } from '../src/bridge/telemetry.js';
 import { isBugReportInboxEnabled } from '../src/bridge/bugReports.js';
 
@@ -40,5 +40,39 @@ describe('isBugReportInboxEnabled (default off)', () => {
 
   it('is on for any other value, as before', () => {
     for (const v of ['1', 'true', 'yes', 'on', 'prod']) expect(isBugReportInboxEnabled({ BUGREPORT_INBOX: v })).toBe(true);
+  });
+});
+
+describe('loadFileEnv (NAME_FILE → NAME)', () => {
+  const files: Record<string, string> = { '/run/secrets/token': '123:abc\n', '/run/secrets/key': 'k' };
+  const read = (p: string): string => {
+    const v = files[p];
+    if (v === undefined) throw new Error('ENOENT');
+    return v;
+  };
+
+  it('fills an unset variable from its file, trimming the trailing newline', () => {
+    const env: NodeJS.ProcessEnv = { TELEGRAM_BOT_TOKEN_FILE: '/run/secrets/token', MAX_SESSION_KEY_FILE: ' /run/secrets/key ' };
+    loadFileEnv(env, read);
+    expect(env.TELEGRAM_BOT_TOKEN).toBe('123:abc');
+    expect(env.MAX_SESSION_KEY).toBe('k');
+  });
+
+  it('keeps an explicitly set variable and ignores an empty _FILE', () => {
+    const env: NodeJS.ProcessEnv = { TELEGRAM_BOT_TOKEN: 'direct', TELEGRAM_BOT_TOKEN_FILE: '/run/secrets/token', TELEGRAM_PROXY_FILE: '' };
+    loadFileEnv(env, read);
+    expect(env.TELEGRAM_BOT_TOKEN).toBe('direct');
+    expect(env.TELEGRAM_PROXY).toBeUndefined();
+  });
+
+  it('reads only the known secret names, never an unrelated *_FILE', () => {
+    const env: NodeJS.ProcessEnv = { SSL_CERT_FILE: '/nope', COMPOSE_FILE: '/run/secrets/token' };
+    expect(() => loadFileEnv(env, read)).not.toThrow();
+    expect(env.SSL_CERT).toBeUndefined();
+    expect(env.COMPOSE).toBeUndefined();
+  });
+
+  it('throws on a configured but unreadable file', () => {
+    expect(() => loadFileEnv({ MAX_SESSION_KEY_FILE: '/nope' }, read)).toThrow(/MAX_SESSION_KEY_FILE/);
   });
 });

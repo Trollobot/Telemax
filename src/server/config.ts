@@ -1,4 +1,8 @@
 import 'dotenv/config';
+import { loadFileEnv } from '../env.js';
+
+// TELEGRAM_BOT_TOKEN_FILE, MAX_SESSION_KEY_FILE, TELEGRAM_PROXY_FILE… → their variables (Docker secrets).
+loadFileEnv();
 
 export const config = {
   telegramBotToken: process.env.TELEGRAM_BOT_TOKEN ?? '',
