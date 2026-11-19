@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
+import { parseEnvBool } from '../env.js';
 import { createLogger } from '../logger.js';
 
 const logger = createLogger('version');
@@ -9,8 +10,11 @@ const GITHUB_API_TIMEOUT_MS = 8000;
 /** Self-hosted fallback mirror, used only when GitHub's API is unreachable/blocked (e.g. the
  * account gets flagged, or GitHub is filtered on the install's network). Overridable via env so
  * the mirror can move without a code change. Serves `/latest.json` (version manifest) and
- * `/Telemax.git` (a read-only git mirror that update.sh falls back to). */
-const MIRROR_BASE_URL = (process.env.MIRROR_BASE_URL || 'https://zergont-gate.duckdns.org').replace(/\/+$/, '');
+ * `/Telemax.git` (a read-only git mirror that update.sh falls back to). MIRROR_BASE_URL=off (0/false/no)
+ * turns the fallback off: the version check then talks to GitHub only. */
+// Read when used, not at import: app.ts imports this module before config.ts loads .env.
+const mirrorBaseUrl = (): string =>
+  parseEnvBool(process.env.MIRROR_BASE_URL) === false ? '' : (process.env.MIRROR_BASE_URL || 'https://zergont-gate.duckdns.org').replace(/\/+$/, '');
 
 export interface LatestVersionInfo {
   /** Git tag on GitHub, e.g. "v0.3.2". */
@@ -152,7 +156,7 @@ async function fetchLatestFromMirror(): Promise<
   (LatestVersionInfo & { changelog: string[]; changelogs: Record<string, string[]> }) | null
 > {
   try {
-    const res = await fetch(`${MIRROR_BASE_URL}/latest.json`, { signal: AbortSignal.timeout(GITHUB_API_TIMEOUT_MS) });
+    const res = await fetch(`${mirrorBaseUrl()}/latest.json`, { signal: AbortSignal.timeout(GITHUB_API_TIMEOUT_MS) });
     if (!res.ok) {
       logger.error(`Mirror /latest.json returned ${res.status} ${res.statusText}`);
       return null;
@@ -215,7 +219,7 @@ export async function checkVersion(): Promise<VersionStatus> {
   }
 
   // Fallback: self-hosted mirror (GitHub blocked/down/flagged) — it already carries the notes.
-  const mirror = await fetchLatestFromMirror();
+  const mirror = mirrorBaseUrl() ? await fetchLatestFromMirror() : null;
   if (mirror) {
     logger.info(`GitHub unreachable — using mirror for version check (latest ${mirror.tag})`);
     const updateAvailable = isNewerVersion(mirror.version, current);

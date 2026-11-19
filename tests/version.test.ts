@@ -87,3 +87,26 @@ describe('getAppVersion', () => {
     expect(JSON.parse(readFileSync('package.json', 'utf8')).version).toBe('0.0.0');
   });
 });
+
+describe('checkVersion — mirror fallback', () => {
+  it('asks only GitHub when MIRROR_BASE_URL=off, even with GitHub down', async () => {
+    const { vi } = await import('vitest');
+    vi.resetModules();
+    vi.stubEnv('MIRROR_BASE_URL', 'off');
+    const urls: string[] = [];
+    vi.stubGlobal('fetch', async (url: string) => {
+      urls.push(String(url));
+      throw new Error('network down');
+    });
+    try {
+      const { checkVersion } = await import('../src/bridge/version.js');
+      const status = await checkVersion();
+      expect(status.latest).toBeNull();
+      expect(urls.length).toBeGreaterThan(0);
+      expect(urls.every((u) => u.startsWith('https://api.github.com/'))).toBe(true);
+    } finally {
+      vi.unstubAllGlobals();
+      vi.unstubAllEnvs();
+    }
+  });
+});
