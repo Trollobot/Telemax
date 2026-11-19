@@ -723,6 +723,29 @@ export function sendFailureText(err: unknown, downSince?: number | null, now = D
   return `⚠️ Не удалось отправить в MAX: ${message}`;
 }
 
+/**
+ * Places in line per Telegram topic: `take` (synchronous) returns the promise of everything ahead
+ * being done, and the release of this place. Exported for tests.
+ */
+export function createTopicLine(): { take(topicId: number): { prev: Promise<void>; release: () => void } } {
+  const tails = new Map<number, Promise<void>>();
+  return {
+    take(topicId) {
+      const prev = tails.get(topicId) ?? Promise.resolve();
+      let release!: () => void;
+      const mine = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const tail = prev.then(() => mine);
+      tails.set(topicId, tail);
+      void tail.then(() => {
+        if (tails.get(topicId) === tail) tails.delete(topicId);
+      });
+      return { prev, release };
+    },
+  };
+}
+
 /** Why an attachment became its placeholder after all (sendAttachments): the download's own reason, or Telegram's. */
 function placeholderWhy(err: unknown): string {
   if (err instanceof TransientDownloadError) return err.why;
@@ -1806,6 +1829,23 @@ export function wireBridge({
       return myId != null && profile ? resolveContactDisplayName(myId, profile) : 'Владелец';
     },
     isGroupAdmin: (userId) => isGroupAdmin(userId),
+  });
+
+  const topicLine = createTopicLine();
+  const topicPlaces = new WeakMap<object, { prev: Promise<void>; release: () => void }>();
+  // Every message of a topic takes its place in the topic's line on the way in, before any await, and
+  // keeps it until everything it went through is done; the relay to MAX waits for the places ahead
+  // (see the 'message' handler below).
+  bot.use(async (ctx, next) => {
+    const topicId = ctx.message && String(ctx.chat?.id) === targetGroupId ? ctx.message.message_thread_id : undefined;
+    if (!topicId) return next();
+    const place = topicLine.take(topicId);
+    topicPlaces.set(ctx, place);
+    try {
+      return await next();
+    } finally {
+      place.release();
+    }
   });
 
   // A button press answered after Telegram's ~15 s window (it waited out a restart) used to throw
@@ -4110,6 +4150,10 @@ export function wireBridge({
   bot.on('message', async (ctx) => {
     const topicId = ctx.message.message_thread_id;
     if (!topicId) return;
+    // In the order written. Telegraf runs a batch of updates side by side: three messages that waited
+    // for MAX to reconnect together woke up in any order — «1-2-3» reached MAX as «2-1-3» (test,
+    // 2026-11-19). A video ahead in the topic now holds the text behind it, as in Telegram itself.
+    await topicPlaces.get(ctx)?.prev;
     const mapping = await chatMapStore.getByTopicId(topicId);
     if (!mapping) return;
     // Forum service messages carry no user content — and the forum_topic_created right after

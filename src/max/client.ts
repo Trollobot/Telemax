@@ -505,7 +505,7 @@ export class MaxClient extends EventEmitter {
   probeConnection(): Promise<void> {
     if (this.probe) return this.probe;
     const socket = this.socket;
-    if (!socket || !this.authed) return Promise.resolve();
+    if (!socket || !this.authed || socket.destroyed) return Promise.resolve();
     this.probe = new Promise<void>((resolve) => {
       const done = () => {
         clearTimeout(timer);
@@ -532,6 +532,19 @@ export class MaxClient extends EventEmitter {
       }
     });
     return this.probe;
+  }
+
+  /** Resolves once the socket being destroyed has closed ('disconnected'), or after 5 s regardless. */
+  private socketClosed(): Promise<void> {
+    return new Promise((resolve) => {
+      const done = () => {
+        clearTimeout(timer);
+        this.off('disconnected', done);
+        resolve();
+      };
+      const timer = setTimeout(done, 5_000);
+      this.once('disconnected', done);
+    });
   }
 
   private ping(): void {
@@ -916,6 +929,9 @@ export class MaxClient extends EventEmitter {
     // Paused by the user, or a client that never reconnects (tests, tools): nothing to wait for.
     if (this.closedByUser || !this.opts.reconnect) throw err;
     await this.probeConnection();
+    // A socket being torn down (the probe's or the regular ping's verdict) still looks logged in
+    // until its 'close' lands — the history request went out on it and failed (test, 2026-11-19).
+    if (this.socket?.destroyed) await this.socketClosed();
     if (!(await this.waitForLogin(SEND_CHECK_LOGIN_WAIT_MS))) throw new MaxSendUnconfirmedError(err);
     let result: Awaited<ReturnType<typeof lookForSent>>;
     try {

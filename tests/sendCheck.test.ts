@@ -153,3 +153,56 @@ describe('the probe of an unanswered request', () => {
     }
   });
 });
+
+describe('sendMessage — the dead socket is waited out', () => {
+  it('asks the history only on the new connection, not on the one being torn down', async () => {
+    let n = 0;
+    let reconnected = false;
+    const historyOnNew: boolean[] = [];
+    const client = new ScriptedClient((opcode) => {
+      if (opcode === OPCODES.CHAT_HISTORY) {
+        historyOnNew.push(reconnected);
+        return { dir: DIR.OK, payload: { messages: [] } };
+      }
+      if (n++ > 0) return { dir: DIR.OK, payload: { message: { id: 'again', time: 1 } } };
+      // The socket dies under the send: destroyed now, 'close' (disconnected) and a new login later.
+      const internals = client as unknown as { socket: unknown; authed: boolean };
+      internals.socket = { destroyed: true, destroy() {}, write() {} };
+      setTimeout(() => {
+        internals.socket = null;
+        internals.authed = false;
+        client.emit('disconnected');
+      }, 20);
+      setTimeout(() => {
+        internals.socket = { destroy() {}, write() {} };
+        internals.authed = true;
+        reconnected = true;
+        client.emit('authed');
+      }, 40);
+      return lost();
+    });
+    const res = await client.sendMessage(5, 'привет');
+    expect(res.messageId).toBe('again');
+    expect(historyOnNew).toEqual([true]);
+  });
+});
+
+describe('createTopicLine', () => {
+  it('lets a topic’s messages through in the order they came, other topics unaffected', async () => {
+    const { createTopicLine } = await import('../src/bridge/sync.js');
+    const line = createTopicLine();
+    const order: string[] = [];
+    const a = line.take(1);
+    const b = line.take(1);
+    const c = line.take(2);
+    void b.prev.then(() => order.push('b'));
+    void c.prev.then(() => order.push('c'));
+    await new Promise((r) => setTimeout(r, 5));
+    expect(order).toEqual(['c']); // b waits for a; topic 2 does not
+    a.release();
+    await new Promise((r) => setTimeout(r, 5));
+    expect(order).toEqual(['c', 'b']);
+    b.release();
+    c.release();
+  });
+});
