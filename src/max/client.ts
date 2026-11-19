@@ -904,7 +904,10 @@ export class MaxClient extends EventEmitter {
     };
     const knownBefore = this.chatTimes.get(String(chatId)) ?? Date.now() - SEND_CHECK_CLOCK_SLACK_MS;
     try {
-      return { cid, ...sentAnswer(await this.request(OPCODES.MSG_SEND, body)) };
+      const sent = { cid, ...sentAnswer(await this.request(OPCODES.MSG_SEND, body)) };
+      // MAX's own id and time for it — where the message stands in the chat (ordering questions, 2026-11-19).
+      logger.debug(`Sent cid ${cid} to chat ${String(chatId)}: MAX message ${String(sent.messageId)}, time ${String(sent.time)}`);
+      return sent;
     } catch (err) {
       if (!isUnansweredSend(err)) throw err;
       return this.recoverUnansweredSend(chatId, cid, body, knownBefore, err);
