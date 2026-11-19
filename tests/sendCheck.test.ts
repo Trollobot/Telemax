@@ -54,7 +54,7 @@ class ScriptedClient extends MaxClient {
   }
 
   override send(opcode: number, payload?: unknown): void {
-    this.sent.push({ opcode, payload });
+    this.sent.push({ opcode, payload: structuredClone(payload) }); // as it went out
     queueMicrotask(() => {
       if (opcode === OPCODES.PING) {
         this.emit('pong');
@@ -88,7 +88,7 @@ describe('sendMessage — an unanswered send', () => {
     expect(client.sent.some((s) => s.opcode === OPCODES.CHAT_HISTORY)).toBe(true);
   });
 
-  it('not in the history: sent once more, with the same cid', async () => {
+  it('not in the history: sent once more, under a cid of its own', async () => {
     let n = 0;
     const client = new ScriptedClient((opcode) => {
       if (opcode === OPCODES.MSG_SEND) return n++ === 0 ? lost() : { dir: DIR.OK, payload: { message: { id: 'again', time: 1 } } };
@@ -99,8 +99,8 @@ describe('sendMessage — an unanswered send', () => {
     expect(res.messageId).toBe('again');
     const [first, second] = sends(client);
     expect(sends(client)).toHaveLength(2);
-    expect(cidOf(second!)).toBe(cidOf(first!));
-    expect(res.cid).toBe(cidOf(first!));
+    expect(cidOf(second!)).toBeGreaterThan(cidOf(first!));
+    expect(res.cid).toBe(cidOf(second!)); // the echo to drop is the resend's
   });
 
   it('history that cannot be read: unconfirmed, not sent again', async () => {

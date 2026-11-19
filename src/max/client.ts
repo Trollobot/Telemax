@@ -907,7 +907,7 @@ export class MaxClient extends EventEmitter {
       return { cid, ...sentAnswer(await this.request(OPCODES.MSG_SEND, body)) };
     } catch (err) {
       if (!isUnansweredSend(err)) throw err;
-      return { cid, ...(await this.recoverUnansweredSend(chatId, cid, body, knownBefore, err)) };
+      return this.recoverUnansweredSend(chatId, cid, body, knownBefore, err);
     }
   }
 
@@ -921,10 +921,10 @@ export class MaxClient extends EventEmitter {
   private async recoverUnansweredSend(
     chatId: unknown,
     cid: number,
-    body: unknown,
+    body: { message: { cid: bigint } },
     knownBefore: number,
     err: unknown,
-  ): Promise<{ messageId: unknown; attaches: unknown[]; time: unknown }> {
+  ): Promise<{ cid: number; messageId: unknown; attaches: unknown[]; time: unknown }> {
     logger.warn(`MAX did not answer a send (cid ${cid}) — checking the chat's history once MAX is back`);
     // Paused by the user, or a client that never reconnects (tests, tools): nothing to wait for.
     if (this.closedByUser || !this.opts.reconnect) throw err;
@@ -946,11 +946,16 @@ export class MaxClient extends EventEmitter {
     }
     if (result !== 'absent') {
       logger.info(`Unanswered send (cid ${cid}) is in MAX after all — not sent again`);
-      return { messageId: result.found.id, attaches: result.found.attaches ?? [], time: result.found.time };
+      return { cid, messageId: result.found.id, attaches: result.found.attaches ?? [], time: result.found.time };
     }
-    logger.info(`Unanswered send (cid ${cid}) never reached MAX — sending it again`);
+    // Under a cid of its own: with the old one MAX put the message AFTER the one sent right behind
+    // it (1-2-4-3-5, test 2026-11-19) — an old cid seems to take another way through MAX. The new cid
+    // is what the caller remembers for its echo.
+    const again = this.nextCid();
+    logger.info(`Unanswered send (cid ${cid}) never reached MAX — sending it again (cid ${again})`);
+    body.message.cid = BigInt(again);
     try {
-      return sentAnswer(await this.request(OPCODES.MSG_SEND, body));
+      return { cid: again, ...sentAnswer(await this.request(OPCODES.MSG_SEND, body)) };
     } catch (againErr) {
       if (isUnansweredSend(againErr)) throw new MaxSendUnconfirmedError(againErr);
       throw againErr;
