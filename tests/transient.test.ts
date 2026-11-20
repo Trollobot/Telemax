@@ -191,3 +191,15 @@ describe('isStaleCallbackQuery', () => {
     expect(isStaleCallbackQuery(new Error('400: Bad Request: message is not modified'))).toBe(false);
   });
 });
+
+describe('a Telegram handler cut off by the network', () => {
+  it('is a network failure, not a fault (no report, no group notice)', async () => {
+    const { isTransientNetworkError } = await import('../src/bridge/transient.js');
+    const err = Object.assign(
+      new Error('request to https://api.telegram.org/bot#:[REDACTED]/sendMessage failed, reason: Client network socket disconnected before secure TLS connection was established'),
+      { name: 'FetchError', code: 'ECONNRESET' },
+    );
+    expect(isTransientNetworkError(err)).toBe(true);
+    expect(isTransientNetworkError(new TypeError("Cannot read properties of undefined (reading 'id')"))).toBe(false);
+  });
+});

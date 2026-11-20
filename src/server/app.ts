@@ -14,7 +14,7 @@ import { DEFAULT_HISTORY_DAYS } from '../bridge/history.js';
 import { wireBridge, syncAllChatsToTelegram, type ChatCatchUp } from '../bridge/sync.js';
 import { systemView } from '../bridge/panel.js';
 import { RetryBackoff } from '../bridge/catchUp.js';
-import { isStaleCallbackQuery, isTransientTelegramError } from '../bridge/transient.js';
+import { isStaleCallbackQuery, isTransientNetworkError, isTransientTelegramError } from '../bridge/transient.js';
 import { configureErrorReporter, reportBridgeError } from '../bridge/errorReporter.js';
 import { getAppVersion } from '../bridge/version.js';
 import { BUGREPORT_BOT_DESCRIPTION, isBugReportInboxEnabled } from '../bridge/bugReports.js';
@@ -403,6 +403,13 @@ async function startServer(): Promise<void> {
         // A button press answered too late (it waited out a restart) — not a fault: no notice, no report.
         if (isStaleCallbackQuery(err)) {
           logger.info(`A button press arrived too late to answer (update type: ${ctx.updateType})`);
+          return;
+        }
+        // The network let the handler down (Telegram or a proxy dropped the connection mid-answer), not
+        // its code: a warning in the log only. A «⚠️ Ошибка при обработке» would most likely not get
+        // through the same network, and the report was noise (a Windows tester's flaky link, 2026-11-20).
+        if (isTransientNetworkError(err)) {
+          logger.warn(`Telegram handler stopped by a network failure (update type: ${ctx.updateType}): ${(err as Error)?.message ?? String(err)}`);
           return;
         }
         logger.error(`Telegram handler failed (update type: ${ctx.updateType}):`, err);
