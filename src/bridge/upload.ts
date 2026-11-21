@@ -21,6 +21,7 @@ import { isConnectFailure } from './transient.js';
 import { getTelegramProxyAgent } from '../telegram/proxy.js';
 import { renderTgsToWebm, webpToPng } from './lottie.js';
 import { parseEnvBool } from '../env.js';
+import { zipSingleFile } from './zip.js';
 
 const logger = createLogger('upload');
 const CONNECT_RETRY_MS = 3000;
@@ -140,13 +141,43 @@ async function uploadPhotoToMax(max: MaxClient, buffer: Buffer): Promise<{ _type
     body: form,
   });
   if (!res.ok) {
-    const bodyText = await res.text().catch(() => '<unreadable>');
-    throw new Error(`Photo upload POST failed: ${res.status} ${res.statusText} — ${bodyText}`);
+    throw new MaxUploadRefusedError(res.status, 'Photo', await res.text().catch(() => ''));
   }
   const body = (await res.json()) as { photos?: Record<string, { token: string }> };
   const first = body.photos ? Object.values(body.photos)[0] : undefined;
   if (!first) throw new Error('Photo upload response had no photos');
   return { _type: 'PHOTO', photoToken: first.token };
+}
+
+/**
+ * MAX's upload server said no (a 4xx/5xx answer to the POST itself). Its body is an HTML error page
+ * — the message keeps only the status and the page's title: the whole page landed in the group once
+ * (an .html refused with 415, 2026-11-21).
+ */
+export class MaxUploadRefusedError extends Error {
+  constructor(
+    readonly status: number,
+    what: string,
+    body: string,
+  ) {
+    super(`${what} upload POST failed: ${status} ${uploadRefusalTitle(body)}`.trim());
+    this.name = 'MaxUploadRefusedError';
+  }
+}
+
+/** The readable part of an upload server's error body: an HTML page's <title>, else its first line, short. Exported for tests. */
+export function uploadRefusalTitle(body: string): string {
+  const title = /<title[^>]*>([^<]*)<\/title>/i.exec(body)?.[1];
+  const text = (title ?? body.replace(/<[^>]*>/g, ' ')).replace(/\s+/g, ' ').trim();
+  return text.slice(0, 120);
+}
+
+// Attaches that went to MAX as a .zip because MAX refused the file itself (see uploadTelegramAttachmentToMax).
+const zippedAttaches = new WeakSet<object>();
+
+/** Whether this attach is the .zip made because MAX refused the original file — the sender is told so. */
+export function wasZipped(attach: object): boolean {
+  return zippedAttaches.has(attach);
 }
 
 async function uploadFileToMax(max: MaxClient, buffer: Buffer, filename: string): Promise<{ _type: 'FILE'; fileId: unknown }> {
@@ -162,8 +193,7 @@ async function uploadFileToMax(max: MaxClient, buffer: Buffer, filename: string)
     body: buffer,
   });
   if (!res.ok) {
-    const bodyText = await res.text().catch(() => '<unreadable>');
-    throw new Error(`File upload POST failed: ${res.status} ${res.statusText} — ${bodyText}`);
+    throw new MaxUploadRefusedError(res.status, 'File', await res.text().catch(() => ''));
   }
   // Empirically observed: MAX needs a moment to finish processing the upload
   // server-side before the resulting fileId is valid to reference in MSG_SEND.
@@ -189,8 +219,7 @@ export async function uploadFileFromDiskToMax(max: MaxClient, filePath: string, 
     duplex: 'half',
   });
   if (!res.ok) {
-    const bodyText = await res.text().catch(() => '<unreadable>');
-    throw new Error(`File upload POST failed: ${res.status} ${res.statusText} — ${bodyText}`);
+    throw new MaxUploadRefusedError(res.status, 'File', await res.text().catch(() => ''));
   }
   await res.body?.cancel().catch(() => {});
   // The buffered path's 3 s, plus time for MAX to digest a big file before MSG_SEND may use it
@@ -341,5 +370,14 @@ export async function uploadTelegramAttachmentToMax(
   if (kind === 'photo') return uploadPhotoToMax(max, uploadBuffer);
   if (kind === 'video') return uploadVideoToMax(max, uploadBuffer, filename);
   if (kind === 'voice') return uploadVoiceToMax(max, uploadBuffer, filename, duration);
-  return uploadFileToMax(max, uploadBuffer, filename);
+  try {
+    return await uploadFileToMax(max, uploadBuffer, filename);
+  } catch (err) {
+    if (!(err instanceof MaxUploadRefusedError) || err.status !== 415) throw err;
+    // MAX will not take this file as it is (an .html, 2026-11-21) — a .zip of it goes through.
+    logger.info(`MAX refused ${filename} (415) — sending it as ${filename}.zip`);
+    const zipped = await uploadFileToMax(max, zipSingleFile(filename, uploadBuffer), `${filename}.zip`);
+    zippedAttaches.add(zipped);
+    return zipped;
+  }
 }

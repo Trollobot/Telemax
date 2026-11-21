@@ -35,7 +35,7 @@ import {
   type DownloadContext,
 } from './attachments.js';
 import { splitTelegramText, truncateCodePoints, truncateUtf16, MAX_TEXT_LIMIT, TELEGRAM_CAPTION_LIMIT, TELEGRAM_TEXT_LIMIT } from './text.js';
-import { nativeStickersEnabled, uploadTelegramAttachmentToMax } from './upload.js';
+import { nativeStickersEnabled, uploadTelegramAttachmentToMax, wasZipped } from './upload.js';
 import { FileShare, fileShareOptionsFromEnv, TELEGRAM_BOT_DOWNLOAD_LIMIT } from './fileShare.js';
 import { createBigFiles } from './bigFiles.js';
 import { canRenderAnimatedStickers } from './lottie.js';
@@ -705,6 +705,12 @@ export function sendFailureText(err: unknown, downSince?: number | null, now = D
   if (err instanceof MaxUnavailableError || /while not connected/.test(message)) {
     const mins = downSince != null ? Math.floor((now - downSince) / 60_000) : 0;
     return `⚠️ Не отправлено: нет связи с MAX${mins >= 1 ? ` уже ${mins} мин` : ''} — сервер не может до него достучаться. Отправьте ещё раз, когда связь вернётся.`;
+  }
+  if ((err as Error | null)?.name === 'MaxUploadRefusedError') {
+    const status = (err as { status?: number }).status;
+    return status === 415
+      ? '⚠️ Не отправлено: MAX не принимает файлы такого типа. Упакуйте файл в архив (.zip) и отправьте ещё раз.'
+      : `⚠️ Не отправлено: MAX не принял файл (${message.replace(/^\w+ upload POST failed: /, '')}).`;
   }
   if ((err as Error | null)?.name === 'MaxSendUnconfirmedError') {
     return '⚠️ MAX не ответил на отправку, и проверить, дошло ли сообщение, не удалось — посмотрите в MAX, прежде чем отправлять ещё раз.';
@@ -4429,6 +4435,16 @@ export function wireBridge({
       rememberOutgoingSend(mapping.maxChatId, cid, time);
       messageLinks.add({ maxChatId: mapping.maxChatId, maxMessageId: messageId, telegramMessageId: ctx.message.message_id, telegramTopicId: topicId, outgoing: true });
       copyToBroadcasts(messageId, time);
+      // MAX refused the file itself and got a .zip of it (upload.ts) — the sender should know why.
+      if (wasZipped(attach)) {
+        const zipName = `${document?.file_name ?? animation?.file_name ?? audio?.file_name ?? 'file'}.zip`;
+        await bot.telegram
+          .sendMessage(targetGroupId, `ℹ️ MAX не принимает файлы такого типа — отправлен архив «${zipName}».`, {
+            message_thread_id: topicId,
+            reply_parameters: { message_id: ctx.message.message_id, allow_sending_without_reply: true },
+          })
+          .catch((e) => logger.error('Failed to tell the topic a file went as .zip', e));
+      }
     } catch (err) {
       logger.error('Telegram -> MAX forward failed', err);
       // A swallowed send is indistinguishable from success to the sender — report it in the topic.

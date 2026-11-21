@@ -23,6 +23,9 @@ import { truncateUtf16 } from './text.js';
 export function humanError(err: unknown): string {
   const msg = (err as Error)?.message ?? String(err);
   if (/ENOSPC/.test(msg)) return 'на сервере кончилось место';
+  if ((err as Error | null)?.name === 'MaxUploadRefusedError') {
+    return (err as { status?: number }).status === 415 ? 'MAX не принимает файлы такого типа — упакуйте его в архив (.zip)' : `MAX не принял файл (${msg.replace(/^\w+ upload POST failed: /, '')})`;
+  }
   if (err instanceof TransientDownloadError || isTransientNetworkError(err)) return 'прервалась связь с MAX';
   if (/\bE[A-Z]{3,}\b/.test(msg) || /^[A-Za-z ]*Error\b/.test(msg)) return 'внутренняя ошибка моста, подробности — в его логе';
   return msg;
