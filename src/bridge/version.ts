@@ -71,12 +71,22 @@ function cmpSemver(a: [number, number, number], b: [number, number, number]): nu
   return a[0] - b[0] || a[1] - b[1] || a[2] - b[2];
 }
 
+/** X.Y.Z-… — a beta (1.4.3-beta.1, 1.4.3-beta.1+win); build metadata alone (1.4.3+win) is not one. */
+function isPrerelease(raw: string): boolean {
+  return /^v?\d+\.\d+\.\d+-/.test(raw.trim());
+}
+
 /** Whether `latest` is strictly newer than `current` — false when either isn't a plain X.Y.Z, so an
- * unknown build never reports a false-positive update. Exported for tests. */
+ * unknown build never reports a false-positive update. A release is newer than its own beta: a
+ * tester on 1.4.3-beta.1 (a Windows beta among them) is told when 1.4.3 comes out — the suffix was
+ * ignored and the beta took itself for the release. Build metadata (+win) never counts. Exported for tests. */
 export function isNewerVersion(latest: string, current: string): boolean {
   const l = parseSemver(latest);
   const c = parseSemver(current);
-  return l != null && c != null && cmpSemver(l, c) > 0;
+  if (l == null || c == null) return false;
+  const diff = cmpSemver(l, c);
+  if (diff !== 0) return diff > 0;
+  return !isPrerelease(latest) && isPrerelease(current);
 }
 
 /** Highest semver tag published on GitHub. Uses /tags (a plain `git push --tags` is enough — no

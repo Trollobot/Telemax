@@ -346,17 +346,14 @@ export function createBigFiles({ bot, max, targetGroupId, fileShare, onSentToMax
       return;
     }
     await edit(ticket.promptMessageId, ticket.topicId, `⏳ Файл ${label} получен — отправляю в MAX…`);
+    let sent: Awaited<ReturnType<typeof uploadAndSend>>;
     try {
-      const sent = await uploadAndSend(ticket.maxChatId, filePath, size, name, ticket.caption, () => {
+      sent = await uploadAndSend(ticket.maxChatId, filePath, size, name, ticket.caption, () => {
         void edit(ticket.promptMessageId, ticket.topicId, `⏳ Файл ${label} загружен в MAX — MAX его обрабатывает, это может занять несколько минут…`);
       });
-      onSentToMax(ticket, sent);
-      await fileShare.dropTicket(ticket.token);
-      await edit(ticket.promptMessageId, ticket.topicId, `✅ Файл ${label} отправлен в MAX.`);
-      logger.info(`TG -> MAX: uploaded ${name} (${size} bytes) sent to chat ${ticket.maxChatId}`);
     } catch (err) {
       logger.error(`Sending the uploaded ${name} to MAX failed — keeping it as a link`, err);
-        report('send to MAX', err);
+      report('send to MAX', err);
       const file = await fileShare.adoptUpload(ticket, filePath, size, name);
       await edit(
         ticket.promptMessageId,
@@ -364,7 +361,15 @@ export function createBigFiles({ bot, max, targetGroupId, fileShare, onSentToMax
         `⚠️ Файл ${label} получен, но в MAX не ушёл: ${humanError(err)}.
 Он сохранён до ${formatExpiry(file.expiresAt)} — отправить его ещё раз можно из пульта → 📁 Файлы, загружать заново не нужно.`,
       );
+      return;
     }
+    // Sent. The clean-up after it is not part of the send: a failure there (no right to delete the
+    // upload's folder — a files service run as another user, 2026-11-21) said «в MAX не ушёл» about a
+    // file that had gone, inviting a duplicate.
+    onSentToMax(ticket, sent);
+    await fileShare.dropTicket(ticket.token).catch((err) => logger.warn(`The uploaded ${name} went to MAX, but its upload could not be cleaned up`, err));
+    await edit(ticket.promptMessageId, ticket.topicId, `✅ Файл ${label} отправлен в MAX.`);
+    logger.info(`TG -> MAX: uploaded ${name} (${size} bytes) sent to chat ${ticket.maxChatId}`);
   });
 
   // --- MAX → Telegram -------------------------------------------------------------------------
@@ -441,17 +446,25 @@ export function createBigFiles({ bot, max, targetGroupId, fileShare, onSentToMax
     const file = fileShare.get(id);
     if (!file?.target) return { ok: false, text: 'Этот файл не для MAX или его уже нет.' };
     const label = `«${file.name}» (${formatBytes(file.size)})`;
+    let sent: Awaited<ReturnType<typeof uploadAndSend>>;
     try {
-      const sent = await uploadAndSend(file.target.maxChatId, fileShare.pathOf(file), file.size, file.name, file.target.caption);
-      onSentToMax({ ...file.target, token: '', name: file.name, expectedSize: file.size, createdAt: 0, expiresAt: 0 }, sent);
-      await fileShare.remove(file.id);
-      logger.info(`TG -> MAX: stored ${file.name} sent again to chat ${file.target.maxChatId}`);
-      return { ok: true, text: `✅ Файл ${label} отправлен в MAX и удалён с сервера.` };
+      sent = await uploadAndSend(file.target.maxChatId, fileShare.pathOf(file), file.size, file.name, file.target.caption);
     } catch (err) {
       logger.error(`Sending the stored ${file.name} to MAX failed`, err);
       report('resend to MAX', err);
       return { ok: false, text: `⚠️ Файл ${label} в MAX не ушёл: ${humanError(err)}. Он остаётся на сервере — можно попробовать ещё раз.` };
     }
+    onSentToMax({ ...file.target, token: '', name: file.name, expectedSize: file.size, createdAt: 0, expiresAt: 0 }, sent);
+    logger.info(`TG -> MAX: stored ${file.name} sent again to chat ${file.target.maxChatId}`);
+    // As above: sent is sent, whatever the clean-up says.
+    const removed = await fileShare.remove(file.id).then(
+      () => true,
+      (err: unknown) => {
+        logger.warn(`The stored ${file.name} went to MAX, but could not be removed from the server`, err);
+        return false;
+      },
+    );
+    return { ok: true, text: removed ? `✅ Файл ${label} отправлен в MAX и удалён с сервера.` : `✅ Файл ${label} отправлен в MAX. Удалить его с сервера не вышло — подробности в журнале моста.` };
   }
 
   return { offerUpload, offerStore, relayFromMax, resendToMax };

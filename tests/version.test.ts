@@ -73,6 +73,12 @@ describe('isNewerVersion (the one updateAvailable rule for GitHub and the mirror
     expect(isNewerVersion('1.0.10', '1.0.9')).toBe(true); // numeric, not string, compare
     expect(isNewerVersion('1.0.1', '1.0.1')).toBe(false);
     expect(isNewerVersion('1.0.0', '1.0.1')).toBe(false);
+    // A release is newer than its own beta; +win (the Windows build) is not a version difference.
+    expect(isNewerVersion('v1.4.3', '1.4.3-beta.1')).toBe(true);
+    expect(isNewerVersion('v1.4.3', '1.4.3-beta.1+win')).toBe(true);
+    expect(isNewerVersion('v1.4.3', '1.4.3+win')).toBe(false);
+    expect(isNewerVersion('v1.4.2', '1.4.3-beta.1+win')).toBe(false);
+    expect(isNewerVersion('v1.4.3', '1.4.3')).toBe(false);
   });
 
   it('never reports an update when either side is not a version', () => {
