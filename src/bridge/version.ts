@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { parseEnvBool } from '../env.js';
 import { createLogger } from '../logger.js';
 
@@ -33,6 +34,14 @@ export interface VersionStatus {
 }
 
 let cachedVersion: string | null = null;
+
+/**
+ * Where VERSION may be: the start folder (/app in Docker, the Windows build's folder), then next to
+ * the code — dist/ of a build, src/bridge/ under tsx, app/dist/ of the Windows build. Exported for tests.
+ */
+export function versionDirCandidates(cwd = process.cwd(), here = path.dirname(fileURLToPath(import.meta.url))): string[] {
+  return [...new Set([cwd, path.join(here, '..'), path.join(here, '..', '..'), path.join(here, '..', '..', '..')])];
+}
 /**
  * The release version this build reports — the VERSION file, baked into the runtime image (the
  * Dockerfile COPYs it). Works for EVERY build regardless of GIT_COMMIT, so a plain
@@ -44,12 +53,17 @@ let cachedVersion: string | null = null;
  */
 export function getAppVersion(): string {
   if (cachedVersion) return cachedVersion;
-  try {
-    const fromFile = readFileSync(path.join(process.cwd(), 'VERSION'), 'utf8').trim();
-    if (/^\d+\.\d+\.\d+/.test(fromFile)) return (cachedVersion = fromFile);
-  } catch {
-    // An image or tree from before the VERSION file — package.json below.
+  for (const dir of versionDirCandidates()) {
+    try {
+      const fromFile = readFileSync(path.join(dir, 'VERSION'), 'utf8').trim();
+      if (/^\d+\.\d+\.\d+/.test(fromFile)) return (cachedVersion = fromFile);
+    } catch {
+      // Not here — the next place, then package.json below (a tree from before the VERSION file).
+    }
   }
+  // With no VERSION anywhere the bridge reports package.json's 0.0.0 and is never offered an update
+  // (a copy missing files, run under Termux, 2026-11-22).
+  logger.warn('No VERSION file in the start folder or next to the bridge — this copy looks incomplete');
   try {
     const pkg = JSON.parse(readFileSync(path.join(process.cwd(), 'package.json'), 'utf8')) as { version?: unknown };
     cachedVersion = typeof pkg.version === 'string' && pkg.version ? pkg.version : 'unknown';

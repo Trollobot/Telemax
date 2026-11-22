@@ -11,48 +11,22 @@
  * to the only two places that actually talk to MAX: the raw TCP client
  * (client.ts passes MAX_TLS_CA to tls.connect) and the CDN up/downloads
  * (maxFetch below). Everything else stays on Node's bundled Mozilla roots.
+ *
+ * The PEMs are built into the code (russianCa.generated.ts, from certs/ by scripts/gen-russian-ca.mjs):
+ * read from certs/ at run time, a bridge started from another folder or a copy missing the files
+ * could not reach MAX at all (2026-11-22).
  */
-import { existsSync, readFileSync } from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import tls from 'node:tls';
 import { Agent, fetch as undiciFetch, type RequestInit, type Response } from 'undici';
 import { createLogger } from '../logger.js';
+import { RUSSIAN_CA_PEMS } from './russianCa.generated.js';
 
 const logger = createLogger('max-ca');
 
 /**
- * Where certs/ may be: the folder the bridge was started from (/app in Docker, the Windows build's
- * folder), then next to the code itself — dist/ of a build, src/max/ under tsx, app/dist/ of the
- * Windows build. Started from another folder (`node ~/MaxBridge/dist/server.mjs`, a systemd unit
- * without WorkingDirectory), the cwd alone missed it and every connection to MAX failed with
- * «unable to get local issuer certificate». Exported for tests.
- */
-export function certsDirCandidates(cwd = process.cwd(), here = path.dirname(fileURLToPath(import.meta.url))): string[] {
-  return [...new Set([path.join(cwd, 'certs'), path.join(here, '..', 'certs'), path.join(here, '..', '..', 'certs'), path.join(here, '..', '..', '..', 'certs')])];
-}
-
-function loadRussianCaChain(): string[] {
-  const pems: string[] = [];
-  const dirs = certsDirCandidates();
-  for (const file of ['russian_trusted_root_ca.crt', 'russian_trusted_sub_ca.crt']) {
-    const dir = dirs.find((d) => existsSync(path.join(d, file)));
-    try {
-      if (!dir) throw new Error(`not in ${dirs.join(', ')}`);
-      pems.push(readFileSync(path.join(dir, file), 'utf8'));
-    } catch (err) {
-      // Verification stays ON either way — connections to MAX will just fail
-      // against the bundled roots, which is the safe direction to fail in.
-      logger.error(`Missing certs/${file} — TLS to MAX will likely fail ("unable to get local issuer certificate")`, err);
-    }
-  }
-  return pems;
-}
-
-/**
  * A connection to MAX refused on its certificate — not a network failure: something answers in
  * MAX's place (an antivirus or ad blocker «checking HTTPS», a VPN, a corporate proxy) or the bridge
- * has no certs/. Seen on a phone (Termux, 2026-11-22) and on a server that sat 21 hours on it.
+ * missed the state CA (a phone, Termux, 2026-11-22 — before the certificates were built in).
  */
 export function isCertificateErrorMessage(message: string): boolean {
   return /certificate|issuer|self[- ]signed|\bCERT_|altname/i.test(message);
@@ -60,14 +34,14 @@ export function isCertificateErrorMessage(message: string): boolean {
 
 /** What the owner is told when that happens (outage notice, /login, the log). */
 export const MAX_CERT_PROBLEM_TEXT =
-  'Не удалось проверить сертификат сервера MAX. Обычно так бывает, когда соединение перехватывает антивирус, VPN или блокировщик рекламы с проверкой HTTPS, или у моста нет папки certs.';
+  'Не удалось проверить сертификат сервера MAX. Обычно так бывает, когда соединение перехватывает антивирус, VPN или блокировщик рекламы с проверкой HTTPS, или адрес MAX подменён (MAX_HOST, DNS).';
 
 /**
  * Node's bundled Mozilla roots + the Russian state chain. The bundled roots must
  * be re-included explicitly: passing `ca` to tls.connect/undici REPLACES the
  * default store rather than extending it.
  */
-export const MAX_TLS_CA: string[] = [...tls.rootCertificates, ...loadRussianCaChain()];
+export const MAX_TLS_CA: string[] = [...tls.rootCertificates, ...RUSSIAN_CA_PEMS.map((c) => c.pem)];
 
 const maxDispatcher = new Agent({ connect: { ca: MAX_TLS_CA } });
 
