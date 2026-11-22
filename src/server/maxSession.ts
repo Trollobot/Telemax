@@ -4,6 +4,7 @@ import { RetryBackoff } from '../bridge/catchUp.js';
 import { MaxAuthUnavailableError } from '../bridge/maxAuthFlow.js';
 import { reportBridgeError, resetErrorKey } from '../bridge/errorReporter.js';
 import { maskPhone } from '../bridge/status.js';
+import { isCertificateErrorMessage, MAX_CERT_PROBLEM_TEXT } from '../max/ca.js';
 import { createLogger } from '../logger.js';
 
 const logger = createLogger('max-session');
@@ -347,7 +348,7 @@ export class MaxSessionController {
       // Typed: the /login flow shows these alone and ends, no «Проверьте номер…».
       throw new MaxAuthUnavailableError('MAX на паузе — снимите паузу в /panel (▶️ Возобновить MAX) и повторите /login.');
     } else if (this.state_ === 'connecting' || this.state_ === 'stopped') {
-      throw new MaxAuthUnavailableError('Нет связи с MAX — подождите минуту и повторите /login.');
+      throw new MaxAuthUnavailableError(this.unreachableText('Нет связи с MAX — подождите минуту и повторите /login.'));
     }
     // An auth chain now runs on this socket: a pending resume retry defers itself (armResumeRetry)
     // but is NOT ended — it is the only thing that reconnects after a failed resume LOGIN, and
@@ -382,6 +383,12 @@ export class MaxSessionController {
     await this.completeLogin(loginToken);
   }
 
+  /** `text`, or — when MAX's certificate was just refused — the real reason: waiting a minute would not help. */
+  private unreachableText(text: string): string {
+    const recent = this.lastClientError && Date.now() - this.lastClientError.at < 2 * 60_000 ? this.lastClientError.message : '';
+    return isCertificateErrorMessage(recent) ? `${MAX_CERT_PROBLEM_TEXT} Когда это исправлено — повторите /login.` : text;
+  }
+
   /** Forces a clean socket and resolves once it has finished INIT ('ready'). */
   private freshConnectForAuth(): Promise<void> {
     return new Promise<void>((resolve, reject) => {
@@ -392,7 +399,7 @@ export class MaxSessionController {
       };
       const timer = setTimeout(() => {
         client.off('ready', onReady);
-        reject(new MaxAuthUnavailableError('MAX не ответил при переподключении для авторизации — подождите минуту и повторите /login.'));
+        reject(new MaxAuthUnavailableError(this.unreachableText('MAX не ответил при переподключении для авторизации — подождите минуту и повторите /login.')));
       }, FRESH_CONNECT_TIMEOUT_MS);
       client.once('ready', onReady);
       this.connect();
@@ -522,6 +529,7 @@ export class MaxSessionController {
       this.outageStartedAt = Date.now();
       const recent = this.lastClientError && Date.now() - this.lastClientError.at < 10_000 ? this.lastClientError.message : '';
       this.outageCause = outageCause(recent);
+      if (this.outageCause === 'certificate') logger.warn(MAX_CERT_PROBLEM_TEXT);
     }
     if (this.downTimer != null || this.downReported) return;
     this.downTimer = setTimeout(() => {
@@ -529,7 +537,8 @@ export class MaxSessionController {
       this.downReported = true;
       // Every reported loss gets its «✅»: 'max-up' has its own cooldown, which would swallow a second recovery within 10 minutes.
       resetErrorKey('max-up');
-      reportBridgeError('max-down', '❌ Потеряна связь с MAX. Пытаюсь переподключиться…');
+      const certificate = this.outageCause === 'certificate' || isCertificateErrorMessage(this.lastClientError?.message ?? '');
+      reportBridgeError('max-down', `❌ Потеряна связь с MAX. Пытаюсь переподключиться…${certificate ? `\n${MAX_CERT_PROBLEM_TEXT}` : ''}`);
     }, MAX_DOWN_NOTICE_MS);
   }
 
@@ -557,7 +566,9 @@ export function outageCause(message: string): string {
   if (m.includes('ping')) return 'ping-timeout';
   if (/enotfound|eai_again|getaddrinfo/.test(m)) return 'dns';
   if (/econnrefused|ehostunreach|enetunreach|enetdown/.test(m)) return 'unreachable';
-  if (/handshake|tls|certificate|ssl/.test(m)) return 'tls';
+  // Before 'tls': a refused certificate is not a blocked handshake — the fix differs (see MAX_CERT_PROBLEM_TEXT).
+  if (isCertificateErrorMessage(m)) return 'certificate';
+  if (/handshake|tls|ssl/.test(m)) return 'tls';
   if (/etimedout|timed out|timeout/.test(m)) return 'connect-timeout';
   if (/econnreset|epipe|socket hang up|reset/.test(m)) return 'connection-reset';
   return 'other';

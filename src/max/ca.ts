@@ -12,19 +12,34 @@
  * (client.ts passes MAX_TLS_CA to tls.connect) and the CDN up/downloads
  * (maxFetch below). Everything else stays on Node's bundled Mozilla roots.
  */
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import tls from 'node:tls';
 import { Agent, fetch as undiciFetch, type RequestInit, type Response } from 'undici';
 import { createLogger } from '../logger.js';
 
 const logger = createLogger('max-ca');
 
+/**
+ * Where certs/ may be: the folder the bridge was started from (/app in Docker, the Windows build's
+ * folder), then next to the code itself — dist/ of a build, src/max/ under tsx, app/dist/ of the
+ * Windows build. Started from another folder (`node ~/MaxBridge/dist/server.mjs`, a systemd unit
+ * without WorkingDirectory), the cwd alone missed it and every connection to MAX failed with
+ * «unable to get local issuer certificate». Exported for tests.
+ */
+export function certsDirCandidates(cwd = process.cwd(), here = path.dirname(fileURLToPath(import.meta.url))): string[] {
+  return [...new Set([path.join(cwd, 'certs'), path.join(here, '..', 'certs'), path.join(here, '..', '..', 'certs'), path.join(here, '..', '..', '..', 'certs')])];
+}
+
 function loadRussianCaChain(): string[] {
   const pems: string[] = [];
+  const dirs = certsDirCandidates();
   for (const file of ['russian_trusted_root_ca.crt', 'russian_trusted_sub_ca.crt']) {
+    const dir = dirs.find((d) => existsSync(path.join(d, file)));
     try {
-      pems.push(readFileSync(path.join(process.cwd(), 'certs', file), 'utf8'));
+      if (!dir) throw new Error(`not in ${dirs.join(', ')}`);
+      pems.push(readFileSync(path.join(dir, file), 'utf8'));
     } catch (err) {
       // Verification stays ON either way — connections to MAX will just fail
       // against the bundled roots, which is the safe direction to fail in.
@@ -33,6 +48,19 @@ function loadRussianCaChain(): string[] {
   }
   return pems;
 }
+
+/**
+ * A connection to MAX refused on its certificate — not a network failure: something answers in
+ * MAX's place (an antivirus or ad blocker «checking HTTPS», a VPN, a corporate proxy) or the bridge
+ * has no certs/. Seen on a phone (Termux, 2026-11-22) and on a server that sat 21 hours on it.
+ */
+export function isCertificateErrorMessage(message: string): boolean {
+  return /certificate|issuer|self[- ]signed|\bCERT_|altname/i.test(message);
+}
+
+/** What the owner is told when that happens (outage notice, /login, the log). */
+export const MAX_CERT_PROBLEM_TEXT =
+  'Не удалось проверить сертификат сервера MAX. Обычно так бывает, когда соединение перехватывает антивирус, VPN или блокировщик рекламы с проверкой HTTPS, или у моста нет папки certs.';
 
 /**
  * Node's bundled Mozilla roots + the Russian state chain. The bundled roots must
