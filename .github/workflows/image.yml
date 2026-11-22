@@ -1,0 +1,67 @@
+# Publishes the bridge as a ready-made image to GitHub Container Registry on every signed release
+# tag, so an install can run `image: ghcr.io/<owner>/telemax` instead of building on the server —
+# no git checkout, no build tools, no 2-3 GB of free disk for a rebuild, and updates by an ordinary
+# `docker compose pull` (or Watchtower/Renovate) instead of root scripts on the host.
+# Two flavours, like the build-arg: `X.Y.Z` / `latest` (animated stickers, Chromium + ffmpeg) and
+# `X.Y.Z-slim` / `slim`.
+name: image
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        stickers: [full, slim]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # The same rule update.sh applies: only a tag signed by a key in allowed_signers is a release.
+      - name: Verify the release tag signature
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          # actions/checkout may leave a lightweight copy of the tag; fetch the signed tag object itself.
+          git fetch --force origin "refs/tags/$GITHUB_REF_NAME:refs/tags/$GITHUB_REF_NAME"
+          git -c gpg.format=ssh -c gpg.ssh.allowedSignersFile=allowed_signers verify-tag "$GITHUB_REF_NAME"
+
+      - id: meta
+        run: |
+          echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/telemax" >> "$GITHUB_OUTPUT"
+          echo "version=$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_OUTPUT"
+          [ "${{ matrix.stickers }}" = slim ] && echo "suffix=-slim" >> "$GITHUB_OUTPUT" || echo "suffix=" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            STICKERS=${{ matrix.stickers }}
+            GIT_COMMIT=${{ github.sha }}
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}${{ steps.meta.outputs.suffix }}
+            ${{ steps.meta.outputs.image }}:${{ matrix.stickers == 'slim' && 'slim' || 'latest' }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.stickers }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.stickers }}

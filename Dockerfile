@@ -41,6 +41,10 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 COPY --from=build /app/dist ./dist
 COPY entrypoint.sh ./
+# The state directory exists in the image, owned by node: a named volume mounted here starts out with
+# that ownership, so the container also runs with `user: node` (no root step, cap_drop: [ALL]) and
+# without a host ./data bind mount. The bind-mount + root-chown path in entrypoint.sh stays as is.
+RUN mkdir -p /app/.data && chown node:node /app/.data
 # The release version (src/bridge/version.ts) — kept out of package.json, so the npm layers above
 # stay cached from one release to the next.
 COPY VERSION ./
