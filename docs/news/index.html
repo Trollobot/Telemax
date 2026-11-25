@@ -4,13 +4,13 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Новости Telemax — что нового в мосте MAX ↔ Telegram</title>
-<meta name="description" content="Что нового в Telemax: все версии моста MAX ↔ Telegram по-человечески. Последняя — 1.4.4 от 23 ноября 2026: Любые файлы доходят до MAX, связь не зависит от папки запуска.">
+<meta name="description" content="Что нового в Telemax: все версии моста MAX ↔ Telegram по-человечески. Последняя — 1.4.5 от 25 ноября 2026: Прокси для MAX и одно устройство вместо многих.">
 <link rel="canonical" href="https://telemax.svnest.ru/news/">
 <link rel="alternate" type="application/rss+xml" title="Новости Telemax" href="https://telemax.svnest.ru/news/feed.xml">
 <meta property="og:type" content="website">
 <meta property="og:locale" content="ru_RU">
 <meta property="og:site_name" content="Telemax">
-<meta property="og:title" content="Новости Telemax — Любые файлы доходят до MAX, связь не зависит от папки запуска">
+<meta property="og:title" content="Новости Telemax — Прокси для MAX и одно устройство вместо многих">
 <meta property="og:description" content="Все версии моста MAX ↔ Telegram: что появилось и что починили.">
 <meta property="og:url" content="https://telemax.svnest.ru/news/">
 <meta property="og:image" content="https://telemax.svnest.ru/og.png">
@@ -24,6 +24,16 @@
   "url": "https://telemax.svnest.ru/news/",
   "inLanguage": "ru",
   "blogPost": [
+    {
+      "@type": "BlogPosting",
+      "headline": "Telemax 1.4.5: Прокси для MAX и одно устройство вместо многих",
+      "datePublished": "2026-11-25",
+      "url": "https://telemax.svnest.ru/news/#v1.4.5",
+      "author": {
+        "@type": "Organization",
+        "name": "Telemax"
+      }
+    },
     {
       "@type": "BlogPosting",
       "headline": "Telemax 1.4.4: Любые файлы доходят до MAX, связь не зависит от папки запуска",
@@ -213,16 +223,6 @@
         "@type": "Organization",
         "name": "Telemax"
       }
-    },
-    {
-      "@type": "BlogPosting",
-      "headline": "Telemax 1.3.3: Большие файлы: понятные причины сбоев и отправка с сервера",
-      "datePublished": "2026-10-11",
-      "url": "https://telemax.svnest.ru/news/#v1.3.3",
-      "author": {
-        "@type": "Organization",
-        "name": "Telemax"
-      }
     }
   ]
 }
@@ -340,18 +340,28 @@
     <h1>Что нового в Telemax</h1>
     <p class="lead">Каждая версия моста — коротко и по-человечески. О новой версии бот сам скажет в группе, а обновиться можно одной кнопкой «Обновить» в <code>/version</code>.</p>
     <div class="actions">
-      <a class="btn btn-primary" href="#v1.4.4">📦 Версия 1.4.4</a>
+      <a class="btn btn-primary" href="#v1.4.5">🌐 Версия 1.4.5</a>
       <a class="btn btn-ghost" href="feed.xml">📡 RSS-лента</a>
       <a class="btn btn-ghost" href="../#how">Как установить</a>
     </div>
     <div class="facts">
-      <span class="fact">Последняя версия — <b>1.4.4</b>, 23 ноября 2026</span>
-      <span class="fact"><b>50</b> версий с 22 августа 2026</span>
+      <span class="fact">Последняя версия — <b>1.4.5</b>, 25 ноября 2026</span>
+      <span class="fact"><b>51</b> версий с 22 августа 2026</span>
     </div>
   </div>
 
   <div class="feed">
     <div class="month"><h2 class="mh">Ноябрь 2026</h2>
+      <article class="rel" id="v1.4.5">
+        <div class="meta"><a class="ver" href="#v1.4.5" title="Ссылка на эту новость">v1.4.5</a><time datetime="2026-11-25">25 ноября</time></div>
+        <h3><span class="em" aria-hidden="true">🌐</span> Прокси для MAX и одно устройство вместо многих</h3>
+        <ul>
+          <li><b>Прокси для MAX</b> — для моста на сервере за рубежом, если MAX с него недоступен. Через прокси идут соединение с MAX и файлы, сертификат MAX проверяется как обычно. Задать: из Telegram (<code>/panel</code> → ⚙️ Система → 🌐 Прокси для MAX — сообщение с адресом бот сразу удаляет, связь проверяет до сохранения), при установке (если MAX напрямую недоступен), в <code>./setup.sh</code> или переменной <code>MAX_PROXY</code>. Спасибо astron4ik за идею (GitHub #23)</li>
+          <li>Если MAX недоступен больше часа, бот подскажет про прокси для MAX</li>
+          <li>Мост больше не появляется в «Устройствах» MAX новым устройством при каждом перезапуске — он входит под тем же устройством, что и при входе. Если MAX его не примет, мост сам войдёт под новым. Правку прислал sadontsev (GitHub #22)</li>
+          <li>В уведомлении о потере связи бот приводит ответ MAX, если тот отказал сам (например, «приложение устарело»)</li>
+        </ul>
+      </article>
       <article class="rel" id="v1.4.4">
         <div class="meta"><a class="ver" href="#v1.4.4" title="Ссылка на эту новость">v1.4.4</a><time datetime="2026-11-23">23 ноября</time></div>
         <h3><span class="em" aria-hidden="true">📦</span> Любые файлы доходят до MAX, связь не зависит от папки запуска</h3>
