@@ -6,7 +6,14 @@
   <atom:link href="https://telemax.svnest.ru/news/feed.xml" rel="self" type="application/rss+xml"/>
   <description>Что нового в Telemax — бесплатном мосте MAX ↔ Telegram с открытым кодом</description>
   <language>ru</language>
-  <lastBuildDate>Mon, 23 Nov 2026 09:00:00 GMT</lastBuildDate>
+  <lastBuildDate>Wed, 25 Nov 2026 09:00:00 GMT</lastBuildDate>
+  <item>
+    <title>Telemax 1.4.5: Прокси для MAX и одно устройство вместо многих</title>
+    <link>https://telemax.svnest.ru/news/#v1.4.5</link>
+    <guid isPermaLink="false">telemax-1.4.5</guid>
+    <pubDate>Wed, 25 Nov 2026 09:00:00 GMT</pubDate>
+    <description><![CDATA[<ul><li><b>Прокси для MAX</b> — для моста на сервере за рубежом, если MAX с него недоступен. Через прокси идут соединение с MAX и файлы, сертификат MAX проверяется как обычно. Задать: из Telegram (<code>/panel</code> → ⚙️ Система → 🌐 Прокси для MAX — сообщение с адресом бот сразу удаляет, связь проверяет до сохранения), при установке (если MAX напрямую недоступен), в <code>./setup.sh</code> или переменной <code>MAX_PROXY</code>. Спасибо astron4ik за идею (GitHub #23)</li><li>Если MAX недоступен больше часа, бот подскажет про прокси для MAX</li><li>Мост больше не появляется в «Устройствах» MAX новым устройством при каждом перезапуске — он входит под тем же устройством, что и при входе. Если MAX его не примет, мост сам войдёт под новым. Правку прислал sadontsev (GitHub #22)</li><li>В уведомлении о потере связи бот приводит ответ MAX, если тот отказал сам (например, «приложение устарело»)</li></ul>]]></description>
+  </item>
   <item>
     <title>Telemax 1.4.4: Любые файлы доходят до MAX, связь не зависит от папки запуска</title>
     <link>https://telemax.svnest.ru/news/#v1.4.4</link>
@@ -209,13 +216,6 @@
     <guid isPermaLink="false">telemax-1.0.0</guid>
     <pubDate>Mon, 21 Sep 2026 09:00:00 GMT</pubDate>
     <description><![CDATA[<ul><li><b>Установщик стал менеджером мостов:</b> если на сервере уже есть установленный мост (или несколько), та же команда установки открывает меню — обновить или перенастроить существующий, переустановить его начисто (со сбросом настроек и автоматическим бэкапом старых в <code>/root</code>), поставить ещё один мост рядом или удалить ненужный (один или все; перед удалением настройки и данные тоже сохраняются в бэкап). Вместе с последним мостом убирается и общий таймер автообновления</li><li>Явный каталог (<code>INSTALL_DIR=…</code>) и неинтерактивный запуск работают как раньше, без меню и лишних вопросов</li><li><b>README:</b> новый раздел «Несколько мостов на одном сервере» — что у мостов общее, что у каждого своё, и как ими управлять</li></ul>]]></description>
-  </item>
-  <item>
-    <title>Telemax 0.6.6: Боты находятся по MAX ID</title>
-    <link>https://telemax.svnest.ru/news/#v0.6.6</link>
-    <guid isPermaLink="false">telemax-0.6.6</guid>
-    <pubDate>Fri, 18 Sep 2026 09:00:00 GMT</pubDate>
-    <description><![CDATA[<ul><li><b>Пульт:</b> поиск по MAX ID теперь находит и ботов — их длинные ID (например, из ника вида @id4725009270_bot) раньше отвергались MAX с «Ошибкой валидации». Починены и «Начать чат» с ботом, и <code>/invite</code> с <code>/kick</code> по таким ID</li></ul>]]></description>
   </item>
 </channel>
 </rss>
