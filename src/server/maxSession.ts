@@ -1,4 +1,5 @@
 import { isMaxServerError, type VerifyCodeResult } from '../max/client.js';
+import { OPCODES } from '../max/opcodes.js';
 import type { MaxSession } from '../store/sessionStore.js';
 import { RetryBackoff } from '../bridge/catchUp.js';
 import { MaxAuthUnavailableError } from '../bridge/maxAuthFlow.js';
@@ -136,7 +137,7 @@ export class MaxSessionController {
   // When MAX began refusing the resume for a reason not about the session (see isSessionRejection).
   private refusedSince: number | null = null;
   private outageCause: string | null = null;
-  private lastClientError: { at: number; message: string } | null = null;
+  private lastClientError: { at: number; message: string; fromMax?: boolean } | null = null;
   private usingSavedDeviceId = false;
   private outageDetail = '';
 
@@ -173,13 +174,18 @@ export class MaxSessionController {
     // more device in MAX's «Устройства»). Dropped again if MAX rejects a resume under it.
     if (session?.deviceId && this.deps.client.useDeviceId) {
       this.deps.client.useDeviceId(session.deviceId);
-      this.usingSavedDeviceId = true;
+      // useDeviceId falls back to a random id for a malformed one — then there is nothing saved in use.
+      this.usingSavedDeviceId = this.deps.client.deviceId === session.deviceId;
     }
     this.deps.client.on('ready', () => this.onReady());
     this.deps.client.on('disconnected', () => this.onDisconnected());
     // The client says why a socket died just before 'disconnected' (a missed PING, a reset…).
     this.deps.client.on('error', (err: unknown) => {
-      this.lastClientError = { at: Date.now(), message: err instanceof Error ? err.message : String(err) };
+      const fromMax = isMaxServerError(err, OPCODES.INIT);
+      this.lastClientError = { at: Date.now(), message: err instanceof Error ? err.message : String(err), fromMax };
+      // MAX refused the very connection (INIT) under the saved device id: the client reconnects by
+      // itself and would present that id forever — the next INIT goes out under a fresh one.
+      if (fromMax) this.dropSavedDeviceId('connection refused');
     });
     this.connect();
   }
@@ -245,7 +251,9 @@ export class MaxSessionController {
     // MAX rotates the session token on LOGIN and eventually invalidates the previous one, so a
     // resumed login persists the new token too — or every reconnect presents the ORIGINAL one
     // until MAX rejects it.
-    const refreshed: MaxSession = { ...session, sessionToken: login.sessionToken, savedAt: new Date().toISOString() };
+    // The device id it went through under: after a fallback to a fresh one, keeping the old id made
+    // every restart present a device MAX had refused — a rejected LOGIN and one more device each time.
+    const refreshed: MaxSession = { ...session, sessionToken: login.sessionToken, deviceId: this.deps.client.deviceId, savedAt: new Date().toISOString() };
     this.session = refreshed;
     this.lastKnownPhone_ = session.phone;
     this.noteLoginSucceeded();
@@ -262,9 +270,25 @@ export class MaxSessionController {
     }
   }
 
+  /** Back to a fresh random device id if the saved one is in use; false when it was not. */
+  private dropSavedDeviceId(why: string): boolean {
+    if (!this.usingSavedDeviceId) return false;
+    this.usingSavedDeviceId = false;
+    this.deps.client.useDeviceId?.();
+    logger.warn(`MAX refused under the saved device id (${why}) — retrying under a new one`);
+    return true;
+  }
+
   /** The resume LOGIN threw while still current — see MAX_RESUME_REJECTIONS for which failures count. */
   private async onResumeFailed(err: unknown): Promise<void> {
     const msg = err instanceof Error ? err.message : String(err);
+    // Whatever MAX answered under the saved device id — a rejection, or a refusal worded in a way
+    // isSessionRejection does not know — one retry goes out under a fresh id first, as before #22,
+    // instead of six hours on the saved one (or a wiped session) for a device MAX no longer takes.
+    if (isMaxServerError(err) && this.dropSavedDeviceId(msg)) {
+      this.armResumeRetry(RESUME_RETRY_DELAY_MS);
+      return;
+    }
     // MAX answered, but not «the session is no good»: MAX is having trouble — the session stays.
     const refused = isMaxServerError(err) && !isSessionRejection(err);
     if (refused && this.refusedSince == null) {
@@ -272,12 +296,6 @@ export class MaxSessionController {
       void this.deps.reportError?.({ kind: 'internal', step: 'max-refused-resume', error: msg });
     }
     const givingUp = refused && this.refusedSince != null && Date.now() - this.refusedSince >= REFUSAL_GIVE_UP_MS;
-    if (this.usingSavedDeviceId && isMaxServerError(err) && !refused) {
-      // Rejected under the saved device id: the retries below go out under a fresh one, as before.
-      this.usingSavedDeviceId = false;
-      this.deps.client.useDeviceId?.();
-      logger.warn('Resume rejected under the saved device id — retrying under a new one');
-    }
     if (!isMaxServerError(err) || (refused && !givingUp)) {
       // Timeout (an undecodable answer too), or a refusal not about the token: nothing is known
       // against the session, it stays. This loop (reconnect, INIT OK, LOGIN fails) never emits
@@ -545,7 +563,9 @@ export class MaxSessionController {
       const recent = this.lastClientError && Date.now() - this.lastClientError.at < 10_000 ? this.lastClientError.message : '';
       this.outageCause = outageCause(recent);
       if (this.outageCause === 'certificate') logger.warn(MAX_CERT_PROBLEM_TEXT);
-      this.outageDetail = this.outageCause === 'other' ? outageDetailText(recent) : '';
+      // MAX's own refusal only — a local network error («read ECONNABORTED», an address) is not «MAX ответил».
+      const fromMax = this.lastClientError?.fromMax === true && Date.now() - this.lastClientError.at < 10_000;
+      this.outageDetail = fromMax ? outageDetailText(recent) : '';
     }
     if (this.downTimer != null || this.downReported) return;
     this.downTimer = setTimeout(() => {
@@ -598,6 +618,9 @@ export function outageDetailText(message: string): string {
   return message
     .split('\n')[0]!
     .replace(/[A-Za-z0-9_-]{24,}/g, '…')
+    // Addresses and phone numbers do not belong in a group notice, whatever the server put in its text.
+    .replace(/\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b/g, '…')
+    .replace(/\+?\d[\d\s()-]{8,}\d/g, '#')
     .replace(/\d{7,}/g, '#')
     .trim()
     .slice(0, 160);

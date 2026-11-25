@@ -631,7 +631,8 @@ export class MaxClient extends EventEmitter {
       // A refused INIT (e.g. an outdated appVersion) leaves an open socket nothing ever logs in
       // on: dropped instead, so the usual reconnect and outage notice follow.
       if (header.opcode === OPCODES.INIT && header.cmd === DIR.ERR) {
-        this.socket?.destroy(new Error(describeAuthError(payload, 'MAX rejected INIT')));
+        const code = (payload as { error?: unknown } | null)?.error;
+        this.socket?.destroy(new MaxServerError(describeAuthError(payload, 'MAX rejected INIT'), OPCODES.INIT, typeof code === 'string' ? code : undefined));
         return;
       }
       if (header.opcode === OPCODES.LOGIN && header.cmd === DIR.OK) {

@@ -17,7 +17,7 @@ const TIMEOUT = (): Error => new Error('LOGIN timed out');
 
 /** A MaxClient stand-in: `connect()` emits 'ready' on the next tick when `autoReady`; LOGIN answers are scripted through `login`. */
 class FakeClient extends EventEmitter {
-  readonly deviceId = 'dev';
+  deviceId = 'dev';
   autoReady = false;
   connect = vi.fn(() => {
     if (this.autoReady) queueMicrotask(() => this.emit('ready'));
@@ -28,7 +28,10 @@ class FakeClient extends EventEmitter {
   verifyCode = vi.fn(async () => ({ status: 'ok' as const, loginToken: 'login-token' }));
   checkPassword = vi.fn(async () => 'login-token');
   logout = vi.fn(async () => {});
-  useDeviceId = vi.fn();
+  // Like MaxClient.useDeviceId: a digits-only id is taken, anything else (or none) means a fresh one.
+  useDeviceId = vi.fn((id?: string) => {
+    this.deviceId = id && /^\d{6,40}$/.test(id) ? id : `fresh${this.useDeviceId.mock.calls.length}`;
+  });
 }
 
 function setup(session: MaxSession | null = SESSION) {
@@ -410,11 +413,68 @@ describe('MaxSessionController — re-auth notice', () => {
   });
 });
 describe('MaxSessionController — device id', () => {
+  const SAVED = '123456789012345678';
+
   it('presents the device id saved with the session, and drops it after a rejection under it', async () => {
-    const { client } = setup({ ...SESSION, deviceId: '123456789012345678' });
-    expect(client.useDeviceId).toHaveBeenCalledWith('123456789012345678');
+    const { client } = setup({ ...SESSION, deviceId: SAVED });
+    expect(client.useDeviceId).toHaveBeenCalledWith(SAVED);
     await failedResume(client, REJECTED());
     expect(client.useDeviceId).toHaveBeenLastCalledWith();
+  });
+
+  it('saves the id it got in under — after a fallback, the fresh one, so the next start does not repeat the refusal', async () => {
+    const { client, store } = setup({ ...SESSION, deviceId: SAVED });
+    await failedResume(client, REJECTED());
+    expect(client.deviceId).not.toBe(SAVED);
+    client.login.mockResolvedValueOnce({ sessionToken: 'tok2', payload: {} });
+    await vi.advanceTimersByTimeAsync(60_000);
+    client.emit('ready');
+    await settle();
+    expect(store.save).toHaveBeenLastCalledWith(expect.objectContaining({ sessionToken: 'tok2', deviceId: client.deviceId }));
+  });
+
+  it('a refusal worded in a way it does not know also falls back at once, without the 6-hour wait or a lost session', async () => {
+    const { ctl, client, store, reportError } = setup({ ...SESSION, deviceId: SAVED });
+    await failedResume(client, new MaxServerError('Недопустимое состояние сессии', OPCODES.LOGIN));
+    expect(client.useDeviceId).toHaveBeenLastCalledWith();
+    expect(ctl.state).toBe('resumeRetry');
+    expect(reportError).not.toHaveBeenCalled(); // the fallback is tried before anything is reported
+    expect(store.clear).not.toHaveBeenCalled();
+  });
+
+  it('MAX refusing the connection itself (INIT) under the saved id switches to a fresh id for the next one', async () => {
+    const { client } = setup({ ...SESSION, deviceId: SAVED });
+    client.emit('error', new MaxServerError('Приложение устарело', OPCODES.INIT));
+    expect(client.useDeviceId).toHaveBeenLastCalledWith();
+    client.emit('error', new MaxServerError('Приложение устарело', OPCODES.INIT));
+    expect(client.useDeviceId).toHaveBeenCalledTimes(2); // once — the saved id is gone already
+  });
+
+  it('a malformed saved id is not taken for «the saved one»', async () => {
+    const { client } = setup({ ...SESSION, deviceId: 'not-digits' });
+    await failedResume(client, REJECTED());
+    expect(client.useDeviceId).toHaveBeenCalledTimes(1); // no fallback round: nothing saved was in use
+  });
+});
+
+describe('MaxSessionController — «MAX ответил» in the outage notice', () => {
+  // One notice per test: the error reporter holds a key back for a while after it was sent.
+  const outageNotice = async (err: Error): Promise<string> => {
+    const { client } = setup(null);
+    client.emit('error', err);
+    client.emit('disconnected');
+    await vi.advanceTimersByTimeAsync(61_000);
+    return String(notices.mock.calls.at(-1)?.[0] ?? '');
+  };
+
+  it('quotes MAX’s own refusal of the connection', async () => {
+    expect(await outageNotice(new MaxServerError('Приложение устарело', OPCODES.INIT))).toMatch(/MAX ответил: «Приложение устарело»/);
+  });
+
+  it('never quotes a local network error (nor its address) as MAX’s answer', async () => {
+    const local = await outageNotice(Object.assign(new Error('read ECONNABORTED 155.212.204.150:443'), { code: 'ECONNABORTED' }));
+    expect(local).toMatch(/Потеряна связь с MAX/);
+    expect(local).not.toMatch(/MAX ответил|155\.212/);
   });
 });
 describe('outageDetailText', () => {
@@ -422,5 +482,6 @@ describe('outageDetailText', () => {
     const { outageDetailText } = await import('../src/server/maxSession.js');
     expect(outageDetailText('Приложение устарело. Обновите MAX\nstack')).toBe('Приложение устарело. Обновите MAX');
     expect(outageDetailText('bad token AbCdEfGhIjKlMnOpQrStUvWxYz012345 for 79991234567')).toBe('bad token … for #');
+    expect(outageDetailText('нет доступа с 155.212.204.150:443, звоните +7 (999) 123-45-67')).toBe('нет доступа с …, звоните #');
   });
 });
