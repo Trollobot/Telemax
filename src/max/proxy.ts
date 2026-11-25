@@ -89,7 +89,13 @@ export async function openMaxTunnel(proxyUrl: string, host: string, port: number
         reject(new Error(`no tunnel in ${Math.round(timeoutMs / 1000)}s`));
       }, timeoutMs);
     });
-    return await Promise.race([opened, timeout]);
+    const socket = await Promise.race([opened, timeout]);
+    // socks-proxy-agent leaves its connect timeout on the socket as an IDLE timeout that destroys it:
+    // an open MAX connection is quiet for up to a minute between PINGs, and it was cut every ~15 s
+    // (test, 2026-11-25). The tunnel is up — from here the client's own PING watches it.
+    socket.setTimeout(0);
+    socket.removeAllListeners('timeout');
+    return socket;
   } catch (err) {
     throw new MaxProxyError(proxyUrl, err);
   } finally {

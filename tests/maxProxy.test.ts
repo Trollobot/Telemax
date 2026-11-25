@@ -125,3 +125,21 @@ describe('MAX proxy — the setting', () => {
     expect(maxProxyView({ shown: '', source: 'none' }).text).toMatch(/напрямую, без прокси/);
   });
 });
+
+describe('MAX proxy — a quiet tunnel', () => {
+  it('is not cut by the connect timeout once it is open', async () => {
+    const echo = net.createServer((s) => s.pipe(s));
+    await new Promise<void>((r) => echo.listen(0, '127.0.0.1', () => r()));
+    const echoPort = (echo.address() as net.AddressInfo).port;
+    const proxy = await socks5Server();
+    try {
+      const socket = await openMaxTunnel(`socks5://127.0.0.1:${proxy.port}`, '127.0.0.1', echoPort, 300);
+      await new Promise((r) => setTimeout(r, 700)); // idle for longer than the connect timeout
+      expect(socket.destroyed).toBe(false);
+      socket.destroy();
+    } finally {
+      proxy.close();
+      echo.close();
+    }
+  });
+});
