@@ -23,6 +23,9 @@ import { createLogger } from '../logger.js';
 import { config } from './config.js';
 import { installQuietSends } from '../telegram/quiet.js';
 import { MaxSessionController } from './maxSession.js';
+import { getMaxProxy, loadMaxProxyOverride, maxProxySource, proxyUrlProblem, saveMaxProxyOverride } from '../max/proxy.js';
+import { checkMaxThroughProxy } from '../max/ca.js';
+import type { MaxProxyControl } from '../bridge/panel.js';
 import { getTelegramProxyAgent, initTelegramProxy, redactProxyUrl } from '../telegram/proxy.js';
 import { startStatusFile } from '../bridge/statusFile.js';
 import { maskPhone } from '../bridge/status.js';
@@ -306,6 +309,40 @@ async function killMaxSession(): Promise<{ endedOnMax: boolean }> {
 }
 
 /** «🚪 Выйти из MAX» / /logout: the session ends on MAX and here; topics and settings stay, /login brings it back. */
+/** «🌐 Прокси для MAX» in the panel: a proxy is saved only once MAX answers through it (GitHub #23). */
+const maxProxy: MaxProxyControl = {
+  current: () => {
+    const url = getMaxProxy();
+    return { shown: url ? redactProxyUrl(url) : '', source: maxProxySource() };
+  },
+  async apply(url) {
+    const wanted = url?.trim() || null;
+    if (wanted) {
+      const why = proxyUrlProblem(wanted);
+      if (why) return { ok: false, text: `⚠️ Не сохранил: ${why}.` };
+      try {
+        await checkMaxThroughProxy(wanted);
+      } catch (err) {
+        const reason = String((err as Error)?.cause instanceof Error ? ((err as Error).cause as Error).message : ((err as Error)?.message ?? err)).slice(0, 160);
+        logger.warn(`MAX is not reachable through the proxy ${redactProxyUrl(wanted)}: ${reason}`);
+        return { ok: false, text: `⚠️ Через этот прокси MAX не отвечает (${reason}). Прокси не сохранён — всё работает как раньше.` };
+      }
+    }
+    await saveMaxProxyOverride(wanted);
+    logger.info(wanted ? `MAX proxy set from the panel: ${redactProxyUrl(wanted)}` : 'MAX proxy removed from the panel');
+    maxSession.reconnect();
+    const now = getMaxProxy();
+    return {
+      ok: true,
+      text: wanted
+        ? `✅ MAX отвечает через прокси ${redactProxyUrl(wanted)} — сохранил, переподключаюсь.`
+        : now
+          ? `✅ Прокси из пульта убран — действует MAX_PROXY из .env (${redactProxyUrl(now)}). Переподключаюсь.`
+          : '✅ Прокси убран — MAX подключается напрямую. Переподключаюсь.',
+    };
+  },
+};
+
 async function logoutMax(): Promise<{ endedOnMax: boolean }> {
   const result = await maxSession.logout();
   await writeFile(LOGGED_OUT_MARKER, new Date().toISOString(), 'utf8').catch(() => {});
@@ -365,6 +402,14 @@ async function startServer(): Promise<void> {
   });
 
   await settingsStore.load().catch((err) => logger.error('Failed to read .data/settings.json — the defaults apply', err));
+  // The panel's MAX proxy (.data/max-proxy) before the first connect; MAX_PROXY from .env otherwise.
+  await loadMaxProxyOverride().catch((err) => logger.error('Failed to read .data/max-proxy — MAX_PROXY from .env applies', err));
+  const proxyNow = getMaxProxy();
+  if (proxyNow) {
+    const why = proxyUrlProblem(proxyNow);
+    if (why) logger.error(`The MAX proxy ${redactProxyUrl(proxyNow)} is not usable (${why}) — connections to MAX will fail until it is fixed`);
+    else logger.info(`MAX идёт через прокси ${redactProxyUrl(proxyNow)}`);
+  }
   const savedSession = await sessionStore.load();
   noSessionAtBoot = savedSession == null;
   maxSession.start(savedSession);
@@ -434,6 +479,7 @@ async function startServer(): Promise<void> {
         logoutMax,
         rememberChat: (chat) => upsertCachedChat(chat),
         settings: settingsStore,
+        maxProxy,
         suspendChatSync,
         auth: {
           getLastKnownPhone: () => maxSession.lastKnownPhone,

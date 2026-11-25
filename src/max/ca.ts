@@ -17,9 +17,10 @@
  * could not reach MAX at all (2026-11-22).
  */
 import tls from 'node:tls';
-import { Agent, fetch as undiciFetch, type RequestInit, type Response } from 'undici';
+import { Agent, fetch as undiciFetch, type buildConnector, type RequestInit, type Response } from 'undici';
 import { createLogger } from '../logger.js';
 import { RUSSIAN_CA_PEMS } from './russianCa.generated.js';
+import { getMaxProxy, openMaxTunnel } from './proxy.js';
 
 const logger = createLogger('max-ca');
 
@@ -43,7 +44,43 @@ export const MAX_CERT_PROBLEM_TEXT =
  */
 export const MAX_TLS_CA: string[] = [...tls.rootCertificates, ...RUSSIAN_CA_PEMS.map((c) => c.pem)];
 
-const maxDispatcher = new Agent({ connect: { ca: MAX_TLS_CA } });
+/**
+ * undici's connect() through the MAX proxy: a tunnel from the proxy, our own TLS on top — the same
+ * trust set and certificate check as a direct connection (see proxy.ts).
+ */
+function proxyConnector(proxy: string) {
+  return (opts: buildConnector.Options, callback: buildConnector.Callback): void => {
+    openMaxTunnel(proxy, opts.hostname, Number(opts.port) || 443).then(
+      (raw) => {
+        const socket = tls.connect({ socket: raw, servername: opts.servername || opts.hostname, ca: MAX_TLS_CA, rejectUnauthorized: true, ALPNProtocols: ['http/1.1'] });
+        const onError = (err: Error): void => callback(err, null);
+        socket.once('error', onError);
+        socket.once('secureConnect', () => {
+          socket.removeListener('error', onError);
+          callback(null, socket);
+        });
+      },
+      (err: Error) => callback(err, null),
+    );
+  };
+}
+
+// One dispatcher per kind for the proxy in force; a changed proxy (the panel, at run time) gets a
+// fresh one, and the old one closes once its requests are done.
+const dispatchers = new Map<'normal' | 'big', { proxy: string; agent: Agent }>();
+
+function dispatcherFor(kind: 'normal' | 'big'): Agent {
+  const proxy = getMaxProxy();
+  const cached = dispatchers.get(kind);
+  if (cached?.proxy === proxy) return cached.agent;
+  if (cached) void cached.agent.close().catch(() => {});
+  // Gigabyte transfers (fileShare.ts): the defaults (5 min to the response headers) are fine for a
+  // photo but not for MAX digesting a 4 GB upload; bodyTimeout stays an IDLE limit between chunks.
+  const timeouts = kind === 'big' ? { headersTimeout: 30 * 60_000, bodyTimeout: 5 * 60_000 } : {};
+  const agent = new Agent({ ...timeouts, connect: proxy ? proxyConnector(proxy) : { ca: MAX_TLS_CA } });
+  dispatchers.set(kind, { proxy, agent });
+  return agent;
+}
 
 /**
  * fetch() for MAX-owned hosts only (upload slots, file/photo/video CDN) — same
@@ -58,7 +95,7 @@ const maxDispatcher = new Agent({ connect: { ca: MAX_TLS_CA } });
  * with it while plain-TCP traffic kept working.
  */
 export function maxFetch(url: string, init: RequestInit = {}): Promise<Response> {
-  return fetchMaxHost(url, init, maxDispatcher);
+  return fetchMaxHost(url, init, dispatcherFor('normal'));
 }
 
 /**
@@ -147,11 +184,29 @@ async function fetchMaxHost(url: string, init: RequestInit, dispatcher: Agent): 
   }
 }
 
-// Gigabyte transfers (fileShare.ts): the defaults (5 min to the response headers) are fine for a
-// photo but not for MAX digesting a 4 GB upload; bodyTimeout stays an IDLE limit between chunks.
-const maxBigDispatcher = new Agent({ connect: { ca: MAX_TLS_CA }, headersTimeout: 30 * 60_000, bodyTimeout: 5 * 60_000 });
 
 /** maxFetch for streamed multi-gigabyte up/downloads — same trust set, longer timeouts. */
 export function maxFetchBig(url: string, init: RequestInit = {}): Promise<Response> {
-  return fetchMaxHost(url, init, maxBigDispatcher);
+  return fetchMaxHost(url, init, dispatcherFor('big'));
+}
+
+/**
+ * Whether MAX answers through `proxy`: a tunnel to MAX's server and a full TLS handshake with MAX's
+ * certificate checked — what the panel and setup do before a proxy is saved. Rejects with why not.
+ */
+export async function checkMaxThroughProxy(proxy: string, host = 'api2.oneme.ru', timeoutMs = 15_000): Promise<void> {
+  const raw = await openMaxTunnel(proxy, host, 443, timeoutMs);
+  await new Promise<void>((resolve, reject) => {
+    const socket = tls.connect({ socket: raw, servername: host, ca: MAX_TLS_CA, rejectUnauthorized: true });
+    const timer = setTimeout(() => socket.destroy(new Error(`no TLS answer from MAX in ${Math.round(timeoutMs / 1000)}s`)), timeoutMs);
+    socket.once('secureConnect', () => {
+      clearTimeout(timer);
+      socket.destroy();
+      resolve();
+    });
+    socket.once('error', (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+  });
 }

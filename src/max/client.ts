@@ -1,10 +1,12 @@
 import tls from 'node:tls';
+import type net from 'node:net';
 import { EventEmitter } from 'node:events';
 import { pack } from 'msgpackr';
 import { readFrameHeader, encodeFrame, decompressPayload, FRAME_HEADER_SIZE } from './frame.js';
 import { decodeFramePayload, pickObject } from './msgpack.js';
 import { OPCODES, DIR, formatOpcode } from './opcodes.js';
 import { MAX_TLS_CA } from './ca.js';
+import { getMaxProxy, openMaxTunnel } from './proxy.js';
 import { toMaxReaction } from './reactions.js';
 import { findAuthToken, findLongToken, describeAuthError, extractPasswordChallenge, type PasswordChallenge } from './tokens.js';
 import { createLogger } from '../logger.js';
@@ -389,19 +391,53 @@ export class MaxClient extends EventEmitter {
       ca: MAX_TLS_CA,
       autoSelectFamily: true,
     };
-    this.socket = tls.connect(
-      DEFAULT_PORT,
-      this.opts.host,
-      socketOpts,
-      () => {
-        // The reconnect backoff is NOT reset here — only after INIT plus a stable stretch (reconnectAttemptFor).
-        this.socket?.setTimeout(0); // handshake done — PING and keepalive watch the socket from here
-        this.socket?.setKeepAlive(true, TCP_KEEPALIVE_DELAY_MS);
-        this.emit('connected');
-        this.startPing();
-        this.sendDeviceInfo();
-      },
-    );
+    const generation = ++this.connectGeneration;
+    const proxy = getMaxProxy();
+    if (proxy) {
+      void this.connectThroughProxy(proxy, socketOpts, generation);
+      return;
+    }
+    this.attachSocket(tls.connect(DEFAULT_PORT, this.opts.host, socketOpts, () => this.onSecure()));
+  }
+
+  // Bumped by every connect(): a proxy tunnel that opens after a newer connect() (or a disconnect())
+  // is closed instead of becoming the socket.
+  private connectGeneration = 0;
+
+  /** The same TLS as a direct connection — MAX_TLS_CA, rejectUnauthorized — only over the proxy's tunnel (see proxy.ts). */
+  private async connectThroughProxy(proxy: string, socketOpts: tls.ConnectionOptions & { autoSelectFamily?: boolean }, generation: number): Promise<void> {
+    let raw: net.Socket;
+    try {
+      raw = await openMaxTunnel(proxy, this.opts.host, DEFAULT_PORT);
+    } catch (err) {
+      if (generation !== this.connectGeneration || this.closedByUser) return;
+      // What a socket that failed to connect does: report, say disconnected, try again with backoff.
+      this.emit('error', err);
+      this.emit('disconnected');
+      if (this.opts.reconnect) this.scheduleReconnect();
+      return;
+    }
+    if (generation !== this.connectGeneration || this.closedByUser) {
+      raw.destroy();
+      return;
+    }
+    const { autoSelectFamily: _family, ...tlsOpts } = socketOpts;
+    this.attachSocket(tls.connect({ ...tlsOpts, socket: raw }, () => this.onSecure()));
+  }
+
+  /** TLS is up. */
+  private onSecure(): void {
+    // The reconnect backoff is NOT reset here — only after INIT plus a stable stretch (reconnectAttemptFor).
+    this.socket?.setTimeout(0); // handshake done — PING and keepalive watch the socket from here
+    this.socket?.setKeepAlive(true, TCP_KEEPALIVE_DELAY_MS);
+    this.emit('connected');
+    this.startPing();
+    this.sendDeviceInfo();
+  }
+
+  /** Makes `socket` the client's and wires its events. */
+  private attachSocket(socket: tls.TLSSocket): void {
+    this.socket = socket;
 
     this.socket.on('data', (data: Buffer) => {
       // Chunks are only joined once a whole frame can be there: joining on every chunk copied a big
@@ -415,7 +451,6 @@ export class MaxClient extends EventEmitter {
       this.drainBuffer();
     });
 
-    const socket = this.socket;
     // Destroyed with an error: 'error' then 'close' below, which reconnects with backoff.
     socket.setTimeout(TLS_HANDSHAKE_TIMEOUT_MS, () => {
       socket.destroy(Object.assign(new Error(`MAX TLS handshake timed out after ${TLS_HANDSHAKE_TIMEOUT_MS / 1000}s`), { code: 'ETIMEDOUT' }));

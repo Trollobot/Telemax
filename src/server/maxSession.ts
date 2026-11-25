@@ -6,6 +6,7 @@ import { MaxAuthUnavailableError } from '../bridge/maxAuthFlow.js';
 import { reportBridgeError, resetErrorKey } from '../bridge/errorReporter.js';
 import { maskPhone } from '../bridge/status.js';
 import { isCertificateErrorMessage, MAX_CERT_PROBLEM_TEXT } from '../max/ca.js';
+import { getMaxProxy, MAX_PROXY_PROBLEM_TEXT } from '../max/proxy.js';
 import { createLogger } from '../logger.js';
 
 const logger = createLogger('max-session');
@@ -98,6 +99,10 @@ const AUTH_CHAIN_TTL_MS = 10 * 60_000;
 // when there is a session, and INIT OK only without one (a LOGIN that never completes must not go
 // on without any notice); never the TLS handshake alone.
 const MAX_DOWN_NOTICE_MS = 60_000;
+// After this long without MAX (and no proxy for it), the group is told about the MAX proxy once.
+const MAX_LONG_DOWN_HINT_MS = 60 * 60_000;
+export const MAX_LONG_DOWN_TEXT =
+  '⚠️ MAX недоступен уже больше часа. Если сервер моста за рубежом — MAX мог перестать его пускать. Помочь может прокси для MAX в России: /panel → ⚙️ Система → 🌐 Прокси для MAX.';
 const FRESH_CONNECT_TIMEOUT_MS = 15_000;
 
 const SESSION_SAVE_FAILED_TEXT =
@@ -205,6 +210,7 @@ export class MaxSessionController {
     // and the auth chain died with the socket. Likewise on a new socket.
     if (next === 'paused' || next === 'stopped') {
       this.downTimer = clearTimer(this.downTimer);
+      this.longDownTimer = clearTimer(this.longDownTimer);
       this.outageStartedAt = null; // on purpose — no outage to report
     }
     if (next === 'paused' || next === 'stopped' || next === 'connecting') this.authChainStartedAt = null;
@@ -419,6 +425,7 @@ export class MaxSessionController {
   /** `text`, or — when MAX's certificate was just refused — the real reason: waiting a minute would not help. */
   private unreachableText(text: string): string {
     const recent = this.lastClientError && Date.now() - this.lastClientError.at < 2 * 60_000 ? this.lastClientError.message : '';
+    if (recent.startsWith('MAX proxy ')) return `${MAX_PROXY_PROBLEM_TEXT} Затем повторите /login.`;
     return isCertificateErrorMessage(recent) ? `${MAX_CERT_PROBLEM_TEXT} Когда это исправлено — повторите /login.` : text;
   }
 
@@ -469,6 +476,12 @@ export class MaxSessionController {
   }
 
   // --- Panel pause, /kill, shutdown ------------------------------------------------------------
+
+  /** A fresh connection now (the MAX proxy changed): the session resumes on it. Nothing while paused or stopped. */
+  reconnect(): void {
+    if (this.state_ === 'paused' || this.state_ === 'stopped') return;
+    this.connect();
+  }
 
   /** Closes the socket until unpause() or, with `seconds` > 0, until the timer resumes it. disconnect() removes the socket listeners, so no «connection lost» alarm goes out for a deliberate pause. */
   pause(seconds: number): void {
@@ -577,13 +590,26 @@ export class MaxSessionController {
       // MAX's own words when it refused (e.g. «Приложение устарело» on a refused INIT) — without them
       // the notice read like a network blip and the fix (MAX_APP_VERSION) was a guess.
       const why = this.outageDetail ? `\nMAX ответил: «${this.outageDetail}»${/устарел|обнов|outdated|version/i.test(this.outageDetail) ? '\nВероятно, MAX требует более новую версию приложения — см. README, «Если что-то не работает» (MAX_APP_VERSION).' : ''}` : '';
-      reportBridgeError('max-down', `❌ Потеряна связь с MAX. Пытаюсь переподключиться…${certificate ? `\n${MAX_CERT_PROBLEM_TEXT}` : why}`);
+      const proxy = this.outageCause === 'proxy' || (this.lastClientError?.message ?? '').startsWith('MAX proxy ');
+      reportBridgeError('max-down', `❌ Потеряна связь с MAX. Пытаюсь переподключиться…${proxy ? `\n${MAX_PROXY_PROBLEM_TEXT}` : certificate ? `\n${MAX_CERT_PROBLEM_TEXT}` : why}`);
     }, MAX_DOWN_NOTICE_MS);
+    // A whole hour without MAX and no proxy: a server abroad MAX does not let in looks exactly like
+    // this (GitHub #23) — say once where the fix is. Not for a refused certificate or a failing proxy:
+    // those have their own words already.
+    this.longDownTimer = clearTimer(this.longDownTimer);
+    this.longDownTimer = setTimeout(() => {
+      this.longDownTimer = null;
+      if (this.outageStartedAt == null || getMaxProxy() || this.outageCause === 'certificate' || this.outageCause === 'proxy') return;
+      reportBridgeError('max-down-long', MAX_LONG_DOWN_TEXT);
+    }, MAX_LONG_DOWN_HINT_MS);
   }
+
+  private longDownTimer: Timer | null = null;
 
   /** MAX is up again: cancels a running outage window, and reports the recovery of a reported outage. */
   private noteUp(): void {
     this.downTimer = clearTimer(this.downTimer);
+    this.longDownTimer = clearTimer(this.longDownTimer);
     const startedAt = this.outageStartedAt;
     const cause = this.outageCause;
     this.outageStartedAt = null;
@@ -602,6 +628,8 @@ export class MaxSessionController {
 export function outageCause(message: string): string {
   const m = message.toLowerCase();
   if (!m) return 'socket-closed';
+  // The MAX proxy did not let us through (proxy.ts MaxProxyError) — the proxy is what to fix.
+  if (m.startsWith('max proxy ')) return 'proxy';
   if (m.includes('ping')) return 'ping-timeout';
   if (/enotfound|eai_again|getaddrinfo/.test(m)) return 'dns';
   if (/econnrefused|ehostunreach|enetunreach|enetdown/.test(m)) return 'unreachable';

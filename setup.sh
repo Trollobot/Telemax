@@ -347,6 +347,44 @@ verify_telegram_proxy_loop() {
   done
 }
 
+# MAX through a proxy (GitHub #23: a server abroad that MAX does not let in). curl only proves the way
+# to MAX's server: what runs on top of its TLS is MAX's own protocol, not HTTP, so -k and «connected»
+# are enough here — the bridge itself checks MAX's certificate through the proxy.
+check_max_via_proxy() {
+  curl -sk --max-time 12 -o /dev/null --proxy "$1" https://api2.oneme.ru:443/ 2>/dev/null
+}
+
+# Asks for a MAX proxy until MAX answers — through it or, re-checked, directly. Sets $MAX_PROXY
+# ("" = direct). Returns 1 when the user gives up («q»).
+ask_max_proxy_loop() {
+  while true; do
+    echo "    • впишите прокси в России (socks5://логин:пароль@адрес:порт или http://адрес:порт) и Enter — проверю через него;"
+    echo "    • пустой Enter — перепроверить напрямую;"
+    echo "    • q — выйти (настроить сеть сервера и запустить setup.sh снова)."
+    read -rp "  > " MAX_INPUT
+    if has_apostrophe "$MAX_INPUT"; then continue; fi
+    case "$MAX_INPUT" in
+      q | Q) return 1 ;;
+      '')
+        if check_tcp api2.oneme.ru 443; then
+          echo "  MAX (api2.oneme.ru:443): OK"
+          MAX_PROXY=""
+          return 0
+        fi
+        echo "  MAX напрямую всё ещё недоступен."
+        ;;
+      *)
+        if check_max_via_proxy "$MAX_INPUT"; then
+          echo "  MAX через прокси $(redact_proxy "$MAX_INPUT"): OK"
+          MAX_PROXY="$MAX_INPUT"
+          return 0
+        fi
+        echo "  Через этот прокси MAX не отвечает — проверьте адрес, порт, логин и пароль."
+        ;;
+    esac
+  done
+}
+
 # Detects the target Telegram group via getUpdates (needs $TELEGRAM_BOT_TOKEN and jq;
 # honors $TELEGRAM_PROXY). Sets $TARGET_TELEGRAM_GROUP. Loops until found/picked.
 detect_group() {
@@ -572,6 +610,14 @@ if [ -f .env ]; then
     else
       echo "  Прокси Telegram:  нет (напрямую)"
     fi
+    MAX_PROXY=$(env_read MAX_PROXY)
+    if [ -f data/max-proxy ]; then
+      echo "  Прокси MAX:       задан в пульте Telegram (он важнее .env)"
+    elif [ -n "${MAX_PROXY:-}" ]; then
+      echo "  Прокси MAX:       $(redact_proxy "$MAX_PROXY")"
+    else
+      echo "  Прокси MAX:       нет (напрямую)"
+    fi
     echo "  Стикеры (образ):  ${STICKERS:-full}"
     if files_off; then
       echo "  Большие файлы:    выключены (FILES=off)"
@@ -643,6 +689,41 @@ if [ -f .env ]; then
     apply_env_change
   }
 
+  change_max_proxy() {
+    echo
+    MAX_PROXY=$(env_read MAX_PROXY)
+    if [ -f data/max-proxy ]; then
+      echo "⚠️  В пульте Telegram задан свой прокси для MAX — он важнее настройки здесь."
+      echo "   Убрать его: /panel → ⚙️ Система → 🌐 Прокси для MAX."
+    fi
+    if [ -n "${MAX_PROXY:-}" ]; then
+      echo "Текущий прокси MAX (.env): $(redact_proxy "$MAX_PROXY")"
+    else
+      echo "Сейчас прокси для MAX не задан — MAX идёт напрямую."
+    fi
+    echo "Нужен, если MAX с этого сервера недоступен (сервер за рубежом). Прокси — в России."
+    echo "Форматы: socks5://[логин:пароль@]хост:порт или http://[логин:пароль@]хост:порт."
+    echo "Введите новый адрес; «-» — убрать прокси (напрямую); пустой Enter — оставить как есть."
+    read -rp "Прокси MAX: " NEW_PROXY
+    if has_apostrophe "$NEW_PROXY"; then echo "  Настройка не изменена."; return 0; fi
+    case "$NEW_PROXY" in
+      '') echo "Оставляю как есть."; return 0 ;;
+      -) MAX_PROXY="" ;;
+      *)
+        echo "Проверяю связь с MAX через этот прокси..."
+        if ! check_max_via_proxy "$NEW_PROXY"; then
+          echo "  Через этот прокси MAX не отвечает — проверьте адрес, порт, логин и пароль. Настройка не изменена."
+          return 0
+        fi
+        echo "  MAX через прокси $(redact_proxy "$NEW_PROXY"): OK"
+        MAX_PROXY="$NEW_PROXY"
+        ;;
+    esac
+    set_env_var MAX_PROXY "$MAX_PROXY"
+    echo "Сохранено в .env: MAX_PROXY=$( [ -n "$MAX_PROXY" ] && redact_proxy "$MAX_PROXY" || echo '(напрямую)' )"
+    apply_env_change
+  }
+
   change_bot() {
     echo
     echo "Текущий токен: $(mask_token "${TELEGRAM_BOT_TOKEN:-}")"
@@ -699,11 +780,18 @@ if [ -f .env ]; then
   check_connectivity() {
     echo
     echo "Проверяю связь..."
-    if check_tcp api2.oneme.ru 443; then
+    MAX_PROXY=$(env_read MAX_PROXY)
+    if [ -n "${MAX_PROXY:-}" ]; then
+      if check_max_via_proxy "$MAX_PROXY"; then
+        echo "  MAX (через прокси $(redact_proxy "$MAX_PROXY")): OK"
+      else
+        echo "  MAX (через прокси $(redact_proxy "$MAX_PROXY")): нет связи — проверьте прокси (пункт 8)."
+      fi
+    elif check_tcp api2.oneme.ru 443; then
       echo "  MAX (api2.oneme.ru:443): OK"
     else
-      echo "  MAX (api2.oneme.ru:443): нет связи — мост работать не сможет (файрвол/гео-блокировка;"
-      echo "  на IPv6-only хосте нужен NAT64/DNS64 у провайдера)."
+      echo "  MAX (api2.oneme.ru:443): нет связи — мост работать не сможет. Сервер за рубежом? Задайте"
+      echo "  прокси MAX (пункт 8). Иначе — файрвол хостинга; на IPv6-only хосте нужен NAT64/DNS64."
     fi
     check_telegram_once || true
   }
@@ -720,6 +808,7 @@ if [ -f .env ]; then
     echo "  5) Проверить связь с MAX и Telegram"
     echo "  6) Пересобрать и перезапустить контейнер"
     echo "  7) Большие файлы: включить или выключить (с проверкой белого IP и портов)"
+    echo "  8) Изменить прокси MAX (для сервера за рубежом, с проверкой связи до записи)"
     echo "  0) Выход"
     read -rp "Пункт: " MENU_CHOICE
     case "$MENU_CHOICE" in
@@ -729,6 +818,7 @@ if [ -f .env ]; then
       4) change_stickers ;;
       5) check_connectivity ;;
       7) toggle_files ;;
+      8) change_max_proxy ;;
       6)
         if command -v docker >/dev/null 2>&1; then
           compose_up --build
@@ -819,18 +909,23 @@ done
 echo
 echo "Проверяю связь с серверами MAX и Telegram..."
 
-# MAX is fatal: it's always direct, so nothing the user could re-type fixes a blocked
-# MAX — a firewall/geo-block is an environment problem, not a typo. Checked by NAME so
-# an IPv6-only host resolves via DNS64/NAT64 (MAX itself is IPv4-only).
+# MAX unreachable directly: usually a server abroad that MAX does not let in, or the hosting's
+# firewall. A proxy in Russia fixes the first (GitHub #23) — asked for here, saved only once MAX
+# answers through it. Checked by NAME so an IPv6-only host resolves via DNS64/NAT64 (MAX itself is
+# IPv4-only).
+MAX_PROXY=""
 if check_tcp api2.oneme.ru 443; then
   echo "  MAX (api2.oneme.ru:443): OK"
 else
-  echo "  MAX (api2.oneme.ru:443): нет связи"
+  echo "  MAX (api2.oneme.ru:443): напрямую нет связи"
   echo
-  echo "Без связи с сервером MAX мост работать не сможет — обычно это файрвол хостинга"
-  echo "или гео-блокировка. На IPv6-only хосте нужен NAT64/DNS64 у провайдера. Проверьте"
-  echo "сеть сервера и запустите setup.sh снова."
-  exit 1
+  echo "С этого сервера MAX напрямую недоступен. Так бывает с серверами за рубежом (MAX их не пускает)"
+  echo "или из-за файрвола хостинга; на IPv6-only хосте нужен NAT64/DNS64 у провайдера."
+  echo "Если сервер за рубежом — MAX можно пустить через прокси в России."
+  if ! ask_max_proxy_loop; then
+    echo "Без связи с сервером MAX мост работать не сможет. Проверьте сеть сервера и запустите setup.sh снова."
+    exit 1
+  fi
 fi
 
 # Telegram is NOT fatal: the usual cause is a mistyped proxy (or a host that needs a
@@ -941,6 +1036,7 @@ TELEGRAM_PROXY=$(env_quote "$TELEGRAM_PROXY")
 STICKERS=$(env_quote "$STICKERS")
 EOF
 [ "$FILES_SETTING" = off ] && printf "FILES='off'\n" >> .env
+[ -n "$MAX_PROXY" ] && printf 'MAX_PROXY=%s\n' "$(env_quote "$MAX_PROXY")" >> .env
 
 echo
 bold "Готово: .env создан."

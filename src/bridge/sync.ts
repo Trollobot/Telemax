@@ -40,7 +40,7 @@ import { FileShare, fileShareOptionsFromEnv, TELEGRAM_BOT_DOWNLOAD_LIMIT } from 
 import { createBigFiles } from './bigFiles.js';
 import { canRenderAnimatedStickers } from './lottie.js';
 import { reportBridgeError } from './errorReporter.js';
-import { addToMaxContacts, countRu, logoutConfirmView, profileName, wireControlPanel, type PauseControl } from './panel.js';
+import { addToMaxContacts, countRu, logoutConfirmView, profileName, wireControlPanel, type MaxProxyControl, type PauseControl } from './panel.js';
 import { keepPanelBack } from './panelBack.js';
 import { createBugReports, isBugReportInboxEnabled, BUGREPORT_BOT_HANDLE, type BugReports } from './bugReports.js';
 import { createMaxAuthFlow, type MaxAuthCallbacks } from './maxAuthFlow.js';
@@ -1781,6 +1781,8 @@ export interface BridgeOptions {
   restartBridge?: (where: { chatId: number; messageId: number }) => void;
   /** The owner's settings (.data/settings.json) — the history depth lives there. */
   settings?: SettingsStore;
+  /** «🌐 Прокси для MAX» in the panel (server/app.ts). */
+  maxProxy?: MaxProxyControl;
 }
 
 /** Wires MAX push messages <-> Telegram forum topics in both directions (ТЗ.md §1.2). */
@@ -1812,6 +1814,7 @@ export function wireBridge({
   logoutMax,
   rememberChat,
   settings,
+  maxProxy,
 }: BridgeOptions): WiredBridge {
   const historyDays = (): number => settings?.get().historyDays ?? DEFAULT_HISTORY_DAYS;
   // Bug-report channel: private DMs from outsiders become bug reports. The inbox is only ON where
@@ -3432,6 +3435,7 @@ export function wireBridge({
     logout: logoutMax,
     openJoinedChat,
     historyDepth: settings ? { get: historyDays, set: (days) => settings.set({ historyDays: days }) } : undefined,
+    maxProxy,
     files: fileShare,
     resendToMax: (id) => bigFiles.resendToMax(id),
     offerStore: (panelMessageId) => bigFiles.offerStore(panelMessageId),

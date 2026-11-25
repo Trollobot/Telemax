@@ -58,6 +58,16 @@ export interface ControlPanelDeps {
   openJoinedChat?: (chat: MaxLinkChat) => Promise<{ ok: boolean; error?: string; topicName: string; chatLink?: string }>;
   /** «📜 История»: how far back a topic filled from scratch reaches (days, 0 = all) — settings.json via sync.ts. */
   historyDepth?: { get: () => number; set: (days: number) => Promise<void> };
+  /** «🌐 Прокси для MAX» (server/app.ts). */
+  maxProxy?: MaxProxyControl;
+}
+
+/** The MAX proxy as the panel sees it (GitHub #23). */
+export interface MaxProxyControl {
+  /** The proxy in force, its password hidden, and where it comes from. */
+  current(): { shown: string; source: 'panel' | 'env' | 'none' };
+  /** Checks MAX through `url` before anything is saved; null removes the panel's setting. Reconnects MAX on success. */
+  apply(url: string | null): Promise<{ ok: boolean; text: string }>;
 }
 
 export interface PauseControl {
@@ -419,9 +429,29 @@ export function systemView(paused: boolean, note?: string, historyDays?: number)
       [pauseBtn, Markup.button.callback('⬆️ Обновление', 'tlmx_panel:update')],
       [Markup.button.callback('🔄 Пересинхронизация', 'tlmx_panel:resync'), Markup.button.callback('📋 Команды', 'tlmx_panel:help')],
       ...(historyDays != null ? [[Markup.button.callback(`📜 История: ${historyDaysLabel(historyDays)}`, 'tlmx_panel:history')]] : []),
+      [Markup.button.callback('🌐 Прокси для MAX', 'tlmx_panel:mproxy')],
       [Markup.button.callback('🔁 Перезапустить мост', 'tlmx_panel:restart')],
       [Markup.button.callback('◀️ Назад', 'tlmx_panel:root')],
     ]).reply_markup,
+  };
+}
+
+/** «🌐 Прокси для MAX»: what is in force and where from; `note` — the last action's result. Exported for tests. */
+export function maxProxyView(current: { shown: string; source: 'panel' | 'env' | 'none' }, note?: string): View {
+  const where =
+    current.source === 'panel'
+      ? `через прокси ${current.shown} (задан здесь, в пульте)`
+      : current.source === 'env'
+        ? `через прокси ${current.shown} (из MAX_PROXY в .env)`
+        : 'напрямую, без прокси';
+  const rows = [[Markup.button.callback(current.source === 'none' ? '✏️ Задать прокси' : '✏️ Сменить прокси', 'tlmx_panel:mproxy:set')]];
+  if (current.source === 'panel') rows.push([Markup.button.callback('🗑 Убрать прокси', 'tlmx_panel:mproxy:clear')]);
+  rows.push([Markup.button.callback('◀️ Назад', 'tlmx_panel:system')]);
+  return {
+    text:
+      `🌐 Прокси для MAX${note ? `\n${note}` : ''}\n\nСейчас мост подключается к MAX ${where}.\n\n` +
+      'Прокси нужен, если сервер моста за рубежом и MAX с него недоступен. Подойдёт SOCKS5 или HTTP-прокси в России. Через него пойдёт и соединение с MAX, и файлы; сертификат MAX проверяется как обычно.',
+    markup: Markup.inlineKeyboard(rows).reply_markup,
   };
 }
 
@@ -458,7 +488,7 @@ function pauseView(): View {
 }
 
 export function wireControlPanel(deps: ControlPanelDeps): void {
-  const { bot, targetGroupId, max, getActivePhone, triggerFullResync, leaves, startDialog, resolveContactName, getStatus, pause, files, resendToMax, offerStore, restart, logout, openJoinedChat, historyDepth } = deps;
+  const { bot, targetGroupId, max, getActivePhone, triggerFullResync, leaves, startDialog, resolveContactName, getStatus, pause, files, resendToMax, offerStore, restart, logout, openJoinedChat, historyDepth, maxProxy } = deps;
   const card = (f: StoredFile, link?: string): View => fileCardView(f, files!, link, Boolean(resendToMax));
   const root = (): View => rootView(getActivePhone(), pause.until());
   const system = (note?: string): View => systemView(pause.until() != null, note, historyDepth?.get());
@@ -583,6 +613,57 @@ export function wireControlPanel(deps: ControlPanelDeps): void {
     await ctx.answerCbQuery();
     await edit(ctx, system());
   });
+  // --- «🌐 Прокси для MAX» -------------------------------------------------------------------
+  // The next text of the admin who pressed «✏️», in General, is the proxy — deleted at once (it may
+  // carry a password), checked against MAX, and only then saved.
+  const pendingProxy = new Map<number, { panelId: number; at: number }>();
+  bot.action('tlmx_panel:mproxy', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    if (!maxProxy) return;
+    await edit(ctx, maxProxyView(maxProxy.current()));
+  });
+  bot.action('tlmx_panel:mproxy:set', async (ctx) => {
+    await ctx.answerCbQuery('✍️ Пришлите адрес прокси в чат').catch(() => {});
+    const panelId = ctx.callbackQuery?.message?.message_id;
+    if (!maxProxy || panelId == null || !ctx.from) return;
+    pendingProxy.set(ctx.from.id, { panelId, at: Date.now() });
+    await edit(ctx, {
+      text:
+        '🌐 Прокси для MAX\nПришлите адрес прокси следующим сообщением, например:\nsocks5://логин:пароль@адрес:1080\nhttp://адрес:3128\n\n' +
+        'Я сразу удалю это сообщение из группы (в нём может быть пароль), проверю через прокси связь с MAX и только тогда сохраню.',
+      markup: Markup.inlineKeyboard([[Markup.button.callback('✖️ Отмена', 'tlmx_panel:mproxy:cancel')]]).reply_markup,
+    });
+  });
+  bot.action('tlmx_panel:mproxy:cancel', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    if (ctx.from) pendingProxy.delete(ctx.from.id);
+    if (maxProxy) await edit(ctx, maxProxyView(maxProxy.current()));
+  });
+  bot.action('tlmx_panel:mproxy:clear', async (ctx) => {
+    await ctx.answerCbQuery().catch(() => {});
+    if (!maxProxy) return;
+    const result = await maxProxy.apply(null);
+    await edit(ctx, maxProxyView(maxProxy.current(), result.text));
+  });
+  bot.on('message', async (ctx, next) => {
+    const msg = ctx.message as { text?: string; message_thread_id?: number; message_id: number };
+    const open = ctx.from ? pendingProxy.get(ctx.from.id) : undefined;
+    if (!open || !maxProxy || msg.message_thread_id != null || msg.text == null || msg.text.startsWith('/')) return next();
+    pendingProxy.delete(ctx.from!.id);
+    if (Date.now() - open.at > SEARCH_WAIT_MS) return next();
+    // Out of the group first — whatever the check says.
+    await ctx.deleteMessage(msg.message_id).catch((err) => logger.warn('Could not delete the message with the MAX proxy', err));
+    const chatId = chatIdOf(ctx);
+    const show = (view: View) =>
+      bot.telegram.editMessageText(chatId, open.panelId, undefined, view.text, { reply_markup: view.markup }).catch((err) => {
+        if (!/not modified/i.test((err as Error)?.message ?? '')) logger.error('Panel edit failed', err);
+      });
+    await show({ text: '🌐 Прокси для MAX\n⏳ Проверяю связь с MAX через прокси…', markup: Markup.inlineKeyboard([]).reply_markup });
+    const result = await maxProxy.apply(msg.text.trim());
+    await show(maxProxyView(maxProxy.current(), result.text));
+    // consumed — do NOT call next()
+  });
+
   bot.action('tlmx_panel:history', async (ctx) => {
     await ctx.answerCbQuery().catch(() => {});
     if (historyDepth) await edit(ctx, historyDepthView(historyDepth.get()));

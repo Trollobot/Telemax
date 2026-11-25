@@ -18,7 +18,7 @@ export function parseEnvBool(raw: string | undefined): boolean | undefined {
 
 /** The settings that may come from a file. A fixed list: an unrelated *_FILE in the environment
  * (SSL_CERT_FILE, COMPOSE_FILE…) must not be read in — or stop the start when its file is missing. */
-export const SECRET_FILE_VARS = ['TELEGRAM_BOT_TOKEN', 'MAX_SESSION_KEY', 'TELEGRAM_PROXY', 'TARGET_TELEGRAM_GROUP'] as const;
+export const SECRET_FILE_VARS = ['TELEGRAM_BOT_TOKEN', 'MAX_SESSION_KEY', 'TELEGRAM_PROXY', 'MAX_PROXY', 'TARGET_TELEGRAM_GROUP'] as const;
 
 /**
  * Docker-secrets convention (as in the postgres/mysql images): NAME_FILE=/run/secrets/name fills
