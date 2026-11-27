@@ -2187,6 +2187,15 @@ export function wireBridge({
           lastRelayedReaction.delete(key);
           continue;
         }
+        // MAX left the request unanswered: for one message on prod it did so again and again (2026-11-26),
+        // and each time the whole connection went silent with it and had to be re-made. That message is
+        // not asked about again — a reaction removed on it may stay in Telegram, the connection stays up.
+        // And no more polling this round: the next request would only wait on the same silent socket.
+        if (/^Timed out waiting for 0x/.test(String((err as Error | null)?.message ?? ''))) {
+          lastRelayedReaction.delete(key);
+          logger.warn(`MAX did not answer about the reactions on message ${String(relayed.messageId)} of chat ${relayed.chatId} — not asking about it again`);
+          return;
+        }
         logger.error(`Failed to poll MAX reactions for chat ${relayed.chatId} message ${String(relayed.messageId)}`, err);
       }
     }

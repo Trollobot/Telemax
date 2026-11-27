@@ -122,10 +122,10 @@ const DEFAULT_PING_INTERVAL_MS = 50_000;
 // considers outdated («Приложение устарело, пожалуйста, обновитесь» on the SMS request — every new
 // /login broke on 2026-10-12, the day after desktop 26.35.x shipped). The current pair is the newest
 // package in MAX's own apt repo: https://download.max.ru/linux/deb/dists/stable/main/binary-amd64/Packages
-// («Version: 26.41.1», «Filename: …/MAX-26.41.1.83827.deb» → build 83827). MAX_APP_VERSION and
+// («Version: 26.42.0», «Filename: …/MAX-26.42.0.84483.deb» → build 84483). MAX_APP_VERSION and
 // MAX_BUILD_NUMBER in .env override it, so a user can fix the next such bump without waiting for a release.
-const DEFAULT_APP_VERSION = '26.41.1';
-const DEFAULT_BUILD_NUMBER = 83827;
+const DEFAULT_APP_VERSION = '26.42.0';
+const DEFAULT_BUILD_NUMBER = 84483;
 function userAgent(env: NodeJS.ProcessEnv = process.env) {
   const version = (env.MAX_APP_VERSION ?? '').trim();
   const build = Number((env.MAX_BUILD_NUMBER ?? '').trim());
