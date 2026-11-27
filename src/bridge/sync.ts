@@ -1877,6 +1877,8 @@ export function wireBridge({
   // confirmation phrase that is public (open-source, echoed in /help), so without this anyone who
   // finds the bot (a DM, an unrelated group) could trigger them. poll_answer updates carry no
   // `chat`: they pass through, and the poll_answer handler checks poll_id and the voter itself.
+  // Foreign groups the bot keeps silent in — logged once each, not on every message.
+  const quietChats = new Set<number>();
   bot.use(async (ctx, next) => {
     // The bot added to / removed from a chat: only a broadcast's channel promotion means anything to us.
     if (ctx.myChatMember) {
@@ -1935,11 +1937,15 @@ export function wireBridge({
       if (m && (m.new_chat_members || m.left_chat_member || m.group_chat_created || m.supergroup_chat_created || m.migrate_to_chat_id || m.migrate_from_chat_id)) return;
       if (ctx.callbackQuery) {
         ctx.answerCbQuery('Это не ваш мост.').catch(() => {});
-      } else if (ctx.chat.type === 'group' || ctx.chat.type === 'supergroup') {
+      } else if ((ctx.chat.type === 'group' || ctx.chat.type === 'supergroup') && !quietChats.has(ctx.chat.id)) {
         // Anyone can add a bot to their group. Answering every message there made it spammable and
-        // easy to fingerprint; it just leaves instead (broadcast places were handled above).
-        logger.info(`Leaving chat ${ctx.chat.id}: not the bridge group and not a broadcast place`);
-        ctx.leaveChat().catch((err: unknown) => logger.warn(`Could not leave chat ${ctx.chat?.id}`, err));
+        // easy to fingerprint (#17) — it stays silent. It does NOT leave: a group being set up as a
+        // broadcast place right now (the «👥 В группу» join or the «🔎 Бот уже в группе» picker, before
+        // it is saved), or the owner's own group behind a stale TARGET_TELEGRAM_GROUP, would lose the
+        // bot and its admin rights on the first message (independent review, 2026-11-27).
+        if (quietChats.size >= 500) quietChats.clear();
+        quietChats.add(ctx.chat.id);
+        logger.info(`Chat ${ctx.chat.id} is neither the bridge group nor a broadcast place — staying silent there`);
       }
       return;
     }
@@ -2010,6 +2016,12 @@ export function wireBridge({
     if (actor.kind === 'unknown') return; // no sender — fail closed
     const userId = actor.userId;
     if (userId === ctx.botInfo?.id) return next();
+    // Telegram's service senders — a post «as a channel» (Channel_Bot) or a linked channel's automatic
+    // forward (777000) — are nobody's admin, and asking about them can only fail: no ⚠️ for each one.
+    if (userId === 136817688 || userId === 777000) {
+      logger.info(`RELAY=admins: not relaying a ${actor.what} posted by Telegram on behalf of a channel`);
+      return;
+    }
     const cached = adminSeen.get(userId);
     let admin = cached && Date.now() - cached.at < 60_000 ? cached.admin : undefined;
     if (admin === undefined) {
